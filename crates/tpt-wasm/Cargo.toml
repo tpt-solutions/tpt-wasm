@@ -1,0 +1,15 @@
+[package]
+name = "tpt-wasm"
+description = "TPT-Wasm — independent Rust implementation of WebAssembly"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true
+tpt-wasm-decode.workspace = true
+tpt-wasm-validate.workspace = true
+tpt-wasm-runtime.workspace = true
+tpt-wasm-host.workspace = true

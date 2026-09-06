@@ -1,0 +1,12 @@
+[package]
+name = "tpt-wasm-micro"
+description = "Micro Interpreter (Golden Machine) for tpt-wasm — the canonical semantic reference"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true
+tpt-wasm-validate.workspace = true

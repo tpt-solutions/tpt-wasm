@@ -1,0 +1,11 @@
+[package]
+name = "tpt-wasm-format"
+description = "WebAssembly module structure representation for tpt-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true

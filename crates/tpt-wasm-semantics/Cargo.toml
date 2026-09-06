@@ -1,0 +1,11 @@
+[package]
+name = "tpt-wasm-semantics"
+description = "Formal abstract machine for tpt-wasm (Lean 4 correspondence layer)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true

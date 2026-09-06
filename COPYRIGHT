@@ -1,0 +1,16 @@
+Copyright (c) 2026 TPT Solutions
+
+TPT-Wasm is an original, independently authored implementation of WebAssembly.
+It is not derived from, copied from, or a fork of any existing WebAssembly runtime.
+
+The normative sources for this implementation are:
+  - WebAssembly Core Specification (W3C)
+  - WebAssembly binary format specification
+  - WebAssembly text format specification
+  - WebAssembly proposal specifications (where implemented)
+
+All original source code in this repository is copyright TPT Solutions and is
+licensed under the terms described in LICENSE-MIT and LICENSE-APACHE.
+
+Third-party dependencies retain their own copyright and license terms.
+See docs/licensing/provenance.md and NOTICE for details.

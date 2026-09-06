@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tpt-wasm-types",
+    "crates/tpt-wasm-format",
+    "crates/tpt-wasm-decode",
+    "crates/tpt-wasm-validate",
+    "crates/tpt-wasm-micro",
+    "crates/tpt-wasm-runtime",
+    "crates/tpt-wasm-host",
+    "crates/tpt-wasm-capability",
+    "crates/tpt-wasm-resource",
+    "crates/tpt-wasm-semantics",
+    "crates/tpt-wasm-verify",
+    "crates/tpt-wasm-ir",
+    "crates/tpt-wasm-codegen",
+    "crates/tpt-wasm-jit",
+    "crates/tpt-wasm-aot",
+    "crates/tpt-wasm",
+    "crates/tpt-wasm-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["TPT Solutions"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tpt-solutions/tpt-wasm"
+homepage = "https://github.com/tpt-solutions/tpt-wasm"
+documentation = "https://docs.rs/tpt-wasm"
+keywords = ["webassembly", "wasm", "runtime", "interpreter"]
+categories = ["wasm"]
+rust-version = "1.80"
+
+[workspace.metadata.tpt-wasm]
+wasm_core_version = "3.0"
+semantics_version = "0.1"
+
+[workspace.dependencies]
+tpt-wasm-types    = { path = "crates/tpt-wasm-types",    version = "0.1.0" }
+tpt-wasm-format   = { path = "crates/tpt-wasm-format",   version = "0.1.0" }
+tpt-wasm-decode   = { path = "crates/tpt-wasm-decode",   version = "0.1.0" }
+tpt-wasm-validate = { path = "crates/tpt-wasm-validate", version = "0.1.0" }
+tpt-wasm-micro    = { path = "crates/tpt-wasm-micro",    version = "0.1.0" }
+tpt-wasm-runtime  = { path = "crates/tpt-wasm-runtime",  version = "0.1.0" }
+tpt-wasm-host     = { path = "crates/tpt-wasm-host",     version = "0.1.0" }
+tpt-wasm-capability = { path = "crates/tpt-wasm-capability", version = "0.1.0" }
+tpt-wasm-resource = { path = "crates/tpt-wasm-resource", version = "0.1.0" }
+tpt-wasm-semantics = { path = "crates/tpt-wasm-semantics", version = "0.1.0" }
+tpt-wasm-verify   = { path = "crates/tpt-wasm-verify",   version = "0.1.0" }
+tpt-wasm-ir       = { path = "crates/tpt-wasm-ir",       version = "0.1.0" }
+tpt-wasm-codegen  = { path = "crates/tpt-wasm-codegen",  version = "0.1.0" }
+tpt-wasm-jit      = { path = "crates/tpt-wasm-jit",      version = "0.1.0" }
+tpt-wasm-aot      = { path = "crates/tpt-wasm-aot",      version = "0.1.0" }
+tpt-wasm          = { path = "crates/tpt-wasm",          version = "0.1.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+opt-level = 1

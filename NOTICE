@@ -1,0 +1,22 @@
+TPT-Wasm
+Copyright (c) 2026 TPT Solutions
+
+This product includes software developed independently by TPT Solutions.
+
+TPT-Wasm is an independent Rust implementation of WebAssembly.
+It is not a fork, derivative, or copy of any existing WebAssembly runtime.
+
+The implementation is based on the following public specifications:
+  - WebAssembly Core Specification, W3C (https://webassembly.github.io/spec/)
+  - WebAssembly WASI Specification (https://wasi.dev/)
+  - WebAssembly Component Model Specification (https://component-model.bytecodealliance.org/)
+
+The WebAssembly specification test suite is used for interoperability testing only
+and is not incorporated into the distributed software.
+
+Third-party Rust crates used as dependencies retain their own copyright notices
+and license terms. See docs/licensing/provenance.md for the dependency provenance
+record, and the output of `cargo deny` / `cargo metadata` for the full list.
+
+No implementation code from external WebAssembly runtimes (Wasmtime, Wasmer,
+WasmEdge, WAMR, or others) has been incorporated into this project.

@@ -1,0 +1,13 @@
+[package]
+name = "tpt-wasm-aot"
+description = "AOT compiler for tpt-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true
+tpt-wasm-ir.workspace = true
+tpt-wasm-codegen.workspace = true

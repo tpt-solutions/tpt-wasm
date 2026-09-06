@@ -1,0 +1,24 @@
+/target
+Cargo.lock
+**/*.rs.bk
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Fuzzing artifacts
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Lean 4 build artifacts
+formal/.lake/
+formal/lake-manifest.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark results
+criterion/

@@ -1,0 +1,12 @@
+[package]
+name = "tpt-wasm-verify"
+description = "Verification infrastructure for tpt-wasm (invariants, contracts, property tests)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true
+tpt-wasm-semantics.workspace = true

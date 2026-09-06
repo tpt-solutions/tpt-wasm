@@ -1,0 +1,12 @@
+[package]
+name = "tpt-wasm-codegen"
+description = "Baseline code generation for tpt-wasm (correctness over performance)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true
+tpt-wasm-ir.workspace = true

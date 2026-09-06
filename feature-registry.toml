@@ -1,0 +1,61 @@
+# TPT-Wasm Feature Registry
+# Machine-readable record of WebAssembly proposal support.
+# Used to generate compatibility documentation and gate CI tests.
+#
+# States: false = not implemented, "partial" = partial, true = complete
+# Each feature should also have: tested, fuzzed, differential, verified
+
+[core]
+version = "3.0"
+specification = "https://webassembly.github.io/spec/"
+
+[features]
+# WebAssembly MVP
+mvp = true
+
+# Phase 4 proposals (shipped in browsers)
+reference_types    = false
+bulk_memory        = false
+simd               = false
+multi_value        = false
+sign_extension_ops = false
+non_trapping_float_to_int = false
+
+# Phase 4 / shipping
+threads            = false
+extended_const      = false
+
+# Phase 3
+exception_handling = false
+memory64           = false
+multi_memory       = false
+tail_call          = false
+relaxed_simd       = false
+
+# Phase 2
+gc                 = false
+typed_function_references = false
+memory_control     = false
+
+# Planned / research
+branch_hinting     = false
+flexible_vectors   = false
+
+[features.status]
+# For each feature above, track the implementation ladder:
+# decoded    = binary format understood by decoder
+# validated  = validation rules implemented
+# executed   = interpreter executes it
+# compiled   = compiler generates code for it
+# tested     = spec tests pass
+# fuzzed     = fuzz target exists
+# differential = differential test exists
+# verified   = formal property established
+
+[standards]
+wasm_core   = "3.0"
+wasi_preview2 = "pending"
+component_model = "pending"
+
+[semantics]
+version = "0.1"

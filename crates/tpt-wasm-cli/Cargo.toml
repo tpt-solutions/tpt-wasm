@@ -1,0 +1,15 @@
+[package]
+name = "tpt-wasm-cli"
+description = "Command-line interface for tpt-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tpt-wasm"
+path = "src/main.rs"
+
+[dependencies]
+tpt-wasm.workspace = true

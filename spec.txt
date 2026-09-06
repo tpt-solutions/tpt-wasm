@@ -1,0 +1,2249 @@
+TPT-Wasm — Full Design Specification
+
+Project: tpt-wasm
+Language: Rust
+Primary license target: MIT
+Primary maintainer: TPT project owner
+Status: Architecture / greenfield implementation
+Primary standards target: WebAssembly Core 3.0, with subsequent versions tracked explicitly
+Future standards: WASI, Component Model, relevant WebAssembly proposals
+
+1. Executive Summary
+
+tpt-wasm is an independent Rust implementation of WebAssembly designed around four complementary layers:
+
+┌────────────────────────────────────────────────────────────┐
+│                         TPT-WASM                            │
+│                                                            │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐            │
+│  │   MICRO    │  │    HOST    │  │   FORMAL   │            │
+│  │ INTERPRETER│  │ CAPABILITY │  │ VERIFICATION│           │
+│  └─────┬──────┘  └─────┬──────┘  └──────┬─────┘            │
+│        │               │                │                  │
+│        └───────────────┼────────────────┘                  │
+│                        ▼                                   │
+│                 ┌──────────────┐                           │
+│                 │     IR       │                           │
+│                 └──────┬───────┘                           │
+│                        ▼                                   │
+│                 ┌──────────────┐                           │
+│                 │    COMPILER  │                           │
+│                 └──────────────┘                           │
+└────────────────────────────────────────────────────────────┘
+
+The fundamental invariant is:
+
+There is one meaning of a WebAssembly program, expressed formally and embodied by the Micro Interpreter. Every optimized implementation must preserve that meaning.
+
+The project is therefore not principally "a faster WebAssembly runtime."
+
+It is:
+
+A specification-first WebAssembly execution system whose minimal implementation, formal model, host architecture and optimizing compiler are deliberately separated.
+
+2. Project Goals
+2.1 Primary goals
+
+tpt-wasm shall provide:
+
+A correct WebAssembly implementation.
+A minimal executable reference implementation.
+A Rust-native embedding API.
+A capability-oriented host architecture.
+Explicit resource ownership and isolation.
+Deterministic execution modes.
+A formal semantic model.
+A verification architecture.
+An independent compiler IR.
+JIT and AOT compilation.
+Strong differential testing.
+A clean licensing/provenance model.
+Integration with the wider TPT ecosystem.
+Long-term support for WebAssembly evolution.
+3. Non-Goals
+
+tpt-wasm should not initially attempt to:
+
+reproduce Wasmtime's architecture;
+reproduce Wasmtime's API;
+become a fork of Wasmtime;
+make Cranelift the semantic foundation;
+implement every WebAssembly proposal immediately;
+embed TPT-specific domain semantics into Core Wasm;
+make WASI the fundamental host abstraction;
+prove the entire optimizing compiler before shipping useful functionality;
+become a general distributed-computing framework.
+
+The WebAssembly Component Model itself explicitly takes a layered approach and leaves areas such as persistence, distributed computing and deployment outside its scope. tpt-wasm should retain the same discipline.
+
+4. Standards Strategy
+
+The normative foundation is the WebAssembly specification, not another runtime implementation.
+
+The current Core specification defines:
+
+module structure;
+instructions;
+validation;
+instantiation;
+execution;
+binary format;
+text format;
+implementation limits;
+formal properties.
+
+The WebAssembly specification repository also provides an official reference implementation and test suite, which should be treated as an interoperability/testing resource rather than as an implementation dependency.
+
+4.1 Standards hierarchy
+W3C WebAssembly Core
+        │
+        ├── Core semantics
+        ├── Binary format
+        ├── Validation
+        └── Execution
+                │
+                ▼
+             tpt-wasm
+                │
+       ┌────────┼────────┐
+       ▼        ▼        ▼
+     WASI   Component   TPT Host
+
+The project should maintain an explicit standards matrix:
+
+docs/standards/
+    wasm-core.md
+    wasi.md
+    component-model.md
+    proposals.md
+5. Core Architectural Principle
+
+The most important design decision is:
+
+The Micro Interpreter is the Golden Machine.
+
+Everything else is subordinate to the semantic model.
+
+             ┌──────────────────────┐
+             │ WebAssembly semantics│
+             └──────────┬───────────┘
+                        │
+             ┌──────────▼───────────┐
+             │   Golden Machine     │
+             │ Micro Interpreter    │
+             └──────────┬───────────┘
+                        │
+              observable behavior
+                        │
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+       Compiler        Host         Formal
+          │             │             │
+          └─────────────┼─────────────┘
+                        ▼
+                   Verification
+
+This gives the project a stable semantic center.
+
+6. Four-Layer Architecture
+Layer 1 — Micro Interpreter
+
+Question:
+
+What does WebAssembly mean?
+
+Characteristics:
+
+small;
+obvious;
+portable;
+deterministic;
+easy to inspect;
+minimal unsafe;
+specification-oriented;
+intentionally not optimized.
+Layer 2 — Novel Host
+
+Question:
+
+What may a WebAssembly program interact with?
+
+Characteristics:
+
+capabilities;
+resources;
+explicit authority;
+isolation;
+deterministic host modes;
+TPT integration;
+WASI adapters.
+
+WebAssembly itself provides no ambient access to the host; interaction happens through imported/embedder-provided functionality.
+
+tpt-wasm should preserve that principle and make it explicit in its host architecture.
+
+Layer 3 — Formal Verification
+
+Question:
+
+Can we prove that our implementation preserves the specified behavior?
+
+Characteristics:
+
+formal machine;
+transition relations;
+invariants;
+refinement;
+memory safety properties;
+host capability properties;
+eventually compiler correctness.
+Layer 4 — Full Compiler
+
+Question:
+
+Can we execute exactly the same semantics efficiently?
+
+Characteristics:
+
+independent TPT IR;
+baseline compilation;
+optimizing compilation;
+JIT;
+AOT;
+multiple native architectures;
+eventually verified transformations.
+7. Repository Structure
+
+Recommended repository:
+
+tpt-wasm/
+│
+├── Cargo.toml
+├── Cargo.lock
+│
+├── LICENSE
+├── NOTICE
+├── COPYRIGHT
+├── README.md
+├── SECURITY.md
+├── CONTRIBUTING.md
+├── GOVERNANCE.md
+│
+├── docs/
+│   ├── architecture/
+│   │   ├── overview.md
+│   │   ├── layers.md
+│   │   ├── boundaries.md
+│   │   └── invariants.md
+│   │
+│   ├── semantics/
+│   │   ├── machine.md
+│   │   ├── values.md
+│   │   ├── traps.md
+│   │   └── execution.md
+│   │
+│   ├── host/
+│   │   ├── capabilities.md
+│   │   ├── resources.md
+│   │   └── determinism.md
+│   │
+│   ├── verification/
+│   │   ├── model.md
+│   │   ├── invariants.md
+│   │   └── refinement.md
+│   │
+│   ├── compiler/
+│   │   ├── ir.md
+│   │   ├── lowering.md
+│   │   └── optimization.md
+│   │
+│   ├── standards/
+│   │   ├── wasm-core.md
+│   │   ├── wasi.md
+│   │   └── component-model.md
+│   │
+│   └── licensing/
+│       ├── provenance.md
+│       ├── dependencies.md
+│       └── release.md
+│
+├── crates/
+│   ├── tpt-wasm-types/
+│   ├── tpt-wasm-format/
+│   ├── tpt-wasm-decode/
+│   ├── tpt-wasm-validate/
+│   │
+│   ├── tpt-wasm-micro/
+│   ├── tpt-wasm-runtime/
+│   │
+│   ├── tpt-wasm-host/
+│   ├── tpt-wasm-capability/
+│   ├── tpt-wasm-resource/
+│   │
+│   ├── tpt-wasm-semantics/
+│   ├── tpt-wasm-verify/
+│   │
+│   ├── tpt-wasm-ir/
+│   ├── tpt-wasm-codegen/
+│   ├── tpt-wasm-jit/
+│   ├── tpt-wasm-aot/
+│   │
+│   ├── tpt-wasm/
+│   └── tpt-wasm-cli/
+│
+├── formal/
+│   ├── definitions/
+│   ├── proofs/
+│   ├── invariants/
+│   └── tests/
+│
+├── tests/
+│   ├── spec/
+│   ├── interpreter/
+│   ├── validation/
+│   ├── host/
+│   ├── compiler/
+│   ├── differential/
+│   ├── security/
+│   └── regression/
+│
+└── tools/
+    ├── spec-tests/
+    ├── differential/
+    ├── license-audit/
+    └── release/
+8. Crate Dependency Rules
+
+The dependency direction matters.
+
+tpt-wasm-types
+      │
+      ├── format
+      │
+      ├── decode
+      │
+      └── validate
+               │
+               ▼
+        tpt-wasm-micro
+               │
+               ▼
+        tpt-wasm-runtime
+               │
+       ┌───────┴────────┐
+       ▼                ▼
+     host             TPT adapters
+
+
+types
+  │
+  ▼
+semantics
+  │
+  ▼
+verify
+
+
+validate
+  │
+  ▼
+IR
+  │
+  ├── codegen
+  ├── JIT
+  └── AOT
+Critical rule
+
+The compiler must not become a dependency of the interpreter.
+
+The host must not become a dependency of the semantic core.
+
+The TPT ecosystem must not become a dependency of Core Wasm.
+
+9. tpt-wasm-types
+
+This crate contains semantic types.
+
+Examples:
+
+pub enum Value {
+    I32(i32),
+    I64(i64),
+    F32(u32),
+    F64(u64),
+    V128(u128),
+    Ref(RefValue),
+}
+
+It should also define:
+
+ValueType
+ResultType
+FunctionType
+GlobalType
+MemoryType
+TableType
+TagType
+ReferenceType
+
+The representation should remain independent of machine registers.
+
+10. tpt-wasm-format
+
+Represents the WebAssembly module structure.
+
+pub struct Module {
+    pub types: Vec<Type>,
+    pub imports: Vec<Import>,
+    pub functions: Vec<Function>,
+    pub tables: Vec<Table>,
+    pub memories: Vec<Memory>,
+    pub globals: Vec<Global>,
+    pub exports: Vec<Export>,
+    pub elements: Vec<Element>,
+    pub data: Vec<DataSegment>,
+}
+
+This is a semantic representation, not an execution representation.
+
+11. tpt-wasm-decode
+
+Responsibilities:
+
+binary decoding;
+section decoding;
+LEB128;
+indices;
+limits;
+names;
+custom sections.
+
+Principle:
+
+bytes
+ ↓
+decode
+ ↓
+Module
+
+not:
+
+bytes
+ ↓
+decode + validate + instantiate
+
+These concerns remain separate.
+
+12. tpt-wasm-validate
+
+Validation is a first-class stage:
+
+Module
+  │
+  ▼
+Validator
+  │
+  ▼
+ValidatedModule
+
+The validator should establish the static properties necessary for execution.
+
+Conceptually:
+
+pub struct ValidatedModule {
+    module: Module,
+    certificate: ValidationCertificate,
+}
+
+The certificate need not initially be a formal proof object; it is an architectural hook for future verification.
+
+13. Micro Interpreter
+
+Crate:
+
+tpt-wasm-micro
+
+Purpose:
+
+Implement the smallest understandable executable WebAssembly machine.
+
+14. Runtime State
+
+Initial model:
+
+pub struct Store {
+    memories: Vec<MemoryInstance>,
+    tables: Vec<TableInstance>,
+    globals: Vec<GlobalInstance>,
+    functions: Vec<FuncInstance>,
+    instances: Vec<Instance>,
+}
+
+Execution:
+
+pub struct Machine {
+    store: Store,
+    operand_stack: Vec<Value>,
+    frames: Vec<Frame>,
+}
+
+Eventually separate:
+
+Store
+ExecutionState
+Frame
+ControlFrame
+OperandStack
+
+rather than hiding everything inside one object.
+
+15. Instruction Representation
+
+Initial representation should prioritize clarity:
+
+pub enum Instr {
+    Unreachable,
+    Nop,
+
+    Block(BlockType),
+    Loop(BlockType),
+    If(BlockType),
+
+    Br(u32),
+    BrIf(u32),
+    BrTable(BrTable),
+
+    Return,
+
+    Call(u32),
+    CallIndirect(...),
+
+    LocalGet(u32),
+    LocalSet(u32),
+    LocalTee(u32),
+
+    GlobalGet(u32),
+    GlobalSet(u32),
+
+    I32Const(i32),
+    I64Const(i64),
+
+    I32Add,
+    I32Sub,
+    I32Mul,
+
+    // ...
+}
+
+Do not optimize this representation.
+
+The compiler gets its own representation later.
+
+16. Execution API
+
+The interpreter should expose an explicit transition:
+
+pub enum Step {
+    Continue,
+    Return,
+    Trap(Trap),
+    HostCall(HostCall),
+}
+
+and:
+
+pub fn step(machine: &mut Machine) -> Step;
+
+This creates a direct bridge to formal semantics.
+
+17. Traps
+
+Wasm traps must never be represented as Rust panics.
+
+pub enum Trap {
+    Unreachable,
+    IntegerDivisionByZero,
+    IntegerOverflow,
+    InvalidConversion,
+    MemoryOutOfBounds,
+    TableOutOfBounds,
+    NullReference,
+    IndirectCallTypeMismatch,
+    StackOverflow,
+    HostFailure(HostError),
+}
+
+Implementation errors may panic during development, but a valid Wasm program causing a Wasm trap must always produce a structured Trap.
+
+18. Interpreter Safety Requirements
+
+Target:
+
+safe Rust
+
+for the entire Micro Interpreter wherever practical.
+
+Ideal target:
+
+tpt-wasm-micro
+    unsafe blocks: 0
+
+This makes the Micro Interpreter particularly useful as the reference against which optimized implementations are tested.
+
+19. Layer 2 — TPT Host
+
+The host is deliberately different from the core interpreter.
+
+Core principle:
+
+No ambient authority.
+
+Wasm
+ │
+ │ imported function/resource
+ ▼
+Capability
+ │
+ ▼
+Host resource
+20. Capability Architecture
+
+Core types:
+
+pub struct CapabilityId(...);
+
+pub struct CapabilityDescriptor {
+    pub id: CapabilityId,
+    pub operations: Vec<Operation>,
+}
+
+pub struct CapabilityGrant {
+    pub capability: CapabilityId,
+    pub permissions: Permissions,
+}
+
+Host:
+
+pub struct Host {
+    capabilities: CapabilitySet,
+}
+21. Capability Invocation
+
+Conceptually:
+
+pub trait Capability {
+    fn id(&self) -> CapabilityId;
+
+    fn invoke(
+        &mut self,
+        operation: Operation,
+        args: &[Value],
+    ) -> Result<Vec<Value>, HostError>;
+}
+
+This is intentionally not tied to filesystem, sockets or POSIX.
+
+22. Resource Model
+
+Host resources should be represented using opaque handles.
+
+pub struct ResourceId(u64);
+
+Architecture:
+
+Wasm
+ │
+ │ ResourceId
+ ▼
+ResourceTable
+ │
+ ▼
+Host Resource
+
+Never expose Rust pointers or object addresses to Wasm.
+
+23. TPT-System Integration
+
+tpt-wasm should integrate with tpt-system, but through an adapter:
+
+tpt-wasm
+    │
+    ▼
+tpt-wasm-host
+    │
+    ▼
+tpt-system adapter
+    │
+    ▼
+TPT system
+
+This prevents the core runtime from becoming dependent on the entire TPT ecosystem.
+
+This is especially important given your plan for tpt-math, engineering, science, FEM, physics, robotics and the other Level-1 TPT systems. tpt-wasm should provide their execution substrate, not absorb their domain models.
+
+24. TPT Capability Examples
+
+Eventually TPT systems might expose capabilities such as:
+
+tpt.math
+tpt.geometry
+tpt.physics
+tpt.engineering
+tpt.fem
+tpt.robotics
+tpt.workflow
+tpt.system
+
+But these should be external capability implementations, not built into Core Wasm.
+
+For example:
+
+Wasm module
+    │
+    ▼
+"tpt.physics"
+    │
+    ▼
+PhysicsCapability
+    │
+    ▼
+tpt-physics
+25. WASI
+
+WASI should be an adapter layer:
+
+                  tpt-wasm-host
+                        │
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+        WASI       TPT Host       Custom Host
+
+The WASI interface remains important because WebAssembly's official specification ecosystem defines embedding interfaces separately from the Core specification.
+
+But WASI should not dictate the architecture of the core runtime.
+
+26. Deterministic Execution
+
+Make deterministic execution explicit.
+
+pub enum ExecutionMode {
+    Deterministic,
+    HostDependent,
+    RecordReplay,
+}
+
+Deterministic mode:
+
+clock      → virtual
+randomness → seeded
+filesystem → controlled snapshot
+network    → prohibited/recorded
+scheduler  → deterministic
+
+This is valuable for:
+
+testing;
+reproducibility;
+formal verification;
+scientific computation;
+simulation;
+TPT workflows.
+27. Layer 3 — Formal Semantics
+
+Crate:
+
+tpt-wasm-semantics
+
+This should define an abstract machine.
+
+Conceptually:
+
+Configuration =
+{
+    Store,
+    FrameStack,
+    OperandStack,
+    ControlStack
+}
+
+with transitions:
+
+C → C'
+
+The implementation should mirror the structure of the Core WebAssembly execution semantics rather than inventing a different meaning. The current specification explicitly defines execution semantics and formal properties.
+
+28. Formal Invariants
+
+The initial proof program should target:
+
+Type soundness
+Valid(Module)
+    ⇒
+WellTyped(Execution)
+Memory safety
+Valid(Module)
+    ⇒
+NoWasmMemoryOutOfBoundsAccess
+Control-flow safety
+Valid(Module)
+    ⇒
+ValidControlTransfer
+Call safety
+Valid(Module)
+    ⇒
+TypeCorrectCalls
+Host safety
+WasmExecution
+    ⇒
+OnlyGrantedCapabilitiesInvoked
+29. Verification Ladder
+
+Do not attempt "fully verified Wasm compiler" immediately.
+
+Use:
+
+V0  Type invariants
+ ↓
+V1  Interpreter correspondence
+ ↓
+V2  Memory safety
+ ↓
+V3  Host capability safety
+ ↓
+V4  IR refinement
+ ↓
+V5  Compiler transformation correctness
+ ↓
+V6  Machine-code refinement
+
+This makes formal verification a continuous architectural property rather than a giant final project.
+
+30. tpt-wasm-verify
+
+This crate should contain executable verification infrastructure:
+
+invariants
+contracts
+model checking
+property tests
+semantic correspondence
+proof harnesses
+
+The exact formal technology can evolve.
+
+Don't lock the architecture to one verifier before you have a concrete proof workload.
+
+31. Layer 4 — TPT-Wasm IR
+
+Crate:
+
+tpt-wasm-ir
+
+The IR is deliberately independent of the interpreter.
+
+Wasm
+ │
+ ▼
+Validated Wasm
+ │
+ ▼
+TPT-Wasm IR
+ │
+ ├── interpreter backend
+ ├── baseline compiler
+ ├── optimizing compiler
+ └── verification model
+32. IR Design Principles
+
+The IR should support:
+
+SSA eventually;
+explicit control flow;
+typed values;
+explicit memory operations;
+explicit traps;
+explicit calls;
+explicit references;
+explicit host boundaries.
+
+Do not make machine registers part of the initial IR.
+
+33. Compiler Pipeline
+Binary
+  │
+  ▼
+Decode
+  │
+  ▼
+Validate
+  │
+  ▼
+Wasm representation
+  │
+  ▼
+TPT-Wasm IR
+  │
+  ▼
+Optimization
+  │
+  ▼
+Lowering
+  │
+  ▼
+Machine IR
+  │
+  ▼
+Native code
+34. Compiler Modes
+pub enum EngineMode {
+    Micro,
+    Baseline,
+    Optimizing,
+}
+
+Potentially later:
+
+Micro
+Baseline
+Optimizing
+AOT
+
+The public API should allow choosing execution strategy without changing program semantics.
+
+35. Baseline Compiler
+
+First compiler should optimize for:
+
+correctness;
+startup time;
+predictable code generation;
+easy debugging.
+
+Not peak performance.
+
+Pipeline:
+
+Wasm
+ ↓
+TPT IR
+ ↓
+simple lowering
+ ↓
+native code
+36. Optimizing Compiler
+
+Later transformations:
+
+constant folding
+constant propagation
+dead code elimination
+CFG simplification
+local value numbering
+inlining
+bounds-check elimination
+load/store optimization
+common subexpression elimination
+register allocation
+instruction scheduling
+
+Every optimization should have:
+
+precondition
+transformation
+semantic invariant
+tests
+differential test
+fuzz test
+
+Eventually:
+
+proof obligation
+37. Compiler Correctness
+
+The ideal long-term architecture is:
+
+Core Wasm
+    ≈
+TPT-Wasm IR
+    ≈
+Optimized IR
+    ≈
+Machine IR
+    ≈
+Machine Code
+
+Each ≈ represents a refinement/equivalence boundary.
+
+This means the compiler never becomes the definition of Wasm semantics.
+
+38. Differential Testing
+
+This should be one of the project's strongest systems.
+
+Given:
+
+module.wasm
+input
+
+run:
+
+Micro Interpreter
+Formal Model
+Baseline Compiler
+Optimizing Compiler
+External Wasm implementations
+
+Compare:
+
+return values
+traps
+memory
+globals
+tables
+observable host effects
+
+The invariant:
+
+Micro(module)
+    ==
+Compiled(module)
+
+for externally observable behavior.
+
+39. External Wasm Implementations
+
+Other implementations may be used as test oracles.
+
+In particular:
+
+Wasmtime
+Wasmer
+WasmEdge
+WAMR
+official reference interpreter
+
+can be useful for interoperability testing.
+
+But:
+
+external runtime
+       ≠
+implementation dependency
+
+and:
+
+external source
+       ≠
+source material
+
+for the TPT implementation.
+
+The WebAssembly project's own repository already separates its specification, reference implementation and test suite, which gives you a useful model for maintaining that distinction.
+
+40. Fuzzing
+
+Fuzz targets:
+
+decode
+validate
+instantiate
+interpret
+host invocation
+IR generation
+compiler
+JIT
+AOT
+
+Most valuable:
+
+random Wasm
+    │
+    ├── Micro
+    ├── Baseline
+    └── Optimized
+             │
+             ▼
+        differential result
+41. Official Test Suite
+
+Create:
+
+tests/spec/
+
+and track compatibility by feature.
+
+MVP
+reference types
+bulk memory
+SIMD
+multi-memory
+64-bit memories
+exception handling
+GC
+threads
+etc.
+
+Each feature gets:
+
+implemented
+tested
+fuzzed
+differentially tested
+verified
+
+rather than a single binary "supported/not supported" state.
+
+42. Feature Registry
+
+Use a machine-readable registry:
+
+[core]
+version = "3.0"
+
+[features]
+reference_types = true
+bulk_memory = true
+simd = false
+threads = false
+exceptions = false
+gc = false
+memory64 = false
+
+The project should generate its compatibility documentation from this registry.
+
+43. Security Model
+
+Treat each subsystem as a security boundary.
+
+Decoder
+Validator
+Interpreter
+Host
+Resource system
+Compiler
+Executable memory
+
+Threat models should cover:
+
+Decoder
+malformed binaries;
+oversized allocations;
+integer overflow;
+recursion;
+nesting exhaustion.
+Interpreter
+memory OOB;
+table OOB;
+stack exhaustion;
+type confusion;
+reference errors.
+Host
+capability escalation;
+confused deputy;
+resource lifetime violations;
+reentrancy;
+unintended ambient authority.
+Compiler
+incorrect bounds elimination;
+control-flow corruption;
+register allocation bugs;
+calling convention errors;
+executable-memory violations.
+44. Resource Limits
+pub struct Limits {
+    pub max_memory_pages: u64,
+    pub max_table_elements: u32,
+    pub max_instances: u32,
+    pub max_stack_depth: usize,
+    pub max_call_depth: usize,
+    pub max_execution_steps: Option<u64>,
+}
+
+Limits should be shared conceptually across all engines.
+
+The current WebAssembly specification explicitly discusses implementation resource limits, so this belongs in the runtime contract rather than being an accidental compiler detail.
+
+45. unsafe Policy
+Micro
+
+Target:
+
+unsafe = 0
+Host
+
+Target:
+
+unsafe = 0
+Compiler
+
+unsafe allowed only where necessary:
+
+executable memory
+FFI
+calling conventions
+machine-code interaction
+platform-specific operations
+
+Each block must document its safety invariant.
+
+46. Public API
+
+The top-level crate:
+
+tpt-wasm
+
+should expose a clean embedding API.
+
+Conceptually:
+
+let engine = Engine::new(Config::default())?;
+
+let module = Module::from_file(
+    &engine,
+    "program.wasm",
+)?;
+
+let mut store = Store::new(
+    &engine,
+    HostState::default(),
+);
+
+let instance = engine.instantiate(
+    &mut store,
+    &module,
+)?;
+
+let result = instance
+    .get_function("main")?
+    .call(&mut store, &[])?;
+
+The API should be:
+
+stable;
+unsurprising;
+independent of compiler internals;
+independent of the formal system;
+independent of TPT domain crates.
+47. Engine Configuration
+pub struct Config {
+    pub engine_mode: EngineMode,
+    pub features: Features,
+    pub limits: Limits,
+    pub deterministic: bool,
+    pub debugging: bool,
+    pub profiling: bool,
+}
+
+Future:
+
+cache
+AOT
+JIT
+fuel
+epoch interruption
+debugging
+profiling
+component support
+48. Component Model
+
+Treat Components as a higher-level layer:
+
+Component
+   │
+   ├── Core Wasm module(s)
+   │
+   ▼
+Component runtime
+   │
+   ▼
+TPT Host
+
+Do not pollute the Micro Interpreter with Component Model concepts.
+
+The Component Model itself is explicitly designed as a layer over Core WebAssembly and emphasizes composability, sandboxing and capability-safe interfaces.
+
+49. WASI Architecture
+
+Eventually:
+
+tpt-wasm-wasi/
+
+could provide:
+
+WASI
+ │
+ ▼
+TPT Host capability system
+
+rather than:
+
+WASI
+ │
+ ▼
+POSIX
+
+This lets the runtime support both standard WASI programs and TPT-native capabilities.
+
+50. TPT Ecosystem Integration
+
+The intended long-term architecture:
+
+                    tpt-wasm
+                       │
+                ┌──────┴──────┐
+                │             │
+             Runtime        Host
+                │             │
+                │             ▼
+                │        tpt-system
+                │             │
+       ┌────────┼─────────────┼──────────────┐
+       ▼        ▼             ▼              ▼
+    physics    FEM       engineering      robotics
+
+tpt-wasm therefore becomes a computational substrate for the wider TPT family.
+
+51. TPT Domain Boundary
+
+Domain crates should provide:
+
+capabilities
+data models
+algorithms
+systems
+
+They should not reach into:
+
+Wasm interpreter internals
+compiler internals
+machine code
+
+The dependency should flow outward:
+
+tpt-wasm
+    ↑
+tpt-system
+    ↑
+domain crates
+
+rather than:
+
+tpt-wasm
+    ↓
+all TPT domains
+52. Deterministic Scientific Execution
+
+One particularly interesting TPT use case is reproducible computation.
+
+For example:
+
+simulation
+   │
+   ├── deterministic clock
+   ├── deterministic RNG
+   ├── deterministic scheduling
+   ├── versioned inputs
+   └── recorded host effects
+
+producing:
+
+ExecutionArtifact
+
+with:
+
+module hash
+engine version
+host version
+inputs
+capabilities
+configuration
+result
+provenance
+
+That can integrate naturally with your broader TPT system architecture.
+
+53. Provenance
+
+Every execution can eventually expose:
+
+pub struct ExecutionMetadata {
+    pub module_hash: Hash,
+    pub engine_version: Version,
+    pub semantics_version: Version,
+    pub host_version: Version,
+    pub capabilities: Vec<CapabilityId>,
+}
+
+This becomes especially valuable for:
+
+simulations;
+engineering;
+scientific workflows;
+robotics;
+reproducibility;
+formal experiments.
+54. Licensing Architecture
+
+This is a first-class engineering concern.
+
+Target:
+
+Original TPT-Wasm source
+        │
+        ▼
+       MIT
+
+But dependencies retain their own licenses.
+
+Therefore maintain:
+
+docs/licensing/
+    provenance.md
+    dependencies.md
+    release.md
+
+LICENSE
+NOTICE
+55. Clean-Room / Independent Implementation Policy
+
+CONTRIBUTING.md should explicitly state that TPT-Wasm is an independent implementation.
+
+Recommended policy:
+
+TPT-Wasm is implemented independently from existing WebAssembly
+runtimes.
+
+The project may use:
+- public specifications;
+- standards documents;
+- published academic work;
+- public test suites;
+- behavioral interoperability testing;
+- publicly documented algorithms.
+
+Implementation code from external runtimes must not be incorporated
+unless its license and provenance have been explicitly reviewed and
+the use is compatible with the project's licensing policy.
+
+This is an engineering/provenance policy, not a claim of legal immunity.
+
+56. External Implementations
+
+Wasmtime and other runtimes may be used for:
+
+compatibility testing
+performance comparison
+behavioral comparison
+regression testing
+feature discovery
+
+but not as:
+
+source dependency
+vendored implementation
+architectural template to copy mechanically
+57. Dependency Policy
+
+Prefer:
+
+MIT
+BSD
+Apache-2.0
+ISC
+other permissive licenses
+
+subject to final licensing review.
+
+Track:
+
+crate
+version
+license
+copyright
+source
+reason
+transitive dependencies
+
+Automate this in CI.
+
+58. SPDX
+
+Use SPDX identifiers consistently.
+
+Cargo:
+
+license = "MIT"
+
+and source metadata where appropriate:
+
+SPDX-License-Identifier: MIT
+59. CONTRIBUTING.md
+
+Because you've chosen an issues-first development model, keep this deliberately small.
+
+It should state:
+
+Contributions and project discussion are currently managed through
+GitHub Issues.
+
+Issues may cover:
+- bugs
+- feature requests
+- standards compatibility
+- security issues
+- architecture
+- research
+- interoperability
+
+The project is currently maintained by the project owner.
+Pull requests are not part of the normal development workflow.
+
+No DCO/CLA machinery is necessary while you remain the sole implementation maintainer.
+
+If that changes later, add the appropriate contributor process then.
+
+60. GitHub Issues as Architecture Memory
+
+I would actually use Issues quite heavily.
+
+Suggested labels:
+
+architecture
+wasm-core
+validation
+interpreter
+host
+capability
+formal
+compiler
+ir
+jit
+aot
+wasi
+component
+security
+fuzzing
+performance
+licensing
+provenance
+research
+
+Milestones:
+
+M0 Foundation
+M1 Binary
+M2 Micro
+M3 Runtime
+M4 Host
+M5 Formal
+M6 IR
+M7 Compiler
+M8 Optimizer
+M9 Verification
+M10 Production
+
+This fits your AI-assisted development model very well: the issue becomes the durable architectural context, while implementation happens directly in the repository.
+
+61. CI
+
+Minimum CI:
+
+cargo fmt --check
+cargo check
+cargo test
+cargo clippy
+cargo deny
+license audit
+dependency audit
+spec tests
+
+Later:
+
+fuzz smoke tests
+Miri
+sanitizers
+cross compilation
+compiler differential tests
+formal verification
+reproducible builds
+62. Release Artifacts
+
+Every release should eventually include:
+
+source archive
+binaries
+SBOM
+license report
+third-party notices
+feature manifest
+build metadata
+Git commit
+version information
+
+Potentially:
+
+reproducibility metadata
+
+as the project matures.
+
+63. Versioning
+
+Use semantic versioning for the public Rust API:
+
+0.x
+
+during development.
+
+But independently version the semantic model:
+
+Semantics 0.1
+Semantics 0.2
+...
+
+and record the WebAssembly standard:
+
+[standards]
+wasm_core = "3.0"
+
+This is important because WebAssembly itself continues to evolve.
+
+64. Semantic Versioning Rule
+
+An implementation bug fix that changes behavior to conform to the standard is generally not considered a semantic invention.
+
+But changes to:
+
+TPT host ABI
+TPT capability ABI
+public Rust API
+TPT extensions
+
+must be tracked independently.
+
+65. Testing Pyramid
+                 ┌─────────────┐
+                 │ Formal Proof│
+                 └──────┬──────┘
+                        │
+               ┌────────▼────────┐
+               │ Differential    │
+               │ Testing         │
+               └────────┬────────┘
+                        │
+                 ┌──────▼──────┐
+                 │ Fuzzing     │
+                 └──────┬──────┘
+                        │
+                ┌───────▼───────┐
+                │ Spec Tests     │
+                └───────┬───────┘
+                        │
+                 ┌──────▼──────┐
+                 │ Unit Tests  │
+                 └─────────────┘
+
+No individual layer replaces the others.
+
+66. Golden Test Principle
+
+For every compiler feature:
+
+program.wasm
+    │
+    ├── Micro
+    │
+    ├── Baseline
+    │
+    └── Optimized
+
+The Micro result is the golden result.
+
+This gives you a continuously executable semantic regression suite.
+
+67. Compiler Optimization Contract
+
+Every optimization must preserve:
+
+values
+control flow
+traps
+memory effects
+global effects
+table effects
+host effects
+observable ordering
+
+Not merely return values.
+
+For example, an optimization that changes when a trap occurs may be incorrect even if the eventual return value looks identical.
+
+68. Host Effect Model
+
+Host effects should be explicit.
+
+Conceptually:
+
+pub enum Effect {
+    Pure,
+    Read(ResourceId),
+    Write(ResourceId),
+    Execute(CapabilityId),
+    External(CapabilityId),
+}
+
+This may eventually feed:
+
+formal verification
+deterministic replay
+compiler optimization
+security auditing
+TPT provenance
+69. Pure vs Effectful Wasm
+
+The host model should make it possible to identify:
+
+pure Wasm computation
+
+versus:
+
+Wasm + external effects
+
+This could eventually allow:
+
+pure function
+   ↓
+memoization
+parallel execution
+formal reasoning
+
+without compromising the general runtime.
+
+70. Capability Security
+
+The host invariant should eventually be formalized as:
+
+Authority(WasmInstance)
+    ⊆
+GrantedCapabilities(WasmInstance)
+
+and ideally:
+
+Invocation(WasmInstance, Capability)
+    ⇒
+Capability ∈ GrantedCapabilities
+
+This is one of the clearest places where the formal layer can add something genuinely distinctive.
+
+71. Component Model Direction
+
+Eventually:
+
+Core Module
+    │
+    ▼
+Component
+    │
+    ▼
+WIT Interface
+    │
+    ▼
+TPT Capability
+
+This is a particularly natural fit because the Component Model itself emphasizes capability-safe interfaces and fine-grained sandboxing.
+
+tpt-wasm should therefore avoid designing its host ABI in a way that makes future Component Model integration impossible.
+
+72. Future Hardware Targets
+
+The compiler should be designed around:
+
+Architecture
+    │
+    ├── x86_64
+    ├── aarch64
+    ├── riscv64
+    └── future
+
+with architecture-independent IR.
+
+Eventually:
+
+TPT IR
+ ├── CPU
+ ├── GPU
+ ├── accelerator
+ └── specialized hardware
+
+could become possible.
+
+But that is explicitly future architecture, not an initial requirement.
+
+73. Debugging
+
+Eventually support:
+
+breakpoints
+single-step
+stack traces
+locals
+memory inspection
+source maps
+DWARF
+
+The Micro Interpreter should provide the simplest debugging model.
+
+The compiler can then map optimized machine state back to the semantic machine.
+
+74. Profiling
+
+The architecture should permit:
+
+instruction counts
+function timing
+host capability timing
+memory statistics
+allocation statistics
+compiler statistics
+
+without changing program semantics.
+
+75. Caching
+
+Later:
+
+Module
+  │
+  ▼
+Hash
+  │
+  ▼
+Compiled Artifact
+
+with cache keys incorporating:
+
+module hash
+engine version
+semantics version
+compiler version
+target architecture
+compiler configuration
+feature set
+
+This avoids stale compiled artifacts.
+
+76. Security Boundary Around JIT
+
+Executable memory and native code should be isolated into the compiler/runtime boundary.
+
+Conceptually:
+
+Safe semantic runtime
+        │
+        ▼
+Code generation boundary
+        │
+        ▼
+Executable memory
+
+All unsafe should remain concentrated here where practical.
+
+77. Formal Compiler Strategy
+
+Do not attempt:
+
+prove entire optimizing compiler
+
+at first.
+
+Instead:
+
+Interpreter
+   ↓
+IR
+   ↓
+prove simple lowering
+   ↓
+prove individual optimizations
+   ↓
+compose proofs
+
+For example:
+
+constant-fold(x + 0)
+
+can have a tiny proof.
+
+Then:
+
+dead-block elimination
+
+Then:
+
+CFG simplification
+
+and so on.
+
+78. Formal/Executable Correspondence
+
+A particularly strong architecture is:
+
+Formal transition
+        │
+        │ correspondence
+        ▼
+Rust interpreter step()
+
+For every semantic instruction:
+
+FormalRule(op)
+       ≈
+Interpreter(op)
+
+This creates a very concrete verification target.
+
+79. Project Identity
+
+The public project description should be:
+
+TPT-Wasm is an independent Rust implementation of WebAssembly built around a minimal executable semantic core, capability-oriented host, formal verification layer, and native compiler.
+
+Not:
+
+"A Wasmtime alternative."
+
+Not:
+
+"A Wasmtime fork."
+
+Not:
+
+"TPT's implementation of Wasmtime."
+
+The distinction is important technically, architecturally and for provenance.
+
+80. MIT Strategy
+
+Your desired eventual state:
+
+TPT-Wasm original source
+        │
+        ▼
+       MIT
+
+with:
+
+third-party dependencies
+        │
+        ▼
+their respective licenses
+
+and:
+
+external implementations
+        │
+        ▼
+testing/reference only
+
+The repository should never imply that MIT licensing of TPT-Wasm automatically applies to third-party material.
+
+81. Provenance File
+
+Create:
+
+docs/licensing/provenance.md
+
+with an evolving record of:
+
+normative standards
+external test suites
+external runtime comparisons
+dependencies
+generated artifacts
+third-party source
+
+The goal is that, years from now, you can answer:
+
+"Where did every significant piece of this code come from?"
+
+without reconstructing history manually.
+
+82. Dependency Audit
+
+Automate:
+
+cargo metadata
+license detection
+SPDX validation
+dependency tree
+SBOM generation
+
+and fail CI when an unacceptable dependency appears.
+
+This is much easier to do from day one than after the project has accumulated hundreds of dependencies.
+
+83. Release Checklist
+
+Before an MIT release:
+
+□ LICENSE present
+□ copyright ownership confirmed
+□ source provenance audited
+□ dependencies audited
+□ third-party licenses included
+□ generated code audited
+□ test fixtures audited
+□ documentation audited
+□ external source not accidentally vendored
+□ CI green
+□ security issues reviewed
+□ SBOM generated
+□ release source reproducible
+
+For the actual legal release, obtain appropriate legal review rather than relying solely on automation.
+
+84. Development Phases
+M0 — Foundation
+repository
+workspace
+MIT scaffolding
+SPDX
+CI
+architecture
+provenance
+standards registry
+M1 — WebAssembly Types + Binary
+types
+module representation
+decoder
+encoder
+validation
+M2 — Micro Interpreter
+execution
+memory
+tables
+globals
+functions
+control flow
+traps
+
+Target:
+
+Correct enough to become the Golden Machine.
+
+M3 — Runtime
+Store
+Instance
+Linker
+Host functions
+resources
+limits
+M4 — TPT Host
+capabilities
+resources
+deterministic mode
+record/replay
+tpt-system integration
+M5 — Formal Semantics
+abstract machine
+transition rules
+invariants
+interpreter correspondence
+M6 — TPT IR
+typed IR
+CFG
+lowering
+verification hooks
+M7 — Baseline Compiler
+Wasm
+→ TPT IR
+→ native
+M8 — Optimizing Compiler
+optimization passes
+JIT
+AOT
+caching
+M9 — Formal Compiler Verification
+IR refinement
+optimization proofs
+lowering proofs
+M10 — Production Platform
+WASI
+Component Model
+debugging
+profiling
+multiple architectures
+production security hardening
+85. Definition of Done — Micro
+
+Do not move on merely because simple programs execute.
+
+Require:
+
+✓ Core specification tests
+✓ validation tests
+✓ malformed binary tests
+✓ fuzzing
+✓ deterministic execution
+✓ differential testing
+✓ trap correctness
+✓ resource limits
+✓ no unexplained interpreter panics
+86. Definition of Done — Compiler
+
+Require:
+
+✓ Micro equivalence
+✓ fuzz differential testing
+✓ trap equivalence
+✓ host-effect equivalence
+✓ memory equivalence
+✓ regression suite
+✓ architecture-specific tests
+
+before calling an optimization production-ready.
+
+87. Definition of Done — Host
+
+Require:
+
+✓ explicit capability grants
+✓ resource isolation
+✓ no ambient authority
+✓ deterministic mode
+✓ capability audit
+✓ resource lifetime tests
+✓ malicious module tests
+88. Definition of Done — Formal
+
+Progressively:
+
+✓ semantic model
+✓ interpreter correspondence
+✓ core invariants
+✓ memory properties
+✓ host capability properties
+✓ selected compiler transformations
+
+Full machine-code verification remains a long-term goal rather than a release blocker.
+
+89. Architectural Invariants
+
+These should eventually become part of docs/architecture/invariants.md.
+
+Invariant 1
+Core Wasm semantics do not depend on TPT.
+Invariant 2
+The host has no ambient authority.
+Invariant 3
+The Micro Interpreter defines observable semantics.
+Invariant 4
+The compiler must preserve Micro semantics.
+Invariant 5
+The formal model is independent of compiler implementation details.
+Invariant 6
+TPT domain systems integrate through host/capability boundaries.
+Invariant 7
+External runtimes are test/reference dependencies, not source dependencies.
+Invariant 8
+Original TPT-Wasm implementation remains independently attributable.
+90. Final Architecture
+
+The complete system becomes:
+
+                           WEBASSEMBLY
+                          CORE STANDARD
+                               │
+                               ▼
+                 ┌──────────────────────────┐
+                 │     TPT-WASM SEMANTICS   │
+                 │                          │
+                 │ types                     │
+                 │ validation                │
+                 │ instantiation             │
+                 │ execution                 │
+                 │ traps                     │
+                 └────────────┬─────────────┘
+                              │
+              ┌───────────────┼────────────────┐
+              │               │                │
+              ▼               ▼                ▼
+       ┌────────────┐ ┌──────────────┐ ┌───────────────┐
+       │   MICRO    │ │   FORMAL     │ │      IR       │
+       │ INTERPRETER│ │    MODEL     │ │               │
+       └─────┬──────┘ └──────┬───────┘ └───────┬───────┘
+             │               │                 │
+             │               │                 ▼
+             │               │         ┌───────────────┐
+             │               │         │    COMPILER   │
+             │               │         └───────┬───────┘
+             │               │                 │
+             └───────────────┼─────────────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ TPT-WASM HOST   │
+                    │                 │
+                    │ capabilities    │
+                    │ resources       │
+                    │ determinism     │
+                    │ WASI            │
+                    └────────┬────────┘
+                             │
+                             ▼
+                       ┌───────────┐
+                       │tpt-system │
+                       └─────┬─────┘
+                             │
+             ┌───────────────┼──────────────────┐
+             ▼               ▼                  ▼
+          physics           FEM             robotics
+             │               │                  │
+             └───────────────┼──────────────────┘
+                             ▼
+                     TPT DOMAIN SYSTEMS
+
+And the central correctness relationship is:
+
+                   ┌──────────────────┐
+                   │  WASM SEMANTICS  │
+                   └────────┬─────────┘
+                            │
+                 ┌──────────┴──────────┐
+                 │                     │
+                 ▼                     ▼
+        ┌────────────────┐     ┌───────────────┐
+        │ Micro Machine  │     │ Formal Machine│
+        └───────┬────────┘     └───────┬───────┘
+                │                      │
+                └──────────┬───────────┘
+                           │
+                     correspondence
+                           │
+                           ▼
+                     ┌───────────┐
+                     │  TPT IR   │
+                     └─────┬─────┘
+                           │
+                      refinement
+                           │
+                           ▼
+                     MACHINE CODE
+The key idea
+
+I think this version gives tpt-wasm a very strong identity:
+
+WebAssembly is the standard.
+
+The Micro Interpreter is the executable definition.
+
+The Formal layer is the mathematical definition.
+
+The Host is the authority boundary.
+
+The IR is the compiler boundary.
+
+The compiler is an optimized implementation of the semantics.
+
+TPT systems are clients of the host, not part of Core Wasm.
+
+And MIT is a property of your independently authored implementation and its carefully audited dependencies, not a property you inherit from another runtime.

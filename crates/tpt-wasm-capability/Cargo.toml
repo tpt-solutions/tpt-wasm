@@ -1,0 +1,11 @@
+[package]
+name = "tpt-wasm-capability"
+description = "WebAssembly capability types and trait for tpt-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true

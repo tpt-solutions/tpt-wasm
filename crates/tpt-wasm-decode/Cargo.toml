@@ -1,0 +1,12 @@
+[package]
+name = "tpt-wasm-decode"
+description = "WebAssembly binary format decoder for tpt-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true
+tpt-wasm-format.workspace = true

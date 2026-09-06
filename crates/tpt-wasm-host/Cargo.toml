@@ -1,0 +1,14 @@
+[package]
+name = "tpt-wasm-host"
+description = "TPT capability-oriented host for tpt-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tpt-wasm-types.workspace = true
+tpt-wasm-runtime.workspace = true
+tpt-wasm-capability.workspace = true
+tpt-wasm-resource.workspace = true
