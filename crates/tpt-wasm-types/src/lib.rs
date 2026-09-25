@@ -8,7 +8,7 @@
 //! independent of machine-register representations.
 
 /// A WebAssembly runtime value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     I32(i32),
     I64(i64),
@@ -21,9 +21,9 @@ pub enum Value {
 }
 
 /// A WebAssembly reference value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefValue {
-    Null(RefType),
+    Null(ReferenceType),
     FuncRef(u32),
     ExternRef(u64),
 }
@@ -36,15 +36,18 @@ pub enum ValueType {
     F32,
     F64,
     V128,
-    Ref(RefType),
+    Ref(ReferenceType),
 }
 
 /// A WebAssembly reference type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RefType {
+pub enum ReferenceType {
     FuncRef,
     ExternRef,
 }
+
+/// Backwards-compatible short name used by the structural format.
+pub type RefType = ReferenceType;
 
 /// The result type of a WebAssembly block or function (a sequence of value types).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +78,7 @@ pub struct MemoryType {
 /// A WebAssembly table type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableType {
-    pub element_type: RefType,
+    pub element_type: ReferenceType,
     pub limits: Limits,
 }
 
@@ -93,7 +96,7 @@ pub struct Limits {
 }
 
 /// Implementation resource limits.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub max_memory_pages: u64,
     pub max_table_elements: u32,
@@ -106,7 +109,7 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_memory_pages: 65536,     // 4 GiB
+            max_memory_pages: 65536, // 4 GiB
             max_table_elements: 10_000_000,
             max_instances: 10_000,
             max_stack_depth: 65536,
@@ -116,8 +119,8 @@ impl Default for ResourceLimits {
     }
 }
 
-/// A WebAssembly trap — never represented as a Rust panic.
-#[derive(Debug, Clone, PartialEq)]
+/// A WebAssembly trap - never represented as a Rust panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trap {
     Unreachable,
     IntegerDivisionByZero,
@@ -131,4 +134,51 @@ pub enum Trap {
     CallDepthExceeded,
     StepsExhausted,
     HostFailure(String),
+}
+
+impl std::fmt::Display for Trap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for Trap {}
+
+impl ValueType {
+    /// Returns whether this is one of the four numeric types in the WebAssembly MVP.
+    pub fn is_mvp_numeric(self) -> bool {
+        matches!(self, Self::I32 | Self::I64 | Self::F32 | Self::F64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RefValue, ReferenceType, Value, ValueType};
+
+    #[test]
+    fn raw_floating_point_values_preserve_nan_bits() {
+        let nan = 0x7fc0_1234;
+        assert_eq!(Value::F32(nan), Value::F32(nan));
+        assert_ne!(Value::F32(nan), Value::F32(0x7fc0_5678));
+    }
+
+    #[test]
+    fn null_references_retain_their_type() {
+        assert_eq!(
+            Value::Ref(RefValue::Null(ReferenceType::ExternRef)),
+            Value::Ref(RefValue::Null(ReferenceType::ExternRef))
+        );
+        assert_ne!(
+            Value::Ref(RefValue::Null(ReferenceType::FuncRef)),
+            Value::Ref(RefValue::Null(ReferenceType::ExternRef))
+        );
+    }
+
+    #[test]
+    fn mvp_numeric_types_exclude_vectors_and_references() {
+        assert!(ValueType::I32.is_mvp_numeric());
+        assert!(ValueType::F64.is_mvp_numeric());
+        assert!(!ValueType::V128.is_mvp_numeric());
+        assert!(!ValueType::Ref(ReferenceType::FuncRef).is_mvp_numeric());
+    }
 }

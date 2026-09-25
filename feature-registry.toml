@@ -11,7 +11,7 @@ specification = "https://webassembly.github.io/spec/"
 
 [features]
 # WebAssembly MVP
-mvp = true
+mvp = "partial"
 
 # Phase 4 proposals (shipped in browsers)
 reference_types    = false
@@ -42,6 +42,14 @@ branch_hinting     = false
 flexible_vectors   = false
 
 [features.status]
+mvp_decoded = "partial"
+mvp_validated = "partial"
+mvp_executed = "partial"
+mvp_compiled = false
+mvp_tested = "partial"
+mvp_fuzzed = "partial"
+mvp_differential = false
+mvp_verified = false
 # For each feature above, track the implementation ladder:
 # decoded    = binary format understood by decoder
 # validated  = validation rules implemented

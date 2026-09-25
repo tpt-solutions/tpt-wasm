@@ -11,10 +11,12 @@
 //!   - Wasm traps are never Rust panics
 //!   - Every optimized implementation must match this interpreter's observable behavior
 
+pub mod execution;
 pub mod instr;
 pub mod machine;
 pub mod store;
 
+pub use execution::{DeterministicRng, ExecutionConfig, ExecutionMode};
 pub use machine::{Machine, Step};
 pub use store::Store;
 

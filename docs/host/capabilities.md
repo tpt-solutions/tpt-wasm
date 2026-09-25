@@ -40,7 +40,27 @@ pub trait Capability {
 }
 ```
 
-The trait is not tied to filesystem, sockets, or POSIX.
+The trait is not tied to filesystem, sockets, or POSIX. Implementations are
+`Send + Sync` so a capability-backed runtime import can safely be registered
+with the runtime's shared execution context.
+
+## Runtime bridge
+
+A runtime import can be backed by one explicitly granted capability:
+
+```rust
+let function = CapabilityHostFunction::new(
+    Arc::new(Mutex::new(host)),
+    capability_id,
+    Operation::execute("read"),
+    function_type,
+);
+engine.linker_mut().define_function("env", "call", function);
+```
+
+The adapter authorizes and invokes through `Host::invoke` on every call. It
+does not grant authority implicitly, and ungranted calls do not reach the
+capability implementation or append an effect record.
 
 ---
 

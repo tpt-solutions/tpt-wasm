@@ -10,3 +10,8 @@ repository.workspace = true
 [dependencies]
 tpt-wasm-types.workspace = true
 tpt-wasm-semantics.workspace = true
+tpt-wasm-ir.workspace = true
+
+[dev-dependencies]
+tpt-wasm-format.workspace = true
+tpt-wasm-validate.workspace = true

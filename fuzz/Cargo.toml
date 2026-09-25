@@ -1,0 +1,22 @@
+[package]
+name = "tpt-wasm-decode-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tpt-wasm-decode = { path = "../crates/tpt-wasm-decode" }
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

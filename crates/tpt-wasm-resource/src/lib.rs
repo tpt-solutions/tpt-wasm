@@ -67,10 +67,46 @@ impl ResourceTable {
     pub fn contains(&self, id: ResourceId) -> bool {
         self.entries.contains_key(&id)
     }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 impl Default for ResourceTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResourceTable;
+
+    #[test]
+    fn handles_are_opaque_monotonic_and_invalidated_on_remove() {
+        let mut table = ResourceTable::new();
+        let first = table.insert(10_u32);
+        let second = table.insert(20_u32);
+        assert!(first.as_u64() < second.as_u64());
+        assert_eq!(table.get::<u32>(first), Some(&10));
+        assert_eq!(table.remove::<u32>(first), Some(10));
+        assert!(!table.contains(first));
+        assert_eq!(table.get::<u32>(first), None);
+        let third = table.insert(30_u32);
+        assert!(third.as_u64() > second.as_u64());
+    }
+
+    #[test]
+    fn wrong_type_removal_preserves_the_resource() {
+        let mut table = ResourceTable::new();
+        let id = table.insert(7_u32);
+        assert_eq!(table.remove::<u64>(id), None);
+        assert!(table.contains(id));
+        assert_eq!(table.get::<u32>(id), Some(&7));
     }
 }

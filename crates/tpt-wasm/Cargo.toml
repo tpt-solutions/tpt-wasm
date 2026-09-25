@@ -13,3 +13,6 @@ tpt-wasm-decode.workspace = true
 tpt-wasm-validate.workspace = true
 tpt-wasm-runtime.workspace = true
 tpt-wasm-host.workspace = true
+tpt-wasm-wasi.workspace = true
+tpt-wasm-capability.workspace = true
+tpt-wasm-resource.workspace = true

@@ -8,5 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+tpt-wasm-format.workspace = true
+tpt-wasm-decode.workspace = true
 tpt-wasm-types.workspace = true
+tpt-wasm-validate.workspace = true
 tpt-wasm-micro.workspace = true

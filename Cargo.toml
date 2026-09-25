@@ -8,6 +8,7 @@ members = [
     "crates/tpt-wasm-micro",
     "crates/tpt-wasm-runtime",
     "crates/tpt-wasm-host",
+    "crates/tpt-wasm-wasi",
     "crates/tpt-wasm-capability",
     "crates/tpt-wasm-resource",
     "crates/tpt-wasm-semantics",
@@ -44,6 +45,7 @@ tpt-wasm-validate = { path = "crates/tpt-wasm-validate", version = "0.1.0" }
 tpt-wasm-micro    = { path = "crates/tpt-wasm-micro",    version = "0.1.0" }
 tpt-wasm-runtime  = { path = "crates/tpt-wasm-runtime",  version = "0.1.0" }
 tpt-wasm-host     = { path = "crates/tpt-wasm-host",     version = "0.1.0" }
+tpt-wasm-wasi    = { path = "crates/tpt-wasm-wasi",    version = "0.1.0" }
 tpt-wasm-capability = { path = "crates/tpt-wasm-capability", version = "0.1.0" }
 tpt-wasm-resource = { path = "crates/tpt-wasm-resource", version = "0.1.0" }
 tpt-wasm-semantics = { path = "crates/tpt-wasm-semantics", version = "0.1.0" }

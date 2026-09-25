@@ -12,3 +12,6 @@ tpt-wasm-types.workspace = true
 tpt-wasm-runtime.workspace = true
 tpt-wasm-capability.workspace = true
 tpt-wasm-resource.workspace = true
+
+[dev-dependencies]
+tpt-wasm-format.workspace = true

@@ -70,6 +70,7 @@ See [todo.md](todo.md) for the full milestone tracker (M0–M10).
 | `tpt-wasm-micro` | Micro Interpreter (Golden Machine, zero unsafe) |
 | `tpt-wasm-runtime` | Store, Instance, Linker, Engine |
 | `tpt-wasm-host` | TPT capability host |
+| `tpt-wasm-wasi` | Explicit WASI capability adapter facade |
 | `tpt-wasm-capability` | Capability types and trait |
 | `tpt-wasm-resource` | Resource table and opaque handles |
 | `tpt-wasm-semantics` | Formal abstract machine |

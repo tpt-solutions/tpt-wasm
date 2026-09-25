@@ -41,6 +41,21 @@ implements the same transitions. The correspondence is:
 FormalRule(op) ≈ Interpreter(op)   (per instruction)
 ```
 
+## Validate → Instantiate and Link
+
+Input: `ValidatedModule` plus explicit host/instance definitions
+Output: `Instance` sharing an engine-owned `Store`
+
+Instantiation resolves imports against typed linker definitions. Wasm function,
+table, memory, and global exports are represented by addresses in one shared
+store; mutable state therefore aliases the provider instance rather than being
+copied. Function signatures and Wasm limit/global types are checked before the
+module is committed. Definitions from unrelated stores are rejected.
+
+```
+ValidatedModule → Linker resolution → shared Store → Instance
+```
+
 ## Validate → IR
 
 The compiler receives a `ValidatedModule` and produces IR. It does not re-validate.

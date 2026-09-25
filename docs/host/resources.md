@@ -25,6 +25,17 @@ Host Resource (any Rust type)
 The `ResourceTable` maps opaque `ResourceId` handles to boxed host resources
 using type-erased `Box<dyn Any>`. Downcasting is done on the host side.
 
+Capability-backed runtime imports are authorized before they can reach this
+resource boundary:
+
+```text
+Wasm → HostFunction → Host::invoke → CapabilitySet::authorize → Capability
+```
+
+A module reaches a capability only through an explicitly defined runtime
+import; the host is checked on every invocation, so no ambient authority is
+inferred from module structure or import names.
+
 ## Lifetime
 
 Resources are created by the host (via `ResourceTable::insert`), passed to Wasm
