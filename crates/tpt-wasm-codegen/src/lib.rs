@@ -8,7 +8,8 @@
 //!
 //! Pipeline: Wasm → TPT IR → simple lowering → native code
 //!
-//! Status: M7 — portable baseline slice implemented; native backends pending.
+//! Status: M7 — portable baseline slice for the straight-line MVP instruction
+//! set represented by the IR; native backends pending.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -97,6 +98,30 @@ pub enum I64BinaryOp {
     Xor,
 }
 
+/// A portable baseline `f32` binary operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum F32BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    Copysign,
+}
+
+/// A portable baseline `f64` binary operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum F64BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    Copysign,
+}
+
 /// A deterministic portable baseline operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaselineOp {
@@ -139,6 +164,100 @@ pub enum BaselineOp {
         left: u32,
         right: u32,
         comparison: tpt_wasm_ir::IntComparison,
+    },
+    ConstF32 {
+        slot: u32,
+        value: u32,
+    },
+    ConstF64 {
+        slot: u32,
+        value: u64,
+    },
+    F32Binary {
+        result: u32,
+        left: u32,
+        right: u32,
+        operation: F32BinaryOp,
+    },
+    F32Unary {
+        result: u32,
+        value: u32,
+        operation: tpt_wasm_ir::FloatUnary,
+    },
+    F32Compare {
+        result: u32,
+        left: u32,
+        right: u32,
+        comparison: tpt_wasm_ir::FloatComparison,
+    },
+    F64Binary {
+        result: u32,
+        left: u32,
+        right: u32,
+        operation: F64BinaryOp,
+    },
+    F64Unary {
+        result: u32,
+        value: u32,
+        operation: tpt_wasm_ir::FloatUnary,
+    },
+    F64Compare {
+        result: u32,
+        left: u32,
+        right: u32,
+        comparison: tpt_wasm_ir::FloatComparison,
+    },
+    Drop {
+        value: u32,
+    },
+    Select {
+        result: u32,
+        condition: u32,
+        left: u32,
+        right: u32,
+    },
+    LocalGet {
+        result: u32,
+        local: u32,
+    },
+    LocalSet {
+        local: u32,
+        value: u32,
+    },
+    LocalTee {
+        result: u32,
+        local: u32,
+        value: u32,
+    },
+    I32Unary {
+        result: u32,
+        value: u32,
+        operation: tpt_wasm_ir::IntUnary,
+    },
+    I64Unary {
+        result: u32,
+        value: u32,
+        operation: tpt_wasm_ir::IntUnary,
+    },
+    IntConvert {
+        result: u32,
+        value: u32,
+        operation: tpt_wasm_ir::IntConversion,
+    },
+    Reinterpret {
+        result: u32,
+        value: u32,
+        operation: tpt_wasm_ir::Reinterpret,
+    },
+    FloatConvert {
+        result: u32,
+        value: u32,
+        operation: tpt_wasm_ir::FloatConversion,
+    },
+    FloatTrunc {
+        result: u32,
+        value: u32,
+        operation: tpt_wasm_ir::FloatTrunc,
     },
     Return(Vec<u32>),
     Trap(Trap),
@@ -210,6 +329,13 @@ impl SlotState {
                 actual,
             })
         }
+    }
+
+    /// The slot and declared type of a value, used where a value only needs to
+    /// agree with itself (locals, `select` arms) instead of a fixed type.
+    fn typed(&self, id: ValueId) -> Result<(u32, ValueType), CodegenError> {
+        let slot = self.slot(id)?;
+        Ok((slot, self.types[slot as usize]))
     }
 }
 
@@ -536,6 +662,355 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     comparison: *comparison,
                 });
             }
+            IrInstr::ConstF32 { result, value } => {
+                let slot = state.define(*result)?;
+                ops.push(BaselineOp::ConstF32 {
+                    slot,
+                    value: *value,
+                });
+            }
+            IrInstr::F32Add { .. }
+            | IrInstr::F32Sub { .. }
+            | IrInstr::F32Mul { .. }
+            | IrInstr::F32Div { .. }
+            | IrInstr::F32Min { .. }
+            | IrInstr::F32Max { .. }
+            | IrInstr::F32Copysign { .. } => {
+                let (operation, result, left, right) = match instruction {
+                    IrInstr::F32Add {
+                        result,
+                        left,
+                        right,
+                    } => (F32BinaryOp::Add, *result, *left, *right),
+                    IrInstr::F32Sub {
+                        result,
+                        left,
+                        right,
+                    } => (F32BinaryOp::Sub, *result, *left, *right),
+                    IrInstr::F32Mul {
+                        result,
+                        left,
+                        right,
+                    } => (F32BinaryOp::Mul, *result, *left, *right),
+                    IrInstr::F32Div {
+                        result,
+                        left,
+                        right,
+                    } => (F32BinaryOp::Div, *result, *left, *right),
+                    IrInstr::F32Min {
+                        result,
+                        left,
+                        right,
+                    } => (F32BinaryOp::Min, *result, *left, *right),
+                    IrInstr::F32Max {
+                        result,
+                        left,
+                        right,
+                    } => (F32BinaryOp::Max, *result, *left, *right),
+                    IrInstr::F32Copysign {
+                        result,
+                        left,
+                        right,
+                    } => (F32BinaryOp::Copysign, *result, *left, *right),
+                    _ => return Err(CodegenError::UnsupportedInstruction("f32 binary")),
+                };
+                let left = state.expect(left, ValueType::F32)?;
+                let right = state.expect(right, ValueType::F32)?;
+                let result = state.define(result)?;
+                ops.push(BaselineOp::F32Binary {
+                    result,
+                    left,
+                    right,
+                    operation,
+                });
+            }
+            IrInstr::F32Unary {
+                result,
+                value,
+                operation,
+            } => {
+                let value = state.expect(*value, ValueType::F32)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::F32Unary {
+                    result,
+                    value,
+                    operation: *operation,
+                });
+            }
+            IrInstr::F32Compare {
+                result,
+                left,
+                right,
+                comparison,
+            } => {
+                let left = state.expect(*left, ValueType::F32)?;
+                let right = state.expect(*right, ValueType::F32)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::F32Compare {
+                    result,
+                    left,
+                    right,
+                    comparison: *comparison,
+                });
+            }
+            IrInstr::ConstF64 { result, value } => {
+                let slot = state.define(*result)?;
+                ops.push(BaselineOp::ConstF64 {
+                    slot,
+                    value: *value,
+                });
+            }
+            IrInstr::F64Add { .. }
+            | IrInstr::F64Sub { .. }
+            | IrInstr::F64Mul { .. }
+            | IrInstr::F64Div { .. }
+            | IrInstr::F64Min { .. }
+            | IrInstr::F64Max { .. }
+            | IrInstr::F64Copysign { .. } => {
+                let (operation, result, left, right) = match instruction {
+                    IrInstr::F64Add {
+                        result,
+                        left,
+                        right,
+                    } => (F64BinaryOp::Add, *result, *left, *right),
+                    IrInstr::F64Sub {
+                        result,
+                        left,
+                        right,
+                    } => (F64BinaryOp::Sub, *result, *left, *right),
+                    IrInstr::F64Mul {
+                        result,
+                        left,
+                        right,
+                    } => (F64BinaryOp::Mul, *result, *left, *right),
+                    IrInstr::F64Div {
+                        result,
+                        left,
+                        right,
+                    } => (F64BinaryOp::Div, *result, *left, *right),
+                    IrInstr::F64Min {
+                        result,
+                        left,
+                        right,
+                    } => (F64BinaryOp::Min, *result, *left, *right),
+                    IrInstr::F64Max {
+                        result,
+                        left,
+                        right,
+                    } => (F64BinaryOp::Max, *result, *left, *right),
+                    IrInstr::F64Copysign {
+                        result,
+                        left,
+                        right,
+                    } => (F64BinaryOp::Copysign, *result, *left, *right),
+                    _ => return Err(CodegenError::UnsupportedInstruction("f64 binary")),
+                };
+                let left = state.expect(left, ValueType::F64)?;
+                let right = state.expect(right, ValueType::F64)?;
+                let result = state.define(result)?;
+                ops.push(BaselineOp::F64Binary {
+                    result,
+                    left,
+                    right,
+                    operation,
+                });
+            }
+            IrInstr::F64Unary {
+                result,
+                value,
+                operation,
+            } => {
+                let value = state.expect(*value, ValueType::F64)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::F64Unary {
+                    result,
+                    value,
+                    operation: *operation,
+                });
+            }
+            IrInstr::F64Compare {
+                result,
+                left,
+                right,
+                comparison,
+            } => {
+                let left = state.expect(*left, ValueType::F64)?;
+                let right = state.expect(*right, ValueType::F64)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::F64Compare {
+                    result,
+                    left,
+                    right,
+                    comparison: *comparison,
+                });
+            }
+            IrInstr::Drop { value } => {
+                // `drop` discards a value that has already been computed, so it
+                // only needs to type-check the operand; the slot stays live for
+                // the remainder of the straight-line sequence.
+                let value = state.slot(*value)?;
+                ops.push(BaselineOp::Drop { value });
+            }
+            IrInstr::Select {
+                result,
+                condition,
+                left,
+                right,
+            } => {
+                let condition = state.expect(*condition, ValueType::I32)?;
+                let (left_slot, left_type) = state.typed(*left)?;
+                let (right_slot, right_type) = state.typed(*right)?;
+                if left_type != right_type {
+                    return Err(CodegenError::TypeMismatch {
+                        value: *right,
+                        expected: left_type,
+                        actual: right_type,
+                    });
+                }
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::Select {
+                    result,
+                    condition,
+                    left: left_slot,
+                    right: right_slot,
+                });
+            }
+            IrInstr::LocalGet { result, local } => {
+                // Locals are pre-allocated slots, so a `get` is a typed copy.
+                let (local, _) = state.typed(*local)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::LocalGet { result, local });
+            }
+            IrInstr::LocalSet { local, value } => {
+                let (local, local_type) = state.typed(*local)?;
+                let value = state.expect(*value, local_type)?;
+                ops.push(BaselineOp::LocalSet { local, value });
+            }
+            IrInstr::LocalTee {
+                result,
+                local,
+                value,
+            } => {
+                let (local, local_type) = state.typed(*local)?;
+                let value = state.expect(*value, local_type)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::LocalTee {
+                    result,
+                    local,
+                    value,
+                });
+            }
+            IrInstr::I32Unary {
+                result,
+                value,
+                operation,
+            } => {
+                let value = state.expect(*value, ValueType::I32)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::I32Unary {
+                    result,
+                    value,
+                    operation: *operation,
+                });
+            }
+            IrInstr::I64Unary {
+                result,
+                value,
+                operation,
+            } => {
+                let value = state.expect(*value, ValueType::I64)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::I64Unary {
+                    result,
+                    value,
+                    operation: *operation,
+                });
+            }
+            IrInstr::IntConvert {
+                result,
+                value,
+                operation,
+            } => {
+                let source = match operation {
+                    tpt_wasm_ir::IntConversion::I32WrapI64 => ValueType::I64,
+                    tpt_wasm_ir::IntConversion::I64ExtendI32S
+                    | tpt_wasm_ir::IntConversion::I64ExtendI32U => ValueType::I32,
+                };
+                let value = state.expect(*value, source)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::IntConvert {
+                    result,
+                    value,
+                    operation: *operation,
+                });
+            }
+            IrInstr::Reinterpret {
+                result,
+                value,
+                operation,
+            } => {
+                let source = match operation {
+                    tpt_wasm_ir::Reinterpret::I32FromF32 => ValueType::F32,
+                    tpt_wasm_ir::Reinterpret::I64FromF64 => ValueType::F64,
+                    tpt_wasm_ir::Reinterpret::F32FromI32 => ValueType::I32,
+                    tpt_wasm_ir::Reinterpret::F64FromI64 => ValueType::I64,
+                };
+                let value = state.expect(*value, source)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::Reinterpret {
+                    result,
+                    value,
+                    operation: *operation,
+                });
+            }
+            IrInstr::FloatConvert {
+                result,
+                value,
+                operation,
+            } => {
+                let source = match operation {
+                    tpt_wasm_ir::FloatConversion::F32FromI32S
+                    | tpt_wasm_ir::FloatConversion::F32FromI32U => ValueType::I32,
+                    tpt_wasm_ir::FloatConversion::F32FromI64S
+                    | tpt_wasm_ir::FloatConversion::F32FromI64U => ValueType::I64,
+                    tpt_wasm_ir::FloatConversion::F32FromF64 => ValueType::F64,
+                    tpt_wasm_ir::FloatConversion::F64FromI32S
+                    | tpt_wasm_ir::FloatConversion::F64FromI32U => ValueType::I32,
+                    tpt_wasm_ir::FloatConversion::F64FromI64S
+                    | tpt_wasm_ir::FloatConversion::F64FromI64U => ValueType::I64,
+                    tpt_wasm_ir::FloatConversion::F64FromF32 => ValueType::F32,
+                };
+                let value = state.expect(*value, source)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::FloatConvert {
+                    result,
+                    value,
+                    operation: *operation,
+                });
+            }
+            IrInstr::FloatTrunc {
+                result,
+                value,
+                operation,
+            } => {
+                let source = match operation {
+                    tpt_wasm_ir::FloatTrunc::I32FromF32S
+                    | tpt_wasm_ir::FloatTrunc::I32FromF32U
+                    | tpt_wasm_ir::FloatTrunc::I64FromF32S
+                    | tpt_wasm_ir::FloatTrunc::I64FromF32U => ValueType::F32,
+                    tpt_wasm_ir::FloatTrunc::I32FromF64S
+                    | tpt_wasm_ir::FloatTrunc::I32FromF64U
+                    | tpt_wasm_ir::FloatTrunc::I64FromF64S
+                    | tpt_wasm_ir::FloatTrunc::I64FromF64U => ValueType::F64,
+                };
+                let value = state.expect(*value, source)?;
+                let result = state.define(*result)?;
+                ops.push(BaselineOp::FloatTrunc {
+                    result,
+                    value,
+                    operation: *operation,
+                });
+            }
             _ => return Err(CodegenError::UnsupportedInstruction("instruction")),
         }
     }
@@ -552,6 +1027,11 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
         }
         Terminator::Trap(trap) => BaselineOp::Trap(trap.clone()),
         Terminator::Unreachable => BaselineOp::Unreachable,
+        // The portable baseline executor is still single-block; control flow
+        // is rejected rather than approximated, per the lowering contract.
+        Terminator::Branch { .. } | Terminator::CondBranch { .. } => {
+            return Err(CodegenError::UnsupportedTerminator("control flow"))
+        }
     };
     ops.push(terminator);
     Ok(BaselineFunction {
@@ -636,6 +1116,150 @@ impl BaselineFunction {
                     let right = i64_slot(&slots, *right)?;
                     slots[*result as usize] =
                         Some(Value::I32(compare_i64(left, right, *comparison)));
+                }
+                BaselineOp::ConstF32 { slot, value } => {
+                    slots[*slot as usize] = Some(Value::F32(*value));
+                }
+                BaselineOp::F32Binary {
+                    result,
+                    left,
+                    right,
+                    operation,
+                } => {
+                    let left = f32_slot(&slots, *left)?;
+                    let right = f32_slot(&slots, *right)?;
+                    slots[*result as usize] =
+                        Some(Value::F32(eval_f32_binary(*operation, left, right)));
+                }
+                BaselineOp::F32Unary {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    let value = f32_slot(&slots, *value)?;
+                    slots[*result as usize] = Some(Value::F32(eval_f32_unary(*operation, value)));
+                }
+                BaselineOp::F32Compare {
+                    result,
+                    left,
+                    right,
+                    comparison,
+                } => {
+                    let left = f32_slot(&slots, *left)?;
+                    let right = f32_slot(&slots, *right)?;
+                    slots[*result as usize] =
+                        Some(Value::I32(compare_f32(left, right, *comparison) as i32));
+                }
+                BaselineOp::ConstF64 { slot, value } => {
+                    slots[*slot as usize] = Some(Value::F64(*value));
+                }
+                BaselineOp::F64Binary {
+                    result,
+                    left,
+                    right,
+                    operation,
+                } => {
+                    let left = f64_slot(&slots, *left)?;
+                    let right = f64_slot(&slots, *right)?;
+                    slots[*result as usize] =
+                        Some(Value::F64(eval_f64_binary(*operation, left, right)));
+                }
+                BaselineOp::F64Unary {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    let value = f64_slot(&slots, *value)?;
+                    slots[*result as usize] = Some(Value::F64(eval_f64_unary(*operation, value)));
+                }
+                BaselineOp::F64Compare {
+                    result,
+                    left,
+                    right,
+                    comparison,
+                } => {
+                    let left = f64_slot(&slots, *left)?;
+                    let right = f64_slot(&slots, *right)?;
+                    slots[*result as usize] =
+                        Some(Value::I32(compare_f64(left, right, *comparison) as i32));
+                }
+                BaselineOp::Drop { value } => {
+                    // The operand was already evaluated; a straight-line `drop`
+                    // only ends its live range, so the slot is left untouched.
+                    let _ = read_slot(&slots, *value)?;
+                }
+                BaselineOp::Select {
+                    result,
+                    condition,
+                    left,
+                    right,
+                } => {
+                    let condition = i32_slot(&slots, *condition)?;
+                    let selected = if condition != 0 {
+                        read_slot(&slots, *left)?
+                    } else {
+                        read_slot(&slots, *right)?
+                    };
+                    slots[*result as usize] = Some(selected);
+                }
+                BaselineOp::LocalGet { result, local } => {
+                    slots[*result as usize] = Some(read_slot(&slots, *local)?);
+                }
+                BaselineOp::LocalSet { local, value } => {
+                    slots[*local as usize] = Some(read_slot(&slots, *value)?);
+                }
+                BaselineOp::LocalTee {
+                    result,
+                    local,
+                    value,
+                } => {
+                    let value = read_slot(&slots, *value)?;
+                    slots[*local as usize] = Some(value.clone());
+                    slots[*result as usize] = Some(value);
+                }
+                BaselineOp::I32Unary {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    let value = i32_slot(&slots, *value)?;
+                    slots[*result as usize] = Some(Value::I32(eval_i32_unary(*operation, value)));
+                }
+                BaselineOp::I64Unary {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    let value = i64_slot(&slots, *value)?;
+                    slots[*result as usize] = Some(Value::I64(eval_i64_unary(*operation, value)));
+                }
+                BaselineOp::IntConvert {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    slots[*result as usize] = Some(eval_int_convert(&slots, *operation, *value)?);
+                }
+                BaselineOp::Reinterpret {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    slots[*result as usize] = Some(eval_reinterpret(&slots, *operation, *value)?);
+                }
+                BaselineOp::FloatConvert {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    slots[*result as usize] = Some(eval_float_convert(&slots, *operation, *value)?);
+                }
+                BaselineOp::FloatTrunc {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    slots[*result as usize] = Some(eval_float_trunc(&slots, *operation, *value)?);
                 }
                 BaselineOp::Return(results) => {
                     return results
@@ -840,6 +1464,390 @@ fn i32_slot(slots: &[Option<Value>], slot: u32) -> Result<i32, Trap> {
     }
 }
 
+/// Read a slot whose value is already known to be the right type.
+///
+/// Type safety is established at lowering time, so this only has to reject a
+/// slot that was never written; it is the typed-slot counterpart of the
+/// `i32_slot`/`f32_slot` accessors.
+fn read_slot(slots: &[Option<Value>], slot: u32) -> Result<Value, Trap> {
+    slots
+        .get(slot as usize)
+        .and_then(Clone::clone)
+        .ok_or_else(|| Trap::HostFailure("baseline operand slot is empty".into()))
+}
+
+fn eval_i32_unary(operation: tpt_wasm_ir::IntUnary, value: i32) -> i32 {
+    match operation {
+        tpt_wasm_ir::IntUnary::Clz => value.leading_zeros() as i32,
+        tpt_wasm_ir::IntUnary::Ctz => value.trailing_zeros() as i32,
+        tpt_wasm_ir::IntUnary::Popcnt => value.count_ones() as i32,
+    }
+}
+
+fn eval_i64_unary(operation: tpt_wasm_ir::IntUnary, value: i64) -> i64 {
+    match operation {
+        tpt_wasm_ir::IntUnary::Clz => value.leading_zeros() as i64,
+        tpt_wasm_ir::IntUnary::Ctz => value.trailing_zeros() as i64,
+        tpt_wasm_ir::IntUnary::Popcnt => value.count_ones() as i64,
+    }
+}
+
+fn eval_int_convert(
+    slots: &[Option<Value>],
+    operation: tpt_wasm_ir::IntConversion,
+    value: u32,
+) -> Result<Value, Trap> {
+    use tpt_wasm_ir::IntConversion;
+    let result = match operation {
+        // `i32.wrap_i64` keeps the low 32 bits, reinterpreted as signed.
+        IntConversion::I32WrapI64 => Value::I32(i64_slot(slots, value)? as i32),
+        IntConversion::I64ExtendI32S => Value::I64(i64::from(i32_slot(slots, value)?)),
+        IntConversion::I64ExtendI32U => Value::I64(i64::from(i32_slot(slots, value)? as u32)),
+    };
+    Ok(result)
+}
+
+fn eval_reinterpret(
+    slots: &[Option<Value>],
+    operation: tpt_wasm_ir::Reinterpret,
+    value: u32,
+) -> Result<Value, Trap> {
+    use tpt_wasm_ir::Reinterpret;
+    // Reinterpretation moves raw bits and never inspects or changes them, so
+    // NaN payloads and signed zeros survive untouched.
+    let result = match operation {
+        Reinterpret::I32FromF32 => Value::I32(f32_slot(slots, value)?.to_bits() as i32),
+        Reinterpret::I64FromF64 => Value::I64(f64_slot(slots, value)?.to_bits() as i64),
+        Reinterpret::F32FromI32 => Value::F32(i32_slot(slots, value)? as u32),
+        Reinterpret::F64FromI64 => Value::F64(i64_slot(slots, value)? as u64),
+    };
+    Ok(result)
+}
+
+fn eval_float_convert(
+    slots: &[Option<Value>],
+    operation: tpt_wasm_ir::FloatConversion,
+    value: u32,
+) -> Result<Value, Trap> {
+    use tpt_wasm_ir::FloatConversion;
+    let result = match operation {
+        // These conversions are total, but the result still goes through NaN
+        // canonicalization so the result is bit-identical to Micro's.
+        FloatConversion::F32FromI32S => Value::F32(f32_result(i32_slot(slots, value)? as f32)),
+        FloatConversion::F32FromI32U => {
+            Value::F32(f32_result((i32_slot(slots, value)? as u32) as f32))
+        }
+        FloatConversion::F32FromI64S => Value::F32(f32_result(i64_slot(slots, value)? as f32)),
+        FloatConversion::F32FromI64U => {
+            Value::F32(f32_result((i64_slot(slots, value)? as u64) as f32))
+        }
+        FloatConversion::F32FromF64 => Value::F32(f32_result(f64_slot(slots, value)? as f32)),
+        FloatConversion::F64FromI32S => Value::F64(f64_result(i32_slot(slots, value)? as f64)),
+        FloatConversion::F64FromI32U => {
+            Value::F64(f64_result((i32_slot(slots, value)? as u32) as f64))
+        }
+        FloatConversion::F64FromI64S => Value::F64(f64_result(i64_slot(slots, value)? as f64)),
+        FloatConversion::F64FromI64U => {
+            Value::F64(f64_result((i64_slot(slots, value)? as u64) as f64))
+        }
+        FloatConversion::F64FromF32 => Value::F64(f64_result(f32_slot(slots, value)? as f64)),
+    };
+    Ok(result)
+}
+
+fn eval_float_trunc(
+    slots: &[Option<Value>],
+    operation: tpt_wasm_ir::FloatTrunc,
+    value: u32,
+) -> Result<Value, Trap> {
+    use tpt_wasm_ir::FloatTrunc;
+    // Truncation toward zero then traps unless the truncated value fits the
+    // destination. NaN and infinity are rejected by the same finiteness check,
+    // and every failure is `InvalidConversion` rather than a Rust panic.
+    let invalid = || Trap::InvalidConversion;
+    let result = match operation {
+        FloatTrunc::I32FromF32S => {
+            let value = f32_slot(slots, value)?;
+            if !value.is_finite() {
+                return Err(invalid());
+            }
+            let truncated = value.trunc();
+            if truncated < i32::MIN as f32 || truncated >= 2147483648.0f32 {
+                return Err(invalid());
+            }
+            Value::I32(truncated as i32)
+        }
+        FloatTrunc::I32FromF32U => {
+            let value = f32_slot(slots, value)?;
+            if !value.is_finite() {
+                return Err(invalid());
+            }
+            let truncated = value.trunc();
+            if !(0.0..4294967296.0f32).contains(&truncated) {
+                return Err(invalid());
+            }
+            Value::I32(truncated as u32 as i32)
+        }
+        FloatTrunc::I32FromF64S => {
+            let value = f64_slot(slots, value)?;
+            if !value.is_finite() {
+                return Err(invalid());
+            }
+            let truncated = value.trunc();
+            if truncated < i32::MIN as f64 || truncated >= 2147483648.0f64 {
+                return Err(invalid());
+            }
+            Value::I32(truncated as i32)
+        }
+        FloatTrunc::I32FromF64U => {
+            let value = f64_slot(slots, value)?;
+            if !value.is_finite() {
+                return Err(invalid());
+            }
+            let truncated = value.trunc();
+            if !(0.0..4294967296.0f64).contains(&truncated) {
+                return Err(invalid());
+            }
+            Value::I32(truncated as u32 as i32)
+        }
+        FloatTrunc::I64FromF32S => {
+            let value = f32_slot(slots, value)?;
+            if !value.is_finite() {
+                return Err(invalid());
+            }
+            let truncated = value.trunc();
+            if !(-9223372036854775808.0f32..9223372036854775808.0f32).contains(&truncated) {
+                return Err(invalid());
+            }
+            Value::I64(truncated as i64)
+        }
+        FloatTrunc::I64FromF32U => {
+            let value = f32_slot(slots, value)?;
+            if !value.is_finite() {
+                return Err(invalid());
+            }
+            let truncated = value.trunc();
+            if !(0.0..18446744073709551616.0f32).contains(&truncated) {
+                return Err(invalid());
+            }
+            Value::I64(truncated as u64 as i64)
+        }
+        FloatTrunc::I64FromF64S => {
+            let value = f64_slot(slots, value)?;
+            if !value.is_finite() {
+                return Err(invalid());
+            }
+            let truncated = value.trunc();
+            if !(-9223372036854775808.0f64..9223372036854775808.0f64).contains(&truncated) {
+                return Err(invalid());
+            }
+            Value::I64(truncated as i64)
+        }
+        FloatTrunc::I64FromF64U => {
+            let value = f64_slot(slots, value)?;
+            if !value.is_finite() {
+                return Err(invalid());
+            }
+            let truncated = value.trunc();
+            if !(0.0..18446744073709551616.0f64).contains(&truncated) {
+                return Err(invalid());
+            }
+            Value::I64(truncated as u64 as i64)
+        }
+    };
+    Ok(result)
+}
+
+/// The canonical NaN bit patterns produced by arithmetic IEEE 754 operations.
+const F32_CANONICAL_NAN: u32 = 0x7fc0_0000;
+const F64_CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
+
+/// Canonicalize any NaN result, preserving every other bit pattern exactly.
+///
+/// Wasm permits non-deterministic NaN payloads; this backend fixes on the
+/// canonical quiet NaN, matching Micro so differential tests compare
+/// bit-for-bit rather than by IEEE equality.
+fn f32_result(value: f32) -> u32 {
+    if value.is_nan() {
+        F32_CANONICAL_NAN
+    } else {
+        value.to_bits()
+    }
+}
+
+fn f64_result(value: f64) -> u64 {
+    if value.is_nan() {
+        F64_CANONICAL_NAN
+    } else {
+        value.to_bits()
+    }
+}
+
+fn f32_slot(slots: &[Option<Value>], slot: u32) -> Result<f32, Trap> {
+    match slots
+        .get(slot as usize)
+        .and_then(Clone::clone)
+        .ok_or_else(|| Trap::HostFailure("baseline operand slot is empty".into()))?
+    {
+        Value::F32(bits) => Ok(f32::from_bits(bits)),
+        _ => Err(Trap::HostFailure(
+            "baseline f32 operand type mismatch".into(),
+        )),
+    }
+}
+
+fn f64_slot(slots: &[Option<Value>], slot: u32) -> Result<f64, Trap> {
+    match slots
+        .get(slot as usize)
+        .and_then(Clone::clone)
+        .ok_or_else(|| Trap::HostFailure("baseline operand slot is empty".into()))?
+    {
+        Value::F64(bits) => Ok(f64::from_bits(bits)),
+        _ => Err(Trap::HostFailure(
+            "baseline f64 operand type mismatch".into(),
+        )),
+    }
+}
+
+/// `f32.min`: NaN propagates, and `min(-0, +0)` is `-0`.
+fn f32_min(left: f32, right: f32) -> f32 {
+    if left.is_nan() || right.is_nan() {
+        f32::from_bits(F32_CANONICAL_NAN)
+    } else if left == 0.0 && right == 0.0 {
+        if left.is_sign_negative() || right.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
+    } else if left < right {
+        left
+    } else {
+        right
+    }
+}
+
+/// `f32.max`: NaN propagates, and `max(-0, +0)` is `+0`.
+fn f32_max(left: f32, right: f32) -> f32 {
+    if left.is_nan() || right.is_nan() {
+        f32::from_bits(F32_CANONICAL_NAN)
+    } else if left == 0.0 && right == 0.0 {
+        if left.is_sign_positive() || right.is_sign_positive() {
+            0.0
+        } else {
+            -0.0
+        }
+    } else if left > right {
+        left
+    } else {
+        right
+    }
+}
+
+fn f64_min(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::from_bits(F64_CANONICAL_NAN)
+    } else if left == 0.0 && right == 0.0 {
+        if left.is_sign_negative() || right.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
+    } else if left < right {
+        left
+    } else {
+        right
+    }
+}
+
+fn f64_max(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::from_bits(F64_CANONICAL_NAN)
+    } else if left == 0.0 && right == 0.0 {
+        if left.is_sign_positive() || right.is_sign_positive() {
+            0.0
+        } else {
+            -0.0
+        }
+    } else if left > right {
+        left
+    } else {
+        right
+    }
+}
+
+fn eval_f32_binary(operation: F32BinaryOp, left: f32, right: f32) -> u32 {
+    match operation {
+        // `copysign` is a bit operation and must not canonicalize the NaN
+        // payload; the arithmetic operations must.
+        F32BinaryOp::Copysign => f32::copysign(left, right).to_bits(),
+        F32BinaryOp::Add => f32_result(left + right),
+        F32BinaryOp::Sub => f32_result(left - right),
+        F32BinaryOp::Mul => f32_result(left * right),
+        F32BinaryOp::Div => f32_result(left / right),
+        F32BinaryOp::Min => f32_result(f32_min(left, right)),
+        F32BinaryOp::Max => f32_result(f32_max(left, right)),
+    }
+}
+
+fn eval_f64_binary(operation: F64BinaryOp, left: f64, right: f64) -> u64 {
+    match operation {
+        F64BinaryOp::Copysign => f64::copysign(left, right).to_bits(),
+        F64BinaryOp::Add => f64_result(left + right),
+        F64BinaryOp::Sub => f64_result(left - right),
+        F64BinaryOp::Mul => f64_result(left * right),
+        F64BinaryOp::Div => f64_result(left / right),
+        F64BinaryOp::Min => f64_result(f64_min(left, right)),
+        F64BinaryOp::Max => f64_result(f64_max(left, right)),
+    }
+}
+
+fn eval_f32_unary(operation: tpt_wasm_ir::FloatUnary, value: f32) -> u32 {
+    match operation {
+        // `abs` and `neg` only manipulate the sign bit and preserve payloads.
+        tpt_wasm_ir::FloatUnary::Abs => value.to_bits() & 0x7fff_ffff,
+        tpt_wasm_ir::FloatUnary::Neg => value.to_bits() ^ 0x8000_0000,
+        tpt_wasm_ir::FloatUnary::Ceil => f32_result(value.ceil()),
+        tpt_wasm_ir::FloatUnary::Floor => f32_result(value.floor()),
+        tpt_wasm_ir::FloatUnary::Trunc => f32_result(value.trunc()),
+        tpt_wasm_ir::FloatUnary::Nearest => f32_result(value.round_ties_even()),
+        tpt_wasm_ir::FloatUnary::Sqrt => f32_result(value.sqrt()),
+    }
+}
+
+fn eval_f64_unary(operation: tpt_wasm_ir::FloatUnary, value: f64) -> u64 {
+    match operation {
+        tpt_wasm_ir::FloatUnary::Abs => value.to_bits() & 0x7fff_ffff_ffff_ffff,
+        tpt_wasm_ir::FloatUnary::Neg => value.to_bits() ^ 0x8000_0000_0000_0000,
+        tpt_wasm_ir::FloatUnary::Ceil => f64_result(value.ceil()),
+        tpt_wasm_ir::FloatUnary::Floor => f64_result(value.floor()),
+        tpt_wasm_ir::FloatUnary::Trunc => f64_result(value.trunc()),
+        tpt_wasm_ir::FloatUnary::Nearest => f64_result(value.round_ties_even()),
+        tpt_wasm_ir::FloatUnary::Sqrt => f64_result(value.sqrt()),
+    }
+}
+
+fn compare_f32(left: f32, right: f32, comparison: tpt_wasm_ir::FloatComparison) -> bool {
+    match comparison {
+        tpt_wasm_ir::FloatComparison::Eq => left == right,
+        tpt_wasm_ir::FloatComparison::Ne => left != right,
+        tpt_wasm_ir::FloatComparison::Lt => left < right,
+        tpt_wasm_ir::FloatComparison::Gt => left > right,
+        tpt_wasm_ir::FloatComparison::Le => left <= right,
+        tpt_wasm_ir::FloatComparison::Ge => left >= right,
+    }
+}
+
+fn compare_f64(left: f64, right: f64, comparison: tpt_wasm_ir::FloatComparison) -> bool {
+    match comparison {
+        tpt_wasm_ir::FloatComparison::Eq => left == right,
+        tpt_wasm_ir::FloatComparison::Ne => left != right,
+        tpt_wasm_ir::FloatComparison::Lt => left < right,
+        tpt_wasm_ir::FloatComparison::Gt => left > right,
+        tpt_wasm_ir::FloatComparison::Le => left <= right,
+        tpt_wasm_ir::FloatComparison::Ge => left >= right,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{lower_function, BaselineOp, CodegenError, I32BinaryOp};
@@ -876,6 +1884,7 @@ mod tests {
             entry: BlockId(0),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
+                params: Vec::new(),
                 instrs: vec![
                     IrInstr::ConstI32 {
                         result: ValueId(0),
@@ -914,11 +1923,29 @@ mod tests {
         assert_eq!(first.execute(Vec::new()).unwrap(), vec![Value::I32(42)]);
     }
 
-    fn execute_micro(body: &[u8], arity: usize) -> Result<Vec<Value>, Trap> {
+    /// Run one body in Micro with the given local declarations, mirroring the
+    /// zero-initialization the baseline backend performs for its local slots.
+    fn execute_micro_with_locals(
+        body: &[u8],
+        arity: usize,
+        locals: &[tpt_wasm_format::LocalDecl],
+    ) -> Result<Vec<Value>, Trap> {
         let instructions = decode_body(body).unwrap();
+        let mut frame_locals = Vec::new();
+        for declaration in locals {
+            for _ in 0..declaration.count {
+                frame_locals.push(match declaration.value_type {
+                    ValueType::I32 => Value::I32(0),
+                    ValueType::I64 => Value::I64(0),
+                    ValueType::F32 => Value::F32(0),
+                    ValueType::F64 => Value::F64(0),
+                    other => panic!("unsupported local type in fixture: {other:?}"),
+                });
+            }
+        }
         let mut machine = Machine::new();
         machine
-            .push_frame(Frame::new(0, 0, Vec::new(), instructions, arity))
+            .push_frame(Frame::new(0, 0, frame_locals, instructions, arity))
             .unwrap();
         match machine.run() {
             Step::Return(values) => Ok(values),
@@ -927,9 +1954,13 @@ mod tests {
         }
     }
 
-    /// Lower one straight-line Wasm body through the real
+    /// Lower one straight-line Wasm body that declares locals, through the real
     /// validate → IR → baseline pipeline.
-    fn lower_body(body: &[u8], result: ValueType) -> super::BaselineFunction {
+    fn lower_body_with_locals(
+        body: &[u8],
+        result: ValueType,
+        locals: &[tpt_wasm_format::LocalDecl],
+    ) -> super::BaselineFunction {
         let module = Module {
             types: vec![FunctionType {
                 params: ResultType(Vec::new()),
@@ -937,7 +1968,7 @@ mod tests {
             }],
             functions: vec![Function {
                 type_index: 0,
-                locals: Vec::new(),
+                locals: locals.to_vec(),
                 body: body.to_vec(),
             }],
             ..Module::default()
@@ -949,11 +1980,20 @@ mod tests {
 
     /// Assert the baseline backend and the Micro interpreter agree.
     fn assert_matches_micro(body: &[u8], result: ValueType) -> Result<Vec<Value>, Trap> {
-        let baseline = lower_body(body, result);
+        assert_matches_micro_with_locals(body, result, &[])
+    }
+
+    /// Assert agreement for a body that declares locals.
+    fn assert_matches_micro_with_locals(
+        body: &[u8],
+        result: ValueType,
+        locals: &[tpt_wasm_format::LocalDecl],
+    ) -> Result<Vec<Value>, Trap> {
+        let baseline = lower_body_with_locals(body, result, locals);
         let baseline_result = baseline.execute(Vec::new());
         assert_eq!(
             baseline_result,
-            execute_micro(body, 1),
+            execute_micro_with_locals(body, 1, locals),
             "baseline and Micro diverged for {body:02x?}"
         );
         baseline_result
@@ -1153,6 +2193,523 @@ mod tests {
         }
     }
 
+    /// Build a two-operand `f32` body: `f32.const left; f32.const right; op; end`.
+    ///
+    /// `f32.const` immediates are raw little-endian bit patterns, so these
+    /// fixtures can carry NaN payloads and signed zeros exactly.
+    fn binary_body_f32(left: u32, right: u32, opcode: u8) -> Vec<u8> {
+        let mut body = vec![0x43];
+        body.extend_from_slice(&left.to_le_bytes());
+        body.push(0x43);
+        body.extend_from_slice(&right.to_le_bytes());
+        body.push(opcode);
+        body.push(0x0b);
+        body
+    }
+
+    /// Build a one-operand `f32` body: `f32.const value; op; end`.
+    fn unary_body_f32(value: u32, opcode: u8) -> Vec<u8> {
+        let mut body = vec![0x43];
+        body.extend_from_slice(&value.to_le_bytes());
+        body.push(opcode);
+        body.push(0x0b);
+        body
+    }
+
+    /// Build a two-operand `f64` body: `f64.const left; f64.const right; op; end`.
+    fn binary_body_f64(left: u64, right: u64, opcode: u8) -> Vec<u8> {
+        let mut body = vec![0x44];
+        body.extend_from_slice(&left.to_le_bytes());
+        body.push(0x44);
+        body.extend_from_slice(&right.to_le_bytes());
+        body.push(opcode);
+        body.push(0x0b);
+        body
+    }
+
+    /// Build a one-operand `f64` body: `f64.const value; op; end`.
+    fn unary_body_f64(value: u64, opcode: u8) -> Vec<u8> {
+        let mut body = vec![0x44];
+        body.extend_from_slice(&value.to_le_bytes());
+        body.push(opcode);
+        body.push(0x0b);
+        body
+    }
+
+    const F32_POS_ZERO: u32 = 0x0000_0000;
+    const F32_NEG_ZERO: u32 = 0x8000_0000;
+    const F32_NAN: u32 = 0x7fc0_1234;
+    const F32_INFINITY: u32 = 0x7f80_0000;
+    const F32_NEG_INFINITY: u32 = 0xff80_0000;
+    const F64_POS_ZERO: u64 = 0x0000_0000_0000_0000;
+    const F64_NEG_ZERO: u64 = 0x8000_0000_0000_0000;
+    const F64_NAN: u64 = 0x7ff8_0000_0000_1234;
+    const F64_INFINITY: u64 = 0x7ff0_0000_0000_0000;
+    const F64_NEG_INFINITY: u64 = 0xfff0_0000_0000_0000;
+
+    #[test]
+    fn baseline_matches_micro_for_every_f32_binary_op() {
+        // f32 binary opcodes are 0x92..=0x98: add, sub, mul, div, min, max,
+        // copysign. The operand set covers ordinary values, signed zeros, a NaN
+        // payload, and infinities so NaN and zero identity rules are exercised.
+        let operands: &[(u32, u32)] = &[
+            (1.5f32.to_bits(), 2.25f32.to_bits()),
+            (F32_POS_ZERO, F32_NEG_ZERO),
+            (F32_NEG_ZERO, F32_POS_ZERO),
+            (F32_NAN, 1.0f32.to_bits()),
+            (1.0f32.to_bits(), F32_NAN),
+            (F32_INFINITY, F32_NEG_INFINITY),
+            (F32_INFINITY, 0.0f32.to_bits()),
+        ];
+        for opcode in 0x92..=0x98 {
+            for (left, right) in operands {
+                let _ =
+                    assert_matches_micro(&binary_body_f32(*left, *right, opcode), ValueType::F32);
+            }
+        }
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_every_f64_binary_op() {
+        // f64 binary opcodes are 0xa0..=0xa6, mirroring the f32 set at 64 bits.
+        let operands: &[(u64, u64)] = &[
+            (1.5f64.to_bits(), 2.25f64.to_bits()),
+            (F64_POS_ZERO, F64_NEG_ZERO),
+            (F64_NEG_ZERO, F64_POS_ZERO),
+            (F64_NAN, 1.0f64.to_bits()),
+            (1.0f64.to_bits(), F64_NAN),
+            (F64_INFINITY, F64_NEG_INFINITY),
+            (F64_INFINITY, 0.0f64.to_bits()),
+        ];
+        for opcode in 0xa0..=0xa6 {
+            for (left, right) in operands {
+                let _ =
+                    assert_matches_micro(&binary_body_f64(*left, *right, opcode), ValueType::F64);
+            }
+        }
+    }
+
+    #[test]
+    fn baseline_min_and_max_follow_wasm_zero_and_nan_rules() {
+        // 0x96 is f32.min, 0x97 is f32.max, 0xa4 is f64.min, 0xa5 is f64.max.
+        assert_eq!(
+            assert_matches_micro(
+                &binary_body_f32(F32_NEG_ZERO, F32_POS_ZERO, 0x96),
+                ValueType::F32,
+            ),
+            Ok(vec![Value::F32(F32_NEG_ZERO)])
+        );
+        assert_eq!(
+            assert_matches_micro(
+                &binary_body_f32(F32_NEG_ZERO, F32_POS_ZERO, 0x97),
+                ValueType::F32,
+            ),
+            Ok(vec![Value::F32(F32_POS_ZERO)])
+        );
+        // NaN propagates through min and max as the canonical quiet NaN.
+        assert_eq!(
+            assert_matches_micro(
+                &binary_body_f32(F32_NAN, 1.0f32.to_bits(), 0x96),
+                ValueType::F32,
+            ),
+            Ok(vec![Value::F32(0x7fc0_0000)])
+        );
+        assert_eq!(
+            assert_matches_micro(
+                &binary_body_f64(F64_NAN, 1.0f64.to_bits(), 0xa5),
+                ValueType::F64,
+            ),
+            Ok(vec![Value::F64(0x7ff8_0000_0000_0000)])
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_every_f32_unary_op() {
+        // f32 unary opcodes are 0x8b..=0x91: abs, neg, ceil, floor, trunc,
+        // nearest, sqrt. Halfway inputs are included so ties-to-even rounding
+        // is exercised.
+        let values = [
+            1.5f32.to_bits(),
+            (-1.5f32).to_bits(),
+            0.5f32.to_bits(),
+            2.5f32.to_bits(),
+            F32_POS_ZERO,
+            F32_NEG_ZERO,
+            F32_NAN,
+            F32_NEG_INFINITY,
+        ];
+        for opcode in 0x8b..=0x91 {
+            for value in values {
+                let _ = assert_matches_micro(&unary_body_f32(value, opcode), ValueType::F32);
+            }
+        }
+        // f32.nearest (0x90) rounds halfway cases to the nearest even integer.
+        assert_eq!(
+            assert_matches_micro(&unary_body_f32(2.5f32.to_bits(), 0x90), ValueType::F32),
+            Ok(vec![Value::F32(2.0f32.to_bits())])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body_f32(3.5f32.to_bits(), 0x90), ValueType::F32),
+            Ok(vec![Value::F32(4.0f32.to_bits())])
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_every_f64_unary_op() {
+        // f64 unary opcodes are 0x99..=0x9f, mirroring the f32 set.
+        let values = [
+            1.5f64.to_bits(),
+            (-1.5f64).to_bits(),
+            0.5f64.to_bits(),
+            2.5f64.to_bits(),
+            F64_POS_ZERO,
+            F64_NEG_ZERO,
+            F64_NAN,
+            F64_NEG_INFINITY,
+        ];
+        for opcode in 0x99..=0x9f {
+            for value in values {
+                let _ = assert_matches_micro(&unary_body_f64(value, opcode), ValueType::F64);
+            }
+        }
+        assert_eq!(
+            assert_matches_micro(&unary_body_f64(2.5f64.to_bits(), 0x9e), ValueType::F64),
+            Ok(vec![Value::F64(2.0f64.to_bits())])
+        );
+    }
+
+    #[test]
+    fn baseline_abs_neg_and_copysign_preserve_nan_payloads() {
+        // These three operations are defined bitwise, so they must keep the NaN
+        // payload rather than canonicalizing it the way arithmetic does.
+        assert_eq!(
+            assert_matches_micro(&unary_body_f32(F32_NAN, 0x8b), ValueType::F32),
+            Ok(vec![Value::F32(0x7fc0_1234)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body_f32(F32_NAN, 0x8c), ValueType::F32),
+            Ok(vec![Value::F32(F32_NAN | 0x8000_0000)])
+        );
+        assert_eq!(
+            assert_matches_micro(
+                &binary_body_f32(1.0f32.to_bits(), F32_NEG_ZERO, 0x98),
+                ValueType::F32,
+            ),
+            Ok(vec![Value::F32(1.0f32.to_bits() | 0x8000_0000)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body_f64(F64_NAN, 0x99), ValueType::F64),
+            Ok(vec![Value::F64(0x7ff8_0000_0000_1234)])
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_every_float_comparison() {
+        // f32 comparisons are 0x5b..=0x60 and f64 comparisons are 0x61..=0x66.
+        // Every comparison yields an i32, and NaN operands make all ordered
+        // comparisons false while `ne` stays true.
+        let f32_operands: &[(u32, u32)] = &[
+            (1.0f32.to_bits(), 2.0f32.to_bits()),
+            ((-1.0f32).to_bits(), 1.0f32.to_bits()),
+            (F32_POS_ZERO, F32_NEG_ZERO),
+            (F32_NAN, 1.0f32.to_bits()),
+            (F32_NAN, F32_NAN),
+        ];
+        for opcode in 0x5b..=0x60 {
+            for (left, right) in f32_operands {
+                let _ =
+                    assert_matches_micro(&binary_body_f32(*left, *right, opcode), ValueType::I32);
+            }
+        }
+        let f64_operands: &[(u64, u64)] = &[
+            (1.0f64.to_bits(), 2.0f64.to_bits()),
+            ((-1.0f64).to_bits(), 1.0f64.to_bits()),
+            (F64_POS_ZERO, F64_NEG_ZERO),
+            (F64_NAN, 1.0f64.to_bits()),
+            (F64_NAN, F64_NAN),
+        ];
+        for opcode in 0x61..=0x66 {
+            for (left, right) in f64_operands {
+                let _ =
+                    assert_matches_micro(&binary_body_f64(*left, *right, opcode), ValueType::I32);
+            }
+        }
+        // NaN is unordered: `eq` is false and `ne` is true.
+        assert_eq!(
+            assert_matches_micro(&binary_body_f32(F32_NAN, F32_NAN, 0x5b), ValueType::I32),
+            Ok(vec![Value::I32(0)])
+        );
+        assert_eq!(
+            assert_matches_micro(&binary_body_f32(F32_NAN, F32_NAN, 0x5c), ValueType::I32),
+            Ok(vec![Value::I32(1)])
+        );
+    }
+
+    #[test]
+    fn baseline_preserves_f32_constants_bit_exactly() {
+        // Floating-point constants are raw bit patterns and must round-trip
+        // through lowering without being reinterpreted as Rust floats. `abs`
+        // only clears the sign bit, so it exposes the stored payload directly.
+        for bits in [
+            F32_POS_ZERO,
+            F32_NEG_ZERO,
+            F32_NAN,
+            F32_INFINITY,
+            1.0f32.to_bits(),
+        ] {
+            assert_eq!(
+                assert_matches_micro(&unary_body_f32(bits, 0x8b), ValueType::F32),
+                Ok(vec![Value::F32(bits & 0x7fff_ffff)])
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_local_get_set_and_tee() {
+        // Locals are zero-initialized. The body sets a local, reads it back, and
+        // tees a second value, so all three access forms are exercised at once.
+        let locals = [tpt_wasm_format::LocalDecl {
+            count: 2,
+            value_type: ValueType::I32,
+        }];
+        // i32.const 41; local.set 0; local.get 0; i32.const 1; i32.add;
+        // local.tee 1; end  ->  42
+        let body = [
+            vec![0x41],
+            encode_i32(41),
+            vec![0x21, 0x00],
+            vec![0x20, 0x00, 0x41],
+            encode_i32(1),
+            vec![0x6a, 0x22, 0x01],
+            vec![0x0b],
+        ]
+        .concat();
+        assert_eq!(
+            assert_matches_micro_with_locals(&body, ValueType::I32, &locals),
+            Ok(vec![Value::I32(42)])
+        );
+        // A declared-but-unset local reads as zero: local.get 0 directly.
+        let read_unset = [vec![0x20, 0x00, 0x0b]].concat();
+        assert_eq!(
+            assert_matches_micro_with_locals(&read_unset, ValueType::I32, &locals),
+            Ok(vec![Value::I32(0)])
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_select_and_drop() {
+        // select is typed on both arms; drop simply discards a value.
+        // i32.const 11; i32.const 22; i32.const 0; select -> 22
+        let select_zero = [
+            vec![0x41],
+            encode_i32(11),
+            vec![0x41],
+            encode_i32(22),
+            vec![0x41, 0x00, 0x1b, 0x0b],
+        ]
+        .concat();
+        assert_eq!(
+            assert_matches_micro(&select_zero, ValueType::I32),
+            Ok(vec![Value::I32(22)])
+        );
+        // The same body with a non-zero condition selects the first arm.
+        let select_nonzero = [
+            vec![0x41],
+            encode_i32(11),
+            vec![0x41],
+            encode_i32(22),
+            vec![0x41, 0x01, 0x1b, 0x0b],
+        ]
+        .concat();
+        assert_eq!(
+            assert_matches_micro(&select_nonzero, ValueType::I32),
+            Ok(vec![Value::I32(11)])
+        );
+        // i32.const 7; i32.const 8; i32.add; drop; i32.const 9 -> 9
+        let dropped = [
+            vec![0x41],
+            encode_i32(7),
+            vec![0x41],
+            encode_i32(8),
+            vec![0x6a, 0x1a],
+            vec![0x41],
+            encode_i32(9),
+            vec![0x0b],
+        ]
+        .concat();
+        assert_eq!(
+            assert_matches_micro(&dropped, ValueType::I32),
+            Ok(vec![Value::I32(9)])
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_every_integer_bit_count_op() {
+        // i32 clz/ctz/popcnt are 0x67..=0x69 and i64 forms are 0x79..=0x7b.
+        for opcode in 0x67..=0x69 {
+            for value in [0i32, 1, -1, i32::MIN, i32::MAX, 0b1010_0101] {
+                let _ = assert_matches_micro(&unary_body(value, opcode), ValueType::I32);
+            }
+        }
+        for opcode in 0x79..=0x7b {
+            for value in [0i64, 1, -1, i64::MIN, i64::MAX, 0b1010_0101] {
+                let _ = assert_matches_micro(&unary_body_i64(value, opcode), ValueType::I64);
+            }
+        }
+        // clz(0) is the full width and popcnt counts set bits.
+        assert_eq!(
+            assert_matches_micro(&unary_body(0, 0x67), ValueType::I32),
+            Ok(vec![Value::I32(32)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body_i64(0, 0x79), ValueType::I64),
+            Ok(vec![Value::I64(64)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body(0b1010_0101, 0x69), ValueType::I32),
+            Ok(vec![Value::I32(4)])
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_integer_width_conversions() {
+        // 0xa7 is i32.wrap_i64, 0xac is i64.extend_i32_s, 0xad is i64.extend_i32_u.
+        for value in [0i64, 1, -1, i64::MIN, i64::MAX, i64::from(i32::MAX) + 1] {
+            let _ = assert_matches_micro(&unary_body_i64(value, 0xa7), ValueType::I32);
+        }
+        for value in [0i32, 1, -1, i32::MIN, i32::MAX] {
+            let _ = assert_matches_micro(&unary_body(value, 0xac), ValueType::I64);
+            let _ = assert_matches_micro(&unary_body(value, 0xad), ValueType::I64);
+        }
+        // Signed extension sign-extends; unsigned extension zero-extends.
+        assert_eq!(
+            assert_matches_micro(&unary_body(-1, 0xac), ValueType::I64),
+            Ok(vec![Value::I64(-1)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body(-1, 0xad), ValueType::I64),
+            Ok(vec![Value::I64(4294967295)])
+        );
+        // wrap keeps the low 32 bits.
+        assert_eq!(
+            assert_matches_micro(&unary_body_i64(0x1_0000_0001, 0xa7), ValueType::I32),
+            Ok(vec![Value::I32(1)])
+        );
+    }
+
+    #[test]
+    fn baseline_reinterprets_bits_without_touching_them() {
+        // 0xbc..=0xbf are the four reinterpret operations. Round-tripping a NaN
+        // payload proves no canonicalization happens on the way through.
+        assert_eq!(
+            assert_matches_micro(&unary_body_f32(F32_NAN, 0xbc), ValueType::I32),
+            Ok(vec![Value::I32(F32_NAN as i32)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body(F32_NAN as i32, 0xbe), ValueType::F32),
+            Ok(vec![Value::F32(F32_NAN)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body_f64(F64_NAN, 0xbd), ValueType::I64),
+            Ok(vec![Value::I64(F64_NAN as i64)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body_i64(F64_NAN as i64, 0xbf), ValueType::F64),
+            Ok(vec![Value::F64(F64_NAN)])
+        );
+        // Reinterpret also preserves signed zero, which a numeric conversion
+        // would lose.
+        assert_eq!(
+            assert_matches_micro(&unary_body_f32(F32_NEG_ZERO, 0xbc), ValueType::I32),
+            Ok(vec![Value::I32(F32_NEG_ZERO as i32)])
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_every_float_conversion() {
+        // 0xb2..=0xbb are the ten non-trapping float conversions.
+        for value in [0i32, 1, -1, i32::MIN, i32::MAX] {
+            let _ = assert_matches_micro(&unary_body(value, 0xb2), ValueType::F32);
+            let _ = assert_matches_micro(&unary_body(value, 0xb3), ValueType::F32);
+            let _ = assert_matches_micro(&unary_body(value, 0xb7), ValueType::F64);
+            let _ = assert_matches_micro(&unary_body(value, 0xb8), ValueType::F64);
+        }
+        for value in [0i64, 1, -1, i64::MIN, i64::MAX] {
+            let _ = assert_matches_micro(&unary_body_i64(value, 0xb4), ValueType::F32);
+            let _ = assert_matches_micro(&unary_body_i64(value, 0xb5), ValueType::F32);
+            let _ = assert_matches_micro(&unary_body_i64(value, 0xb9), ValueType::F64);
+            let _ = assert_matches_micro(&unary_body_i64(value, 0xba), ValueType::F64);
+        }
+        // 0xb6 narrows f64 to f32 and 0xbb widens f32 to f64, NaN included.
+        for bits in [F32_NAN, F32_NEG_ZERO, 1.5f32.to_bits(), F32_INFINITY] {
+            let _ = assert_matches_micro(&unary_body_f32(bits, 0xbb), ValueType::F64);
+        }
+        for bits in [F64_NAN, F64_NEG_ZERO, 1.5f64.to_bits(), F64_INFINITY] {
+            let _ = assert_matches_micro(&unary_body_f64(bits, 0xb6), ValueType::F32);
+        }
+    }
+
+    #[test]
+    fn baseline_reproduces_every_float_truncation_trap() {
+        // 0xa8..=0xab truncate to i32 and 0xae..=0xb1 truncate to i64.
+        for opcode in [0xa8u8, 0xa9, 0xaa, 0xab, 0xae, 0xaf, 0xb0, 0xb1] {
+            let result = if matches!(opcode, 0xa8..=0xab) {
+                ValueType::I32
+            } else {
+                ValueType::I64
+            };
+            let from_f32 = matches!(opcode, 0xa8 | 0xa9 | 0xae | 0xaf);
+            // NaN, both infinities, and out-of-range magnitudes all trap.
+            let invalid: &[(u32, u64)] = &[
+                (F32_NAN, F64_NAN),
+                (F32_INFINITY, F64_INFINITY),
+                (F32_NEG_INFINITY, F64_NEG_INFINITY),
+                (1e30f32.to_bits(), 1e30f64.to_bits()),
+                ((-1e30f32).to_bits(), (-1e30f64).to_bits()),
+            ];
+            for (f32_bits, f64_bits) in invalid {
+                let body = if from_f32 {
+                    unary_body_f32(*f32_bits, opcode)
+                } else {
+                    unary_body_f64(*f64_bits, opcode)
+                };
+                assert_eq!(
+                    assert_matches_micro(&body, result),
+                    Err(Trap::InvalidConversion),
+                    "opcode {opcode:#04x} should trap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_in_range_float_truncations() {
+        // Truncation is toward zero, so fractional parts are discarded rather
+        // than rounded, and the unsigned forms reject negatives.
+        assert_eq!(
+            assert_matches_micro(&unary_body_f32(3.9f32.to_bits(), 0xa8), ValueType::I32),
+            Ok(vec![Value::I32(3)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body_f32((-3.9f32).to_bits(), 0xa8), ValueType::I32),
+            Ok(vec![Value::I32(-3)])
+        );
+        assert_eq!(
+            assert_matches_micro(&unary_body_f64(3.9f64.to_bits(), 0xb0), ValueType::I64),
+            Ok(vec![Value::I64(3)])
+        );
+        // A negative value has no unsigned representation and must trap.
+        assert_eq!(
+            assert_matches_micro(&unary_body_f32((-1.0f32).to_bits(), 0xa9), ValueType::I32),
+            Err(Trap::InvalidConversion)
+        );
+        // -1.0 is exactly representable as i64 but still traps as unsigned.
+        assert_eq!(
+            assert_matches_micro(&unary_body_f64((-1.0f64).to_bits(), 0xb1), ValueType::I64),
+            Err(Trap::InvalidConversion)
+        );
+    }
+
     /// Encode a single `i32.const` signed LEB128 immediate.
     fn encode_i32(value: i32) -> Vec<u8> {
         let mut remaining = value;
@@ -1172,12 +2729,13 @@ mod tests {
 
     #[test]
     fn baseline_rejects_unsupported_ops_and_preserves_traps() {
-        // Local access is modeled in the IR but not yet lowered by the baseline
-        // backend, so it must be rejected rather than silently ignored.
+        // Direct calls are modeled in the IR but not yet lowered by the baseline
+        // backend, so they must be rejected rather than silently ignored.
         let mut unsupported = add_function();
-        unsupported.blocks[0].instrs[0] = IrInstr::LocalGet {
-            result: ValueId(0),
-            local: ValueId(0),
+        unsupported.blocks[0].instrs[0] = IrInstr::Call {
+            function: 0,
+            arguments: Vec::new(),
+            results: vec![ValueId(0)],
         };
         assert_eq!(
             lower_function(&unsupported),
@@ -1195,6 +2753,7 @@ mod tests {
             entry: BlockId(0),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
+                params: Vec::new(),
                 instrs: Vec::new(),
                 terminator: Terminator::Trap(Trap::IntegerDivisionByZero),
             }],

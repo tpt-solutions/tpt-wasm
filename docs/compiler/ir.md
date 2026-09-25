@@ -1,6 +1,7 @@
 # TPT-Wasm IR
 
-**Status:** M6 — typed straight-line subset implemented
+**Status:** M6 — typed straight-line subset implemented; multi-block IR and
+dominance verification implemented
 **Crate:** `tpt-wasm-ir`
 
 ## Position in pipeline
@@ -28,10 +29,13 @@ the Micro interpreter:
   typed value table, an entry block, and basic blocks.
 - `ValueId` names each SSA-ready result. Floating-point constants retain raw
   bits, so NaN payloads are not changed during lowering.
-- `BasicBlock` owns typed instructions and exactly one terminator.
-- The current verifier accepts one terminal block per function. This matches
-  the current straight-line lowering slice and rejects multi-block input until
-  branch verification is implemented.
+- `BasicBlock` owns typed instructions, optional block parameters, and exactly
+  one terminator.
+- The verifier now accepts multi-block functions. Block parameters are the
+  block-argument form of a phi: each incoming edge supplies one value per
+  target parameter, in order.
+- `Terminator` supports `Branch` and `CondBranch` in addition to return, trap,
+  and unreachable.
 - `VerifiedIrModule` keeps its payload private. Consumers can inspect it or
   consume it into a mutable compiler input, but cannot mutate a certified module
   in place.
@@ -62,24 +66,36 @@ The implemented instruction set is:
 
 - value IDs are unique and declared in the function value table;
 - parameter arity and parameter types match the Wasm signature;
-- parameters and locals have unique definitions;
-- every use is dominated by a definition in the single supported block;
+- block IDs are unique, the entry block exists, and every block is reachable;
+- every incoming edge supplies exactly as many values as the target block has
+  parameters, and their types match those parameters;
+- every use is dominated by its definition, computed with an iterative
+  immediate-dominator fixpoint over reverse postorder;
 - SSA result IDs are defined at most once;
 - constants and arithmetic operands have the required Wasm types;
 - direct-call targets exist and argument/result signatures match;
-- return arity, value types, and definitions match the function signature;
-- the entry block exists and the function has exactly one supported block.
+- return arity, value types, and definitions match the function signature.
+
+Dominance is the reason a value defined in only one arm of a branch cannot be
+read after the merge: a use must be reachable from its definition on every path.
+An unreachable block is reported rather than ignored, so a malformed dead region
+cannot hide behind a live one.
 
 `lower_and_verify` composes lowering and verification and returns the
 certificate-backed `VerifiedIrModule`.
 
 ## Scope boundary
 
-This is not yet a complete MVP compiler IR. Structured control flow,
-multi-block local dataflow, globals, memory, tables, imported or indirect calls, references,
-remaining numeric operations and explicit host boundaries are
-not yet represented by the instruction set. Lowering rejects those constructs
-explicitly; it never discards or approximates their behavior.
+The IR can now *represent* and *verify* multi-block control flow, but the
+lowering pass does not yet emit it: Wasm `block`, `loop`, `if`/`else`, `br`,
+`br_if`, `br_table`, and `return` are still rejected during lowering. Until that
+pass lands, control flow exists as a verified representation and a target for
+later passes rather than as produced code.
+
+Globals, memory, tables, imported or indirect calls, references, remaining
+numeric operations, and explicit host boundaries are not yet represented by the
+instruction set. Lowering rejects those constructs explicitly; it never
+discards or approximates their behavior.
 
 See [lowering.md](lowering.md) for the stage-by-stage contract and
 [refinement.md](../verification/refinement.md) for the executable V4 projection

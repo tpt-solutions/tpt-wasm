@@ -148,10 +148,14 @@
 - [x] Design the typed IR foundation in `tpt-wasm-ir` (SSA-ready values, basic blocks, explicit terminators)
 - [x] Implement IR value types aligned with Wasm types
 - [ ] Expand the IR instruction set to the full validated MVP (structured control flow, locals/globals, memory, tables, calls, references, remaining numeric operations, explicit host boundaries)
+  - Structured control flow representation and dominance verification: done. Multi-block IR with block parameters, `Branch`/`CondBranch` terminators, and dominance-checked uses.
+  - Lowering Wasm `block`/`loop`/`if`/`br`/`br_if`/`br_table`/`return` into that CFG, and multi-block local dataflow, are still pending.
 - [x] Implement the initial `Wasm → TPT IR` lowering pass for straight-line constants, `drop`, `select`, `nop`, straight-line local access, defined direct calls, integer arithmetic/comparison/division/remainder/bitwise/shift/rotation operations, integer unary bit-count, integer width/signedness conversion, non-trapping f32/f64 conversion, trapping float-to-integer conversion, and raw-bit reinterpretation operations, f32/f64 comparisons/unary/binary operations, and f32/f64 add/sub/mul/div
 - [ ] Expand lowering to every construct represented by the IR instruction set
 - [x] Implement IR type-checking / structural verification for the current instruction set
-- [ ] Extend IR verification for branches, dominance, memory effects, imported/indirect calls, references, and host effects
+- [x] Extend IR verification for branches, dominance, memory effects, imported/indirect calls, references, and host effects
+  - Branches, block parameters, and dominance: done — multi-block CFG with an iterative immediate-dominator fixpoint, reachable-block enforcement, and per-edge arity/type checks.
+  - Memory effects, imported/indirect calls, references, and host effects: still pending; those instructions are not yet in the IR.
 - [x] Add an executable V4 projection hook for the IR/formal-model overlap
 - [x] Add lowering differential tests against Micro for the current subset
 - [x] Document the IR and lowering contract in `docs/compiler/ir.md` and `docs/compiler/lowering.md`
@@ -166,6 +170,12 @@
 - [x] Implement the initial portable baseline lowering/execution slice (`i32.const`, `i32.add`, and terminators)
 - [x] Extend the portable baseline to the full straight-line `i32` set: 15 binary ops, `i32.eqz`, and 10 comparisons with Wasm-exact wrapping, masking, and trap rules
 - [x] Extend the portable baseline to the symmetric straight-line `i64` set, including width-correct shift masking and division traps
+- [x] Extend the portable baseline to the symmetric straight-line `f32` set: 7 binary ops, 7 unary ops, 6 comparisons, with Wasm-exact NaN canonicalization, NaN-payload-preserving `abs`/`neg`/`copysign`, signed-zero `min`/`max`, and ties-to-even `nearest`
+- [x] Extend the portable baseline to the symmetric straight-line `f64` set with the same operation set and IEEE 754 identities
+- [x] Extend the portable baseline to straight-line locals: `local.get`, `local.set`, and `local.tee` over zero-initialized slots, plus `drop` and `select`
+- [x] Extend the portable baseline to the straight-line integer unary set (`clz`, `ctz`, `popcnt`) and the non-trapping width/signedness conversions
+- [x] Extend the portable baseline to raw-bit reinterpretation and to the non-trapping float conversions, preserving NaN payloads and signed zeros
+- [x] Extend the portable baseline to the trapping float truncations with Wasm-exact `InvalidConversion` boundaries (NaN, infinity, out-of-range, negative-to-unsigned)
 - [ ] Implement simple lowering pipeline: IR → machine IR → native (x86_64 first)
 - [ ] Wire `EngineMode::Baseline` to codegen backend in `Engine`
 - [ ] Implement aarch64 backend stub
@@ -175,7 +185,7 @@
 - [ ] Verify trap equivalence (same traps at same points)
 - [ ] Verify host-effect equivalence
 
-> M7 now has a deterministic portable baseline slice with independent execution and Micro differential coverage for the full straight-line `i32` and `i64` sets: both constants, all fifteen binary operations per width, both `eqz` forms, all twenty comparisons, and the return/trap/unreachable terminators. Differential tests drive the real validate → IR → baseline pipeline and assert identical results and traps. Float, memory, table, local, and control-flow lowering, native x86-64/AArch64 code generation, executable-memory integration, and `EngineMode::Baseline` remain pending.
+> M7 now has a deterministic portable baseline slice with independent execution and Micro differential coverage for the full straight-line MVP instruction set that the IR represents: constants and every arithmetic, comparison, and bit-count operation at all four widths; `drop`, `select`, and `local.get`/`set`/`tee` over zero-initialized slots; non-trapping integer width and signedness conversions; raw-bit reinterpretation; the non-trapping float conversions; and the trapping float truncations; plus the return/trap/unreachable terminators. IEEE 754 behavior is reproduced exactly, and differential tests drive the real validate → IR → baseline pipeline asserting identical results and traps bit-for-bit, including NaN canonicalization, NaN-payload preservation across reinterpretation, signed-zero `min`/`max`, ties-to-even rounding, and every `InvalidConversion` boundary. Memory, table, and control-flow lowering, direct and indirect calls, native x86-64/AArch64 code generation, executable-memory integration, and `EngineMode::Baseline` remain pending.
 
 
 ---

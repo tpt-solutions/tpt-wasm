@@ -16,6 +16,22 @@ use crate::{lower_module, LoweringError};
 pub enum VerificationError {
     DuplicateValue(ValueId),
     MissingBlock(super::BlockId),
+    DuplicateBlock(super::BlockId),
+    UnreachableBlock {
+        function: usize,
+    },
+    BlockParameterArity {
+        function: usize,
+        block: super::BlockId,
+        expected: usize,
+        actual: usize,
+    },
+    DoesNotDominate {
+        function: usize,
+        value: ValueId,
+        defined_in: super::BlockId,
+        used_in: super::BlockId,
+    },
     UnknownFunction(u32),
     CallArity {
         function: u32,
@@ -117,7 +133,7 @@ pub fn lower_and_verify(
     })
 }
 
-/// Verify value definitions, instruction types, entry points, and returns.
+/// Verify value definitions, instruction types, control flow, and returns.
 pub fn verify_module(module: &IrModule) -> Result<IrVerificationCertificate, VerificationError> {
     for (function_index, function) in module.functions.iter().enumerate() {
         verify_function(function, function_index, &module.functions)?;
@@ -131,17 +147,24 @@ fn verify_function(
     functions: &[super::IrFunction],
 ) -> Result<(), VerificationError> {
     let values = value_types(&function.values)?;
-    verify_blocks(function, function_index)?;
+    let order = verify_blocks(function, function_index)?;
     verify_parameters(function, function_index, &values)?;
+    verify_dominance(function, function_index, &order)?;
 
-    let mut defined = HashSet::new();
-    for id in function.params.iter().chain(&function.locals) {
-        if !defined.insert(*id) {
-            return Err(VerificationError::RedefinedValue(*id));
-        }
-    }
-
-    for block in &function.blocks {
+    // Within a block, operands must already be defined. Cross-block visibility
+    // is governed by dominance, which `verify_dominance` establishes above.
+    for &block_index in &order {
+        let block = &function.blocks[block_index];
+        // Function parameters and locals are entry-block values, so they are in
+        // scope wherever dominance reaches; a block parameter is in scope only
+        // within its own block.
+        let mut defined: HashSet<ValueId> = function
+            .params
+            .iter()
+            .chain(&function.locals)
+            .copied()
+            .chain(block.params.iter().copied())
+            .collect();
         for instruction in &block.instrs {
             verify_instruction(
                 instruction,
@@ -151,21 +174,13 @@ fn verify_function(
                 &mut defined,
             )?;
         }
-        if let super::Terminator::Return(results) = &block.terminator {
-            verify_results(
-                results,
-                &function.function_type.results.0,
-                function_index,
-                &values,
-                &defined,
-            )?;
-        }
-    }
-
-    for value in &function.values {
-        if !defined.contains(&value.id) {
-            return Err(VerificationError::UndefinedValue(value.id));
-        }
+        verify_terminator(
+            &block.terminator,
+            function_index,
+            &values,
+            &defined,
+            &function.function_type.results.0,
+        )?;
     }
     Ok(())
 }
@@ -182,20 +197,616 @@ fn value_types(
     Ok(types)
 }
 
+/// Verify block structure and return block indices in reverse postorder.
+///
+/// Reverse postorder guarantees a block is visited before any block reachable
+/// from it along a non-back edge, which is what makes the dominator fixpoint
+/// converge. An unreachable block is reported rather than skipped so a dead but
+/// malformed region cannot hide behind a live one.
 fn verify_blocks(
     function: &super::IrFunction,
     function_index: usize,
-) -> Result<(), VerificationError> {
-    if function.blocks.len() != 1 {
-        return Err(VerificationError::UnsupportedBlockCount {
-            function: function_index,
-            actual: function.blocks.len(),
-        });
-    }
-    if function.blocks[0].id != function.entry {
+) -> Result<Vec<usize>, VerificationError> {
+    if function.blocks.is_empty() {
         return Err(VerificationError::MissingBlock(function.entry));
     }
+    let mut index_of = HashMap::with_capacity(function.blocks.len());
+    for (index, block) in function.blocks.iter().enumerate() {
+        if index_of.insert(block.id, index).is_some() {
+            return Err(VerificationError::DuplicateBlock(block.id));
+        }
+    }
+    let entry = *index_of
+        .get(&function.entry)
+        .ok_or(VerificationError::MissingBlock(function.entry))?;
+
+    // Resolve every edge once, reporting a dangling target here.
+    let mut successors: Vec<Vec<usize>> = Vec::with_capacity(function.blocks.len());
+    for block in &function.blocks {
+        let mut edges = Vec::new();
+        for successor in block.terminator.successors() {
+            let target = *index_of
+                .get(&successor)
+                .ok_or(VerificationError::MissingBlock(successor))?;
+            edges.push(target);
+        }
+        successors.push(edges);
+    }
+
+    // Iterative depth-first postorder, to avoid deep recursion on long bodies.
+    let mut postorder = Vec::with_capacity(function.blocks.len());
+    let mut visited = vec![false; function.blocks.len()];
+    let mut stack = vec![(entry, false)];
+    while let Some((index, finished)) = stack.pop() {
+        if finished {
+            postorder.push(index);
+            continue;
+        }
+        if visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        stack.push((index, true));
+        for &successor in successors[index].iter().rev() {
+            if !visited[successor] {
+                stack.push((successor, false));
+            }
+        }
+    }
+    postorder.reverse();
+
+    // A block the lowering allocated but never wired up is dead weight, not a
+    // malformed CFG. Wasm explicitly permits unreachable code after an
+    // unconditional branch, so unreachable blocks are not an error; they simply
+    // cannot affect the function's result and are excluded from the
+    // dominance, definition, and branch-type checks that follow.
+    //
+    // What is still required is that a *reachable* block never supplies a value
+    // to a target whose parameters it does not fill, which `verify_branch_types`
+    // checks below.
+
+    // Every incoming edge must supply exactly the target's parameter count.
+    for (index, block) in function.blocks.iter().enumerate() {
+        for predecessor in predecessors_of(&successors, index) {
+            let incoming = incoming_arity(&function.blocks[predecessor].terminator, index);
+            if incoming != block.params.len() {
+                return Err(VerificationError::BlockParameterArity {
+                    function: function_index,
+                    block: block.id,
+                    expected: block.params.len(),
+                    actual: incoming,
+                });
+            }
+        }
+    }
+    Ok(postorder)
+}
+
+/// Predecessor block indices of `target`, in block order.
+fn predecessors_of(successors: &[Vec<usize>], target: usize) -> Vec<usize> {
+    successors
+        .iter()
+        .enumerate()
+        .filter(|(_, edges)| edges.contains(&target))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The number of values a terminator supplies to the block at `target`.
+fn incoming_arity(terminator: &super::Terminator, target: usize) -> usize {
+    match terminator {
+        super::Terminator::Branch { target: t, values } if t.0 as usize == target => values.len(),
+        super::Terminator::CondBranch {
+            then_target,
+            then_values,
+            else_target,
+            else_values,
+            ..
+        } => {
+            if then_target.0 as usize == target {
+                then_values.len()
+            } else if else_target.0 as usize == target {
+                else_values.len()
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Immediate dominators by block index; `usize::MAX` means not yet computed.
+struct Dominators {
+    idom: Vec<usize>,
+    depth: Vec<usize>,
+}
+
+impl Dominators {
+    /// Does `ancestor` dominate `node`? A block always dominates itself.
+    ///
+    /// The walk is bounded by the tree depth so a malformed `idom` cycle cannot
+    /// spin here; verification reports the structural problem separately.
+    fn dominates(&self, ancestor: usize, node: usize) -> bool {
+        let mut current = node;
+        for _ in 0..=self.depth.len() {
+            if current == ancestor {
+                return true;
+            }
+            let next = self.idom[current];
+            if next == usize::MAX || next == current || self.depth[next] <= self.depth[ancestor] {
+                return false;
+            }
+            current = next;
+        }
+        false
+    }
+}
+
+/// Compute immediate dominators with the iterative Cooper–Harvey–Kennedy
+/// fixpoint over reverse postorder.
+fn compute_dominators(
+    function: &super::IrFunction,
+    entry: usize,
+    order: &[usize],
+    successors: &[Vec<usize>],
+) -> Dominators {
+    let count = function.blocks.len();
+    let mut position = vec![usize::MAX; count];
+    for (rank, index) in order.iter().enumerate() {
+        position[*index] = rank;
+    }
+    let mut idom = vec![usize::MAX; count];
+    idom[entry] = entry;
+    // The fixpoint converges in at most one pass per block. The bound is a
+    // backstop so a malformed graph can never spin here.
+    for _ in 0..=count {
+        let mut changed = false;
+        for &block in order {
+            if block == entry {
+                continue;
+            }
+            let mut candidate = usize::MAX;
+            for predecessor in predecessors_of(successors, block) {
+                if idom[predecessor] == usize::MAX {
+                    continue;
+                }
+                candidate = match candidate {
+                    usize::MAX => predecessor,
+                    current => intersect(&idom, &position, current, predecessor),
+                };
+            }
+            if candidate != usize::MAX && idom[block] != candidate {
+                idom[block] = candidate;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Depth follows from the dominator tree, whose parent always has a smaller
+    // reverse-postorder rank than its child.
+    let mut depth = vec![0usize; count];
+    for &block in order {
+        if block != entry && idom[block] != usize::MAX {
+            depth[block] = depth[idom[block]] + 1;
+        }
+    }
+    Dominators { idom, depth }
+}
+
+/// Intersect two dominator paths, walking whichever is later in postorder up
+/// until the two meet.
+///
+/// Both walks are bounded by the number of blocks. The entry dominates itself,
+/// so a cycle through it must stop there rather than follow `idom` forever.
+fn intersect(idom: &[usize], position: &[usize], mut a: usize, mut b: usize) -> usize {
+    for _ in 0..=idom.len() {
+        while a != b && position[a] > position[b] {
+            let next = idom[a];
+            if next == usize::MAX || next == a {
+                return b;
+            }
+            a = next;
+        }
+        while a != b && position[b] > position[a] {
+            let next = idom[b];
+            if next == usize::MAX || next == b {
+                return a;
+            }
+            b = next;
+        }
+        if a == b {
+            return a;
+        }
+    }
+    // The two paths never met; the later block is the safer answer.
+    if position[a] <= position[b] {
+        a
+    } else {
+        b
+    }
+}
+
+/// Check that every used value is dominated by its definition, that no value is
+/// defined twice, and that branch operands match the target parameter types.
+fn verify_dominance(
+    function: &super::IrFunction,
+    function_index: usize,
+    order: &[usize],
+) -> Result<(), VerificationError> {
+    let values = value_types(&function.values)?;
+    let entry = function
+        .blocks
+        .iter()
+        .position(|block| block.id == function.entry)
+        .ok_or(VerificationError::MissingBlock(function.entry))?;
+    let successors = resolve_successors(function)?;
+    let dominators = compute_dominators(function, entry, order, &successors);
+
+    // Record the defining block of every value. Parameters and locals are
+    // entry-block values; block parameters and instruction results are defined
+    // in the block that introduces them.
+    //
+    // A local is storage rather than an SSA register: it exists for the whole
+    // function and is re-assigned by `local.set`. Treating it as dominating
+    // only the entry block would reject the ordinary pattern of writing a local
+    // inside a branch and reading it afterwards, so locals are marked as
+    // dominating the entire function.
+    let mut def_block: HashMap<ValueId, usize> = HashMap::new();
+    for id in function.params.iter().chain(&function.locals) {
+        def_block.insert(*id, entry);
+    }
+    let local_set: HashSet<ValueId> = function.locals.iter().copied().collect();
+    // Definitions are recorded for every block, not only reachable ones. A merge
+    // block's parameters are declared even if the block is never entered, and
+    // leaving them undefined would make an otherwise valid function look like
+    // it reads an uninitialized value.
+    for block_index in 0..function.blocks.len() {
+        for id in &function.blocks[block_index].params {
+            if def_block.insert(*id, block_index).is_some() {
+                return Err(VerificationError::RedefinedValue(*id));
+            }
+        }
+        for instruction in &function.blocks[block_index].instrs {
+            for result in instruction_results(instruction) {
+                if def_block.insert(result, block_index).is_some() {
+                    return Err(VerificationError::RedefinedValue(result));
+                }
+            }
+        }
+    }
+
+    for &block_index in order {
+        let block = &function.blocks[block_index];
+        let mut used_here: Vec<ValueId> = Vec::new();
+        for instruction in &block.instrs {
+            used_here.extend(instruction_operands(instruction));
+        }
+        used_here.extend(terminator_operands(&block.terminator));
+        for used in used_here {
+            let defining = *def_block
+                .get(&used)
+                .ok_or(VerificationError::UndefinedValue(used))?;
+            // A local written in a branch is still readable on every path,
+            // because the local's initial value is always present.
+            if local_set.contains(&used) || dominators.dominates(defining, block_index) {
+                continue;
+            }
+            return Err(VerificationError::DoesNotDominate {
+                function: function_index,
+                value: used,
+                defined_in: function.blocks[defining].id,
+                used_in: block.id,
+            });
+        }
+    }
+
+    // A declared value that no instruction, block parameter, parameter, or local
+    // defines would be an uninitialized read. Every declaration is recorded in
+    // `def_block` above, so a value absent from the table is one the lowering
+    // never emitted a definition for.
+    for value in &function.values {
+        if !def_block.contains_key(&value.id) {
+            return Err(VerificationError::UndefinedValue(value.id));
+        }
+    }
+    verify_branch_types(function, function_index, &values)
+}
+
+/// Map each terminator's target block IDs to block indices.
+fn resolve_successors(function: &super::IrFunction) -> Result<Vec<Vec<usize>>, VerificationError> {
+    let mut index_of = HashMap::with_capacity(function.blocks.len());
+    for (index, block) in function.blocks.iter().enumerate() {
+        index_of.insert(block.id, index);
+    }
+    let mut resolved = Vec::with_capacity(function.blocks.len());
+    for block in &function.blocks {
+        let mut edges = Vec::new();
+        for successor in block.terminator.successors() {
+            edges.push(
+                *index_of
+                    .get(&successor)
+                    .ok_or(VerificationError::MissingBlock(successor))?,
+            );
+        }
+        resolved.push(edges);
+    }
+    Ok(resolved)
+}
+
+/// Branch operands must agree with the target block's parameter types.
+fn verify_branch_types(
+    function: &super::IrFunction,
+    function_index: usize,
+    values: &HashMap<ValueId, ValueType>,
+) -> Result<(), VerificationError> {
+    for block in &function.blocks {
+        let edges: Vec<(super::BlockId, &[ValueId])> = match &block.terminator {
+            super::Terminator::Branch { target, values } => vec![(*target, values)],
+            super::Terminator::CondBranch {
+                then_target,
+                then_values,
+                else_target,
+                else_values,
+                ..
+            } => vec![(*then_target, then_values), (*else_target, else_values)],
+            _ => Vec::new(),
+        };
+        for (target, args) in edges {
+            let target_block = function
+                .blocks
+                .iter()
+                .find(|candidate| candidate.id == target)
+                .ok_or(VerificationError::MissingBlock(target))?;
+            for (argument, parameter) in args.iter().zip(&target_block.params) {
+                expect_type(
+                    *argument,
+                    value_type(*parameter, values)?,
+                    function_index,
+                    values,
+                )?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Values a terminator reads.
+fn terminator_operands(terminator: &super::Terminator) -> Vec<ValueId> {
+    match terminator {
+        super::Terminator::Return(values) => values.clone(),
+        super::Terminator::Branch { values, .. } => values.clone(),
+        super::Terminator::CondBranch {
+            condition,
+            then_values,
+            else_values,
+            ..
+        } => {
+            let mut operands = Vec::with_capacity(1 + then_values.len() + else_values.len());
+            operands.push(*condition);
+            operands.extend(then_values.iter().copied());
+            operands.extend(else_values.iter().copied());
+            operands
+        }
+        super::Terminator::Trap(_) | super::Terminator::Unreachable => Vec::new(),
+    }
+}
+
+/// A function's return terminator must match its declared result arity/types.
+fn verify_results(
+    results: &[ValueId],
+    expected_types: &[ValueType],
+    function_index: usize,
+    values: &HashMap<ValueId, ValueType>,
+    defined: &HashSet<ValueId>,
+) -> Result<(), VerificationError> {
+    if results.len() != expected_types.len() {
+        return Err(VerificationError::ReturnArity {
+            function: function_index,
+            expected: expected_types.len(),
+            actual: results.len(),
+        });
+    }
+    for (id, expected) in results.iter().zip(expected_types) {
+        expect_defined_type(*id, *expected, function_index, values, defined)?;
+    }
+    Ok(())
+}
+
+/// Within-block terminator checks that do not depend on dominance.
+fn verify_terminator(
+    terminator: &super::Terminator,
+    function_index: usize,
+    values: &HashMap<ValueId, ValueType>,
+    defined: &HashSet<ValueId>,
+    result_types: &[ValueType],
+) -> Result<(), VerificationError> {
+    match terminator {
+        super::Terminator::Return(results) => {
+            verify_results(results, result_types, function_index, values, defined)
+        }
+        super::Terminator::Branch { values: args, .. } => {
+            for id in args {
+                require_defined(*id, values, defined)?;
+            }
+            Ok(())
+        }
+        super::Terminator::CondBranch {
+            condition,
+            then_values,
+            else_values,
+            ..
+        } => {
+            expect_defined_type(*condition, ValueType::I32, function_index, values, defined)?;
+            for id in then_values.iter().chain(else_values) {
+                require_defined(*id, values, defined)?;
+            }
+            Ok(())
+        }
+        super::Terminator::Trap(_) | super::Terminator::Unreachable => Ok(()),
+    }
+}
+
+/// Values an instruction reads.
+///
+/// The dataflow instructions each have a distinct operand set and are listed
+/// explicitly; the numeric instructions all share a `left`/`right` or single
+/// `value` shape and are matched by pattern.
+fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
+    use super::IrInstr::*;
+    match instruction {
+        // Constants read nothing.
+        ConstI32 { .. } | ConstI64 { .. } | ConstF32 { .. } | ConstF64 { .. } => Vec::new(),
+        // A get names its local; a set and tee read the stored value, and the
+        // local they name is a pre-allocated slot rather than an operand.
+        LocalGet { local, .. } => vec![*local],
+        LocalSet { value, .. } | LocalTee { value, .. } => vec![*value],
+        Drop { value } => vec![*value],
+        Select {
+            condition,
+            left,
+            right,
+            ..
+        } => vec![*condition, *left, *right],
+        // A function index is not a value; only the arguments are read.
+        Call { arguments, .. } => arguments.clone(),
+        // The remaining instructions are unary or binary numeric.
+        I32Compare { left, right, .. }
+        | I64Compare { left, right, .. }
+        | F32Compare { left, right, .. }
+        | F64Compare { left, right, .. }
+        | I32Add { left, right, .. }
+        | I32Sub { left, right, .. }
+        | I32Mul { left, right, .. }
+        | I32DivS { left, right, .. }
+        | I32DivU { left, right, .. }
+        | I32RemS { left, right, .. }
+        | I32RemU { left, right, .. }
+        | I32Shl { left, right, .. }
+        | I32ShrS { left, right, .. }
+        | I32ShrU { left, right, .. }
+        | I32Rotl { left, right, .. }
+        | I32Rotr { left, right, .. }
+        | I32And { left, right, .. }
+        | I32Or { left, right, .. }
+        | I32Xor { left, right, .. }
+        | I64Add { left, right, .. }
+        | I64Sub { left, right, .. }
+        | I64Mul { left, right, .. }
+        | I64DivS { left, right, .. }
+        | I64DivU { left, right, .. }
+        | I64RemS { left, right, .. }
+        | I64RemU { left, right, .. }
+        | I64Shl { left, right, .. }
+        | I64ShrS { left, right, .. }
+        | I64ShrU { left, right, .. }
+        | I64Rotl { left, right, .. }
+        | I64Rotr { left, right, .. }
+        | I64And { left, right, .. }
+        | I64Or { left, right, .. }
+        | I64Xor { left, right, .. }
+        | F32Add { left, right, .. }
+        | F32Sub { left, right, .. }
+        | F32Mul { left, right, .. }
+        | F32Div { left, right, .. }
+        | F32Min { left, right, .. }
+        | F32Max { left, right, .. }
+        | F32Copysign { left, right, .. }
+        | F64Add { left, right, .. }
+        | F64Sub { left, right, .. }
+        | F64Mul { left, right, .. }
+        | F64Div { left, right, .. }
+        | F64Min { left, right, .. }
+        | F64Max { left, right, .. }
+        | F64Copysign { left, right, .. } => vec![*left, *right],
+        I32Eqz { value, .. }
+        | I64Eqz { value, .. }
+        | I32Unary { value, .. }
+        | I64Unary { value, .. }
+        | F32Unary { value, .. }
+        | F64Unary { value, .. }
+        | IntConvert { value, .. }
+        | Reinterpret { value, .. }
+        | FloatConvert { value, .. }
+        | FloatTrunc { value, .. } => vec![*value],
+    }
+}
+
+/// Values an instruction defines.
+fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
+    use super::IrInstr::*;
+    match instruction {
+        Call { results, .. } => results.clone(),
+        // Neither a drop nor a set produces a new value; a get, tee, and select do.
+        Drop { .. } | LocalSet { .. } => Vec::new(),
+        LocalGet { result, .. } | LocalTee { result, .. } | Select { result, .. } => {
+            vec![*result]
+        }
+        // Every remaining instruction produces exactly one `result`.
+        ConstI32 { result, .. }
+        | ConstI64 { result, .. }
+        | ConstF32 { result, .. }
+        | ConstF64 { result, .. }
+        | I32Eqz { result, .. }
+        | I64Eqz { result, .. }
+        | I32Compare { result, .. }
+        | I64Compare { result, .. }
+        | F32Compare { result, .. }
+        | F64Compare { result, .. }
+        | I32Add { result, .. }
+        | I32Sub { result, .. }
+        | I32Mul { result, .. }
+        | I32DivS { result, .. }
+        | I32DivU { result, .. }
+        | I32RemS { result, .. }
+        | I32RemU { result, .. }
+        | I32Shl { result, .. }
+        | I32ShrS { result, .. }
+        | I32ShrU { result, .. }
+        | I32Rotl { result, .. }
+        | I32Rotr { result, .. }
+        | I32And { result, .. }
+        | I32Or { result, .. }
+        | I32Xor { result, .. }
+        | I64Add { result, .. }
+        | I64Sub { result, .. }
+        | I64Mul { result, .. }
+        | I64DivS { result, .. }
+        | I64DivU { result, .. }
+        | I64RemS { result, .. }
+        | I64RemU { result, .. }
+        | I64Shl { result, .. }
+        | I64ShrS { result, .. }
+        | I64ShrU { result, .. }
+        | I64Rotl { result, .. }
+        | I64Rotr { result, .. }
+        | I64And { result, .. }
+        | I64Or { result, .. }
+        | I64Xor { result, .. }
+        | F32Add { result, .. }
+        | F32Sub { result, .. }
+        | F32Mul { result, .. }
+        | F32Div { result, .. }
+        | F32Min { result, .. }
+        | F32Max { result, .. }
+        | F32Copysign { result, .. }
+        | F64Add { result, .. }
+        | F64Sub { result, .. }
+        | F64Mul { result, .. }
+        | F64Div { result, .. }
+        | F64Min { result, .. }
+        | F64Max { result, .. }
+        | F64Copysign { result, .. }
+        | I32Unary { result, .. }
+        | I64Unary { result, .. }
+        | F32Unary { result, .. }
+        | F64Unary { result, .. }
+        | IntConvert { result, .. }
+        | Reinterpret { result, .. }
+        | FloatConvert { result, .. }
+        | FloatTrunc { result, .. } => vec![*result],
+    }
 }
 
 fn verify_parameters(
@@ -755,24 +1366,4 @@ fn expect_defined_type(
 ) -> Result<(), VerificationError> {
     require_defined(id, values, defined)?;
     expect_type(id, expected, function_index, values)
-}
-
-fn verify_results(
-    results: &[ValueId],
-    expected_types: &[ValueType],
-    function_index: usize,
-    values: &HashMap<ValueId, ValueType>,
-    defined: &HashSet<ValueId>,
-) -> Result<(), VerificationError> {
-    if results.len() != expected_types.len() {
-        return Err(VerificationError::ReturnArity {
-            function: function_index,
-            expected: expected_types.len(),
-            actual: results.len(),
-        });
-    }
-    for (id, expected) in results.iter().zip(expected_types) {
-        expect_defined_type(*id, *expected, function_index, values, defined)?;
-    }
-    Ok(())
 }

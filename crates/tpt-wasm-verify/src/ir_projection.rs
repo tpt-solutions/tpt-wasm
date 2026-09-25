@@ -226,6 +226,11 @@ pub fn project_function_to_model(
         Terminator::Return(_) => Instruction::End,
         Terminator::Unreachable => Instruction::Unreachable,
         Terminator::Trap(_) => return Err(IrProjectionError::UnsupportedTerminator("trap")),
+        // The formal model overlap is still single-block, so control flow is
+        // rejected explicitly rather than projected approximately.
+        Terminator::Branch { .. } | Terminator::CondBranch { .. } => {
+            return Err(IrProjectionError::UnsupportedTerminator("control flow"))
+        }
     });
 
     let local_types = function

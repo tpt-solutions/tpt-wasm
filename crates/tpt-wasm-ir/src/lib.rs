@@ -52,6 +52,9 @@ pub struct IrValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BasicBlock {
     pub id: BlockId,
+    /// Values entering this block from a predecessor, in the order the
+    /// predecessor supplies them. This is the block-parameter form of a phi.
+    pub params: Vec<ValueId>,
     pub instrs: Vec<IrInstr>,
     pub terminator: Terminator,
 }
@@ -727,4 +730,33 @@ pub enum Terminator {
     Return(Vec<ValueId>),
     Trap(Trap),
     Unreachable,
+    /// Unconditional branch, passing `values` to the target block's parameters.
+    Branch {
+        target: BlockId,
+        values: Vec<ValueId>,
+    },
+    /// Two-way branch. `then_values` feed the `then_target` block parameters and
+    /// `else_values` feed the `else_target` block parameters.
+    CondBranch {
+        condition: ValueId,
+        then_target: BlockId,
+        then_values: Vec<ValueId>,
+        else_target: BlockId,
+        else_values: Vec<ValueId>,
+    },
+}
+
+impl Terminator {
+    /// The blocks this terminator transfers control to.
+    pub fn successors(&self) -> Vec<BlockId> {
+        match self {
+            Self::Return(_) | Self::Trap(_) | Self::Unreachable => Vec::new(),
+            Self::Branch { target, .. } => vec![*target],
+            Self::CondBranch {
+                then_target,
+                else_target,
+                ..
+            } => vec![*then_target, *else_target],
+        }
+    }
 }
