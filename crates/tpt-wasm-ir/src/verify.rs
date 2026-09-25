@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use tpt_wasm_types::ValueType;
+use tpt_wasm_types::{ReferenceType, ValueType};
 
 use super::{IrModule, ValueId};
 use crate::{lower_module, LoweringError};
@@ -50,6 +50,18 @@ pub enum VerificationError {
     RedefinedValue(ValueId),
     UndefinedValue(ValueId),
     UseBeforeDefinition(ValueId),
+    /// A memory or global index with no corresponding declaration.
+    UnknownGlobal(u32),
+    /// A table index with no corresponding declaration.
+    UnknownTable(u32),
+    /// `call_indirect` through a table that does not hold function references.
+    NotAFunctionTable(u32),
+    /// A call naming a type index the module does not declare.
+    UnknownType(u32),
+    /// `global.set` naming a global declared immutable.
+    ImmutableGlobal(u32),
+    /// A memory instruction in a module that declares no memory.
+    NoMemory,
     ParameterArity {
         function: usize,
         expected: usize,
@@ -136,7 +148,7 @@ pub fn lower_and_verify(
 /// Verify value definitions, instruction types, control flow, and returns.
 pub fn verify_module(module: &IrModule) -> Result<IrVerificationCertificate, VerificationError> {
     for (function_index, function) in module.functions.iter().enumerate() {
-        verify_function(function, function_index, &module.functions)?;
+        verify_function(function, function_index, module)?;
     }
     Ok(IrVerificationCertificate { _private: () })
 }
@@ -144,35 +156,42 @@ pub fn verify_module(module: &IrModule) -> Result<IrVerificationCertificate, Ver
 fn verify_function(
     function: &super::IrFunction,
     function_index: usize,
-    functions: &[super::IrFunction],
+    module: &IrModule,
 ) -> Result<(), VerificationError> {
     let values = value_types(&function.values)?;
     let order = verify_blocks(function, function_index)?;
     verify_parameters(function, function_index, &values)?;
-    verify_dominance(function, function_index, &order)?;
+    let scope = verify_dominance(function, function_index, &order)?;
 
     // Within a block, operands must already be defined. Cross-block visibility
-    // is governed by dominance, which `verify_dominance` establishes above.
+    // comes from dominance: a block sees every value defined in a block that
+    // dominates it, which is what `verify_dominance` has just established. The
+    // block's *own* results are deliberately not pre-seeded, so an operand used
+    // before the instruction that defines it in the same block is still caught.
     for &block_index in &order {
         let block = &function.blocks[block_index];
-        // Function parameters and locals are entry-block values, so they are in
-        // scope wherever dominance reaches; a block parameter is in scope only
-        // within its own block.
+        // Parameters and locals are entry-block storage: they exist for the whole
+        // function, so they are visible in every block including the entry.
         let mut defined: HashSet<ValueId> = function
             .params
             .iter()
             .chain(&function.locals)
             .copied()
-            .chain(block.params.iter().copied())
             .collect();
+        // A block parameter is bound by the edge that enters the block, so it is
+        // in scope for that block.
+        defined.extend(block.params.iter().copied());
+        // A value defined in a strictly dominating block is already initialized
+        // by the time control reaches this one. The block's own results are not
+        // pre-seeded, so using one before the instruction that defines it in this
+        // same block is still caught below.
+        for (id, defining) in &scope.def_block {
+            if *defining != block_index && scope.dominators.dominates(*defining, block_index) {
+                defined.insert(*id);
+            }
+        }
         for instruction in &block.instrs {
-            verify_instruction(
-                instruction,
-                function_index,
-                functions,
-                &values,
-                &mut defined,
-            )?;
+            verify_instruction(instruction, function_index, module, &values, &mut defined)?;
         }
         verify_terminator(
             &block.terminator,
@@ -333,7 +352,13 @@ impl Dominators {
                 return true;
             }
             let next = self.idom[current];
-            if next == usize::MAX || next == current || self.depth[next] <= self.depth[ancestor] {
+            // The comparison must be strict. `next` may *be* the ancestor, in
+            // which case the loop head is what recognizes it; bailing on
+            // `depth[next] <= depth[ancestor]` would report the ancestor as not
+            // dominating itself's descendants. Bailing only when `next` is
+            // strictly above the ancestor is safe, because then the ancestor is
+            // not on this path.
+            if next == usize::MAX || next == current || self.depth[next] < self.depth[ancestor] {
                 return false;
             }
             current = next;
@@ -430,11 +455,14 @@ fn intersect(idom: &[usize], position: &[usize], mut a: usize, mut b: usize) -> 
 
 /// Check that every used value is dominated by its definition, that no value is
 /// defined twice, and that branch operands match the target parameter types.
+///
+/// Returns the dominator tree and the defining block of every value, so the
+/// caller can scope each block's visible values the same way.
 fn verify_dominance(
     function: &super::IrFunction,
     function_index: usize,
     order: &[usize],
-) -> Result<(), VerificationError> {
+) -> Result<Scope, VerificationError> {
     let values = value_types(&function.values)?;
     let entry = function
         .blocks
@@ -511,7 +539,17 @@ fn verify_dominance(
             return Err(VerificationError::UndefinedValue(value.id));
         }
     }
-    verify_branch_types(function, function_index, &values)
+    verify_branch_types(function, function_index, &values)?;
+    Ok(Scope {
+        dominators,
+        def_block,
+    })
+}
+
+/// What each block can see: the dominator tree and where every value is defined.
+struct Scope {
+    dominators: Dominators,
+    def_block: HashMap<ValueId, usize>,
 }
 
 /// Map each terminator's target block IDs to block indices.
@@ -671,6 +709,23 @@ fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
         } => vec![*condition, *left, *right],
         // A function index is not a value; only the arguments are read.
         Call { arguments, .. } => arguments.clone(),
+        // An indirect call reads its arguments and its table-index operand.
+        CallIndirect {
+            arguments, operand, ..
+        } => {
+            let mut read = arguments.clone();
+            read.push(*operand);
+            read
+        }
+        // A load reads its address operand; a store reads address and value.
+        Load { address, .. } => vec![*address],
+        Store { address, value, .. } => vec![*address, *value],
+        // `memory.size` reads nothing; `memory.grow` reads the page delta.
+        MemorySize { .. } => Vec::new(),
+        MemoryGrow { delta, .. } => vec![*delta],
+        // A global index is not a value; a set reads the value it stores.
+        GlobalGet { .. } => Vec::new(),
+        GlobalSet { value, .. } => vec![*value],
         // The remaining instructions are unary or binary numeric.
         I32Compare { left, right, .. }
         | I64Compare { left, right, .. }
@@ -738,13 +793,18 @@ fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
     use super::IrInstr::*;
     match instruction {
         Call { results, .. } => results.clone(),
-        // Neither a drop nor a set produces a new value; a get, tee, and select do.
-        Drop { .. } | LocalSet { .. } => Vec::new(),
+        CallIndirect { results, .. } => results.clone(),
+        // Neither a drop, a store, nor a `global.set` produces a new value.
+        Drop { .. } | LocalSet { .. } | Store { .. } | GlobalSet { .. } => Vec::new(),
         LocalGet { result, .. } | LocalTee { result, .. } | Select { result, .. } => {
             vec![*result]
         }
         // Every remaining instruction produces exactly one `result`.
-        ConstI32 { result, .. }
+        Load { result, .. }
+        | MemorySize { result }
+        | MemoryGrow { result, .. }
+        | GlobalGet { result, .. }
+        | ConstI32 { result, .. }
         | ConstI64 { result, .. }
         | ConstF32 { result, .. }
         | ConstF64 { result, .. }
@@ -863,7 +923,7 @@ fn expect_type(
 fn verify_instruction(
     instruction: &super::IrInstr,
     function_index: usize,
-    functions: &[super::IrFunction],
+    module: &IrModule,
     values: &HashMap<ValueId, ValueType>,
     defined: &mut HashSet<ValueId>,
 ) -> Result<(), VerificationError> {
@@ -1302,7 +1362,8 @@ fn verify_instruction(
         } => {
             let callee_index = usize::try_from(*function)
                 .map_err(|_| VerificationError::UnknownFunction(*function))?;
-            let callee = functions
+            let callee = module
+                .functions
                 .get(callee_index)
                 .ok_or(VerificationError::UnknownFunction(*function))?;
             if arguments.len() != callee.function_type.params.0.len() {
@@ -1323,6 +1384,128 @@ fn verify_instruction(
                 });
             }
             for (result, expected) in results.iter().zip(&callee.function_type.results.0) {
+                define_value(*result, *expected, function_index, values, defined)?;
+            }
+            Ok(())
+        }
+        super::IrInstr::Load {
+            result,
+            address,
+            operation,
+            ..
+        } => {
+            if module.memory.is_none() {
+                return Err(VerificationError::NoMemory);
+            }
+            expect_defined_type(*address, ValueType::I32, function_index, values, defined)?;
+            define_value(
+                *result,
+                operation.result_type(),
+                function_index,
+                values,
+                defined,
+            )
+        }
+        super::IrInstr::Store {
+            address,
+            value,
+            operation,
+            ..
+        } => {
+            if module.memory.is_none() {
+                return Err(VerificationError::NoMemory);
+            }
+            expect_defined_type(*address, ValueType::I32, function_index, values, defined)?;
+            expect_defined_type(
+                *value,
+                operation.operand_type(),
+                function_index,
+                values,
+                defined,
+            )?;
+            Ok(())
+        }
+        super::IrInstr::MemorySize { result } => {
+            if module.memory.is_none() {
+                return Err(VerificationError::NoMemory);
+            }
+            define_value(*result, ValueType::I32, function_index, values, defined)
+        }
+        super::IrInstr::MemoryGrow { result, delta } => {
+            if module.memory.is_none() {
+                return Err(VerificationError::NoMemory);
+            }
+            expect_defined_type(*delta, ValueType::I32, function_index, values, defined)?;
+            define_value(*result, ValueType::I32, function_index, values, defined)
+        }
+        super::IrInstr::GlobalGet { result, global } => {
+            let declaration = module
+                .globals
+                .get(*global as usize)
+                .ok_or(VerificationError::UnknownGlobal(*global))?;
+            define_value(
+                *result,
+                declaration.value_type,
+                function_index,
+                values,
+                defined,
+            )
+        }
+        super::IrInstr::GlobalSet { global, value } => {
+            let declaration = module
+                .globals
+                .get(*global as usize)
+                .ok_or(VerificationError::UnknownGlobal(*global))?;
+            if !declaration.mutable {
+                return Err(VerificationError::ImmutableGlobal(*global));
+            }
+            expect_defined_type(
+                *value,
+                declaration.value_type,
+                function_index,
+                values,
+                defined,
+            )?;
+            Ok(())
+        }
+        super::IrInstr::CallIndirect {
+            type_index,
+            table,
+            operand,
+            arguments,
+            results,
+        } => {
+            let table_declaration = module
+                .tables
+                .get(*table as usize)
+                .ok_or(VerificationError::UnknownTable(*table))?;
+            if table_declaration.element_type != ReferenceType::FuncRef {
+                return Err(VerificationError::NotAFunctionTable(*table));
+            }
+            let callee_type = module
+                .types
+                .get(*type_index as usize)
+                .ok_or(VerificationError::UnknownType(*type_index))?;
+            // The table index is the topmost stack operand, above the arguments.
+            expect_defined_type(*operand, ValueType::I32, function_index, values, defined)?;
+            if arguments.len() != callee_type.params.0.len() {
+                return Err(VerificationError::CallArity {
+                    function: *type_index,
+                    expected: callee_type.params.0.len(),
+                    actual: arguments.len(),
+                });
+            }
+            for (argument, expected) in arguments.iter().zip(&callee_type.params.0) {
+                expect_defined_type(*argument, *expected, function_index, values, defined)?;
+            }
+            if results.len() != callee_type.results.0.len() {
+                return Err(VerificationError::CallResultArity {
+                    function: *type_index,
+                    expected: callee_type.results.0.len(),
+                    actual: results.len(),
+                });
+            }
+            for (result, expected) in results.iter().zip(&callee_type.results.0) {
                 define_value(*result, *expected, function_index, values, defined)?;
             }
             Ok(())

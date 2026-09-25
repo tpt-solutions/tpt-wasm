@@ -11,14 +11,14 @@
 //! straight-line code with stable local slots and defined direct calls, and
 //! rejects constructs that are not yet represented by this IR version.
 
-use tpt_wasm_types::{FunctionType, Trap, ValueType};
+use tpt_wasm_types::{FunctionType, ReferenceType, Trap, Value, ValueType};
 
 mod lower;
 #[cfg(test)]
 mod tests;
 mod verify;
 
-pub use lower::{lower_module, LoweringError};
+pub use lower::{const_expr_i32, lower_module, LoweringError};
 pub use verify::{
     lower_and_verify, verify_module, IrVerificationCertificate, LowerAndVerifyError,
     VerificationError, VerifiedIrModule,
@@ -28,6 +28,62 @@ pub use verify::{
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IrModule {
     pub functions: Vec<IrFunction>,
+    /// Module-level globals, in index order. Keeping them here lets the verifier
+    /// check a `global.get`/`global.set` against the declaration without the
+    /// original Wasm module.
+    pub globals: Vec<IrGlobal>,
+    /// The single linear memory, if the module declares one. MVP allows at most
+    /// one memory, and every memory instruction addresses memory 0.
+    pub memory: Option<IrMemory>,
+    /// Tables, in index order. MVP allows at most one table.
+    pub tables: Vec<IrTable>,
+    /// The module's function types, in index order. A `call_indirect` names one
+    /// of these rather than a function, so the signature is checked against the
+    /// table entry's type at run time.
+    pub types: Vec<FunctionType>,
+}
+
+/// One module-level table declaration and its initial contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrTable {
+    /// MVP tables hold function references.
+    pub element_type: ReferenceType,
+    pub min: u64,
+    pub max: Option<u64>,
+    /// Function indices from the module's active element segment.
+    pub elements: Vec<u32>,
+    /// Where those function indices start in the table.
+    pub offset: u32,
+}
+
+/// One module-level global declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrGlobal {
+    pub value_type: ValueType,
+    pub mutable: bool,
+    /// The value the global starts with, from its constant initializer.
+    pub init: Value,
+}
+
+/// The module's linear memory declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrMemory {
+    /// Initial size in 64 KiB pages.
+    pub min_pages: u64,
+    /// Declared maximum, or `None` when the module sets no maximum.
+    pub max_pages: Option<u64>,
+    /// Initial contents, in the order the active data segments write them.
+    ///
+    /// Applied at instantiation, before any function runs, so a later segment
+    /// overwrites an earlier one at the same address.
+    pub segments: Vec<IrDataSegment>,
+}
+
+/// One active data segment: bytes written at `offset` when the module starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrDataSegment {
+    pub offset: u32,
+    pub bytes: Vec<u8>,
 }
 
 /// A function in the TPT IR.
@@ -408,6 +464,144 @@ pub enum IrInstr {
         arguments: Vec<ValueId>,
         results: Vec<ValueId>,
     },
+    /// Read `width` bytes little-endian from `address + offset`.
+    Load {
+        result: ValueId,
+        address: ValueId,
+        offset: u32,
+        operation: MemoryLoad,
+    },
+    /// Write the low `width` bytes of `value` at `address + offset`.
+    Store {
+        address: ValueId,
+        value: ValueId,
+        offset: u32,
+        operation: MemoryStore,
+    },
+    /// Current size of memory 0, in pages.
+    MemorySize {
+        result: ValueId,
+    },
+    /// Grow memory 0 by `delta` pages, yielding the previous size or -1.
+    MemoryGrow {
+        result: ValueId,
+        delta: ValueId,
+    },
+    GlobalGet {
+        result: ValueId,
+        global: u32,
+    },
+    GlobalSet {
+        global: u32,
+        value: ValueId,
+    },
+    /// Indirect call through table 0, dispatching on the function's type.
+    CallIndirect {
+        /// The expected signature, as a module type index.
+        type_index: u32,
+        /// The table the index operand reads.
+        table: u32,
+        /// The `i32` table index, the last operand popped.
+        operand: ValueId,
+        arguments: Vec<ValueId>,
+        results: Vec<ValueId>,
+    },
+}
+
+/// The width, signedness, and result type of one Wasm memory load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryLoad {
+    /// `i32.load`: 4 bytes, sign-extended into the low 32 bits of an `i32`.
+    I32,
+    /// `i64.load`: 8 bytes, a full `i64`.
+    I64,
+    /// `f32.load`: 4 bytes, raw bits reinterpreted as `f32`.
+    F32,
+    /// `f64.load`: 8 bytes, raw bits reinterpreted as `f64`.
+    F64,
+    I32_8S,
+    I32_8U,
+    I32_16S,
+    I32_16U,
+    I64_8S,
+    I64_8U,
+    I64_16S,
+    I64_16U,
+    I64_32S,
+    I64_32U,
+}
+
+impl MemoryLoad {
+    /// Bytes touched by this load.
+    pub fn width(self) -> u32 {
+        match self {
+            MemoryLoad::I32 | MemoryLoad::F32 | MemoryLoad::I64_32S | MemoryLoad::I64_32U => 4,
+            MemoryLoad::I64 | MemoryLoad::F64 => 8,
+            MemoryLoad::I32_8S | MemoryLoad::I32_8U | MemoryLoad::I64_8S | MemoryLoad::I64_8U => 1,
+            MemoryLoad::I32_16S
+            | MemoryLoad::I32_16U
+            | MemoryLoad::I64_16S
+            | MemoryLoad::I64_16U => 2,
+        }
+    }
+
+    /// The value type this load produces.
+    pub fn result_type(self) -> ValueType {
+        match self {
+            MemoryLoad::I32
+            | MemoryLoad::I32_8S
+            | MemoryLoad::I32_8U
+            | MemoryLoad::I32_16S
+            | MemoryLoad::I32_16U => ValueType::I32,
+            MemoryLoad::F32 => ValueType::F32,
+            MemoryLoad::F64 => ValueType::F64,
+            MemoryLoad::I64
+            | MemoryLoad::I64_8S
+            | MemoryLoad::I64_8U
+            | MemoryLoad::I64_16S
+            | MemoryLoad::I64_16U
+            | MemoryLoad::I64_32S
+            | MemoryLoad::I64_32U => ValueType::I64,
+        }
+    }
+}
+
+/// Which bytes of a value one Wasm memory store writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryStore {
+    I32,
+    I64,
+    F32,
+    F64,
+    I32_8,
+    I32_16,
+    I64_8,
+    I64_16,
+    I64_32,
+}
+
+impl MemoryStore {
+    /// Bytes written by this store.
+    pub fn width(self) -> u32 {
+        match self {
+            MemoryStore::I32 | MemoryStore::F32 | MemoryStore::I64_32 => 4,
+            MemoryStore::I64 | MemoryStore::F64 => 8,
+            MemoryStore::I32_8 | MemoryStore::I64_8 => 1,
+            MemoryStore::I32_16 | MemoryStore::I64_16 => 2,
+        }
+    }
+
+    /// The value type this store consumes.
+    pub fn operand_type(self) -> ValueType {
+        match self {
+            MemoryStore::I32 | MemoryStore::I32_8 | MemoryStore::I32_16 => ValueType::I32,
+            MemoryStore::F32 => ValueType::F32,
+            MemoryStore::F64 => ValueType::F64,
+            MemoryStore::I64 | MemoryStore::I64_8 | MemoryStore::I64_16 | MemoryStore::I64_32 => {
+                ValueType::I64
+            }
+        }
+    }
 }
 
 /// A signed or unsigned integer comparison operation.

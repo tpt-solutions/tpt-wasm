@@ -6,13 +6,13 @@
 use std::fmt;
 
 use tpt_wasm_format::Function;
-use tpt_wasm_types::{FunctionType, ValueType};
+use tpt_wasm_types::{FunctionType, Value, ValueType};
 use tpt_wasm_validate::ValidatedModule;
 
 use super::{
     BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
-    IntConversion, IntUnary, IrFunction, IrInstr, IrModule, IrValue, Reinterpret, Terminator,
-    ValueId,
+    IntConversion, IntUnary, IrDataSegment, IrFunction, IrGlobal, IrInstr, IrMemory, IrModule,
+    IrTable, IrValue, MemoryLoad, MemoryStore, Reinterpret, Terminator, ValueId,
 };
 
 /// Errors produced while lowering a validated module.
@@ -22,6 +22,10 @@ pub enum LoweringError {
     UnsupportedInstruction(u8),
     UnknownType(u32),
     UnknownFunction(u32),
+    /// A `global.get`/`global.set` naming a global that does not exist.
+    UnknownGlobal(u32),
+    /// `global.set` naming a global declared immutable.
+    ImmutableGlobal(u32),
     LocalOverflow,
     UnknownLocal(u32),
     InvalidOpcode(u8),
@@ -68,27 +72,131 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             .ok_or(LoweringError::UnknownType(function.type_index))?;
         functions.push(lower_function(function, function_type, module)?);
     }
-    Ok(IrModule { functions })
+    let globals = module
+        .globals
+        .iter()
+        .map(|global| {
+            Ok(IrGlobal {
+                value_type: global.global_type.value_type,
+                mutable: global.global_type.mutable,
+                init: read_const_expr(&global.init, global.global_type.value_type)?,
+            })
+        })
+        .collect::<Result<Vec<_>, LoweringError>>()?;
+    // MVP data segments are all active and all address memory 0, and their
+    // offset must be a constant `i32`. They are kept in module order so that a
+    // later segment overwrites an earlier one at the same address.
+    let mut segments = Vec::with_capacity(module.data.len());
+    for segment in &module.data {
+        let tpt_wasm_format::DataMode::Active {
+            memory_index,
+            offset,
+        } = &segment.mode
+        else {
+            return Err(LoweringError::UnsupportedFeature("passive data segments"));
+        };
+        if *memory_index != 0 {
+            return Err(LoweringError::UnsupportedFeature("non-zero memory index"));
+        }
+        segments.push(IrDataSegment {
+            offset: element_segment_offset(offset)?,
+            bytes: segment.data.clone(),
+        });
+    }
+    let memory = match module.memories.as_slice() {
+        [] => None,
+        [only] => {
+            if only.memory_type.memory64 {
+                return Err(LoweringError::UnsupportedFeature("64-bit memory"));
+            }
+            Some(IrMemory {
+                min_pages: only.memory_type.limits.min,
+                max_pages: only.memory_type.limits.max,
+                segments,
+            })
+        }
+        _ => return Err(LoweringError::UnsupportedFeature("multiple memories")),
+    };
+    // MVP allows at most one table, and its contents come from a single active
+    // element segment whose offset must be a constant `i32`.
+    let tables = match module.tables.as_slice() {
+        [] => Vec::new(),
+        [only] => {
+            if only.table_type.element_type != tpt_wasm_types::ReferenceType::FuncRef {
+                return Err(LoweringError::UnsupportedFeature("non-funcref table"));
+            }
+            let active: Vec<&tpt_wasm_format::Element> = module
+                .elements
+                .iter()
+                .filter(|element| {
+                    matches!(element.mode, tpt_wasm_format::ElementMode::Active { .. })
+                })
+                .collect();
+            if active.len() > 1 {
+                return Err(LoweringError::UnsupportedFeature(
+                    "multiple element segments",
+                ));
+            }
+            let (elements, offset) = match active.first() {
+                Some(element) => {
+                    let tpt_wasm_format::ElementMode::Active {
+                        table_index,
+                        offset,
+                    } = &element.mode
+                    else {
+                        unreachable!("filtered to active segments above");
+                    };
+                    if *table_index != 0 {
+                        return Err(LoweringError::UnsupportedFeature("non-zero table index"));
+                    }
+                    (element.init.clone(), element_segment_offset(offset)?)
+                }
+                None => (Vec::new(), 0),
+            };
+            vec![IrTable {
+                element_type: only.table_type.element_type,
+                min: only.table_type.limits.min,
+                max: only.table_type.limits.max,
+                elements,
+                offset,
+            }]
+        }
+        _ => return Err(LoweringError::UnsupportedFeature("multiple tables")),
+    };
+    Ok(IrModule {
+        functions,
+        globals,
+        memory,
+        tables,
+        types: module.types.clone(),
+    })
+}
+
+/// Read a constant `i32` expression, as an element segment offset is.
+///
+/// Returns `None` for anything that is not a plain `i32.const`, so a caller
+/// that only needs the common case does not have to match on the error.
+#[allow(dead_code)]
+pub fn const_expr_i32(expr: &tpt_wasm_format::ConstExpr) -> Option<u32> {
+    match read_const_expr(expr, ValueType::I32) {
+        Ok(Value::I32(value)) => u32::try_from(value).ok(),
+        _ => None,
+    }
+}
+
+/// Read an element segment's constant offset, which MVP requires to be an `i32`.
+fn element_segment_offset(expr: &tpt_wasm_format::ConstExpr) -> Result<u32, LoweringError> {
+    let value = read_const_expr(expr, ValueType::I32)?;
+    match value {
+        Value::I32(offset) => u32::try_from(offset)
+            .map_err(|_| LoweringError::UnsupportedFeature("negative element segment offset")),
+        _ => Err(LoweringError::UnsupportedFeature("element segment offset")),
+    }
 }
 
 fn reject_unsupported_module_state(module: &tpt_wasm_format::Module) -> Result<(), LoweringError> {
     if !module.imports.is_empty() {
         return Err(LoweringError::UnsupportedFeature("imports"));
-    }
-    if !module.tables.is_empty() {
-        return Err(LoweringError::UnsupportedFeature("tables"));
-    }
-    if !module.memories.is_empty() {
-        return Err(LoweringError::UnsupportedFeature("memories"));
-    }
-    if !module.globals.is_empty() {
-        return Err(LoweringError::UnsupportedFeature("globals"));
-    }
-    if !module.elements.is_empty() {
-        return Err(LoweringError::UnsupportedFeature("element segments"));
-    }
-    if !module.data.is_empty() {
-        return Err(LoweringError::UnsupportedFeature("data segments"));
     }
     if module.start.is_some() {
         return Err(LoweringError::UnsupportedFeature("start functions"));
@@ -121,6 +229,13 @@ struct ControlFrame {
     /// Block a branch to this label targets: a loop's header, or the merge block
     /// created when the label is closed.
     target: BlockId,
+    /// Block control continues at once the label's body finishes normally.
+    ///
+    /// This differs from `target` only for a loop. A branch to a loop label
+    /// re-enters its header, so the body must be able to *leave* by a different
+    /// edge; collapsing the two would make falling off the end of a loop body
+    /// jump back to the header instead of exiting.
+    exit: BlockId,
 }
 
 /// Accumulates the basic blocks of one function body.
@@ -262,13 +377,11 @@ fn open_label(
 
     // A loop re-enters its own header, so the header is also where the body
     // starts. The others get a separate merge block. Both are allocated now so
-    // a branch can name them before either is filled.
+    // a branch can name them before either is filled. Even a loop gets its own
+    // merge block: falling off the end of a loop body must exit the loop, which
+    // is a different edge from the back edge into the header.
     let header = builder.allocate_block();
-    let merge = if kind == ControlKind::Loop {
-        header
-    } else {
-        builder.allocate_block()
-    };
+    let merge = builder.allocate_block();
     // An `if` needs a third block for the `else` arm, because the condition's
     // false edge must land in a block the arm actually fills. With no `else`,
     // that block is a bare jump to the merge.
@@ -317,6 +430,7 @@ fn open_label(
         else_block,
         unreachable: false,
         target: receiving,
+        exit: merge,
     });
     Ok(())
 }
@@ -430,6 +544,7 @@ fn lower_branch_table(
             else_block: None,
             unreachable: false,
             target: BlockId(0),
+            exit: BlockId(0),
         },
     )?;
     let selector = state.pop(ValueType::I32)?;
@@ -506,9 +621,10 @@ fn close_label(
     if is_else && frame.kind != ControlKind::If {
         return Err(LoweringError::ElseWithoutIf);
     }
-    // Both arms of an `if` converge on one merge block, which is the label's
-    // target and already carries the label's results as block parameters.
-    let merge = frame.target;
+    // Control resumes at the label's exit block, which already carries the
+    // label's results as block parameters. For a `block` or `if` the exit is
+    // also the branch target; for a loop it is the block after the header.
+    let merge = frame.exit;
     let else_block = frame.else_block;
     if is_else {
         // The `then` arm is complete. End it by branching to the merge and
@@ -594,6 +710,7 @@ fn lower_function(
         else_block: None,
         unreachable: false,
         target: BlockId(0),
+        exit: BlockId(0),
     }];
     lower_body(&mut reader, module, &mut state, &mut builder, &mut controls)?;
     // Lowering may have appended synthetic local slots for values that must
@@ -706,6 +823,13 @@ fn lower_body(
             }
             0x01 => {}
             0x10 => lower_call(reader.u32()?, module, state, builder)?,
+            0x11 => {
+                // `call_indirect` is a type index then a table index, followed on
+                // the stack by the arguments and finally the table index.
+                let type_index = reader.u32()?;
+                let table = reader.u32()?;
+                lower_call_indirect(type_index, table, module, state, builder)?
+            }
             0x1a => {
                 let value = state.pop_any()?;
                 builder.push(IrInstr::Drop { value });
@@ -714,6 +838,31 @@ fn lower_body(
             0x20 => lower_local_get(reader.u32()?, state, builder)?,
             0x21 => lower_local_set(reader.u32()?, state, builder)?,
             0x22 => lower_local_tee(reader.u32()?, state, builder)?,
+            0x23 => lower_global_get(reader.u32()?, module, state, builder)?,
+            0x24 => lower_global_set(reader.u32()?, module, state, builder)?,
+            0x28..=0x35 => lower_load(opcode, reader, state, builder)?,
+            0x36..=0x3e => lower_store(opcode, reader, state, builder)?,
+            0x3f => {
+                // `memory.size` carries a reserved memory index byte that MVP
+                // requires to be zero.
+                let index = reader.byte()?;
+                if index != 0 {
+                    return Err(LoweringError::UnsupportedFeature("multi-memory"));
+                }
+                let result = state.allocate(ValueType::I32)?;
+                builder.push(IrInstr::MemorySize { result });
+                state.push(result, ValueType::I32);
+            }
+            0x40 => {
+                let index = reader.byte()?;
+                if index != 0 {
+                    return Err(LoweringError::UnsupportedFeature("multi-memory"));
+                }
+                let delta = state.pop(ValueType::I32)?;
+                let result = state.allocate(ValueType::I32)?;
+                builder.push(IrInstr::MemoryGrow { result, delta });
+                state.push(result, ValueType::I32);
+            }
             0x41 => {
                 let value = reader.i32()?;
                 let result = state.allocate(ValueType::I32)?;
@@ -760,6 +909,156 @@ fn lower_body(
     }
 }
 
+/// Map a load opcode to its width, signedness, and result type.
+fn load_operation(opcode: u8) -> Option<MemoryLoad> {
+    Some(match opcode {
+        0x28 => MemoryLoad::I32,
+        0x29 => MemoryLoad::I64,
+        0x2a => MemoryLoad::F32,
+        0x2b => MemoryLoad::F64,
+        0x2c => MemoryLoad::I32_8S,
+        0x2d => MemoryLoad::I32_8U,
+        0x2e => MemoryLoad::I32_16S,
+        0x2f => MemoryLoad::I32_16U,
+        0x30 => MemoryLoad::I64_8S,
+        0x31 => MemoryLoad::I64_8U,
+        0x32 => MemoryLoad::I64_16S,
+        0x33 => MemoryLoad::I64_16U,
+        0x34 => MemoryLoad::I64_32S,
+        0x35 => MemoryLoad::I64_32U,
+        _ => return None,
+    })
+}
+
+/// Map a store opcode to the bytes it writes and the value it consumes.
+fn store_operation(opcode: u8) -> Option<MemoryStore> {
+    Some(match opcode {
+        0x36 => MemoryStore::I32,
+        0x37 => MemoryStore::I64,
+        0x38 => MemoryStore::F32,
+        0x39 => MemoryStore::F64,
+        0x3a => MemoryStore::I32_8,
+        0x3b => MemoryStore::I32_16,
+        0x3c => MemoryStore::I64_8,
+        0x3d => MemoryStore::I64_16,
+        0x3e => MemoryStore::I64_32,
+        _ => return None,
+    })
+}
+
+/// Read a `memarg`. The alignment hint is advisory in Wasm and is not carried in
+/// the IR, so only the static offset is kept.
+fn read_memarg(reader: &mut BodyReader<'_>) -> Result<u32, LoweringError> {
+    let _align = reader.u32()?;
+    reader.u32()
+}
+
+fn lower_load(
+    opcode: u8,
+    reader: &mut BodyReader<'_>,
+    state: &mut LoweringState,
+    builder: &mut BodyBuilder,
+) -> Result<(), LoweringError> {
+    let operation = load_operation(opcode).ok_or(LoweringError::UnsupportedInstruction(opcode))?;
+    let offset = read_memarg(reader)?;
+    let address = state.pop(ValueType::I32)?;
+    let result_type = operation.result_type();
+    let result = state.allocate(result_type)?;
+    builder.push(IrInstr::Load {
+        result,
+        address,
+        offset,
+        operation,
+    });
+    state.push(result, result_type);
+    Ok(())
+}
+
+fn lower_store(
+    opcode: u8,
+    reader: &mut BodyReader<'_>,
+    state: &mut LoweringState,
+    builder: &mut BodyBuilder,
+) -> Result<(), LoweringError> {
+    let operation = store_operation(opcode).ok_or(LoweringError::UnsupportedInstruction(opcode))?;
+    let offset = read_memarg(reader)?;
+    let value = state.pop(operation.operand_type())?;
+    let address = state.pop(ValueType::I32)?;
+    builder.push(IrInstr::Store {
+        address,
+        value,
+        offset,
+        operation,
+    });
+    Ok(())
+}
+
+fn lower_global_get(
+    index: u32,
+    module: &tpt_wasm_format::Module,
+    state: &mut LoweringState,
+    builder: &mut BodyBuilder,
+) -> Result<(), LoweringError> {
+    let declaration = module
+        .globals
+        .get(index as usize)
+        .ok_or(LoweringError::UnknownGlobal(index))?;
+    let value_type = declaration.global_type.value_type;
+    let result = state.allocate(value_type)?;
+    builder.push(IrInstr::GlobalGet {
+        result,
+        global: index,
+    });
+    state.push(result, value_type);
+    Ok(())
+}
+
+fn lower_global_set(
+    index: u32,
+    module: &tpt_wasm_format::Module,
+    state: &mut LoweringState,
+    builder: &mut BodyBuilder,
+) -> Result<(), LoweringError> {
+    let declaration = module
+        .globals
+        .get(index as usize)
+        .ok_or(LoweringError::UnknownGlobal(index))?;
+    if !declaration.global_type.mutable {
+        return Err(LoweringError::ImmutableGlobal(index));
+    }
+    let value = state.pop(declaration.global_type.value_type)?;
+    builder.push(IrInstr::GlobalSet {
+        global: index,
+        value,
+    });
+    Ok(())
+}
+
+/// Decode a global's constant initializer.
+///
+/// MVP initializers are a single numeric constant followed by `end`. Anything
+/// else needs the import and reference machinery, and is rejected rather than
+/// approximated.
+pub(crate) fn read_const_expr(
+    expr: &tpt_wasm_format::ConstExpr,
+    value_type: ValueType,
+) -> Result<Value, LoweringError> {
+    let mut reader = BodyReader::new(&expr.0);
+    // The initializer is `t.const <immediate> end`, so the opcode comes first and
+    // must agree with the declared type.
+    let value = match (reader.byte()?, value_type) {
+        (0x41, ValueType::I32) => Value::I32(reader.i32()?),
+        (0x42, ValueType::I64) => Value::I64(reader.i64()?),
+        (0x43, ValueType::F32) => Value::F32(reader.f32()?),
+        (0x44, ValueType::F64) => Value::F64(reader.f64()?),
+        _ => return Err(LoweringError::UnsupportedFeature("global initializer")),
+    };
+    if reader.byte()? != 0x0b || reader.remaining() != 0 {
+        return Err(LoweringError::UnsupportedFeature("global initializer"));
+    }
+    Ok(value)
+}
+
 fn lower_call(
     function: u32,
     module: &tpt_wasm_format::Module,
@@ -774,12 +1073,34 @@ fn lower_call(
         .types
         .get(callee.type_index as usize)
         .ok_or(LoweringError::UnknownType(callee.type_index))?;
+    let arguments = pop_arguments(callee_type, state)?;
+    let results = allocate_results(callee_type, state)?;
+    builder.push(IrInstr::Call {
+        function,
+        arguments,
+        results,
+    });
+    Ok(())
+}
+/// Pop the declared arguments, topmost first.
+fn pop_arguments(
+    callee_type: &tpt_wasm_types::FunctionType,
+    state: &mut LoweringState,
+) -> Result<Vec<ValueId>, LoweringError> {
     let mut arguments = Vec::with_capacity(callee_type.params.0.len());
     for expected in callee_type.params.0.iter().rev() {
         arguments.push(state.pop(*expected)?);
     }
     arguments.reverse();
-    let results = callee_type
+    Ok(arguments)
+}
+
+/// Allocate the declared results and push them onto the operand stack.
+fn allocate_results(
+    callee_type: &tpt_wasm_types::FunctionType,
+    state: &mut LoweringState,
+) -> Result<Vec<ValueId>, LoweringError> {
+    callee_type
         .results
         .0
         .iter()
@@ -788,9 +1109,31 @@ fn lower_call(
             state.push(result, *value_type);
             Ok(result)
         })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
-    builder.push(IrInstr::Call {
-        function,
+        .collect()
+}
+
+fn lower_call_indirect(
+    type_index: u32,
+    table: u32,
+    module: &tpt_wasm_format::Module,
+    state: &mut LoweringState,
+    builder: &mut BodyBuilder,
+) -> Result<(), LoweringError> {
+    let callee_type = module
+        .types
+        .get(type_index as usize)
+        .ok_or(LoweringError::UnknownType(type_index))?;
+    // The table index sits above the arguments on the operand stack, so it is
+    // popped first. The arguments come off underneath it, topmost first, and
+    // the results are pushed only once the index has been taken, since a result
+    // of the same type would otherwise be mistaken for it.
+    let operand = state.pop(ValueType::I32)?;
+    let arguments = pop_arguments(callee_type, state)?;
+    let results = allocate_results(callee_type, state)?;
+    builder.push(IrInstr::CallIndirect {
+        type_index,
+        table,
+        operand,
         arguments,
         results,
     });

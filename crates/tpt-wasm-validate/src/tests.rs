@@ -54,6 +54,43 @@ fn empty_module_is_valid() {
 }
 
 #[test]
+fn br_if_consumes_the_label_values_it_branches_with() {
+    // `block (result i32) { 7; 0; br_if 0; 99 } end`
+    //
+    // `br_if` pops the condition and the label's value on *both* paths, so the
+    // fall-through starts from an empty stack and may push a fresh `99` for the
+    // block's result. A validator that restores the popped value would see two
+    // values at the block's `end` and wrongly reject this module.
+    let body = vec![
+        0x02, 0x7f, // block (result i32)
+        0x41, 0x07, // i32.const 7
+        0x41, 0x00, // i32.const 0
+        0x0d, 0x00, // br_if 0
+        0x41, 0xe3, 0x00, // i32.const 99 (signed LEB128, two bytes)
+        0x0b, // end (block)
+        0x0b, // end (function)
+    ];
+    let module = module_with_function(function_type(vec![], vec![ValueType::I32]), body);
+    assert!(validate(module).is_ok());
+}
+
+#[test]
+fn br_if_still_requires_the_label_value_to_be_present() {
+    // The same shape with no value for the block's result must be rejected, so
+    // the test above cannot pass by simply skipping the arity check.
+    let body = vec![
+        0x02, 0x7f, // block (result i32)
+        0x41, 0x00, // i32.const 0
+        0x0d, 0x00, // br_if 0
+        0x41, 0xe3, 0x00, // i32.const 99
+        0x0b, // end (block)
+        0x0b, // end (function)
+    ];
+    let module = module_with_function(function_type(vec![], vec![ValueType::I32]), body);
+    assert!(validate(module).is_err());
+}
+
+#[test]
 fn valid_constant_result_is_accepted() {
     let module = module_with_function(
         function_type(vec![], vec![ValueType::I32]),

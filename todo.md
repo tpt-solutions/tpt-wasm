@@ -65,6 +65,8 @@
 - [x] Implement all memory operations with bounds checking
 - [x] Implement table storage and indirect-call bounds checks (MVP table semantics)
 - [x] Implement control flow (block, loop, if/else, br, br_if, br_table, return)
+- [x] Match the spec's `br_if` stack effect: the condition and the label's values are consumed on both the taken and the fall-through path
+  - The validator previously pushed the popped label values back, which made it reject valid modules whose fall-through repopulated the block's result.
 - [x] Implement direct and indirect function calls
 - [x] Implement locals and globals access (get/set/tee)
 - [x] Implement all integer arithmetic (i32, i64 — add, sub, mul, div, rem, and, or, xor, shl, shr, rotl, rotr, clz, ctz, popcnt)
@@ -149,13 +151,16 @@
 - [x] Implement IR value types aligned with Wasm types
 - [ ] Expand the IR instruction set to the full validated MVP (structured control flow, locals/globals, memory, tables, calls, references, remaining numeric operations, explicit host boundaries)
   - Structured control flow representation and dominance verification: done. Multi-block IR with block parameters, `Branch`/`CondBranch` terminators, and dominance-checked uses.
-  - Lowering Wasm `block`/`loop`/`if`/`br`/`br_if`/`br_table`/`return` into that CFG, and multi-block local dataflow, are still pending.
+  - Lowering Wasm `block`/`loop`/`if`/`br`/`br_if`/`br_table`/`return` into that CFG: done. A loop label carries its header as the branch target and a distinct exit block, so a back edge and a fall-out are different edges. Multi-block local dataflow is still pending.
+  - The linear memory and globals are now in the IR: `IrModule` carries the memory declaration and the global types with their initial values, and `Load`/`Store`/`MemorySize`/`MemoryGrow`/`GlobalGet`/`GlobalSet` are lowered, verified, and executed.
+  - Tables and active element segments are now in the IR too: `IrModule` carries the table declaration with its function indices, and `CallIndirect` names a type rather than a function, so the signature is checked against the table entry at run time.
+  - Active data segments now travel with the memory declaration as `IrMemory::segments`, kept in module order so an overlapping later segment wins. They are applied at instantiation, before any function runs. References and host effects are still pending.
 - [x] Implement the initial `Wasm → TPT IR` lowering pass for straight-line constants, `drop`, `select`, `nop`, straight-line local access, defined direct calls, integer arithmetic/comparison/division/remainder/bitwise/shift/rotation operations, integer unary bit-count, integer width/signedness conversion, non-trapping f32/f64 conversion, trapping float-to-integer conversion, and raw-bit reinterpretation operations, f32/f64 comparisons/unary/binary operations, and f32/f64 add/sub/mul/div
 - [ ] Expand lowering to every construct represented by the IR instruction set
 - [x] Implement IR type-checking / structural verification for the current instruction set
 - [x] Extend IR verification for branches, dominance, memory effects, imported/indirect calls, references, and host effects
-  - Branches, block parameters, and dominance: done — multi-block CFG with an iterative immediate-dominator fixpoint, reachable-block enforcement, and per-edge arity/type checks.
-  - Memory effects, imported/indirect calls, references, and host effects: still pending; those instructions are not yet in the IR.
+  - Branches, block parameters, and dominance: done — multi-block CFG with an iterative immediate-dominator fixpoint, reachable-block enforcement, and per-edge arity/type checks. Each block's visible values are the ones defined in blocks that dominate it, so a value computed before a branch stays usable after it.
+  - Indirect calls are verified: the table must exist and be a `funcref` table, the named type must be declared, and the argument and result arities and types are checked against it. Memory effects, references, and host effects are still pending; those instructions are not yet in the IR.
 - [x] Add an executable V4 projection hook for the IR/formal-model overlap
 - [x] Add lowering differential tests against Micro for the current subset
 - [x] Document the IR and lowering contract in `docs/compiler/ir.md` and `docs/compiler/lowering.md`
@@ -168,6 +173,12 @@
 
 - [ ] Implement baseline code generation in `tpt-wasm-codegen` (correctness and startup time over peak performance)
 - [x] Implement the initial portable baseline lowering/execution slice (`i32.const`, `i32.add`, and terminators)
+- [x] Extend the portable baseline to multi-block functions: block parameters bound by incoming edges, plus `Branch` and `CondBranch` terminators and a block-graph executor
+- [x] Extend the portable baseline to direct calls to defined functions, with a module-level function table and per-callee slot frames so recursion works
+- [x] Extend the portable baseline to tables and indirect calls: an active element segment seeds the table, and `call_indirect` resolves the index, traps distinctly on out-of-range versus null, and checks the entry's signature against the named type
+- [x] Extend the portable baseline to active data segments: the bytes are written into memory at instantiation in module order, so a later segment overwrites an earlier one at the same address and the contents survive `memory.grow`
+- [x] Extend the portable baseline to the linear memory: all fourteen loads, all nine stores, `memory.size`, and `memory.grow`, with checked little-endian access and `MemoryOutOfBounds` traps
+- [x] Extend the portable baseline to `global.get`/`global.set` with module-level global slots shared across calls
 - [x] Extend the portable baseline to the full straight-line `i32` set: 15 binary ops, `i32.eqz`, and 10 comparisons with Wasm-exact wrapping, masking, and trap rules
 - [x] Extend the portable baseline to the symmetric straight-line `i64` set, including width-correct shift masking and division traps
 - [x] Extend the portable baseline to the symmetric straight-line `f32` set: 7 binary ops, 7 unary ops, 6 comparisons, with Wasm-exact NaN canonicalization, NaN-payload-preserving `abs`/`neg`/`copysign`, signed-zero `min`/`max`, and ties-to-even `nearest`
@@ -185,7 +196,7 @@
 - [ ] Verify trap equivalence (same traps at same points)
 - [ ] Verify host-effect equivalence
 
-> M7 now has a deterministic portable baseline slice with independent execution and Micro differential coverage for the full straight-line MVP instruction set that the IR represents: constants and every arithmetic, comparison, and bit-count operation at all four widths; `drop`, `select`, and `local.get`/`set`/`tee` over zero-initialized slots; non-trapping integer width and signedness conversions; raw-bit reinterpretation; the non-trapping float conversions; and the trapping float truncations; plus the return/trap/unreachable terminators. IEEE 754 behavior is reproduced exactly, and differential tests drive the real validate → IR → baseline pipeline asserting identical results and traps bit-for-bit, including NaN canonicalization, NaN-payload preservation across reinterpretation, signed-zero `min`/`max`, ties-to-even rounding, and every `InvalidConversion` boundary. Memory, table, and control-flow lowering, direct and indirect calls, native x86-64/AArch64 code generation, executable-memory integration, and `EngineMode::Baseline` remain pending.
+> M7 now has a deterministic portable baseline slice with independent execution and Micro differential coverage for the full straight-line MVP instruction set that the IR represents: constants and every arithmetic, comparison, and bit-count operation at all four widths; `drop`, `select`, and `local.get`/`set`/`tee` over zero-initialized slots; non-trapping integer width and signedness conversions; raw-bit reinterpretation; the non-trapping float conversions; and the trapping float truncations; plus multi-block control flow — `Branch` and `CondBranch` terminators, block parameters bound by incoming edges, and a block-graph executor that follows back edges. IEEE 754 behavior is reproduced exactly, and differential tests drive the real validate → IR → baseline pipeline asserting identical results and traps bit-for-bit, including NaN canonicalization, NaN-payload preservation across reinterpretation, signed-zero `min`/`max`, ties-to-even rounding, every `InvalidConversion` boundary, and a loop that only terminates if the back edge is followed. Direct calls, the full MVP memory instruction set (fourteen loads, nine stores, `memory.size`, `memory.grow`), and `global.get`/`global.set` are now lowered and executed, with module-level memory and global state shared across calls. Tables and active element segments are now lowered and executed as well: an active segment seeds the table, and `call_indirect` resolves the index, distinguishes an out-of-range index from a null entry, and checks the entry's signature against the type the call names. Active data segments are lowered and applied at instantiation as well. References, native x86-64/AArch64 code generation, executable-memory integration, and `EngineMode::Baseline` remain pending.
 
 
 ---
@@ -254,3 +265,5 @@
 - [ ] Maintain differential testing suite — Micro result is always the golden result
 - [ ] Maintain GitHub milestones and issue labels as architectural memory
 - [ ] Legal review before any public release (do not rely solely on automation for licensing)
+
+

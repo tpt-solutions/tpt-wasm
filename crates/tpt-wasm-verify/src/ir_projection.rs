@@ -219,6 +219,22 @@ pub fn project_function_to_model(
                 tpt_wasm_ir::FloatConversion::F64FromF32 => FloatConversion::F64FromF32,
             }),
             IrInstr::Call { function, .. } => Instruction::Call(*function),
+            // The formal model has no tables, so an indirect call cannot be
+            // projected: its target is a runtime table lookup.
+            IrInstr::CallIndirect { .. } => {
+                return Err(IrProjectionError::UnsupportedInstruction("call_indirect"))
+            }
+            // The formal model has no memory or global state, so these are
+            // rejected explicitly rather than projected approximately.
+            IrInstr::Load { .. } | IrInstr::Store { .. } | IrInstr::MemorySize { .. } => {
+                return Err(IrProjectionError::UnsupportedInstruction("memory"))
+            }
+            IrInstr::MemoryGrow { .. } => {
+                return Err(IrProjectionError::UnsupportedInstruction("memory.grow"))
+            }
+            IrInstr::GlobalGet { .. } | IrInstr::GlobalSet { .. } => {
+                return Err(IrProjectionError::UnsupportedInstruction("global"))
+            }
         });
     }
 

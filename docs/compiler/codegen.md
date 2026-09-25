@@ -1,25 +1,104 @@
 # Baseline Code Generation
 
 **Status:** M7 — portable baseline slice for the straight-line MVP instruction set
-represented by the IR; native backends pending
+and structured control flow represented by the IR; native backends pending
 
 `tpt-wasm-codegen` currently provides a deterministic, portable lowering artifact
-for straight-line numeric functions. It is independent of Micro and does not
-claim to produce executable native code yet.
+for numeric functions. It is independent of Micro and does not claim to produce
+executable native code yet.
 
 ## Pipeline
 
 ```text
 VerifiedIrModule
   -> lower_function
-  -> BaselineFunction (dense value slots + BaselineOp)
+  -> BaselineFunction (blocks of dense value slots + BaselineOp)
   -> independent baseline execution
 ```
 
-`lower_function` rejects multi-block functions, unknown or mistyped values, and
-unsupported IR instructions instead of dropping behavior. The current baseline
-executor supports return, trap, and unreachable terminators and is covered by
-Micro differential tests.
+`lower_function` accepts multi-block functions. Blocks keep the IR's order and
+are addressed by index; each block's parameters are slots that an incoming edge
+binds. An edge carries the slots of the operands for its target, mirroring the
+IR's block-argument phis.
+
+`lower_function` rejects unknown or mistyped values, malformed control flow
+(a branch to a missing block, a duplicate block id, an edge whose arity does not
+match its target, a missing entry block), and unsupported IR instructions,
+instead of dropping behavior. The baseline executor walks the block graph and
+supports return, trap, unreachable, unconditional, and two-way branches, and is
+covered by Micro differential tests including a loop that requires following a
+back edge.
+
+## Memory and globals
+
+`BaselineModule` owns the functions plus the memory and globals they share. State
+is shared across calls the way it is in Wasm: a callee observes the caller's
+stores, and a `global.set` inside a callee is visible to the caller.
+
+`execute` and `execute_with` have no module, so a function that touches memory or
+globals reports that it needs one rather than reading uninitialized data. Use
+`BaselineModule::lower` followed by `call`.
+
+Loads read little-endian bytes and apply the opcode's extension: a float load is a
+pure bit reinterpretation, so a NaN payload survives a round trip through memory,
+and an out-of-bounds access traps with `MemoryOutOfBounds` rather than reading
+adjacent memory. `memory.grow` returns the previous page count, or -1 when the
+request would exceed the declared maximum.
+
+## Calls
+
+A `call` names a function by module index, so the functions of a module are
+lowered together with `lower_module` and executed through
+`BaselineFunction::execute_with`, which takes the function table. `execute` has
+no table, so a function containing a call reports that the target is missing
+rather than guessing.
+
+Each callee allocates its own slot frame, so recursion and re-entrancy behave as
+they do in Wasm. A callee's arguments and results are type-checked against the
+slots, and a result of the wrong type is rejected rather than stored.
+
+## Active data segments
+
+`IrMemory::segments` carries the module's active data segments as
+`(offset, bytes)` pairs, in module order. `BaselineModule::new` applies them to
+the freshly allocated memory before any function can run, so the ordering rule
+the specification requires is structural rather than incidental: a later segment
+overwrites an earlier one at the same address. Growth appends zeroed pages and
+leaves the segment's bytes untouched.
+
+A segment that would not fit the declared memory is rejected as a lowering
+error. The validator already bounds-checks it, so reaching that arm means the two
+disagree — the same reasoning used for element segments.
+
+## Tables and indirect calls
+
+`IrModule` carries the MVP table declaration together with the function indices
+from its single active element segment, so the baseline never re-reads the Wasm
+module. `BaselineModule::new` seeds a `Vec<Option<u32>>` from that declaration:
+`None` is a null reference, and any slot the segment does not reach stays null.
+
+`call_indirect` names a *type*, not a function, so the signature is checked
+against whatever entry the table holds and the trap fires when they disagree —
+the same order of operations Micro uses. Two failure modes are deliberately
+distinct: an index past the end of the table is `TableOutOfBounds`, while an
+index inside it that was never written is `NullReference`.
+
+Resolution order matters in the lowering. The table index sits *above* the
+arguments on the operand stack, so it is popped first, then the arguments
+topmost-first, and only then are the results allocated and pushed — a result of
+the same type as the index would otherwise be popped as the index.
+
+## Control flow
+
+The executor keeps a `current` block index and loops until a block ends in
+`Return`, `Trap`, or `Unreachable`. `Branch` and `CondBranch` set the next block
+after copying the edge's operands into the target's parameter slots. A block
+with no terminator is reported as a lowering bug rather than silently accepted.
+
+There is deliberately no step limit, so a non-terminating program loops forever
+just as it does under Micro. A fuel bound would make the baseline and the golden
+machine disagree on exactly those programs, which differential testing must not
+allow.
 
 ## Implemented operation set
 
@@ -108,10 +187,12 @@ accepted while the next value up traps.
 
 ## Not yet lowered
 
-Multi-block control flow, memory and table access, and direct or indirect calls
-are still rejected with `UnsupportedInstruction` rather than approximated. A
-native `CompiledFunction` is reserved for the later executable-memory boundary
-and is not produced by this portable slice.
+`externref`/reference-typed values and host effects are still rejected with
+`UnsupportedInstruction` rather than approximated, as are the post-MVP proposals
+(`multi-memory`, `memory64`, passive data segments, passive and declarative
+element segments, exception handling). A native `CompiledFunction` is reserved
+for the later executable-memory boundary and is not produced by this portable
+slice.
 
 ## Differential testing
 

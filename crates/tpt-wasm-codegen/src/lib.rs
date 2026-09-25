@@ -9,12 +9,13 @@
 //! Pipeline: Wasm → TPT IR → simple lowering → native code
 //!
 //! Status: M7 — portable baseline slice for the straight-line MVP instruction
-//! set represented by the IR; native backends pending.
+//! set and structured control flow represented by the IR; native backends
+//! pending.
 
 use std::collections::HashMap;
 use std::fmt;
 
-use tpt_wasm_ir::{IrFunction, IrInstr, Terminator, ValueId};
+use tpt_wasm_ir::{BlockId, IrFunction, IrInstr, Terminator, ValueId};
 use tpt_wasm_types::{FunctionType, Trap, Value, ValueType};
 
 /// Target architecture for code generation.
@@ -39,6 +40,14 @@ pub enum CodegenError {
         actual: usize,
     },
     MissingEntryBlock,
+    DuplicateBlock(BlockId),
+    UnknownBlock(BlockId),
+    /// A branch edge supplied the wrong number of values for its target.
+    BranchArity {
+        target: BlockId,
+        expected: usize,
+        actual: usize,
+    },
     DuplicateValue(ValueId),
     UnknownValue(ValueId),
     TypeMismatch {
@@ -48,6 +57,8 @@ pub enum CodegenError {
     },
     UnsupportedInstruction(&'static str),
     UnsupportedTerminator(&'static str),
+    /// A memory declaration this backend cannot represent.
+    UnsupportedMemory(&'static str),
 }
 
 impl fmt::Display for CodegenError {
@@ -262,16 +273,88 @@ pub enum BaselineOp {
     Return(Vec<u32>),
     Trap(Trap),
     Unreachable,
+    /// Unconditional jump, binding `values` to the target block's parameters.
+    Branch {
+        target: u32,
+        values: Vec<u32>,
+    },
+    /// Two-way jump, binding the matching operand list to each target.
+    CondBranch {
+        condition: u32,
+        then_target: u32,
+        then_values: Vec<u32>,
+        else_target: u32,
+        else_values: Vec<u32>,
+    },
+    /// Direct call to the function at this index in the module's function table.
+    ///
+    /// Execution needs that table, so a function containing a call can only be
+    /// run by [`BaselineFunction::execute_with`].
+    Call {
+        function: u32,
+        arguments: Vec<u32>,
+        results: Vec<u32>,
+    },
+    /// Indirect call: read `operand` from the table, then dispatch.
+    CallIndirect {
+        /// The expected signature, as an index into the module's types.
+        type_index: u32,
+        /// Slot of the `i32` table index.
+        operand: u32,
+        arguments: Vec<u32>,
+        results: Vec<u32>,
+    },
+    /// Read `width` bytes little-endian from memory at `address + offset`.
+    Load {
+        result: u32,
+        address: u32,
+        offset: u32,
+        operation: tpt_wasm_ir::MemoryLoad,
+    },
+    /// Write the low `width` bytes of `value` at `address + offset`.
+    Store {
+        address: u32,
+        value: u32,
+        offset: u32,
+        operation: tpt_wasm_ir::MemoryStore,
+    },
+    MemorySize {
+        result: u32,
+    },
+    MemoryGrow {
+        result: u32,
+        delta: u32,
+    },
+    GlobalGet {
+        result: u32,
+        global: u32,
+    },
+    GlobalSet {
+        global: u32,
+        value: u32,
+    },
 }
 
-/// A certified single-block IR function lowered to portable baseline code.
+/// One basic block of a lowered baseline function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineBlock {
+    /// Slots that receive the values supplied by whichever edge arrived here.
+    pub params: Vec<u32>,
+    /// Instructions followed by exactly one terminator operation.
+    pub ops: Vec<BaselineOp>,
+}
+
+/// A certified IR function lowered to portable baseline code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineFunction {
     pub function_type: FunctionType,
     pub params: Vec<u32>,
     pub locals: Vec<u32>,
     pub value_types: Vec<ValueType>,
-    pub ops: Vec<BaselineOp>,
+    /// Blocks in the same order as the IR function's blocks.
+    pub blocks: Vec<BaselineBlock>,
+    /// Index of the entry block within `blocks`.
+    pub entry: u32,
 }
 
 struct SlotState {
@@ -339,18 +422,29 @@ impl SlotState {
     }
 }
 
-/// Lower one certified single-block IR function to portable baseline code.
+/// Lower one certified IR function to portable baseline code.
+///
+/// Every basic block is lowered; branch edges carry the slots that bind the
+/// target block's parameters, mirroring the IR's block-argument phis.
 pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, CodegenError> {
-    if function.blocks.len() != 1 {
-        return Err(CodegenError::UnsupportedBlockCount {
-            actual: function.blocks.len(),
-        });
-    }
-    let block = &function.blocks[0];
-    if block.id != function.entry {
+    if function.blocks.is_empty() {
         return Err(CodegenError::MissingEntryBlock);
     }
     let mut state = SlotState::new(function)?;
+    // Branch targets are IR block ids; the baseline addresses blocks by index.
+    let mut index_of = HashMap::with_capacity(function.blocks.len());
+    for (index, block) in function.blocks.iter().enumerate() {
+        let index = u32::try_from(index).map_err(|_| CodegenError::UnsupportedBlockCount {
+            actual: function.blocks.len(),
+        })?;
+        if index_of.insert(block.id, index).is_some() {
+            return Err(CodegenError::DuplicateBlock(block.id));
+        }
+    }
+    if !index_of.contains_key(&function.entry) {
+        return Err(CodegenError::MissingEntryBlock);
+    }
+    let entry = index_of[&function.entry];
     let params = function
         .params
         .iter()
@@ -361,691 +455,1100 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
         .iter()
         .map(|id| state.define(*id))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut ops = Vec::with_capacity(block.instrs.len() + 1);
-    for instruction in &block.instrs {
-        match instruction {
-            IrInstr::ConstI32 { result, value } => {
-                let slot = state.define(*result)?;
-                ops.push(BaselineOp::ConstI32 {
-                    slot,
-                    value: *value,
-                });
-            }
-            IrInstr::I32Add { .. }
-            | IrInstr::I32Sub { .. }
-            | IrInstr::I32Mul { .. }
-            | IrInstr::I32DivS { .. }
-            | IrInstr::I32DivU { .. }
-            | IrInstr::I32RemS { .. }
-            | IrInstr::I32RemU { .. }
-            | IrInstr::I32Shl { .. }
-            | IrInstr::I32ShrS { .. }
-            | IrInstr::I32ShrU { .. }
-            | IrInstr::I32Rotl { .. }
-            | IrInstr::I32Rotr { .. }
-            | IrInstr::I32And { .. }
-            | IrInstr::I32Or { .. }
-            | IrInstr::I32Xor { .. } => {
-                let operation = match instruction {
-                    IrInstr::I32Add { .. } => I32BinaryOp::Add,
-                    IrInstr::I32Sub { .. } => I32BinaryOp::Sub,
-                    IrInstr::I32Mul { .. } => I32BinaryOp::Mul,
-                    IrInstr::I32DivS { .. } => I32BinaryOp::DivS,
-                    IrInstr::I32DivU { .. } => I32BinaryOp::DivU,
-                    IrInstr::I32RemS { .. } => I32BinaryOp::RemS,
-                    IrInstr::I32RemU { .. } => I32BinaryOp::RemU,
-                    IrInstr::I32Shl { .. } => I32BinaryOp::Shl,
-                    IrInstr::I32ShrS { .. } => I32BinaryOp::ShrS,
-                    IrInstr::I32ShrU { .. } => I32BinaryOp::ShrU,
-                    IrInstr::I32Rotl { .. } => I32BinaryOp::Rotl,
-                    IrInstr::I32Rotr { .. } => I32BinaryOp::Rotr,
-                    IrInstr::I32And { .. } => I32BinaryOp::And,
-                    IrInstr::I32Or { .. } => I32BinaryOp::Or,
-                    IrInstr::I32Xor { .. } => I32BinaryOp::Xor,
-                    _ => return Err(CodegenError::UnsupportedInstruction("i32 binary")),
-                };
-                let (result, left, right) = match instruction {
-                    IrInstr::I32Add {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32Sub {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32Mul {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32DivS {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32DivU {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32RemS {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32RemU {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32Shl {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32ShrS {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32ShrU {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32Rotl {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32Rotr {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32And {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32Or {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I32Xor {
-                        result,
-                        left,
-                        right,
-                    } => (*result, *left, *right),
-                    _ => unreachable!(),
-                };
-                let left = state.expect(left, ValueType::I32)?;
-                let right = state.expect(right, ValueType::I32)?;
-                let result = state.define(result)?;
-                ops.push(BaselineOp::I32Binary {
-                    result,
-                    left,
-                    right,
-                    operation,
-                });
-            }
-            IrInstr::I32Eqz { result, value } => {
-                let value = state.expect(*value, ValueType::I32)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::I32Eqz { result, value });
-            }
-            IrInstr::I32Compare {
-                result,
-                left,
-                right,
-                comparison,
-            } => {
-                let left = state.expect(*left, ValueType::I32)?;
-                let right = state.expect(*right, ValueType::I32)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::I32Compare {
-                    result,
-                    left,
-                    right,
-                    comparison: *comparison,
-                });
-            }
-            IrInstr::ConstI64 { result, value } => {
-                let slot = state.define(*result)?;
-                ops.push(BaselineOp::ConstI64 {
-                    slot,
-                    value: *value,
-                });
-            }
-            IrInstr::I64Add { .. }
-            | IrInstr::I64Sub { .. }
-            | IrInstr::I64Mul { .. }
-            | IrInstr::I64DivS { .. }
-            | IrInstr::I64DivU { .. }
-            | IrInstr::I64RemS { .. }
-            | IrInstr::I64RemU { .. }
-            | IrInstr::I64Shl { .. }
-            | IrInstr::I64ShrS { .. }
-            | IrInstr::I64ShrU { .. }
-            | IrInstr::I64Rotl { .. }
-            | IrInstr::I64Rotr { .. }
-            | IrInstr::I64And { .. }
-            | IrInstr::I64Or { .. }
-            | IrInstr::I64Xor { .. } => {
-                let operation = match instruction {
-                    IrInstr::I64Add { .. } => I64BinaryOp::Add,
-                    IrInstr::I64Sub { .. } => I64BinaryOp::Sub,
-                    IrInstr::I64Mul { .. } => I64BinaryOp::Mul,
-                    IrInstr::I64DivS { .. } => I64BinaryOp::DivS,
-                    IrInstr::I64DivU { .. } => I64BinaryOp::DivU,
-                    IrInstr::I64RemS { .. } => I64BinaryOp::RemS,
-                    IrInstr::I64RemU { .. } => I64BinaryOp::RemU,
-                    IrInstr::I64Shl { .. } => I64BinaryOp::Shl,
-                    IrInstr::I64ShrS { .. } => I64BinaryOp::ShrS,
-                    IrInstr::I64ShrU { .. } => I64BinaryOp::ShrU,
-                    IrInstr::I64Rotl { .. } => I64BinaryOp::Rotl,
-                    IrInstr::I64Rotr { .. } => I64BinaryOp::Rotr,
-                    IrInstr::I64And { .. } => I64BinaryOp::And,
-                    IrInstr::I64Or { .. } => I64BinaryOp::Or,
-                    IrInstr::I64Xor { .. } => I64BinaryOp::Xor,
-                    _ => return Err(CodegenError::UnsupportedInstruction("i64 binary")),
-                };
-                let (result, left, right) = match instruction {
-                    IrInstr::I64Add {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64Sub {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64Mul {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64DivS {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64DivU {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64RemS {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64RemU {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64Shl {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64ShrS {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64ShrU {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64Rotl {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64Rotr {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64And {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64Or {
-                        result,
-                        left,
-                        right,
-                    }
-                    | IrInstr::I64Xor {
-                        result,
-                        left,
-                        right,
-                    } => (*result, *left, *right),
-                    _ => unreachable!(),
-                };
-                let left = state.expect(left, ValueType::I64)?;
-                let right = state.expect(right, ValueType::I64)?;
-                let result = state.define(result)?;
-                ops.push(BaselineOp::I64Binary {
-                    result,
-                    left,
-                    right,
-                    operation,
-                });
-            }
-            IrInstr::I64Eqz { result, value } => {
-                let value = state.expect(*value, ValueType::I64)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::I64Eqz { result, value });
-            }
-            IrInstr::I64Compare {
-                result,
-                left,
-                right,
-                comparison,
-            } => {
-                let left = state.expect(*left, ValueType::I64)?;
-                let right = state.expect(*right, ValueType::I64)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::I64Compare {
-                    result,
-                    left,
-                    right,
-                    comparison: *comparison,
-                });
-            }
-            IrInstr::ConstF32 { result, value } => {
-                let slot = state.define(*result)?;
-                ops.push(BaselineOp::ConstF32 {
-                    slot,
-                    value: *value,
-                });
-            }
-            IrInstr::F32Add { .. }
-            | IrInstr::F32Sub { .. }
-            | IrInstr::F32Mul { .. }
-            | IrInstr::F32Div { .. }
-            | IrInstr::F32Min { .. }
-            | IrInstr::F32Max { .. }
-            | IrInstr::F32Copysign { .. } => {
-                let (operation, result, left, right) = match instruction {
-                    IrInstr::F32Add {
-                        result,
-                        left,
-                        right,
-                    } => (F32BinaryOp::Add, *result, *left, *right),
-                    IrInstr::F32Sub {
-                        result,
-                        left,
-                        right,
-                    } => (F32BinaryOp::Sub, *result, *left, *right),
-                    IrInstr::F32Mul {
-                        result,
-                        left,
-                        right,
-                    } => (F32BinaryOp::Mul, *result, *left, *right),
-                    IrInstr::F32Div {
-                        result,
-                        left,
-                        right,
-                    } => (F32BinaryOp::Div, *result, *left, *right),
-                    IrInstr::F32Min {
-                        result,
-                        left,
-                        right,
-                    } => (F32BinaryOp::Min, *result, *left, *right),
-                    IrInstr::F32Max {
-                        result,
-                        left,
-                        right,
-                    } => (F32BinaryOp::Max, *result, *left, *right),
-                    IrInstr::F32Copysign {
-                        result,
-                        left,
-                        right,
-                    } => (F32BinaryOp::Copysign, *result, *left, *right),
-                    _ => return Err(CodegenError::UnsupportedInstruction("f32 binary")),
-                };
-                let left = state.expect(left, ValueType::F32)?;
-                let right = state.expect(right, ValueType::F32)?;
-                let result = state.define(result)?;
-                ops.push(BaselineOp::F32Binary {
-                    result,
-                    left,
-                    right,
-                    operation,
-                });
-            }
-            IrInstr::F32Unary {
-                result,
-                value,
-                operation,
-            } => {
-                let value = state.expect(*value, ValueType::F32)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::F32Unary {
-                    result,
-                    value,
-                    operation: *operation,
-                });
-            }
-            IrInstr::F32Compare {
-                result,
-                left,
-                right,
-                comparison,
-            } => {
-                let left = state.expect(*left, ValueType::F32)?;
-                let right = state.expect(*right, ValueType::F32)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::F32Compare {
-                    result,
-                    left,
-                    right,
-                    comparison: *comparison,
-                });
-            }
-            IrInstr::ConstF64 { result, value } => {
-                let slot = state.define(*result)?;
-                ops.push(BaselineOp::ConstF64 {
-                    slot,
-                    value: *value,
-                });
-            }
-            IrInstr::F64Add { .. }
-            | IrInstr::F64Sub { .. }
-            | IrInstr::F64Mul { .. }
-            | IrInstr::F64Div { .. }
-            | IrInstr::F64Min { .. }
-            | IrInstr::F64Max { .. }
-            | IrInstr::F64Copysign { .. } => {
-                let (operation, result, left, right) = match instruction {
-                    IrInstr::F64Add {
-                        result,
-                        left,
-                        right,
-                    } => (F64BinaryOp::Add, *result, *left, *right),
-                    IrInstr::F64Sub {
-                        result,
-                        left,
-                        right,
-                    } => (F64BinaryOp::Sub, *result, *left, *right),
-                    IrInstr::F64Mul {
-                        result,
-                        left,
-                        right,
-                    } => (F64BinaryOp::Mul, *result, *left, *right),
-                    IrInstr::F64Div {
-                        result,
-                        left,
-                        right,
-                    } => (F64BinaryOp::Div, *result, *left, *right),
-                    IrInstr::F64Min {
-                        result,
-                        left,
-                        right,
-                    } => (F64BinaryOp::Min, *result, *left, *right),
-                    IrInstr::F64Max {
-                        result,
-                        left,
-                        right,
-                    } => (F64BinaryOp::Max, *result, *left, *right),
-                    IrInstr::F64Copysign {
-                        result,
-                        left,
-                        right,
-                    } => (F64BinaryOp::Copysign, *result, *left, *right),
-                    _ => return Err(CodegenError::UnsupportedInstruction("f64 binary")),
-                };
-                let left = state.expect(left, ValueType::F64)?;
-                let right = state.expect(right, ValueType::F64)?;
-                let result = state.define(result)?;
-                ops.push(BaselineOp::F64Binary {
-                    result,
-                    left,
-                    right,
-                    operation,
-                });
-            }
-            IrInstr::F64Unary {
-                result,
-                value,
-                operation,
-            } => {
-                let value = state.expect(*value, ValueType::F64)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::F64Unary {
-                    result,
-                    value,
-                    operation: *operation,
-                });
-            }
-            IrInstr::F64Compare {
-                result,
-                left,
-                right,
-                comparison,
-            } => {
-                let left = state.expect(*left, ValueType::F64)?;
-                let right = state.expect(*right, ValueType::F64)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::F64Compare {
-                    result,
-                    left,
-                    right,
-                    comparison: *comparison,
-                });
-            }
-            IrInstr::Drop { value } => {
-                // `drop` discards a value that has already been computed, so it
-                // only needs to type-check the operand; the slot stays live for
-                // the remainder of the straight-line sequence.
-                let value = state.slot(*value)?;
-                ops.push(BaselineOp::Drop { value });
-            }
-            IrInstr::Select {
-                result,
-                condition,
-                left,
-                right,
-            } => {
-                let condition = state.expect(*condition, ValueType::I32)?;
-                let (left_slot, left_type) = state.typed(*left)?;
-                let (right_slot, right_type) = state.typed(*right)?;
-                if left_type != right_type {
-                    return Err(CodegenError::TypeMismatch {
-                        value: *right,
-                        expected: left_type,
-                        actual: right_type,
+    // Block parameters (phi nodes) get slots up front so that an edge from any
+    // block can bind its operands no matter which order the blocks appear in.
+    let mut block_params = Vec::with_capacity(function.blocks.len());
+    for block in &function.blocks {
+        let mut slots = Vec::with_capacity(block.params.len());
+        for id in &block.params {
+            slots.push(state.define(*id)?);
+        }
+        block_params.push(slots);
+    }
+
+    let mut blocks = Vec::with_capacity(function.blocks.len());
+    for (index, block) in function.blocks.iter().enumerate() {
+        let mut ops = Vec::with_capacity(block.instrs.len() + 1);
+        for instruction in &block.instrs {
+            match instruction {
+                IrInstr::ConstI32 { result, value } => {
+                    let slot = state.define(*result)?;
+                    ops.push(BaselineOp::ConstI32 {
+                        slot,
+                        value: *value,
                     });
                 }
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::Select {
+                IrInstr::I32Add { .. }
+                | IrInstr::I32Sub { .. }
+                | IrInstr::I32Mul { .. }
+                | IrInstr::I32DivS { .. }
+                | IrInstr::I32DivU { .. }
+                | IrInstr::I32RemS { .. }
+                | IrInstr::I32RemU { .. }
+                | IrInstr::I32Shl { .. }
+                | IrInstr::I32ShrS { .. }
+                | IrInstr::I32ShrU { .. }
+                | IrInstr::I32Rotl { .. }
+                | IrInstr::I32Rotr { .. }
+                | IrInstr::I32And { .. }
+                | IrInstr::I32Or { .. }
+                | IrInstr::I32Xor { .. } => {
+                    let operation = match instruction {
+                        IrInstr::I32Add { .. } => I32BinaryOp::Add,
+                        IrInstr::I32Sub { .. } => I32BinaryOp::Sub,
+                        IrInstr::I32Mul { .. } => I32BinaryOp::Mul,
+                        IrInstr::I32DivS { .. } => I32BinaryOp::DivS,
+                        IrInstr::I32DivU { .. } => I32BinaryOp::DivU,
+                        IrInstr::I32RemS { .. } => I32BinaryOp::RemS,
+                        IrInstr::I32RemU { .. } => I32BinaryOp::RemU,
+                        IrInstr::I32Shl { .. } => I32BinaryOp::Shl,
+                        IrInstr::I32ShrS { .. } => I32BinaryOp::ShrS,
+                        IrInstr::I32ShrU { .. } => I32BinaryOp::ShrU,
+                        IrInstr::I32Rotl { .. } => I32BinaryOp::Rotl,
+                        IrInstr::I32Rotr { .. } => I32BinaryOp::Rotr,
+                        IrInstr::I32And { .. } => I32BinaryOp::And,
+                        IrInstr::I32Or { .. } => I32BinaryOp::Or,
+                        IrInstr::I32Xor { .. } => I32BinaryOp::Xor,
+                        _ => return Err(CodegenError::UnsupportedInstruction("i32 binary")),
+                    };
+                    let (result, left, right) = match instruction {
+                        IrInstr::I32Add {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32Sub {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32Mul {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32DivS {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32DivU {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32RemS {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32RemU {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32Shl {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32ShrS {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32ShrU {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32Rotl {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32Rotr {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32And {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32Or {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I32Xor {
+                            result,
+                            left,
+                            right,
+                        } => (*result, *left, *right),
+                        _ => unreachable!(),
+                    };
+                    let left = state.expect(left, ValueType::I32)?;
+                    let right = state.expect(right, ValueType::I32)?;
+                    let result = state.define(result)?;
+                    ops.push(BaselineOp::I32Binary {
+                        result,
+                        left,
+                        right,
+                        operation,
+                    });
+                }
+                IrInstr::I32Eqz { result, value } => {
+                    let value = state.expect(*value, ValueType::I32)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::I32Eqz { result, value });
+                }
+                IrInstr::I32Compare {
+                    result,
+                    left,
+                    right,
+                    comparison,
+                } => {
+                    let left = state.expect(*left, ValueType::I32)?;
+                    let right = state.expect(*right, ValueType::I32)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::I32Compare {
+                        result,
+                        left,
+                        right,
+                        comparison: *comparison,
+                    });
+                }
+                IrInstr::ConstI64 { result, value } => {
+                    let slot = state.define(*result)?;
+                    ops.push(BaselineOp::ConstI64 {
+                        slot,
+                        value: *value,
+                    });
+                }
+                IrInstr::I64Add { .. }
+                | IrInstr::I64Sub { .. }
+                | IrInstr::I64Mul { .. }
+                | IrInstr::I64DivS { .. }
+                | IrInstr::I64DivU { .. }
+                | IrInstr::I64RemS { .. }
+                | IrInstr::I64RemU { .. }
+                | IrInstr::I64Shl { .. }
+                | IrInstr::I64ShrS { .. }
+                | IrInstr::I64ShrU { .. }
+                | IrInstr::I64Rotl { .. }
+                | IrInstr::I64Rotr { .. }
+                | IrInstr::I64And { .. }
+                | IrInstr::I64Or { .. }
+                | IrInstr::I64Xor { .. } => {
+                    let operation = match instruction {
+                        IrInstr::I64Add { .. } => I64BinaryOp::Add,
+                        IrInstr::I64Sub { .. } => I64BinaryOp::Sub,
+                        IrInstr::I64Mul { .. } => I64BinaryOp::Mul,
+                        IrInstr::I64DivS { .. } => I64BinaryOp::DivS,
+                        IrInstr::I64DivU { .. } => I64BinaryOp::DivU,
+                        IrInstr::I64RemS { .. } => I64BinaryOp::RemS,
+                        IrInstr::I64RemU { .. } => I64BinaryOp::RemU,
+                        IrInstr::I64Shl { .. } => I64BinaryOp::Shl,
+                        IrInstr::I64ShrS { .. } => I64BinaryOp::ShrS,
+                        IrInstr::I64ShrU { .. } => I64BinaryOp::ShrU,
+                        IrInstr::I64Rotl { .. } => I64BinaryOp::Rotl,
+                        IrInstr::I64Rotr { .. } => I64BinaryOp::Rotr,
+                        IrInstr::I64And { .. } => I64BinaryOp::And,
+                        IrInstr::I64Or { .. } => I64BinaryOp::Or,
+                        IrInstr::I64Xor { .. } => I64BinaryOp::Xor,
+                        _ => return Err(CodegenError::UnsupportedInstruction("i64 binary")),
+                    };
+                    let (result, left, right) = match instruction {
+                        IrInstr::I64Add {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64Sub {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64Mul {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64DivS {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64DivU {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64RemS {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64RemU {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64Shl {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64ShrS {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64ShrU {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64Rotl {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64Rotr {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64And {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64Or {
+                            result,
+                            left,
+                            right,
+                        }
+                        | IrInstr::I64Xor {
+                            result,
+                            left,
+                            right,
+                        } => (*result, *left, *right),
+                        _ => unreachable!(),
+                    };
+                    let left = state.expect(left, ValueType::I64)?;
+                    let right = state.expect(right, ValueType::I64)?;
+                    let result = state.define(result)?;
+                    ops.push(BaselineOp::I64Binary {
+                        result,
+                        left,
+                        right,
+                        operation,
+                    });
+                }
+                IrInstr::I64Eqz { result, value } => {
+                    let value = state.expect(*value, ValueType::I64)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::I64Eqz { result, value });
+                }
+                IrInstr::I64Compare {
+                    result,
+                    left,
+                    right,
+                    comparison,
+                } => {
+                    let left = state.expect(*left, ValueType::I64)?;
+                    let right = state.expect(*right, ValueType::I64)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::I64Compare {
+                        result,
+                        left,
+                        right,
+                        comparison: *comparison,
+                    });
+                }
+                IrInstr::ConstF32 { result, value } => {
+                    let slot = state.define(*result)?;
+                    ops.push(BaselineOp::ConstF32 {
+                        slot,
+                        value: *value,
+                    });
+                }
+                IrInstr::F32Add { .. }
+                | IrInstr::F32Sub { .. }
+                | IrInstr::F32Mul { .. }
+                | IrInstr::F32Div { .. }
+                | IrInstr::F32Min { .. }
+                | IrInstr::F32Max { .. }
+                | IrInstr::F32Copysign { .. } => {
+                    let (operation, result, left, right) = match instruction {
+                        IrInstr::F32Add {
+                            result,
+                            left,
+                            right,
+                        } => (F32BinaryOp::Add, *result, *left, *right),
+                        IrInstr::F32Sub {
+                            result,
+                            left,
+                            right,
+                        } => (F32BinaryOp::Sub, *result, *left, *right),
+                        IrInstr::F32Mul {
+                            result,
+                            left,
+                            right,
+                        } => (F32BinaryOp::Mul, *result, *left, *right),
+                        IrInstr::F32Div {
+                            result,
+                            left,
+                            right,
+                        } => (F32BinaryOp::Div, *result, *left, *right),
+                        IrInstr::F32Min {
+                            result,
+                            left,
+                            right,
+                        } => (F32BinaryOp::Min, *result, *left, *right),
+                        IrInstr::F32Max {
+                            result,
+                            left,
+                            right,
+                        } => (F32BinaryOp::Max, *result, *left, *right),
+                        IrInstr::F32Copysign {
+                            result,
+                            left,
+                            right,
+                        } => (F32BinaryOp::Copysign, *result, *left, *right),
+                        _ => return Err(CodegenError::UnsupportedInstruction("f32 binary")),
+                    };
+                    let left = state.expect(left, ValueType::F32)?;
+                    let right = state.expect(right, ValueType::F32)?;
+                    let result = state.define(result)?;
+                    ops.push(BaselineOp::F32Binary {
+                        result,
+                        left,
+                        right,
+                        operation,
+                    });
+                }
+                IrInstr::F32Unary {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    let value = state.expect(*value, ValueType::F32)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::F32Unary {
+                        result,
+                        value,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::F32Compare {
+                    result,
+                    left,
+                    right,
+                    comparison,
+                } => {
+                    let left = state.expect(*left, ValueType::F32)?;
+                    let right = state.expect(*right, ValueType::F32)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::F32Compare {
+                        result,
+                        left,
+                        right,
+                        comparison: *comparison,
+                    });
+                }
+                IrInstr::ConstF64 { result, value } => {
+                    let slot = state.define(*result)?;
+                    ops.push(BaselineOp::ConstF64 {
+                        slot,
+                        value: *value,
+                    });
+                }
+                IrInstr::F64Add { .. }
+                | IrInstr::F64Sub { .. }
+                | IrInstr::F64Mul { .. }
+                | IrInstr::F64Div { .. }
+                | IrInstr::F64Min { .. }
+                | IrInstr::F64Max { .. }
+                | IrInstr::F64Copysign { .. } => {
+                    let (operation, result, left, right) = match instruction {
+                        IrInstr::F64Add {
+                            result,
+                            left,
+                            right,
+                        } => (F64BinaryOp::Add, *result, *left, *right),
+                        IrInstr::F64Sub {
+                            result,
+                            left,
+                            right,
+                        } => (F64BinaryOp::Sub, *result, *left, *right),
+                        IrInstr::F64Mul {
+                            result,
+                            left,
+                            right,
+                        } => (F64BinaryOp::Mul, *result, *left, *right),
+                        IrInstr::F64Div {
+                            result,
+                            left,
+                            right,
+                        } => (F64BinaryOp::Div, *result, *left, *right),
+                        IrInstr::F64Min {
+                            result,
+                            left,
+                            right,
+                        } => (F64BinaryOp::Min, *result, *left, *right),
+                        IrInstr::F64Max {
+                            result,
+                            left,
+                            right,
+                        } => (F64BinaryOp::Max, *result, *left, *right),
+                        IrInstr::F64Copysign {
+                            result,
+                            left,
+                            right,
+                        } => (F64BinaryOp::Copysign, *result, *left, *right),
+                        _ => return Err(CodegenError::UnsupportedInstruction("f64 binary")),
+                    };
+                    let left = state.expect(left, ValueType::F64)?;
+                    let right = state.expect(right, ValueType::F64)?;
+                    let result = state.define(result)?;
+                    ops.push(BaselineOp::F64Binary {
+                        result,
+                        left,
+                        right,
+                        operation,
+                    });
+                }
+                IrInstr::F64Unary {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    let value = state.expect(*value, ValueType::F64)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::F64Unary {
+                        result,
+                        value,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::F64Compare {
+                    result,
+                    left,
+                    right,
+                    comparison,
+                } => {
+                    let left = state.expect(*left, ValueType::F64)?;
+                    let right = state.expect(*right, ValueType::F64)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::F64Compare {
+                        result,
+                        left,
+                        right,
+                        comparison: *comparison,
+                    });
+                }
+                IrInstr::Drop { value } => {
+                    // `drop` discards a value that has already been computed, so it
+                    // only needs to type-check the operand; the slot stays live for
+                    // the remainder of the straight-line sequence.
+                    let value = state.slot(*value)?;
+                    ops.push(BaselineOp::Drop { value });
+                }
+                IrInstr::Select {
                     result,
                     condition,
-                    left: left_slot,
-                    right: right_slot,
-                });
-            }
-            IrInstr::LocalGet { result, local } => {
-                // Locals are pre-allocated slots, so a `get` is a typed copy.
-                let (local, _) = state.typed(*local)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::LocalGet { result, local });
-            }
-            IrInstr::LocalSet { local, value } => {
-                let (local, local_type) = state.typed(*local)?;
-                let value = state.expect(*value, local_type)?;
-                ops.push(BaselineOp::LocalSet { local, value });
-            }
-            IrInstr::LocalTee {
-                result,
-                local,
-                value,
-            } => {
-                let (local, local_type) = state.typed(*local)?;
-                let value = state.expect(*value, local_type)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::LocalTee {
+                    left,
+                    right,
+                } => {
+                    let condition = state.expect(*condition, ValueType::I32)?;
+                    let (left_slot, left_type) = state.typed(*left)?;
+                    let (right_slot, right_type) = state.typed(*right)?;
+                    if left_type != right_type {
+                        return Err(CodegenError::TypeMismatch {
+                            value: *right,
+                            expected: left_type,
+                            actual: right_type,
+                        });
+                    }
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::Select {
+                        result,
+                        condition,
+                        left: left_slot,
+                        right: right_slot,
+                    });
+                }
+                IrInstr::LocalGet { result, local } => {
+                    // Locals are pre-allocated slots, so a `get` is a typed copy.
+                    let (local, _) = state.typed(*local)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::LocalGet { result, local });
+                }
+                IrInstr::LocalSet { local, value } => {
+                    let (local, local_type) = state.typed(*local)?;
+                    let value = state.expect(*value, local_type)?;
+                    ops.push(BaselineOp::LocalSet { local, value });
+                }
+                IrInstr::LocalTee {
                     result,
                     local,
                     value,
-                });
-            }
-            IrInstr::I32Unary {
-                result,
-                value,
-                operation,
-            } => {
-                let value = state.expect(*value, ValueType::I32)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::I32Unary {
+                } => {
+                    let (local, local_type) = state.typed(*local)?;
+                    let value = state.expect(*value, local_type)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::LocalTee {
+                        result,
+                        local,
+                        value,
+                    });
+                }
+                IrInstr::I32Unary {
                     result,
                     value,
-                    operation: *operation,
-                });
-            }
-            IrInstr::I64Unary {
-                result,
-                value,
-                operation,
-            } => {
-                let value = state.expect(*value, ValueType::I64)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::I64Unary {
+                    operation,
+                } => {
+                    let value = state.expect(*value, ValueType::I32)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::I32Unary {
+                        result,
+                        value,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::I64Unary {
                     result,
                     value,
-                    operation: *operation,
-                });
-            }
-            IrInstr::IntConvert {
-                result,
-                value,
-                operation,
-            } => {
-                let source = match operation {
-                    tpt_wasm_ir::IntConversion::I32WrapI64 => ValueType::I64,
-                    tpt_wasm_ir::IntConversion::I64ExtendI32S
-                    | tpt_wasm_ir::IntConversion::I64ExtendI32U => ValueType::I32,
-                };
-                let value = state.expect(*value, source)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::IntConvert {
+                    operation,
+                } => {
+                    let value = state.expect(*value, ValueType::I64)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::I64Unary {
+                        result,
+                        value,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::IntConvert {
                     result,
                     value,
-                    operation: *operation,
-                });
-            }
-            IrInstr::Reinterpret {
-                result,
-                value,
-                operation,
-            } => {
-                let source = match operation {
-                    tpt_wasm_ir::Reinterpret::I32FromF32 => ValueType::F32,
-                    tpt_wasm_ir::Reinterpret::I64FromF64 => ValueType::F64,
-                    tpt_wasm_ir::Reinterpret::F32FromI32 => ValueType::I32,
-                    tpt_wasm_ir::Reinterpret::F64FromI64 => ValueType::I64,
-                };
-                let value = state.expect(*value, source)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::Reinterpret {
+                    operation,
+                } => {
+                    let source = match operation {
+                        tpt_wasm_ir::IntConversion::I32WrapI64 => ValueType::I64,
+                        tpt_wasm_ir::IntConversion::I64ExtendI32S
+                        | tpt_wasm_ir::IntConversion::I64ExtendI32U => ValueType::I32,
+                    };
+                    let value = state.expect(*value, source)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::IntConvert {
+                        result,
+                        value,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::Reinterpret {
                     result,
                     value,
-                    operation: *operation,
-                });
-            }
-            IrInstr::FloatConvert {
-                result,
-                value,
-                operation,
-            } => {
-                let source = match operation {
-                    tpt_wasm_ir::FloatConversion::F32FromI32S
-                    | tpt_wasm_ir::FloatConversion::F32FromI32U => ValueType::I32,
-                    tpt_wasm_ir::FloatConversion::F32FromI64S
-                    | tpt_wasm_ir::FloatConversion::F32FromI64U => ValueType::I64,
-                    tpt_wasm_ir::FloatConversion::F32FromF64 => ValueType::F64,
-                    tpt_wasm_ir::FloatConversion::F64FromI32S
-                    | tpt_wasm_ir::FloatConversion::F64FromI32U => ValueType::I32,
-                    tpt_wasm_ir::FloatConversion::F64FromI64S
-                    | tpt_wasm_ir::FloatConversion::F64FromI64U => ValueType::I64,
-                    tpt_wasm_ir::FloatConversion::F64FromF32 => ValueType::F32,
-                };
-                let value = state.expect(*value, source)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::FloatConvert {
+                    operation,
+                } => {
+                    let source = match operation {
+                        tpt_wasm_ir::Reinterpret::I32FromF32 => ValueType::F32,
+                        tpt_wasm_ir::Reinterpret::I64FromF64 => ValueType::F64,
+                        tpt_wasm_ir::Reinterpret::F32FromI32 => ValueType::I32,
+                        tpt_wasm_ir::Reinterpret::F64FromI64 => ValueType::I64,
+                    };
+                    let value = state.expect(*value, source)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::Reinterpret {
+                        result,
+                        value,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::FloatConvert {
                     result,
                     value,
-                    operation: *operation,
-                });
-            }
-            IrInstr::FloatTrunc {
-                result,
-                value,
-                operation,
-            } => {
-                let source = match operation {
-                    tpt_wasm_ir::FloatTrunc::I32FromF32S
-                    | tpt_wasm_ir::FloatTrunc::I32FromF32U
-                    | tpt_wasm_ir::FloatTrunc::I64FromF32S
-                    | tpt_wasm_ir::FloatTrunc::I64FromF32U => ValueType::F32,
-                    tpt_wasm_ir::FloatTrunc::I32FromF64S
-                    | tpt_wasm_ir::FloatTrunc::I32FromF64U
-                    | tpt_wasm_ir::FloatTrunc::I64FromF64S
-                    | tpt_wasm_ir::FloatTrunc::I64FromF64U => ValueType::F64,
-                };
-                let value = state.expect(*value, source)?;
-                let result = state.define(*result)?;
-                ops.push(BaselineOp::FloatTrunc {
+                    operation,
+                } => {
+                    let source = match operation {
+                        tpt_wasm_ir::FloatConversion::F32FromI32S
+                        | tpt_wasm_ir::FloatConversion::F32FromI32U => ValueType::I32,
+                        tpt_wasm_ir::FloatConversion::F32FromI64S
+                        | tpt_wasm_ir::FloatConversion::F32FromI64U => ValueType::I64,
+                        tpt_wasm_ir::FloatConversion::F32FromF64 => ValueType::F64,
+                        tpt_wasm_ir::FloatConversion::F64FromI32S
+                        | tpt_wasm_ir::FloatConversion::F64FromI32U => ValueType::I32,
+                        tpt_wasm_ir::FloatConversion::F64FromI64S
+                        | tpt_wasm_ir::FloatConversion::F64FromI64U => ValueType::I64,
+                        tpt_wasm_ir::FloatConversion::F64FromF32 => ValueType::F32,
+                    };
+                    let value = state.expect(*value, source)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::FloatConvert {
+                        result,
+                        value,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::FloatTrunc {
                     result,
                     value,
-                    operation: *operation,
-                });
+                    operation,
+                } => {
+                    let source = match operation {
+                        tpt_wasm_ir::FloatTrunc::I32FromF32S
+                        | tpt_wasm_ir::FloatTrunc::I32FromF32U
+                        | tpt_wasm_ir::FloatTrunc::I64FromF32S
+                        | tpt_wasm_ir::FloatTrunc::I64FromF32U => ValueType::F32,
+                        tpt_wasm_ir::FloatTrunc::I32FromF64S
+                        | tpt_wasm_ir::FloatTrunc::I32FromF64U
+                        | tpt_wasm_ir::FloatTrunc::I64FromF64S
+                        | tpt_wasm_ir::FloatTrunc::I64FromF64U => ValueType::F64,
+                    };
+                    let value = state.expect(*value, source)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::FloatTrunc {
+                        result,
+                        value,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::Call {
+                    function,
+                    arguments,
+                    results,
+                } => {
+                    // The callee's signature was checked against the module by the
+                    // verifier; the baseline only needs the argument and result
+                    // slots, and re-checks that the arity is self-consistent.
+                    let mut argument_slots = Vec::with_capacity(arguments.len());
+                    for id in arguments {
+                        argument_slots.push(state.slot(*id)?);
+                    }
+                    let mut result_slots = Vec::with_capacity(results.len());
+                    for id in results {
+                        result_slots.push(state.define(*id)?);
+                    }
+                    ops.push(BaselineOp::Call {
+                        function: *function,
+                        arguments: argument_slots,
+                        results: result_slots,
+                    });
+                }
+                IrInstr::CallIndirect {
+                    type_index,
+                    operand,
+                    arguments,
+                    results,
+                    ..
+                } => {
+                    let operand = state.expect(*operand, ValueType::I32)?;
+                    let mut argument_slots = Vec::with_capacity(arguments.len());
+                    for id in arguments {
+                        argument_slots.push(state.slot(*id)?);
+                    }
+                    let mut result_slots = Vec::with_capacity(results.len());
+                    for id in results {
+                        result_slots.push(state.define(*id)?);
+                    }
+                    ops.push(BaselineOp::CallIndirect {
+                        type_index: *type_index,
+                        operand,
+                        arguments: argument_slots,
+                        results: result_slots,
+                    });
+                }
+                IrInstr::Load {
+                    result,
+                    address,
+                    offset,
+                    operation,
+                } => {
+                    let address = state.expect(*address, ValueType::I32)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::Load {
+                        result,
+                        address,
+                        offset: *offset,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::Store {
+                    address,
+                    value,
+                    offset,
+                    operation,
+                } => {
+                    let address = state.expect(*address, ValueType::I32)?;
+                    let value = state.expect(*value, operation.operand_type())?;
+                    ops.push(BaselineOp::Store {
+                        address,
+                        value,
+                        offset: *offset,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::MemorySize { result } => {
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::MemorySize { result });
+                }
+                IrInstr::MemoryGrow { result, delta } => {
+                    let delta = state.expect(*delta, ValueType::I32)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::MemoryGrow { result, delta });
+                }
+                IrInstr::GlobalGet { result, global } => {
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::GlobalGet {
+                        result,
+                        global: *global,
+                    });
+                }
+                IrInstr::GlobalSet { global, value } => {
+                    // The global's declared type was checked by the verifier; the
+                    // baseline only needs the value's slot.
+                    let value = state.slot(*value)?;
+                    ops.push(BaselineOp::GlobalSet {
+                        global: *global,
+                        value,
+                    });
+                } // Every IR instruction is lowered above. When the IR grows, this
+                  // arm becomes reachable again and rejects the new instruction
+                  // rather than silently dropping it; until then it is dead, so the
+                  // `IrInstr` match above is the exhaustive one.
             }
-            _ => return Err(CodegenError::UnsupportedInstruction("instruction")),
         }
+        let terminator = match &block.terminator {
+            Terminator::Return(results) => {
+                let mut slots = Vec::with_capacity(results.len());
+                for (id, expected) in results.iter().zip(&function.function_type.results.0) {
+                    slots.push(state.expect(*id, *expected)?);
+                }
+                if slots.len() != function.function_type.results.0.len() {
+                    return Err(CodegenError::UnsupportedTerminator("return arity"));
+                }
+                BaselineOp::Return(slots)
+            }
+            Terminator::Trap(trap) => BaselineOp::Trap(trap.clone()),
+            Terminator::Unreachable => BaselineOp::Unreachable,
+            Terminator::Branch { target, values } => {
+                let (index, slots) = lower_edge(*target, values, &index_of, &block_params, &state)?;
+                BaselineOp::Branch {
+                    target: index,
+                    values: slots,
+                }
+            }
+            Terminator::CondBranch {
+                condition,
+                then_target,
+                then_values,
+                else_target,
+                else_values,
+            } => {
+                let condition = state.expect(*condition, ValueType::I32)?;
+                let (then_index, then_slots) =
+                    lower_edge(*then_target, then_values, &index_of, &block_params, &state)?;
+                let (else_index, else_slots) =
+                    lower_edge(*else_target, else_values, &index_of, &block_params, &state)?;
+                BaselineOp::CondBranch {
+                    condition,
+                    then_target: then_index,
+                    then_values: then_slots,
+                    else_target: else_index,
+                    else_values: else_slots,
+                }
+            }
+        };
+        ops.push(terminator);
+        blocks.push(BaselineBlock {
+            params: block_params[index].clone(),
+            ops,
+        });
     }
-    let terminator = match &block.terminator {
-        Terminator::Return(results) => {
-            let mut slots = Vec::with_capacity(results.len());
-            for (id, expected) in results.iter().zip(&function.function_type.results.0) {
-                slots.push(state.expect(*id, *expected)?);
-            }
-            if slots.len() != function.function_type.results.0.len() {
-                return Err(CodegenError::UnsupportedTerminator("return arity"));
-            }
-            BaselineOp::Return(slots)
-        }
-        Terminator::Trap(trap) => BaselineOp::Trap(trap.clone()),
-        Terminator::Unreachable => BaselineOp::Unreachable,
-        // The portable baseline executor is still single-block; control flow
-        // is rejected rather than approximated, per the lowering contract.
-        Terminator::Branch { .. } | Terminator::CondBranch { .. } => {
-            return Err(CodegenError::UnsupportedTerminator("control flow"))
-        }
-    };
-    ops.push(terminator);
     Ok(BaselineFunction {
         function_type: function.function_type.clone(),
         params,
         locals,
         value_types: state.types,
-        ops,
+        blocks,
+        entry,
     })
+}
+
+/// Resolve one outgoing edge: the target's block index plus the slots of the
+/// operands bound to that block's parameters.
+///
+/// The verifier has already proved edges well-typed, but the baseline re-checks
+/// arity and types so it stays safe when handed an unverified IR function.
+fn lower_edge(
+    target: BlockId,
+    values: &[ValueId],
+    index_of: &HashMap<BlockId, u32>,
+    block_params: &[Vec<u32>],
+    state: &SlotState,
+) -> Result<(u32, Vec<u32>), CodegenError> {
+    let index = *index_of
+        .get(&target)
+        .ok_or(CodegenError::UnknownBlock(target))?;
+    let expected = &block_params[index as usize];
+    if values.len() != expected.len() {
+        return Err(CodegenError::BranchArity {
+            target,
+            expected: expected.len(),
+            actual: values.len(),
+        });
+    }
+    let mut slots = Vec::with_capacity(values.len());
+    for (id, param) in values.iter().zip(expected) {
+        // Target parameters are already allocated slots, so their type is known
+        // without a second lookup through the value table.
+        slots.push(state.expect(*id, state.types[*param as usize])?);
+    }
+    Ok((index, slots))
+}
+
+/// Lower every function of a verified module into a function table.
+///
+/// A `Call` names a function by module index, so the functions must be lowered
+/// together to be executable.
+pub fn lower_module(module: &tpt_wasm_ir::IrModule) -> Result<Vec<BaselineFunction>, CodegenError> {
+    module.functions.iter().map(lower_function).collect()
+}
+
+/// The linear memory a lowered module executes against.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BaselineMemory {
+    data: Vec<u8>,
+    max_pages: Option<u64>,
+}
+
+/// One 64 KiB page.
+const PAGE_SIZE: usize = 65_536;
+/// The architecture limit on page count, and so on address space.
+const MAX_PAGES: u64 = 65_536;
+
+impl BaselineMemory {
+    /// Build a memory of `min_pages` zeroed pages, capped by `max_pages`.
+    pub fn new(min_pages: u64, max_pages: Option<u64>) -> Result<Self, CodegenError> {
+        if min_pages > MAX_PAGES {
+            return Err(CodegenError::UnsupportedMemory("page count"));
+        }
+        let bytes = usize::try_from(min_pages * PAGE_SIZE as u64)
+            .map_err(|_| CodegenError::UnsupportedMemory("page count"))?;
+        Ok(Self {
+            data: vec![0; bytes],
+            max_pages,
+        })
+    }
+
+    /// Current size in pages.
+    pub fn pages(&self) -> u32 {
+        u32::try_from(self.data.len() / PAGE_SIZE).unwrap_or(u32::MAX)
+    }
+
+    /// Read `width` bytes little-endian, trapping if the access is out of bounds.
+    fn read(&self, address: u64, width: u64) -> Result<u64, Trap> {
+        let end = address.checked_add(width).ok_or(Trap::MemoryOutOfBounds)?;
+        if end > self.data.len() as u64 {
+            return Err(Trap::MemoryOutOfBounds);
+        }
+        let start = address as usize;
+        let mut bits = 0u64;
+        for (index, byte) in self.data[start..start + width as usize].iter().enumerate() {
+            bits |= u64::from(*byte) << (index * 8);
+        }
+        Ok(bits)
+    }
+
+    /// Write the low `width` bytes of `bits`, trapping if out of bounds.
+    fn write(&mut self, address: u64, width: u64, bits: u64) -> Result<(), Trap> {
+        let end = address.checked_add(width).ok_or(Trap::MemoryOutOfBounds)?;
+        if end > self.data.len() as u64 {
+            return Err(Trap::MemoryOutOfBounds);
+        }
+        let start = address as usize;
+        for index in 0..width as usize {
+            self.data[start + index] = (bits >> (index * 8)) as u8;
+        }
+        Ok(())
+    }
+
+    /// Grow by `delta` pages, returning the previous size or -1 on failure.
+    fn grow(&mut self, delta: u64) -> i32 {
+        let previous = self.pages() as u64;
+        let requested = match previous.checked_add(delta) {
+            Some(total) => total,
+            None => return -1,
+        };
+        if let Some(max) = self.max_pages {
+            if requested > max {
+                return -1;
+            }
+        }
+        if requested > MAX_PAGES {
+            return -1;
+        }
+        let bytes = match usize::try_from(requested * PAGE_SIZE as u64) {
+            Ok(bytes) => bytes,
+            Err(_) => return -1,
+        };
+        self.data.resize(bytes, 0);
+        previous as i32
+    }
+}
+
+/// A lowered module: its functions plus the table, memory, and globals they
+/// share.
+///
+/// State is shared across calls exactly as it is in Wasm, so a callee observes
+/// the caller's stores and a `global.set` inside a callee is visible to the
+/// caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineModule {
+    pub functions: Vec<BaselineFunction>,
+    /// One table, holding optional function indices into `functions`.
+    table: Option<BaselineTable>,
+    /// The module's function types, needed to check an indirect call's target.
+    types: Vec<FunctionType>,
+    memory: Option<BaselineMemory>,
+    globals: Vec<Value>,
+}
+
+/// A table of optional function references, as MVP `funcref` tables hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaselineTable {
+    /// `None` is a null reference, which `call_indirect` traps on.
+    elements: Vec<Option<u32>>,
+}
+
+impl BaselineModule {
+    /// Build a runnable module from a verified IR module and its lowered
+    /// functions, which must be in the same order.
+    pub fn new(
+        module: &tpt_wasm_ir::IrModule,
+        functions: Vec<BaselineFunction>,
+    ) -> Result<Self, CodegenError> {
+        let memory = match module.memory.as_ref() {
+            Some(declaration) => {
+                let mut memory = BaselineMemory::new(declaration.min_pages, declaration.max_pages)?;
+                // Active data segments are applied in module order, so a later
+                // segment overwrites an earlier one at the same address.
+                for segment in &declaration.segments {
+                    let start = segment.offset as usize;
+                    let end = start + segment.bytes.len();
+                    if end > memory.data.len() {
+                        return Err(CodegenError::UnsupportedMemory(
+                            "data segment does not fit the memory",
+                        ));
+                    }
+                    memory.data[start..end].copy_from_slice(&segment.bytes);
+                }
+                Some(memory)
+            }
+            None => None,
+        };
+        let table = match module.tables.first() {
+            Some(declaration) => {
+                let length = usize::try_from(declaration.min)
+                    .map_err(|_| CodegenError::UnsupportedMemory("table size"))?;
+                let mut elements = vec![None; length];
+                for (position, function) in declaration.elements.iter().enumerate() {
+                    let slot = declaration.offset as usize + position;
+                    // The validator bounds-checks the segment against the table,
+                    // so a slot past the end here means the two disagree.
+                    let cell = elements
+                        .get_mut(slot)
+                        .ok_or(CodegenError::UnsupportedMemory(
+                            "element segment does not fit the table",
+                        ))?;
+                    *cell = Some(*function);
+                }
+                Some(BaselineTable { elements })
+            }
+            None => None,
+        };
+        Ok(Self {
+            functions,
+            table,
+            types: module.types.clone(),
+            memory,
+            globals: module.globals.iter().map(|g| g.init.clone()).collect(),
+        })
+    }
+
+    /// Lower a verified IR module and wrap it so it can be executed.
+    pub fn lower(module: &tpt_wasm_ir::IrModule) -> Result<Self, CodegenError> {
+        Self::new(module, lower_module(module)?)
+    }
+
+    /// Call one function by index.
+    pub fn call(&mut self, index: usize, args: Vec<Value>) -> Result<Vec<Value>, Trap> {
+        if index >= self.functions.len() {
+            return Err(Trap::HostFailure(
+                "baseline call target is not in the module".into(),
+            ));
+        }
+        // `functions` is copied out so the callee borrow is independent of
+        // `self`, which lets the recursive call take `&mut state` as well.
+        let functions: &[BaselineFunction] = &self.functions;
+        let mut state = ExecState {
+            functions,
+            table: self.table.as_ref(),
+            types: &self.types,
+            memory: self.memory.as_mut(),
+            globals: &mut self.globals,
+        };
+        functions[index].run(&mut state, args)
+    }
+}
+
+/// Everything one execution shares: the callee table, the table, memory, globals.
+struct ExecState<'a> {
+    functions: &'a [BaselineFunction],
+    table: Option<&'a BaselineTable>,
+    /// Module types, so an indirect call can check its target's signature.
+    types: &'a [FunctionType],
+    memory: Option<&'a mut BaselineMemory>,
+    globals: &'a mut Vec<Value>,
 }
 
 impl BaselineFunction {
     /// Execute this portable baseline function without invoking Micro.
+    ///
+    /// This has no module, so a function that calls, or that touches memory or
+    /// globals, cannot run this way; use [`BaselineModule::call`].
     pub fn execute(&self, args: Vec<Value>) -> Result<Vec<Value>, Trap> {
+        self.execute_with(&[], args)
+    }
+
+    /// Execute this function with `functions` as the module's function table.
+    ///
+    /// There is still no memory or global state, so a function using those traps
+    /// rather than silently reading uninitialized data.
+    pub fn execute_with(
+        &self,
+        functions: &[BaselineFunction],
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, Trap> {
+        let functions: &[BaselineFunction] = functions;
+        let mut state = ExecState {
+            functions,
+            table: None,
+            types: &[],
+            memory: None,
+            globals: &mut Vec::new(),
+        };
+        self.run(&mut state, args)
+    }
+
+    /// Run this function against the module state, which is shared with any
+    /// callee it invokes.
+    fn run(&self, state: &mut ExecState<'_>, args: Vec<Value>) -> Result<Vec<Value>, Trap> {
         if args.len() != self.params.len() {
             return Err(Trap::HostFailure("baseline argument arity mismatch".into()));
         }
@@ -1057,230 +1560,408 @@ impl BaselineFunction {
         for slot in &self.locals {
             slots[*slot as usize] = Some(default_value(self.value_types[*slot as usize]));
         }
-        for op in &self.ops {
-            match op {
-                BaselineOp::ConstI32 { slot, value } => {
-                    slots[*slot as usize] = Some(Value::I32(*value));
+        // Walk the block graph from the entry block. A well-formed function always
+        // reaches a `Return`, `Trap`, or `Unreachable`; a block that falls off the
+        // end is a lowering bug and is reported rather than silently accepted.
+        let mut current = self.entry;
+        loop {
+            let block = &self.blocks[current as usize];
+            let mut next: Option<(u32, Vec<u32>)> = None;
+            for op in &block.ops {
+                match op {
+                    BaselineOp::ConstI32 { slot, value } => {
+                        slots[*slot as usize] = Some(Value::I32(*value));
+                    }
+                    BaselineOp::I32Binary {
+                        result,
+                        left,
+                        right,
+                        operation,
+                    } => {
+                        let left = i32_slot(&slots, *left)?;
+                        let right = i32_slot(&slots, *right)?;
+                        let value = eval_i32_binary(*operation, left, right)?;
+                        slots[*result as usize] = Some(Value::I32(value));
+                    }
+                    BaselineOp::I32Eqz { result, value } => {
+                        let value = i32_slot(&slots, *value)?;
+                        slots[*result as usize] = Some(Value::I32((value == 0) as i32));
+                    }
+                    BaselineOp::I32Compare {
+                        result,
+                        left,
+                        right,
+                        comparison,
+                    } => {
+                        let left = i32_slot(&slots, *left)?;
+                        let right = i32_slot(&slots, *right)?;
+                        slots[*result as usize] =
+                            Some(Value::I32(compare_i32(left, right, *comparison)));
+                    }
+                    BaselineOp::ConstI64 { slot, value } => {
+                        slots[*slot as usize] = Some(Value::I64(*value));
+                    }
+                    BaselineOp::I64Binary {
+                        result,
+                        left,
+                        right,
+                        operation,
+                    } => {
+                        let left = i64_slot(&slots, *left)?;
+                        let right = i64_slot(&slots, *right)?;
+                        let value = eval_i64_binary(*operation, left, right)?;
+                        slots[*result as usize] = Some(Value::I64(value));
+                    }
+                    BaselineOp::I64Eqz { result, value } => {
+                        let value = i64_slot(&slots, *value)?;
+                        slots[*result as usize] = Some(Value::I32((value == 0) as i32));
+                    }
+                    BaselineOp::I64Compare {
+                        result,
+                        left,
+                        right,
+                        comparison,
+                    } => {
+                        let left = i64_slot(&slots, *left)?;
+                        let right = i64_slot(&slots, *right)?;
+                        slots[*result as usize] =
+                            Some(Value::I32(compare_i64(left, right, *comparison)));
+                    }
+                    BaselineOp::ConstF32 { slot, value } => {
+                        slots[*slot as usize] = Some(Value::F32(*value));
+                    }
+                    BaselineOp::F32Binary {
+                        result,
+                        left,
+                        right,
+                        operation,
+                    } => {
+                        let left = f32_slot(&slots, *left)?;
+                        let right = f32_slot(&slots, *right)?;
+                        slots[*result as usize] =
+                            Some(Value::F32(eval_f32_binary(*operation, left, right)));
+                    }
+                    BaselineOp::F32Unary {
+                        result,
+                        value,
+                        operation,
+                    } => {
+                        let value = f32_slot(&slots, *value)?;
+                        slots[*result as usize] =
+                            Some(Value::F32(eval_f32_unary(*operation, value)));
+                    }
+                    BaselineOp::F32Compare {
+                        result,
+                        left,
+                        right,
+                        comparison,
+                    } => {
+                        let left = f32_slot(&slots, *left)?;
+                        let right = f32_slot(&slots, *right)?;
+                        slots[*result as usize] =
+                            Some(Value::I32(compare_f32(left, right, *comparison) as i32));
+                    }
+                    BaselineOp::ConstF64 { slot, value } => {
+                        slots[*slot as usize] = Some(Value::F64(*value));
+                    }
+                    BaselineOp::F64Binary {
+                        result,
+                        left,
+                        right,
+                        operation,
+                    } => {
+                        let left = f64_slot(&slots, *left)?;
+                        let right = f64_slot(&slots, *right)?;
+                        slots[*result as usize] =
+                            Some(Value::F64(eval_f64_binary(*operation, left, right)));
+                    }
+                    BaselineOp::F64Unary {
+                        result,
+                        value,
+                        operation,
+                    } => {
+                        let value = f64_slot(&slots, *value)?;
+                        slots[*result as usize] =
+                            Some(Value::F64(eval_f64_unary(*operation, value)));
+                    }
+                    BaselineOp::F64Compare {
+                        result,
+                        left,
+                        right,
+                        comparison,
+                    } => {
+                        let left = f64_slot(&slots, *left)?;
+                        let right = f64_slot(&slots, *right)?;
+                        slots[*result as usize] =
+                            Some(Value::I32(compare_f64(left, right, *comparison) as i32));
+                    }
+                    BaselineOp::Drop { value } => {
+                        // The operand was already evaluated; a straight-line `drop`
+                        // only ends its live range, so the slot is left untouched.
+                        let _ = read_slot(&slots, *value)?;
+                    }
+                    BaselineOp::Select {
+                        result,
+                        condition,
+                        left,
+                        right,
+                    } => {
+                        let condition = i32_slot(&slots, *condition)?;
+                        let selected = if condition != 0 {
+                            read_slot(&slots, *left)?
+                        } else {
+                            read_slot(&slots, *right)?
+                        };
+                        slots[*result as usize] = Some(selected);
+                    }
+                    BaselineOp::LocalGet { result, local } => {
+                        slots[*result as usize] = Some(read_slot(&slots, *local)?);
+                    }
+                    BaselineOp::LocalSet { local, value } => {
+                        slots[*local as usize] = Some(read_slot(&slots, *value)?);
+                    }
+                    BaselineOp::LocalTee {
+                        result,
+                        local,
+                        value,
+                    } => {
+                        let value = read_slot(&slots, *value)?;
+                        slots[*local as usize] = Some(value.clone());
+                        slots[*result as usize] = Some(value);
+                    }
+                    BaselineOp::I32Unary {
+                        result,
+                        value,
+                        operation,
+                    } => {
+                        let value = i32_slot(&slots, *value)?;
+                        slots[*result as usize] =
+                            Some(Value::I32(eval_i32_unary(*operation, value)));
+                    }
+                    BaselineOp::I64Unary {
+                        result,
+                        value,
+                        operation,
+                    } => {
+                        let value = i64_slot(&slots, *value)?;
+                        slots[*result as usize] =
+                            Some(Value::I64(eval_i64_unary(*operation, value)));
+                    }
+                    BaselineOp::IntConvert {
+                        result,
+                        value,
+                        operation,
+                    } => {
+                        slots[*result as usize] =
+                            Some(eval_int_convert(&slots, *operation, *value)?);
+                    }
+                    BaselineOp::Reinterpret {
+                        result,
+                        value,
+                        operation,
+                    } => {
+                        slots[*result as usize] =
+                            Some(eval_reinterpret(&slots, *operation, *value)?);
+                    }
+                    BaselineOp::FloatConvert {
+                        result,
+                        value,
+                        operation,
+                    } => {
+                        slots[*result as usize] =
+                            Some(eval_float_convert(&slots, *operation, *value)?);
+                    }
+                    BaselineOp::FloatTrunc {
+                        result,
+                        value,
+                        operation,
+                    } => {
+                        slots[*result as usize] =
+                            Some(eval_float_trunc(&slots, *operation, *value)?);
+                    }
+                    BaselineOp::Return(results) => {
+                        return results
+                            .iter()
+                            .map(|slot| {
+                                slots
+                                    .get(*slot as usize)
+                                    .and_then(Clone::clone)
+                                    .ok_or_else(|| {
+                                        Trap::HostFailure("baseline return slot is empty".into())
+                                    })
+                            })
+                            .collect();
+                    }
+                    BaselineOp::Trap(trap) => return Err(trap.clone()),
+                    BaselineOp::Unreachable => return Err(Trap::Unreachable),
+                    BaselineOp::Load {
+                        result,
+                        address,
+                        offset,
+                        operation,
+                    } => {
+                        let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+                        let effective = effective_address(&slots, *address, *offset)?;
+                        let bits = memory.read(effective, u64::from(operation.width()))?;
+                        slots[*result as usize] = Some(decode_load(*operation, bits));
+                    }
+                    BaselineOp::Store {
+                        address,
+                        value,
+                        offset,
+                        operation,
+                    } => {
+                        let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+                        let effective = effective_address(&slots, *address, *offset)?;
+                        let bits = value_bits(&slots, *value)?;
+                        memory.write(effective, u64::from(operation.width()), bits)?;
+                    }
+                    BaselineOp::MemorySize { result } => {
+                        let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+                        slots[*result as usize] = Some(Value::I32(memory.pages() as i32));
+                    }
+                    BaselineOp::MemoryGrow { result, delta } => {
+                        let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+                        let delta = i32_slot(&slots, *delta)? as u32 as u64;
+                        slots[*result as usize] = Some(Value::I32(memory.grow(delta)));
+                    }
+                    BaselineOp::GlobalGet { result, global } => {
+                        let value = state
+                            .globals
+                            .get(*global as usize)
+                            .ok_or_else(|| {
+                                Trap::HostFailure("baseline global index is out of range".into())
+                            })?
+                            .clone();
+                        slots[*result as usize] = Some(value);
+                    }
+                    BaselineOp::GlobalSet { global, value } => {
+                        let stored = read_slot(&slots, *value)?;
+                        let slot = state.globals.get_mut(*global as usize).ok_or_else(|| {
+                            Trap::HostFailure("baseline global index is out of range".into())
+                        })?;
+                        *slot = stored;
+                    }
+                    BaselineOp::Branch { target, values } => {
+                        next = Some((*target, values.clone()));
+                        break;
+                    }
+                    BaselineOp::CondBranch {
+                        condition,
+                        then_target,
+                        then_values,
+                        else_target,
+                        else_values,
+                    } => {
+                        let condition = i32_slot(&slots, *condition)?;
+                        next = Some(if condition != 0 {
+                            (*then_target, then_values.clone())
+                        } else {
+                            (*else_target, else_values.clone())
+                        });
+                        break;
+                    }
+                    BaselineOp::Call {
+                        function,
+                        arguments,
+                        results,
+                    } => {
+                        // An index outside the table means the function table does
+                        // not match the one this function was lowered against.
+                        let callee = state.functions.get(*function as usize).ok_or_else(|| {
+                            Trap::HostFailure("baseline call target is not in the module".into())
+                        })?;
+                        if callee.params.len() != arguments.len() {
+                            return Err(Trap::HostFailure(
+                                "baseline call argument arity mismatch".into(),
+                            ));
+                        }
+                        let mut call_args = Vec::with_capacity(arguments.len());
+                        for slot in arguments {
+                            call_args.push(read_slot(&slots, *slot)?);
+                        }
+                        let returned = callee.run(state, call_args)?;
+                        if returned.len() != results.len() {
+                            return Err(Trap::HostFailure(
+                                "baseline call result arity mismatch".into(),
+                            ));
+                        }
+                        for (slot, value) in results.iter().copied().zip(returned) {
+                            check_value_type(&value, self.value_types[slot as usize])?;
+                            slots[slot as usize] = Some(value);
+                        }
+                    }
+                    BaselineOp::CallIndirect {
+                        type_index,
+                        operand,
+                        arguments,
+                        results,
+                    } => {
+                        let table = state.table.ok_or_else(|| {
+                            Trap::HostFailure("baseline indirect call needs a table".into())
+                        })?;
+                        let index = i32_slot(&slots, *operand)? as u32;
+                        // Out of range and null are distinct traps, matching the
+                        // order in which the reference is resolved.
+                        let target = table
+                            .elements
+                            .get(index as usize)
+                            .copied()
+                            .ok_or(Trap::TableOutOfBounds)?
+                            .ok_or(Trap::NullReference)?;
+                        let callee = state.functions.get(target as usize).ok_or_else(|| {
+                            Trap::HostFailure(
+                                "baseline indirect target is not in the module".into(),
+                            )
+                        })?;
+                        // The signature is checked against the entry the table
+                        // holds, not against the type index the call names, since
+                        // a mismatch is exactly the trap we are modelling.
+                        let expected = state.types.get(*type_index as usize).ok_or_else(|| {
+                            Trap::HostFailure("baseline indirect call type is unknown".into())
+                        })?;
+                        if &callee.function_type != expected {
+                            return Err(Trap::IndirectCallTypeMismatch);
+                        }
+                        let mut call_args = Vec::with_capacity(arguments.len());
+                        for slot in arguments {
+                            call_args.push(read_slot(&slots, *slot)?);
+                        }
+                        let returned = callee.run(state, call_args)?;
+                        if returned.len() != results.len() {
+                            return Err(Trap::HostFailure(
+                                "baseline indirect call result arity mismatch".into(),
+                            ));
+                        }
+                        for (slot, value) in results.iter().copied().zip(returned) {
+                            check_value_type(&value, self.value_types[slot as usize])?;
+                            slots[slot as usize] = Some(value);
+                        }
+                    }
                 }
-                BaselineOp::I32Binary {
-                    result,
-                    left,
-                    right,
-                    operation,
-                } => {
-                    let left = i32_slot(&slots, *left)?;
-                    let right = i32_slot(&slots, *right)?;
-                    let value = eval_i32_binary(*operation, left, right)?;
-                    slots[*result as usize] = Some(Value::I32(value));
-                }
-                BaselineOp::I32Eqz { result, value } => {
-                    let value = i32_slot(&slots, *value)?;
-                    slots[*result as usize] = Some(Value::I32((value == 0) as i32));
-                }
-                BaselineOp::I32Compare {
-                    result,
-                    left,
-                    right,
-                    comparison,
-                } => {
-                    let left = i32_slot(&slots, *left)?;
-                    let right = i32_slot(&slots, *right)?;
-                    slots[*result as usize] =
-                        Some(Value::I32(compare_i32(left, right, *comparison)));
-                }
-                BaselineOp::ConstI64 { slot, value } => {
-                    slots[*slot as usize] = Some(Value::I64(*value));
-                }
-                BaselineOp::I64Binary {
-                    result,
-                    left,
-                    right,
-                    operation,
-                } => {
-                    let left = i64_slot(&slots, *left)?;
-                    let right = i64_slot(&slots, *right)?;
-                    let value = eval_i64_binary(*operation, left, right)?;
-                    slots[*result as usize] = Some(Value::I64(value));
-                }
-                BaselineOp::I64Eqz { result, value } => {
-                    let value = i64_slot(&slots, *value)?;
-                    slots[*result as usize] = Some(Value::I32((value == 0) as i32));
-                }
-                BaselineOp::I64Compare {
-                    result,
-                    left,
-                    right,
-                    comparison,
-                } => {
-                    let left = i64_slot(&slots, *left)?;
-                    let right = i64_slot(&slots, *right)?;
-                    slots[*result as usize] =
-                        Some(Value::I32(compare_i64(left, right, *comparison)));
-                }
-                BaselineOp::ConstF32 { slot, value } => {
-                    slots[*slot as usize] = Some(Value::F32(*value));
-                }
-                BaselineOp::F32Binary {
-                    result,
-                    left,
-                    right,
-                    operation,
-                } => {
-                    let left = f32_slot(&slots, *left)?;
-                    let right = f32_slot(&slots, *right)?;
-                    slots[*result as usize] =
-                        Some(Value::F32(eval_f32_binary(*operation, left, right)));
-                }
-                BaselineOp::F32Unary {
-                    result,
-                    value,
-                    operation,
-                } => {
-                    let value = f32_slot(&slots, *value)?;
-                    slots[*result as usize] = Some(Value::F32(eval_f32_unary(*operation, value)));
-                }
-                BaselineOp::F32Compare {
-                    result,
-                    left,
-                    right,
-                    comparison,
-                } => {
-                    let left = f32_slot(&slots, *left)?;
-                    let right = f32_slot(&slots, *right)?;
-                    slots[*result as usize] =
-                        Some(Value::I32(compare_f32(left, right, *comparison) as i32));
-                }
-                BaselineOp::ConstF64 { slot, value } => {
-                    slots[*slot as usize] = Some(Value::F64(*value));
-                }
-                BaselineOp::F64Binary {
-                    result,
-                    left,
-                    right,
-                    operation,
-                } => {
-                    let left = f64_slot(&slots, *left)?;
-                    let right = f64_slot(&slots, *right)?;
-                    slots[*result as usize] =
-                        Some(Value::F64(eval_f64_binary(*operation, left, right)));
-                }
-                BaselineOp::F64Unary {
-                    result,
-                    value,
-                    operation,
-                } => {
-                    let value = f64_slot(&slots, *value)?;
-                    slots[*result as usize] = Some(Value::F64(eval_f64_unary(*operation, value)));
-                }
-                BaselineOp::F64Compare {
-                    result,
-                    left,
-                    right,
-                    comparison,
-                } => {
-                    let left = f64_slot(&slots, *left)?;
-                    let right = f64_slot(&slots, *right)?;
-                    slots[*result as usize] =
-                        Some(Value::I32(compare_f64(left, right, *comparison) as i32));
-                }
-                BaselineOp::Drop { value } => {
-                    // The operand was already evaluated; a straight-line `drop`
-                    // only ends its live range, so the slot is left untouched.
-                    let _ = read_slot(&slots, *value)?;
-                }
-                BaselineOp::Select {
-                    result,
-                    condition,
-                    left,
-                    right,
-                } => {
-                    let condition = i32_slot(&slots, *condition)?;
-                    let selected = if condition != 0 {
-                        read_slot(&slots, *left)?
-                    } else {
-                        read_slot(&slots, *right)?
-                    };
-                    slots[*result as usize] = Some(selected);
-                }
-                BaselineOp::LocalGet { result, local } => {
-                    slots[*result as usize] = Some(read_slot(&slots, *local)?);
-                }
-                BaselineOp::LocalSet { local, value } => {
-                    slots[*local as usize] = Some(read_slot(&slots, *value)?);
-                }
-                BaselineOp::LocalTee {
-                    result,
-                    local,
-                    value,
-                } => {
-                    let value = read_slot(&slots, *value)?;
-                    slots[*local as usize] = Some(value.clone());
-                    slots[*result as usize] = Some(value);
-                }
-                BaselineOp::I32Unary {
-                    result,
-                    value,
-                    operation,
-                } => {
-                    let value = i32_slot(&slots, *value)?;
-                    slots[*result as usize] = Some(Value::I32(eval_i32_unary(*operation, value)));
-                }
-                BaselineOp::I64Unary {
-                    result,
-                    value,
-                    operation,
-                } => {
-                    let value = i64_slot(&slots, *value)?;
-                    slots[*result as usize] = Some(Value::I64(eval_i64_unary(*operation, value)));
-                }
-                BaselineOp::IntConvert {
-                    result,
-                    value,
-                    operation,
-                } => {
-                    slots[*result as usize] = Some(eval_int_convert(&slots, *operation, *value)?);
-                }
-                BaselineOp::Reinterpret {
-                    result,
-                    value,
-                    operation,
-                } => {
-                    slots[*result as usize] = Some(eval_reinterpret(&slots, *operation, *value)?);
-                }
-                BaselineOp::FloatConvert {
-                    result,
-                    value,
-                    operation,
-                } => {
-                    slots[*result as usize] = Some(eval_float_convert(&slots, *operation, *value)?);
-                }
-                BaselineOp::FloatTrunc {
-                    result,
-                    value,
-                    operation,
-                } => {
-                    slots[*result as usize] = Some(eval_float_trunc(&slots, *operation, *value)?);
-                }
-                BaselineOp::Return(results) => {
-                    return results
-                        .iter()
-                        .map(|slot| {
-                            slots
-                                .get(*slot as usize)
-                                .and_then(Clone::clone)
-                                .ok_or_else(|| {
-                                    Trap::HostFailure("baseline return slot is empty".into())
-                                })
-                        })
-                        .collect();
-                }
-                BaselineOp::Trap(trap) => return Err(trap.clone()),
-                BaselineOp::Unreachable => return Err(Trap::Unreachable),
             }
+            // Bind the incoming values to the target block's parameter slots,
+            // then continue from that block.
+            let Some((target, values)) = next else {
+                return Err(Trap::HostFailure("baseline block has no terminator".into()));
+            };
+            let target_block = &self.blocks[target as usize];
+            if target_block.params.len() != values.len() {
+                return Err(Trap::HostFailure(
+                    "baseline branch arity does not match target block".into(),
+                ));
+            }
+            for (param, value) in target_block.params.iter().copied().zip(&values) {
+                let value = slots
+                    .get(*value as usize)
+                    .and_then(Clone::clone)
+                    .ok_or_else(|| {
+                        Trap::HostFailure("baseline branch operand slot is empty".into())
+                    })?;
+                slots[param as usize] = Some(value);
+            }
+            current = target;
         }
-        Err(Trap::HostFailure(
-            "baseline function has no terminator".into(),
-        ))
     }
 }
 
@@ -1474,6 +2155,56 @@ fn read_slot(slots: &[Option<Value>], slot: u32) -> Result<Value, Trap> {
         .get(slot as usize)
         .and_then(Clone::clone)
         .ok_or_else(|| Trap::HostFailure("baseline operand slot is empty".into()))
+}
+
+/// The error used when a memory instruction runs without a module memory.
+fn missing_memory() -> Trap {
+    Trap::HostFailure("baseline memory instruction needs a module memory".into())
+}
+
+/// The effective byte address of a memory access, `address + offset`, checked.
+fn effective_address(slots: &[Option<Value>], address: u32, offset: u32) -> Result<u64, Trap> {
+    let base = i32_slot(slots, address)? as u32 as u64;
+    base.checked_add(u64::from(offset))
+        .ok_or(Trap::MemoryOutOfBounds)
+}
+
+/// The raw bits a store writes, taken from the low bytes of the value.
+fn value_bits(slots: &[Option<Value>], value: u32) -> Result<u64, Trap> {
+    Ok(match read_slot(slots, value)? {
+        Value::I32(stored) => u64::from(stored as u32),
+        Value::I64(stored) => stored as u64,
+        Value::F32(stored) => u64::from(stored),
+        Value::F64(stored) => stored,
+        other => {
+            return Err(Trap::HostFailure(format!(
+                "baseline store operand is not a number: {other:?}"
+            )))
+        }
+    })
+}
+
+/// Turn the little-endian bits a load read into the value the opcode produces,
+/// applying the opcode's sign or zero extension.
+fn decode_load(operation: tpt_wasm_ir::MemoryLoad, bits: u64) -> Value {
+    use tpt_wasm_ir::MemoryLoad;
+    match operation {
+        MemoryLoad::I32 => Value::I32(bits as u32 as i32),
+        MemoryLoad::I64 => Value::I64(bits as i64),
+        // A float load is a pure bit reinterpretation, so a NaN payload survives.
+        MemoryLoad::F32 => Value::F32(bits as u32),
+        MemoryLoad::F64 => Value::F64(bits),
+        MemoryLoad::I32_8S => Value::I32(((bits as u8) as i8) as i32),
+        MemoryLoad::I32_8U => Value::I32(bits as u8 as i32),
+        MemoryLoad::I32_16S => Value::I32(((bits as u16) as i16) as i32),
+        MemoryLoad::I32_16U => Value::I32(bits as u16 as i32),
+        MemoryLoad::I64_8S => Value::I64(((bits as u8) as i8) as i64),
+        MemoryLoad::I64_8U => Value::I64(bits as u8 as i64),
+        MemoryLoad::I64_16S => Value::I64(((bits as u16) as i16) as i64),
+        MemoryLoad::I64_16U => Value::I64(bits as u16 as i64),
+        MemoryLoad::I64_32S => Value::I64(((bits as u32) as i32) as i64),
+        MemoryLoad::I64_32U => Value::I64(bits as u32 as i64),
+    }
 }
 
 fn eval_i32_unary(operation: tpt_wasm_ir::IntUnary, value: i32) -> i32 {
@@ -1850,13 +2581,17 @@ fn compare_f64(left: f64, right: f64, comparison: tpt_wasm_ir::FloatComparison) 
 
 #[cfg(test)]
 mod tests {
-    use super::{lower_function, BaselineOp, CodegenError, I32BinaryOp};
-    use tpt_wasm_format::{Function, Module};
+    use super::{
+        lower_function, lower_module, BaselineModule, BaselineOp, CodegenError, I32BinaryOp,
+    };
+    use tpt_wasm_format::{Element, ElementMode, Function, Module, Table};
     use tpt_wasm_ir::{
         lower_and_verify, BasicBlock, BlockId, IrFunction, IrInstr, IrValue, Terminator, ValueId,
     };
     use tpt_wasm_micro::instr::decode_body;
     use tpt_wasm_micro::machine::{Frame, Machine, Step};
+    use tpt_wasm_micro::store::{Instance, Store};
+    use tpt_wasm_types::RefValue;
     use tpt_wasm_types::{FunctionType, ResultType, Trap, Value, ValueType};
 
     fn add_function() -> IrFunction {
@@ -1910,9 +2645,12 @@ mod tests {
         let first = lower_function(&add_function()).unwrap();
         let second = lower_function(&add_function()).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.ops[0], BaselineOp::ConstI32 { slot: 0, value: 20 });
         assert_eq!(
-            first.ops[2],
+            first.blocks[0].ops[0],
+            BaselineOp::ConstI32 { slot: 0, value: 20 }
+        );
+        assert_eq!(
+            first.blocks[0].ops[2],
             BaselineOp::I32Binary {
                 result: 2,
                 left: 0,
@@ -2728,18 +3466,30 @@ mod tests {
     }
 
     #[test]
-    fn baseline_rejects_unsupported_ops_and_preserves_traps() {
-        // Direct calls are modeled in the IR but not yet lowered by the baseline
-        // backend, so they must be rejected rather than silently ignored.
-        let mut unsupported = add_function();
-        unsupported.blocks[0].instrs[0] = IrInstr::Call {
-            function: 0,
-            arguments: Vec::new(),
-            results: vec![ValueId(0)],
+    fn baseline_rejects_unresolvable_values_and_preserves_traps() {
+        // An instruction reading a value that is not in the function's value
+        // table must be rejected rather than read from a missing slot.
+        let mut unknown = add_function();
+        unknown.blocks[0].instrs[2] = IrInstr::I32Add {
+            result: ValueId(2),
+            left: ValueId(0),
+            right: ValueId(9),
         };
         assert_eq!(
-            lower_function(&unsupported),
-            Err(CodegenError::UnsupportedInstruction("instruction"))
+            lower_function(&unknown),
+            Err(CodegenError::UnknownValue(ValueId(9)))
+        );
+
+        // Reading the same value twice is also rejected: the SSA value table
+        // must not accept a duplicate definition.
+        let mut duplicate = add_function();
+        duplicate.blocks[0].instrs[1] = IrInstr::ConstI32 {
+            result: ValueId(0),
+            value: 7,
+        };
+        assert_eq!(
+            lower_function(&duplicate),
+            Err(CodegenError::DuplicateValue(ValueId(0)))
         );
 
         let trap = IrFunction {
@@ -2764,8 +3514,995 @@ mod tests {
             Err(Trap::IntegerDivisionByZero)
         );
         assert_eq!(
-            baseline.ops,
+            baseline.blocks[0].ops,
             vec![BaselineOp::Trap(Trap::IntegerDivisionByZero)]
+        );
+    }
+
+    /// `block (result i32) { i32.const 10; br 0 } end` — a `br` that carries a
+    /// value into the enclosing block's result.
+    const BR_OUT_OF_BLOCK: &[u8] = &[
+        0x02, 0x7f, // block (result i32)
+        0x41, 0x0a, // i32.const 10
+        0x0c, 0x00, // br 0
+        0x0b, // end (block)
+        0x0b, // end (function)
+    ];
+
+    /// `i32.const c; if (result i32) { 20 } else { 30 } end`.
+    fn if_else_body(condition: i32) -> Vec<u8> {
+        let mut body = vec![0x41];
+        body.extend(encode_i32(condition));
+        body.extend_from_slice(&[
+            0x04, 0x7f, // if (result i32)
+            0x41, 0x14, // i32.const 20
+            0x05, // else
+            0x41, 0x1e, // i32.const 30
+            0x0b, // end (if)
+            0x0b, // end (function)
+        ]);
+        body
+    }
+
+    /// `block (result i32) { 7; c; br_if 0; 99 } end` — a conditional branch
+    /// that either jumps out with 7 or falls through to 99.
+    ///
+    /// `br_if` pops the label's value as well as the condition, so the
+    /// fall-through path starts from an empty stack.
+    fn br_if_body(condition: i32) -> Vec<u8> {
+        let mut body = vec![0x02, 0x7f]; // block (result i32)
+        body.push(0x41);
+        body.extend(encode_i32(7));
+        body.push(0x41);
+        body.extend(encode_i32(condition));
+        body.extend_from_slice(&[0x0d, 0x00]); // br_if 0
+        body.push(0x41);
+        body.extend(encode_i32(99));
+        body.extend_from_slice(&[0x0b, 0x0b]); // end (block), end (function)
+        body
+    }
+
+    /// Count up to 5 in a loop through a local, so the baseline must follow a
+    /// genuine back edge: `loop { n = n + 1; br_if 0 while n < 5 }`.
+    const LOOP_TO_FIVE: &[u8] = &[
+        0x41, 0x00, // i32.const 0
+        0x21, 0x00, // local.set 0
+        0x02, 0x40, // block
+        0x03, 0x40, // loop
+        0x20, 0x00, // local.get 0
+        0x41, 0x01, // i32.const 1
+        0x6a, // i32.add
+        0x22, 0x00, // local.tee 0
+        0x41, 0x05, // i32.const 5
+        0x48, // i32.lt_s
+        0x0d, 0x00, // br_if 0
+        0x0b, // end (loop)
+        0x0b, // end (block)
+        0x20, 0x00, // local.get 0
+        0x0b, // end (function)
+    ];
+
+    #[test]
+    fn baseline_matches_micro_for_br_carrying_a_value() {
+        assert_eq!(
+            assert_matches_micro(BR_OUT_OF_BLOCK, ValueType::I32).unwrap(),
+            vec![Value::I32(10)]
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_if_else_on_both_edges() {
+        for condition in [0, 1, -1] {
+            let body = if_else_body(condition);
+            assert_eq!(
+                assert_matches_micro(&body, ValueType::I32).unwrap(),
+                vec![Value::I32(if condition == 0 { 30 } else { 20 })],
+                "condition {condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_br_if_taken_and_falling_through() {
+        for condition in [0, 1] {
+            let body = br_if_body(condition);
+            assert_eq!(
+                assert_matches_micro(&body, ValueType::I32).unwrap(),
+                vec![Value::I32(if condition == 0 { 99 } else { 7 })],
+                "condition {condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_follows_a_loop_back_edge() {
+        // A loop is only correct if the block walk can revisit a block, so this
+        // is the test that would hang or exit early on a missing back edge.
+        let locals = [tpt_wasm_format::LocalDecl {
+            count: 1,
+            value_type: ValueType::I32,
+        }];
+        assert_eq!(
+            assert_matches_micro_with_locals(LOOP_TO_FIVE, ValueType::I32, &locals).unwrap(),
+            vec![Value::I32(5)]
+        );
+    }
+
+    /// A minimal single-block function, used as a starting point for the
+    /// malformed-CFG cases below.
+    fn one_block_function(terminator: Terminator) -> IrFunction {
+        IrFunction {
+            function_type: FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(vec![ValueType::I32]),
+            },
+            params: Vec::new(),
+            locals: Vec::new(),
+            values: vec![IrValue {
+                id: ValueId(0),
+                value_type: ValueType::I32,
+            }],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                instrs: vec![IrInstr::ConstI32 {
+                    result: ValueId(0),
+                    value: 1,
+                }],
+                terminator,
+            }],
+        }
+    }
+
+    #[test]
+    fn baseline_rejects_malformed_control_flow() {
+        // A branch to a block that does not exist.
+        let dangling = one_block_function(Terminator::Branch {
+            target: BlockId(9),
+            values: Vec::new(),
+        });
+        assert_eq!(
+            lower_function(&dangling),
+            Err(CodegenError::UnknownBlock(BlockId(9)))
+        );
+
+        // An edge supplying the wrong number of values for its target.
+        let mut arity = one_block_function(Terminator::Branch {
+            target: BlockId(0),
+            values: Vec::new(),
+        });
+        arity.blocks[0].params = vec![ValueId(1)];
+        arity.values.push(IrValue {
+            id: ValueId(1),
+            value_type: ValueType::I32,
+        });
+        assert_eq!(
+            lower_function(&arity),
+            Err(CodegenError::BranchArity {
+                target: BlockId(0),
+                expected: 1,
+                actual: 0,
+            })
+        );
+
+        // Two blocks sharing one id, which would make a target ambiguous.
+        let mut duplicate = one_block_function(Terminator::Return(vec![ValueId(0)]));
+        duplicate.blocks.push(BasicBlock {
+            id: BlockId(0),
+            params: Vec::new(),
+            instrs: Vec::new(),
+            terminator: Terminator::Unreachable,
+        });
+        assert_eq!(
+            lower_function(&duplicate),
+            Err(CodegenError::DuplicateBlock(BlockId(0)))
+        );
+
+        // An entry block id that is not in the block list.
+        let mut missing = one_block_function(Terminator::Return(vec![ValueId(0)]));
+        missing.entry = BlockId(7);
+        assert_eq!(
+            lower_function(&missing),
+            Err(CodegenError::MissingEntryBlock)
+        );
+    }
+
+    /// The zero value a Wasm local starts with.
+    fn zero_of(value_type: ValueType) -> Value {
+        match value_type {
+            ValueType::I32 => Value::I32(0),
+            ValueType::I64 => Value::I64(0),
+            ValueType::F32 => Value::F32(0),
+            ValueType::F64 => Value::F64(0),
+            other => panic!("unsupported local type in fixture: {other:?}"),
+        }
+    }
+
+    /// Assert the baseline backend and Micro agree on a whole module, so that
+    /// `call` is exercised across function boundaries.
+    ///
+    /// Micro resolves a call through the store's instance, so every function of
+    /// the module is installed first and the entry function is pushed as a frame.
+    fn assert_module_matches_micro(
+        module: &Module,
+        entry: usize,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, Trap> {
+        let validated = tpt_wasm_validate::validate(module.clone()).expect("fixture must validate");
+        let verified = lower_and_verify(&validated).expect("fixture must lower and verify");
+        let mut baseline =
+            BaselineModule::lower(verified.module()).expect("codegen must accept the module");
+        let baseline_result = baseline.call(entry, args.clone());
+        let micro_result = run_in_micro(module, entry, args);
+        assert_eq!(
+            baseline_result, micro_result,
+            "baseline and Micro diverged on the module"
+        );
+        baseline_result
+    }
+
+    /// `$double` doubles its argument; the entry function calls it.
+    fn double_module() -> Module {
+        Module {
+            types: vec![
+                FunctionType {
+                    params: ResultType(Vec::new()),
+                    results: ResultType(vec![ValueType::I32]),
+                },
+                FunctionType {
+                    params: ResultType(vec![ValueType::I32]),
+                    results: ResultType(vec![ValueType::I32]),
+                },
+            ],
+            functions: vec![
+                // 0: (result i32) i32.const 5; call $double
+                Function {
+                    type_index: 0,
+                    locals: vec![],
+                    body: vec![0x41, 0x05, 0x10, 0x01, 0x0b],
+                },
+                // 1: (param i32) (result i32) local.get 0; i32.const 2; i32.mul
+                Function {
+                    type_index: 1,
+                    locals: vec![],
+                    body: vec![0x20, 0x00, 0x41, 0x02, 0x6c, 0x0b],
+                },
+            ],
+            ..Module::default()
+        }
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_a_direct_call() {
+        assert_eq!(
+            assert_module_matches_micro(&double_module(), 0, Vec::new()).unwrap(),
+            vec![Value::I32(10)]
+        );
+    }
+
+    #[test]
+    fn baseline_forwards_call_arguments_and_results() {
+        // The entry takes the argument, so a wrong slot mapping shows up as a
+        // wrong result rather than a fixed constant.
+        let mut module = double_module();
+        module.functions[0].type_index = 1;
+        module.functions[0].body = vec![0x20, 0x00, 0x10, 0x01, 0x0b];
+        for argument in [0, 1, 7, -3] {
+            assert_eq!(
+                assert_module_matches_micro(&module, 0, vec![Value::I32(argument)]).unwrap(),
+                vec![Value::I32(argument.wrapping_mul(2))],
+                "argument {argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_propagates_a_trap_out_of_a_callee() {
+        // The callee divides by zero, so the trap must surface from the caller.
+        let module = Module {
+            types: vec![FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(vec![ValueType::I32]),
+            }],
+            functions: vec![
+                // 0: call $boom
+                Function {
+                    type_index: 0,
+                    locals: vec![],
+                    body: vec![0x10, 0x01, 0x0b],
+                },
+                // 1: (result i32) i32.const 1; i32.const 0; i32.div_s
+                Function {
+                    type_index: 0,
+                    locals: vec![],
+                    body: vec![0x41, 0x01, 0x41, 0x00, 0x6d, 0x0b],
+                },
+            ],
+            ..Module::default()
+        };
+        assert_eq!(
+            assert_module_matches_micro(&module, 0, Vec::new()),
+            Err(Trap::IntegerDivisionByZero)
+        );
+    }
+
+    #[test]
+    fn baseline_supports_recursion() {
+        // A recursive sum-to-n, so each callee needs its own slot frame.
+        let module = Module {
+            types: vec![FunctionType {
+                params: ResultType(vec![ValueType::I32]),
+                results: ResultType(vec![ValueType::I32]),
+            }],
+            functions: vec![Function {
+                type_index: 0,
+                locals: vec![],
+                body: vec![
+                    0x20, 0x00, // local.get 0
+                    0x45, // i32.eqz
+                    0x04, 0x7f, // if (result i32)
+                    0x41, 0x00, // i32.const 0
+                    0x05, // else
+                    // The condition above consumed the only `local.get 0`, so
+                    // `n` is read again here before recursing.
+                    0x20, 0x00, // local.get 0
+                    0x20, 0x00, // local.get 0
+                    0x41, 0x01, // i32.const 1
+                    0x6b, // i32.sub
+                    0x10, 0x00, // call 0
+                    0x6a, // i32.add
+                    0x0b, // end (if)
+                    0x0b, // end (function)
+                ],
+            }],
+            ..Module::default()
+        };
+        // sum(n) = sum(n - 1) + n, so the answer grows with the recursion depth.
+        for argument in [0, 1, 2, 5, 20] {
+            let expected = argument * (argument + 1) / 2;
+            assert_eq!(
+                assert_module_matches_micro(&module, 0, vec![Value::I32(argument)]).unwrap(),
+                vec![Value::I32(expected)],
+                "argument {argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_cannot_resolve_without_a_function_table() {
+        // `execute` has no module, so a call cannot be resolved through it.
+        let validated =
+            tpt_wasm_validate::validate(double_module()).expect("fixture must validate");
+        let verified = lower_and_verify(&validated).expect("fixture must lower and verify");
+        let baseline = lower_module(verified.module()).unwrap();
+        let error = baseline[0].execute(Vec::new()).unwrap_err();
+        assert!(
+            matches!(error, Trap::HostFailure(ref message) if message.contains("call target")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// Run a module's `entry` function in both the baseline module and Micro.
+    ///
+    /// Unlike [`assert_module_matches_micro`], this builds a runnable
+    /// [`super::BaselineModule`] so memory and globals are present on both sides.
+    fn assert_runnable_matches_micro(
+        module: &Module,
+        entry: usize,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, Trap> {
+        let validated = tpt_wasm_validate::validate(module.clone()).expect("fixture must validate");
+        let verified = lower_and_verify(&validated).expect("fixture must lower and verify");
+        let mut baseline =
+            super::BaselineModule::lower(verified.module()).expect("codegen must accept module");
+        let baseline_result = baseline.call(entry, args.clone());
+        let micro_result = run_in_micro(module, entry, args);
+        assert_eq!(
+            baseline_result, micro_result,
+            "baseline and Micro diverged on the runnable module"
+        );
+        baseline_result
+    }
+
+    /// Run one function of a module in Micro with its memory and globals set up.
+    fn run_in_micro(module: &Module, entry: usize, args: Vec<Value>) -> Result<Vec<Value>, Trap> {
+        let mut store = Store::default();
+        let mut func_addrs = Vec::with_capacity(module.functions.len());
+        for (index, function) in module.functions.iter().enumerate() {
+            let function_type = module.types[function.type_index as usize].clone();
+            let mut local_types = function_type.params.0.clone();
+            local_types.extend(function.locals.iter().map(|d| d.value_type));
+            let address = store
+                .add_wasm_function(
+                    0,
+                    index as u32,
+                    function_type,
+                    decode_body(&function.body).expect("fixture body must decode"),
+                    local_types,
+                )
+                .expect("fixture function must install");
+            func_addrs.push(address);
+        }
+        let mut memory_addrs = Vec::new();
+        for memory in &module.memories {
+            let address = store
+                .allocate_memory(memory.memory_type.limits.min, memory.memory_type.limits.max)
+                .expect("test memory should fit in store");
+            // Write the active data segments in module order, so a later segment
+            // overwrites an earlier one at the same address.
+            for segment in &module.data {
+                let tpt_wasm_format::DataMode::Active {
+                    memory_index,
+                    offset,
+                } = &segment.mode
+                else {
+                    panic!("test data segment must be active");
+                };
+                if *memory_index as usize != memory_addrs.len() {
+                    continue;
+                }
+                let base = tpt_wasm_ir::const_expr_i32(offset)
+                    .expect("test data offset must be a constant i32")
+                    as usize;
+                let end = base + segment.data.len();
+                let instance = store
+                    .memory_mut(address)
+                    .expect("test memory should resolve");
+                assert!(
+                    end <= instance.data.len(),
+                    "segment does not fit the memory"
+                );
+                instance.data[base..end].copy_from_slice(&segment.data);
+            }
+            memory_addrs.push(address);
+        }
+        let mut global_addrs = Vec::new();
+        for global in &module.globals {
+            let value = decode_global(&global.init);
+            global_addrs.push(
+                store
+                    .add_global(global.global_type, value)
+                    .expect("test global should fit in store"),
+            );
+        }
+        // Tables, with their active element segments written in. Micro resolves
+        // an indirect call through this, so a table left empty would turn every
+        // index into an out-of-bounds trap.
+        let mut table_addrs = Vec::new();
+        for table in &module.tables {
+            let min =
+                u32::try_from(table.table_type.limits.min).expect("test table should fit a u32");
+            let max = table
+                .table_type
+                .limits
+                .max
+                .map(|max| u32::try_from(max).expect("test table max should fit a u32"));
+            table_addrs.push(
+                store
+                    .allocate_table(table.table_type.element_type, min, max)
+                    .expect("test table should fit in store"),
+            );
+        }
+        for element in &module.elements {
+            let tpt_wasm_format::ElementMode::Active {
+                table_index,
+                offset,
+            } = &element.mode
+            else {
+                panic!("test element segment must be active");
+            };
+            let base = tpt_wasm_ir::const_expr_i32(offset)
+                .expect("test element offset must be a constant i32");
+            let address = table_addrs[*table_index as usize];
+            for (position, function) in element.init.iter().enumerate() {
+                let target = func_addrs[*function as usize];
+                store
+                    .table_mut(address)
+                    .expect("test table should resolve")
+                    .elements[base as usize + position] = Some(RefValue::FuncRef(target));
+            }
+        }
+        let instance = store
+            .add_instance(Instance {
+                module_types: module.types.clone(),
+                func_addrs,
+                table_addrs,
+                memory_addrs,
+                global_addrs,
+            })
+            .expect("test instance must install");
+        let entry_function = &module.functions[entry];
+        let mut locals = args;
+        for declaration in &entry_function.locals {
+            for _ in 0..declaration.count {
+                locals.push(zero_of(declaration.value_type));
+            }
+        }
+        let result_arity = module.types[entry_function.type_index as usize]
+            .results
+            .0
+            .len();
+        let mut machine = Machine::with_store(store);
+        machine
+            .push_frame(Frame::new(
+                instance,
+                entry as u32,
+                locals,
+                decode_body(&entry_function.body).expect("fixture body must decode"),
+                result_arity,
+            ))
+            .expect("entry frame must fit");
+        match machine.run() {
+            Step::Return(values) => Ok(values),
+            Step::Trap(trap) => Err(trap),
+            other => Err(Trap::HostFailure(format!(
+                "Micro did not finish: {other:?}"
+            ))),
+        }
+    }
+
+    /// Decode a validated global initializer for the Micro driver. The trailing
+    /// `end` byte is not part of the immediate.
+    fn decode_global(expr: &tpt_wasm_format::ConstExpr) -> Value {
+        let bytes = &expr.0;
+        match bytes.first() {
+            Some(0x41) => Value::I32(i64_from_leb(&bytes[1..]) as i32),
+            Some(0x42) => Value::I64(i64_from_leb(&bytes[1..])),
+            Some(0x43) => Value::F32(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])),
+            Some(0x44) => {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(&bytes[1..9]);
+                Value::F64(u64::from_le_bytes(raw))
+            }
+            other => panic!("unexpected global initializer opcode: {other:?}"),
+        }
+    }
+
+    fn i64_from_leb(bytes: &[u8]) -> i64 {
+        let mut result: i64 = 0;
+        let mut shift = 0;
+        for byte in bytes {
+            if shift < 64 {
+                result |= i64::from(*byte & 0x7f) << shift;
+            }
+            shift += 7;
+            if byte & 0x80 == 0 {
+                if *byte & 0x40 != 0 {
+                    result |= -1i64 << shift;
+                }
+                break;
+            }
+        }
+        result
+    }
+
+    /// Attach a one-page memory to a module.
+    fn with_memory(inner: Module) -> Module {
+        let mut module = inner;
+        module.memories.push(tpt_wasm_format::Memory {
+            memory_type: tpt_wasm_types::MemoryType {
+                limits: tpt_wasm_types::Limits { min: 1, max: None },
+                memory64: false,
+            },
+        });
+        module
+    }
+
+    /// Attach a global to a module.
+    fn with_global(inner: Module, value_type: ValueType, mutable: bool, init: Vec<u8>) -> Module {
+        let mut module = inner;
+        let mut init = init;
+        init.push(0x0b);
+        module.globals.push(tpt_wasm_format::Global {
+            global_type: tpt_wasm_types::GlobalType {
+                value_type,
+                mutable,
+            },
+            init: tpt_wasm_format::ConstExpr(init),
+        });
+        module
+    }
+
+    /// A one-function module taking no parameters and returning `results`.
+    fn module(_params: Vec<ValueType>, results: Vec<ValueType>, body: Vec<u8>) -> Module {
+        Module {
+            types: vec![FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(results),
+            }],
+            functions: vec![Function {
+                type_index: 0,
+                locals: vec![],
+                body,
+            }],
+            ..Module::default()
+        }
+    }
+
+    /// An `i32.const` with a canonical immediate.
+    fn const_i32(value: i32) -> Vec<u8> {
+        let mut bytes = vec![0x41];
+        bytes.extend(encode_i32(value));
+        bytes
+    }
+
+    #[test]
+    fn baseline_memory_matches_micro() {
+        // Store then load a full word.
+        let mut body = const_i32(4);
+        body.extend(const_i32(0x1234_5678));
+        body.extend_from_slice(&[0x36, 0x02, 0x00]);
+        body.extend(const_i32(4));
+        body.extend_from_slice(&[0x28, 0x02, 0x00]);
+        body.push(0x0b);
+        let module = with_memory(module(Vec::new(), vec![ValueType::I32], body));
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(0x1234_5678u32 as i32)]
+        );
+    }
+
+    #[test]
+    fn baseline_narrow_loads_match_micro() {
+        for (opcode, name, result_type, expected) in [
+            (0x2c, "i32.load8_s", ValueType::I32, Value::I32(-1)),
+            (0x2d, "i32.load8_u", ValueType::I32, Value::I32(255)),
+            (0x30, "i64.load8_s", ValueType::I64, Value::I64(-1)),
+            (0x31, "i64.load8_u", ValueType::I64, Value::I64(255)),
+        ] {
+            let mut body = const_i32(0);
+            body.extend(const_i32(255));
+            body.extend_from_slice(&[0x3a, 0x00, 0x00]);
+            body.extend(const_i32(0));
+            body.extend_from_slice(&[opcode, 0x00, 0x00]);
+            body.push(0x0b);
+            let module = with_memory(module(Vec::new(), vec![result_type], body));
+            assert_eq!(
+                assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+                vec![expected],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_memory_traps_out_of_bounds_like_micro() {
+        let mut body = const_i32(65_535);
+        body.extend_from_slice(&[0x28, 0x02, 0x00]);
+        body.push(0x0b);
+        let module = with_memory(module(Vec::new(), vec![ValueType::I32], body));
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()),
+            Err(Trap::MemoryOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn baseline_memory_size_and_grow_match_micro() {
+        let mut body = vec![0x3f, 0x00];
+        body.extend(const_i32(2));
+        body.extend_from_slice(&[0x40, 0x00, 0x6a, 0x0b]);
+        let module = with_memory(module(Vec::new(), vec![ValueType::I32], body));
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(2)]
+        );
+    }
+
+    #[test]
+    fn baseline_global_read_write_matches_micro() {
+        let mut body = vec![0x23, 0x00];
+        body.extend(const_i32(5));
+        body.extend_from_slice(&[0x6a, 0x24, 0x00, 0x23, 0x00, 0x0b]);
+        let module = with_global(
+            module(Vec::new(), vec![ValueType::I32], body),
+            ValueType::I32,
+            true,
+            const_i32(55),
+        );
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(60)]
+        );
+    }
+
+    #[test]
+    fn baseline_shares_global_state_across_a_call() {
+        // Function 1 bumps the global; the entry calls it and reads the result,
+        // which only works if both frames see the same global slots.
+        let module = with_global(
+            Module {
+                types: vec![
+                    FunctionType {
+                        params: ResultType(Vec::new()),
+                        results: ResultType(vec![ValueType::I32]),
+                    },
+                    FunctionType {
+                        params: ResultType(Vec::new()),
+                        results: ResultType(vec![ValueType::I32]),
+                    },
+                ],
+                functions: vec![
+                    // 0: call 1; drop; global.get 0
+                    Function {
+                        type_index: 0,
+                        locals: vec![],
+                        body: vec![0x10, 0x01, 0x1a, 0x23, 0x00, 0x0b],
+                    },
+                    // 1: global.get 0; +1; global.set 0; global.get 0
+                    Function {
+                        type_index: 1,
+                        locals: vec![],
+                        body: vec![0x23, 0x00, 0x41, 0x01, 0x6a, 0x24, 0x00, 0x23, 0x00, 0x0b],
+                    },
+                ],
+                ..Module::default()
+            },
+            ValueType::I32,
+            true,
+            const_i32(10),
+        );
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(11)]
+        );
+    }
+
+    #[test]
+    fn a_memory_instruction_without_a_memory_traps() {
+        // `execute` has no module memory, so the access is refused rather than
+        // reading uninitialized data.
+        let mut body = const_i32(0);
+        body.extend_from_slice(&[0x28, 0x02, 0x00, 0x0b]);
+        let validated = tpt_wasm_validate::validate(with_memory(module(
+            Vec::new(),
+            vec![ValueType::I32],
+            body,
+        )))
+        .expect("fixture must validate");
+        let verified = lower_and_verify(&validated).expect("fixture must lower and verify");
+        let function = lower_function(&verified.module().functions[0]).unwrap();
+        let error = function.execute(Vec::new()).unwrap_err();
+        assert!(
+            matches!(error, Trap::HostFailure(ref message) if message.contains("module memory")),
+            "unexpected error: {error:?}"
+        );
+    }
+    /// A table of `$double`, with the entry function dispatching through it.
+    ///
+    /// The element segment places `$double` at index 1 of a two-entry table, so
+    /// index 0 is deliberately null and index 1 dispatches.
+    fn dispatch_module() -> Module {
+        Module {
+            types: vec![
+                FunctionType {
+                    params: ResultType(Vec::new()),
+                    results: ResultType(vec![ValueType::I32]),
+                },
+                FunctionType {
+                    params: ResultType(vec![ValueType::I32]),
+                    results: ResultType(vec![ValueType::I32]),
+                },
+            ],
+            // 0: (result i32) i32.const 1; call_indirect type 1, table 0
+            // 1: (param i32) (result i32) local.get 0; i32.const 2; i32.mul
+            functions: vec![
+                Function {
+                    type_index: 0,
+                    locals: vec![],
+                    body: vec![0x41, 0x05, 0x41, 0x01, 0x11, 0x01, 0x00, 0x0b],
+                },
+                Function {
+                    type_index: 1,
+                    locals: vec![],
+                    body: vec![0x20, 0x00, 0x41, 0x02, 0x6c, 0x0b],
+                },
+            ],
+            tables: vec![Table {
+                table_type: tpt_wasm_types::TableType {
+                    element_type: tpt_wasm_types::ReferenceType::FuncRef,
+                    limits: tpt_wasm_types::Limits { min: 2, max: None },
+                },
+                init: None,
+            }],
+            elements: vec![Element {
+                element_type: tpt_wasm_types::RefType::FuncRef,
+                mode: ElementMode::Active {
+                    table_index: 0,
+                    // A constant `i32` offset of 1, as `i32.const 1; end`.
+                    offset: tpt_wasm_format::ConstExpr(vec![0x41, 0x01, 0x0b]),
+                },
+                init: vec![1],
+            }],
+            ..Module::default()
+        }
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_an_indirect_call() {
+        assert_eq!(
+            assert_module_matches_micro(&dispatch_module(), 0, Vec::new()).unwrap(),
+            vec![Value::I32(10)]
+        );
+    }
+
+    #[test]
+    fn an_indirect_call_out_of_range_traps_like_micro() {
+        // Index 7 is past the end of the two-entry table.
+        let mut module = dispatch_module();
+        module.functions[0].body = vec![0x41, 0x05, 0x41, 0x07, 0x11, 0x01, 0x00, 0x0b];
+        assert_eq!(
+            assert_module_matches_micro(&module, 0, Vec::new()),
+            Err(Trap::TableOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn an_indirect_call_through_a_null_entry_traps_like_micro() {
+        // Index 0 is inside the table but was never written by the segment.
+        let mut module = dispatch_module();
+        module.functions[0].body = vec![0x41, 0x05, 0x41, 0x00, 0x11, 0x01, 0x00, 0x0b];
+        assert_eq!(
+            assert_module_matches_micro(&module, 0, Vec::new()),
+            Err(Trap::NullReference)
+        );
+    }
+
+    #[test]
+    fn an_indirect_call_with_the_wrong_type_traps_like_micro() {
+        // Function 0 has type 0, but the call names type 1, so the entry's
+        // signature does not match what the call requires. The segment is moved
+        // to offset 0 so that the call actually reaches function 0.
+        let mut module = dispatch_module();
+        module.elements[0].mode = ElementMode::Active {
+            table_index: 0,
+            offset: tpt_wasm_format::ConstExpr(vec![0x41, 0x00, 0x0b]),
+        };
+        module.elements[0].init = vec![0];
+        module.functions[0].body = vec![0x41, 0x05, 0x41, 0x00, 0x11, 0x01, 0x00, 0x0b];
+        assert_eq!(
+            assert_module_matches_micro(&module, 0, Vec::new()),
+            Err(Trap::IndirectCallTypeMismatch)
+        );
+    }
+
+    #[test]
+    fn an_indirect_call_forwards_its_arguments() {
+        // The table index is the topmost operand, above the arguments, so a
+        // mis-ordered pop shows up as the wrong argument reaching the callee.
+        let mut module = dispatch_module();
+        // (param i32) (result i32) local.get 0; i32.const 0; call_indirect
+        module.types[0] = FunctionType {
+            params: ResultType(vec![ValueType::I32]),
+            results: ResultType(vec![ValueType::I32]),
+        };
+        module.functions[0].type_index = 0;
+        module.functions[0].body = vec![0x20, 0x00, 0x41, 0x01, 0x11, 0x01, 0x00, 0x0b];
+        for argument in [0, 1, 7, -3] {
+            assert_eq!(
+                assert_module_matches_micro(&module, 0, vec![Value::I32(argument)]).unwrap(),
+                vec![Value::I32(argument.wrapping_mul(2))],
+                "argument {argument}"
+            );
+        }
+    }
+
+    /// Attach an active data segment to a module that already has a memory.
+    ///
+    /// The offset is a constant `i32`, encoded the same way the decoder reads it.
+    fn with_data(mut inner: Module, offset: i32, bytes: &[u8]) -> Module {
+        // `encode_i32` emits only the LEB128 immediate, so the opcode and the
+        // terminating `end` byte are added here.
+        let mut encoded = vec![0x41];
+        encoded.extend(encode_i32(offset));
+        encoded.push(0x0b);
+        inner.data.push(tpt_wasm_format::DataSegment {
+            mode: tpt_wasm_format::DataMode::Active {
+                memory_index: 0,
+                offset: tpt_wasm_format::ConstExpr(encoded),
+            },
+            data: bytes.to_vec(),
+        });
+        inner
+    }
+
+    #[test]
+    fn an_active_data_segment_initializes_memory() {
+        // Load the four bytes the segment wrote, little-endian.
+        let mut body = const_i32(0);
+        body.extend_from_slice(&[0x28, 0x02, 0x00]);
+        body.push(0x0b);
+        let module = with_data(
+            with_memory(module(Vec::new(), vec![ValueType::I32], body)),
+            0,
+            &[0x78, 0x56, 0x34, 0x12],
+        );
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(0x1234_5678u32 as i32)]
+        );
+    }
+
+    #[test]
+    fn a_data_segment_at_a_nonzero_offset_lands_where_asked() {
+        // A load at address 0 must miss the segment written at address 4, so a
+        // wrong offset shows up as a zero rather than the expected bytes.
+        let mut body = const_i32(0);
+        body.extend_from_slice(&[0x28, 0x02, 0x00]);
+        body.push(0x0b);
+        let module = with_data(
+            with_memory(module(Vec::new(), vec![ValueType::I32], body)),
+            4,
+            &[0xff, 0xff, 0xff, 0xff],
+        );
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(0)]
+        );
+    }
+
+    #[test]
+    fn a_store_overwrites_data_segment_contents() {
+        // The segment seeds address 0; the function then replaces it, so a
+        // missing segment would still pass but a missing store would not.
+        let mut body = const_i32(0);
+        body.extend(const_i32(0x1111_1111));
+        body.extend_from_slice(&[0x36, 0x02, 0x00]);
+        body.extend(const_i32(0));
+        body.extend_from_slice(&[0x28, 0x02, 0x00]);
+        body.push(0x0b);
+        let module = with_data(
+            with_memory(module(Vec::new(), vec![ValueType::I32], body)),
+            0,
+            &[0x22, 0x33, 0x44, 0x55],
+        );
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(0x1111_1111u32 as i32)]
+        );
+    }
+
+    #[test]
+    fn a_later_data_segment_overwrites_an_earlier_one() {
+        // Two segments overlap at address 0; the second must win, which is the
+        // order the specification requires them to be applied in.
+        let mut body = const_i32(0);
+        body.extend_from_slice(&[0x28, 0x02, 0x00]);
+        body.push(0x0b);
+        let module = with_data(
+            with_data(
+                with_memory(module(Vec::new(), vec![ValueType::I32], body)),
+                0,
+                &[0x01, 0x00, 0x00, 0x00],
+            ),
+            0,
+            &[0x02, 0x00, 0x00, 0x00],
+        );
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(2)]
+        );
+    }
+
+    #[test]
+    fn memory_grow_keeps_data_segment_contents() {
+        // Growth appends zeroed pages; the segment's bytes must survive it. The
+        // grow result is dropped so only the reload is left on the stack.
+        let mut body = const_i32(1);
+        body.extend_from_slice(&[0x40, 0x00]); // memory.grow
+        body.extend_from_slice(&[0x1a]); // drop the old page count
+        body.extend(const_i32(0));
+        body.extend_from_slice(&[0x28, 0x02, 0x00]);
+        body.push(0x0b);
+        let module = with_data(
+            with_memory(module(Vec::new(), vec![ValueType::I32], body)),
+            0,
+            &[0x2a, 0x00, 0x00, 0x00],
+        );
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(42)]
         );
     }
 }

@@ -78,11 +78,127 @@ fn encode_signed_leb(mut value: i64, bits: u32) -> Vec<u8> {
     }
 }
 
+/// Turn the little-endian bits a load read into the value the IR types say it
+/// produces, applying the opcode's sign or zero extension.
+fn decode_load(operation: super::MemoryLoad, bits: u64) -> Result<Value, Trap> {
+    use super::MemoryLoad;
+    Ok(match operation {
+        MemoryLoad::I32 => Value::I32(bits as u32 as i32),
+        MemoryLoad::I64 => Value::I64(bits as i64),
+        // Float loads are pure bit reinterpretations, so a NaN payload survives.
+        MemoryLoad::F32 => Value::F32(bits as u32),
+        MemoryLoad::F64 => Value::F64(bits),
+        MemoryLoad::I32_8S => Value::I32(((bits as u8) as i8) as i32),
+        MemoryLoad::I32_8U => Value::I32(bits as u8 as i32),
+        MemoryLoad::I32_16S => Value::I32(((bits as u16) as i16) as i32),
+        MemoryLoad::I32_16U => Value::I32(bits as u16 as i32),
+        MemoryLoad::I64_8S => Value::I64(((bits as u8) as i8) as i64),
+        MemoryLoad::I64_8U => Value::I64(bits as u8 as i64),
+        MemoryLoad::I64_16S => Value::I64(((bits as u16) as i16) as i64),
+        MemoryLoad::I64_16U => Value::I64(bits as u16 as i64),
+        MemoryLoad::I64_32S => Value::I64(((bits as u32) as i32) as i64),
+        MemoryLoad::I64_32U => Value::I64(bits as u32 as i64),
+    })
+}
+
+const PAGE_SIZE: usize = 65_536;
+const MAX_PAGES: u64 = 65_536;
+
+/// Mutable module state shared by every frame of one execution: the linear
+/// memory and the global slots.
+struct ModuleState {
+    /// Memory 0's bytes.
+    memory: Vec<u8>,
+    /// Current size in pages.
+    pages: u64,
+    /// Declared maximum, or `None`.
+    max_pages: Option<u64>,
+    /// One slot per module global.
+    globals: Vec<Value>,
+}
+
+impl ModuleState {
+    fn new(module: &IrModule) -> Self {
+        let (pages, max_pages, memory) = match module.memory.as_ref() {
+            Some(declaration) => {
+                let mut bytes = vec![0u8; declaration.min_pages as usize * PAGE_SIZE];
+                // Active data segments apply in module order, so a later segment
+                // overwrites an earlier one at the same address.
+                for segment in &declaration.segments {
+                    let start = segment.offset as usize;
+                    let end = start + segment.bytes.len();
+                    assert!(end <= bytes.len(), "segment does not fit the memory");
+                    bytes[start..end].copy_from_slice(&segment.bytes);
+                }
+                (declaration.min_pages, declaration.max_pages, bytes)
+            }
+            None => (0, None, Vec::new()),
+        };
+        Self {
+            memory,
+            pages,
+            max_pages,
+            globals: module.globals.iter().map(|g| g.init.clone()).collect(),
+        }
+    }
+
+    /// Read `width` bytes little-endian, trapping if the access is out of bounds.
+    fn read(&self, address: u64, width: u64) -> Result<u64, Trap> {
+        let end = address.checked_add(width).ok_or(Trap::MemoryOutOfBounds)?;
+        if end > self.memory.len() as u64 {
+            return Err(Trap::MemoryOutOfBounds);
+        }
+        let start = address as usize;
+        let mut bits = 0u64;
+        for (index, byte) in self.memory[start..start + width as usize]
+            .iter()
+            .enumerate()
+        {
+            bits |= u64::from(*byte) << (index * 8);
+        }
+        Ok(bits)
+    }
+
+    /// Write the low `width` bytes of `bits`, trapping if out of bounds.
+    fn write(&mut self, address: u64, width: u64, bits: u64) -> Result<(), Trap> {
+        let end = address.checked_add(width).ok_or(Trap::MemoryOutOfBounds)?;
+        if end > self.memory.len() as u64 {
+            return Err(Trap::MemoryOutOfBounds);
+        }
+        let start = address as usize;
+        for index in 0..width as usize {
+            self.memory[start + index] = (bits >> (index * 8)) as u8;
+        }
+        Ok(())
+    }
+
+    /// Grow by `delta` pages, returning the previous size or -1 on failure.
+    fn grow(&mut self, delta: u64) -> i32 {
+        let previous = self.pages;
+        let requested = match previous.checked_add(delta) {
+            Some(total) => total,
+            None => return -1,
+        };
+        if let Some(max) = self.max_pages {
+            if requested > max {
+                return -1;
+            }
+        }
+        if requested > MAX_PAGES {
+            return -1;
+        }
+        self.memory.resize(requested as usize * PAGE_SIZE, 0);
+        self.pages = requested;
+        previous as i32
+    }
+}
+
 fn execute_ir_function(
     module: &IrModule,
     function_index: usize,
     args: Vec<Value>,
     depth: usize,
+    state: &mut ModuleState,
 ) -> Result<Vec<Value>, Trap> {
     if depth >= 1000 {
         return Err(Trap::CallDepthExceeded);
@@ -354,6 +470,72 @@ fn execute_ir_function(
                     };
                     values.insert(*result, converted);
                 }
+                IrInstr::MemorySize { result } => {
+                    values.insert(*result, Value::I32(state.pages as i32));
+                }
+                IrInstr::MemoryGrow { result, delta } => {
+                    let delta = match values.get(delta) {
+                        Some(Value::I32(value)) => *value as u32 as u64,
+                        _ => return Err(Trap::HostFailure("memory.grow delta".into())),
+                    };
+                    let previous = state.grow(delta);
+                    values.insert(*result, Value::I32(previous));
+                }
+                IrInstr::GlobalGet { result, global } => {
+                    let value = state
+                        .globals
+                        .get(*global as usize)
+                        .ok_or_else(|| Trap::HostFailure("missing global".into()))?;
+                    values.insert(*result, value.clone());
+                }
+                IrInstr::GlobalSet { global, value } => {
+                    let stored = values
+                        .get(value)
+                        .ok_or_else(|| Trap::HostFailure("missing global operand".into()))?
+                        .clone();
+                    *state
+                        .globals
+                        .get_mut(*global as usize)
+                        .ok_or_else(|| Trap::HostFailure("missing global".into()))? = stored;
+                }
+                IrInstr::Load {
+                    result,
+                    address,
+                    offset,
+                    operation,
+                } => {
+                    let base = match values.get(address) {
+                        Some(Value::I32(value)) => *value as u32 as u64,
+                        _ => return Err(Trap::HostFailure("load address".into())),
+                    };
+                    let effective = base
+                        .checked_add(u64::from(*offset))
+                        .ok_or(Trap::MemoryOutOfBounds)?;
+                    let bits = state.read(effective, u64::from(operation.width()))?;
+                    values.insert(*result, decode_load(*operation, bits)?);
+                }
+                IrInstr::Store {
+                    address,
+                    value,
+                    offset,
+                    operation,
+                } => {
+                    let base = match values.get(address) {
+                        Some(Value::I32(value)) => *value as u32 as u64,
+                        _ => return Err(Trap::HostFailure("store address".into())),
+                    };
+                    let effective = base
+                        .checked_add(u64::from(*offset))
+                        .ok_or(Trap::MemoryOutOfBounds)?;
+                    let bits = match values.get(value) {
+                        Some(Value::I32(stored)) => u64::from(*stored as u32),
+                        Some(Value::I64(stored)) => *stored as u64,
+                        Some(Value::F32(stored)) => u64::from(*stored),
+                        Some(Value::F64(stored)) => *stored,
+                        _ => return Err(Trap::HostFailure("store operand".into())),
+                    };
+                    state.write(effective, u64::from(operation.width()), bits)?;
+                }
                 IrInstr::Call {
                     function,
                     arguments,
@@ -368,8 +550,62 @@ fn execute_ir_function(
                                 .ok_or_else(|| Trap::HostFailure("missing call argument".into()))
                         })
                         .collect::<Result<Vec<_>, Trap>>()?;
-                    let call_results =
-                        execute_ir_function(module, *function as usize, call_arguments, depth + 1)?;
+                    let call_results = execute_ir_function(
+                        module,
+                        *function as usize,
+                        call_arguments,
+                        depth + 1,
+                        state,
+                    )?;
+                    if call_results.len() != results.len() {
+                        return Err(Trap::HostFailure("call result arity mismatch".into()));
+                    }
+                    for (result, value) in results.iter().zip(call_results) {
+                        values.insert(*result, value);
+                    }
+                }
+                IrInstr::CallIndirect {
+                    table,
+                    operand,
+                    arguments,
+                    results,
+                    ..
+                } => {
+                    // The table holds optional function indices, as a `funcref`
+                    // table does; a null or out-of-range index is a trap.
+                    let index = values
+                        .get(operand)
+                        .and_then(|value| match value {
+                            Value::I32(index) => Some(*index as u32),
+                            _ => None,
+                        })
+                        .ok_or_else(|| Trap::HostFailure("missing table index".into()))?;
+                    let declaration = module
+                        .tables
+                        .get(*table as usize)
+                        .ok_or_else(|| Trap::HostFailure("unknown table".into()))?;
+                    let slot = declaration.offset as usize + index as usize;
+                    let target = declaration
+                        .elements
+                        .get(slot)
+                        .copied()
+                        .ok_or(Trap::TableOutOfBounds)?;
+                    let call_arguments = arguments
+                        .iter()
+                        .map(|argument| {
+                            values
+                                .get(argument)
+                                .cloned()
+                                .ok_or_else(|| Trap::HostFailure("missing call argument".into()))
+                        })
+                        .collect::<Result<Vec<_>, Trap>>()?;
+                    let call_results = execute_ir_function(
+                        module,
+                        target as usize,
+                        call_arguments,
+                        depth + 1,
+                        state,
+                    )?;
                     if call_results.len() != results.len() {
                         return Err(Trap::HostFailure("call result arity mismatch".into()));
                     }
@@ -1164,13 +1400,31 @@ fn execute_micro_at(
             .expect("test function should fit in store");
         func_addrs.push(address);
     }
+    // The instance's memory and global lists must be populated, otherwise a
+    // load or `global.get` resolves against an empty instance and traps.
+    let mut memory_addrs = Vec::new();
+    for memory in &module.memories {
+        let address = store
+            .allocate_memory(memory.memory_type.limits.min, memory.memory_type.limits.max)
+            .expect("test memory should fit in store");
+        memory_addrs.push(address);
+    }
+    let mut global_addrs = Vec::new();
+    for global in &module.globals {
+        let value = read_const_expr_bytes(&global.init, global.global_type.value_type)
+            .expect("validated global initializer should decode");
+        let address = store
+            .add_global(global.global_type, value)
+            .expect("test global should fit in store");
+        global_addrs.push(address);
+    }
     store
         .add_instance(StoreInstance {
             module_types: module.types.clone(),
             func_addrs,
             table_addrs: Vec::new(),
-            memory_addrs: Vec::new(),
-            global_addrs: Vec::new(),
+            memory_addrs,
+            global_addrs,
         })
         .expect("test instance should fit in store");
 
@@ -1212,7 +1466,14 @@ fn assert_differential_at(
 ) -> Result<Vec<Value>, Trap> {
     let validated = validated(module.clone());
     let verified = lower_and_verify(&validated).expect("supported module should lower and verify");
-    let ir_result = execute_ir_function(verified.module(), function_index, args.clone(), 0);
+    let mut state = ModuleState::new(verified.module());
+    let ir_result = execute_ir_function(
+        verified.module(),
+        function_index,
+        args.clone(),
+        0,
+        &mut state,
+    );
     assert_eq!(ir_result, execute_micro_at(&module, function_index, args));
     ir_result
 }
@@ -2134,17 +2395,41 @@ fn float_truncation_matches_micro_and_traps_on_invalid_values() {
 
 #[test]
 fn unsupported_module_state_and_instructions_are_rejected() {
+    // A memory and a global are now part of the IR, so a module declaring them
+    // lowers instead of being rejected. The memory keeps its declared bounds and
+    // the global keeps its type and initial value, so a later stage can run the
+    // function without re-reading the Wasm module.
     let mut with_memory = module(Vec::new(), Vec::new(), vec![0x0b]);
     with_memory.memories.push(tpt_wasm_format::Memory {
         memory_type: tpt_wasm_types::MemoryType {
-            limits: tpt_wasm_types::Limits { min: 1, max: None },
+            limits: tpt_wasm_types::Limits {
+                min: 2,
+                max: Some(4),
+            },
             memory64: false,
         },
     });
+    with_memory.globals.push(tpt_wasm_format::Global {
+        global_type: tpt_wasm_types::GlobalType {
+            value_type: ValueType::I32,
+            mutable: true,
+        },
+        init: tpt_wasm_format::ConstExpr(vec![0x41, 0x2a, 0x0b]),
+    });
+    let outcome = lower_module(&validated(with_memory));
+    let lowered = outcome.expect("a module with a memory and a global should lower");
     assert_eq!(
-        lower_module(&validated(with_memory)),
-        Err(LoweringError::UnsupportedFeature("memories"))
+        lowered.memory,
+        Some(super::IrMemory {
+            min_pages: 2,
+            max_pages: Some(4),
+            segments: Vec::new(),
+        })
     );
+    assert_eq!(lowered.globals.len(), 1);
+    assert_eq!(lowered.globals[0].value_type, ValueType::I32);
+    assert!(lowered.globals[0].mutable);
+    assert_eq!(lowered.globals[0].init, Value::I32(42));
 
     let mut with_export = module(Vec::new(), Vec::new(), vec![0x0b]);
     with_export.exports.push(Export {
@@ -2260,6 +2545,273 @@ fn if_without_else_yields_only_when_the_condition_holds() {
         assert_differential(unguarded, Vec::new()),
         Ok(vec![Value::I32(0)])
     );
+}
+
+/// Decode a validated global initializer for the Micro test driver, reusing the
+/// IR's own decoder so both paths agree on what an initializer means.
+fn read_const_expr_bytes(
+    expr: &tpt_wasm_format::ConstExpr,
+    value_type: ValueType,
+) -> Result<Value, Trap> {
+    crate::lower::read_const_expr(expr, value_type)
+        .map_err(|error| Trap::HostFailure(format!("global initializer: {error:?}")))
+}
+
+/// Attach a single-page memory to a module.
+fn with_memory(inner: Module) -> Module {
+    let mut module = inner;
+    module.memories.push(tpt_wasm_format::Memory {
+        memory_type: tpt_wasm_types::MemoryType {
+            limits: tpt_wasm_types::Limits { min: 1, max: None },
+            memory64: false,
+        },
+    });
+    module
+}
+
+/// Attach a global to a module.
+fn with_global(inner: Module, value_type: ValueType, mutable: bool, init: Vec<u8>) -> Module {
+    let mut module = inner;
+    let mut init = init;
+    init.push(0x0b);
+    module.globals.push(tpt_wasm_format::Global {
+        global_type: tpt_wasm_types::GlobalType {
+            value_type,
+            mutable,
+        },
+        init: tpt_wasm_format::ConstExpr(init),
+    });
+    module
+}
+
+/// An `i32.const` instruction with a canonically encoded immediate.
+fn const_i32(value: i32) -> Vec<u8> {
+    let mut bytes = vec![0x41];
+    bytes.extend(encode_i32(value));
+    bytes
+}
+
+/// An `i64.const` instruction with a canonically encoded immediate.
+fn const_i64(value: i64) -> Vec<u8> {
+    let mut bytes = vec![0x42];
+    bytes.extend(encode_i64(value));
+    bytes
+}
+
+#[test]
+fn memory_store_then_load_round_trips() {
+    // (memory 1) store 0x12345678 at address 4, then load it back.
+    let mut body = const_i32(4);
+    body.extend(const_i32(0x1234_5678));
+    body.extend_from_slice(&[0x36, 0x02, 0x00]); // i32.store align=2 offset=0
+    body.extend(const_i32(4));
+    body.extend_from_slice(&[0x28, 0x02, 0x00]); // i32.load align=2 offset=0
+    body.push(0x0b);
+    let inner = module(Vec::new(), vec![ValueType::I32], body);
+    assert_eq!(
+        assert_differential(with_memory(inner), Vec::new()),
+        Ok(vec![Value::I32(0x1234_5678u32 as i32)])
+    );
+}
+
+#[test]
+fn every_narrow_load_sign_and_zero_extends() {
+    // Write 0xFF into the low byte of memory 0 and read it back with each
+    // width, checking the documented extension rules. The `i32` loads produce an
+    // `i32` and the `i64` loads an `i64`, so the result type follows the opcode.
+    let cases: &[(u8, &str, ValueType, Value)] = &[
+        (0x2c, "i32.load8_s", ValueType::I32, Value::I32(-1)),
+        (0x2d, "i32.load8_u", ValueType::I32, Value::I32(255)),
+        (0x30, "i64.load8_s", ValueType::I64, Value::I64(-1)),
+        (0x31, "i64.load8_u", ValueType::I64, Value::I64(255)),
+    ];
+    for (opcode, name, result_type, expected) in cases {
+        let mut body = const_i32(0);
+        body.extend(const_i32(255));
+        body.extend_from_slice(&[0x3a, 0x00, 0x00]); // i32.store8
+        body.extend(const_i32(0));
+        body.extend_from_slice(&[*opcode, 0x00, 0x00]); // the load under test
+        body.push(0x0b);
+        let inner = module(Vec::new(), vec![*result_type], body);
+        let result = assert_differential(with_memory(inner), Vec::new());
+        assert_eq!(result, Ok(vec![expected.clone()]), "{name}");
+    }
+}
+
+#[test]
+fn float_memory_access_preserves_raw_bits() {
+    // Store a signalling-NaN bit pattern and load it back; a round trip through
+    // memory must not canonicalize it.
+    let bits: u32 = 0x7f80_0001;
+    let mut body = vec![0x41, 0x00, 0x43];
+    body.extend(bits.to_le_bytes());
+    body.extend_from_slice(&[0x38, 0x02, 0x00]); // f32.store
+    body.extend_from_slice(&[0x41, 0x00, 0x2a, 0x02, 0x00]); // f32.load
+    body.push(0x0b);
+    let inner = module(Vec::new(), vec![ValueType::F32], body);
+    assert_eq!(
+        assert_differential(with_memory(inner), Vec::new()),
+        Ok(vec![Value::F32(bits)])
+    );
+}
+
+#[test]
+fn an_out_of_bounds_access_traps() {
+    // A one-page memory is 65536 bytes, so a 4-byte load at 65535 is out of
+    // bounds and must trap on both sides.
+    let inner = module(
+        Vec::new(),
+        vec![ValueType::I32],
+        vec![0x41, 0xff, 0xff, 0x03, 0x28, 0x02, 0x00, 0x0b],
+    );
+    assert_eq!(
+        assert_differential(with_memory(inner), Vec::new()),
+        Err(Trap::MemoryOutOfBounds)
+    );
+}
+
+#[test]
+fn memory_size_and_grow_track_the_page_count() {
+    // Start at one page, grow by two, and report the sizes along the way.
+    let inner = module(
+        Vec::new(),
+        vec![ValueType::I32],
+        vec![
+            0x3f, 0x00, // memory.size
+            0x41, 0x02, // i32.const 2
+            0x40, 0x00, // memory.grow
+            0x6a, // i32.add
+            0x0b,
+        ],
+    );
+    // One page initially; growing by two returns the previous size, one.
+    assert_eq!(
+        assert_differential(with_memory(inner), Vec::new()),
+        Ok(vec![Value::I32(2)])
+    );
+}
+
+#[test]
+fn a_global_reads_and_writes_its_slot() {
+    // Bump a mutable global and return its new value.
+    let inner = module(
+        Vec::new(),
+        vec![ValueType::I32],
+        vec![
+            0x23, 0x00, // global.get 0
+            0x41, 0x05, // i32.const 5
+            0x6a, // i32.add
+            0x24, 0x00, // global.set 0
+            0x23, 0x00, // global.get 0
+            0x0b,
+        ],
+    );
+    let module = with_global(inner, ValueType::I32, true, vec![0x41, 0x37]);
+    // The global starts at 55, so it becomes 60.
+    assert_eq!(
+        assert_differential(module, Vec::new()),
+        Ok(vec![Value::I32(60)])
+    );
+}
+
+#[test]
+fn globals_of_each_numeric_type_round_trip() {
+    for (value_type, init, expected) in [
+        (ValueType::I32, const_i32(42), Value::I32(42)),
+        (
+            ValueType::I64,
+            const_i64(0x1234_5678),
+            Value::I64(0x1234_5678),
+        ),
+    ] {
+        let inner = module(Vec::new(), vec![value_type], vec![0x23, 0x00, 0x0b]);
+        let module = with_global(inner, value_type, false, init);
+        assert_eq!(
+            assert_differential(module, Vec::new()),
+            Ok(vec![expected]),
+            "global {value_type:?}"
+        );
+    }
+}
+
+#[test]
+fn verifier_rejects_memory_use_in_a_module_without_memory() {
+    // The Wasm validator rejects a load in a module with no memory before the IR
+    // ever sees it, so this builds the IR directly to reach the IR's own check.
+    // A verifier that is only ever fed validated input could not catch a
+    // hand-forged module, so the check has to stand on its own.
+    let inner = module(Vec::new(), vec![ValueType::I32], vec![0x41, 0x00, 0x0b]);
+    let mut ir = lower_module(&validated(inner)).unwrap();
+    assert_eq!(ir.memory, None);
+    ir.functions[0].blocks[0].instrs = vec![
+        IrInstr::ConstI32 {
+            result: ValueId(0),
+            value: 0,
+        },
+        super::IrInstr::Load {
+            result: ValueId(1),
+            address: ValueId(0),
+            offset: 0,
+            operation: super::MemoryLoad::I32,
+        },
+    ];
+    ir.functions[0].values.push(IrValue {
+        id: ValueId(1),
+        value_type: ValueType::I32,
+    });
+    assert_eq!(verify_module(&ir), Err(VerificationError::NoMemory));
+}
+
+#[test]
+fn a_value_defined_before_a_branch_is_usable_after_it() {
+    // `1 + if 2 { 10 } else { 20 }`
+    //
+    // The `i32.const 1` lives in the entry block while the `i32.add` sits in the
+    // merge block after the `if`. The entry dominates that merge, so the constant
+    // is in scope there. Scoping each block only by its own parameters and
+    // locals would wrongly report this as a use before definition.
+    let body = module(
+        Vec::new(),
+        vec![ValueType::I32],
+        vec![
+            0x41, 0x01, // i32.const 1
+            0x41, 0x02, // i32.const 2
+            0x04, 0x7f, // if (result i32)
+            0x41, 0x0a, // i32.const 10
+            0x05, // else
+            0x41, 0x14, // i32.const 20
+            0x0b, // end (if)
+            0x6a, // i32.add
+            0x0b, // end
+        ],
+    );
+    assert_eq!(
+        assert_differential(body, Vec::new()),
+        Ok(vec![Value::I32(11)])
+    );
+}
+
+#[test]
+fn a_branch_produces_multiple_blocks_that_all_verify() {
+    // A sanity check that an `if`/`else` really lowers to a multi-block CFG and
+    // that every block in it passes verification, so the merge-block scoping above
+    // is not being tested against a straight-line function.
+    let validated = validated(module(
+        Vec::new(),
+        vec![ValueType::I32],
+        vec![
+            0x41, 0x01, // i32.const 1
+            0x04, 0x7f, // if (result i32)
+            0x41, 0x0a, // i32.const 10
+            0x05, // else
+            0x41, 0x14, // i32.const 20
+            0x0b, // end (if)
+            0x0b, // end
+        ],
+    ));
+    let ir = lower_module(&validated).unwrap();
+    assert!(ir.functions[0].blocks.len() > 1);
+    assert!(verify_module(&ir).is_ok());
 }
 
 /// A `br_table` selecting between three arms that each push a constant and
@@ -2428,10 +2980,86 @@ fn diamond_ir() -> IrFunction {
 fn verifier_accepts_a_diamond_with_a_block_parameter() {
     let ir = IrModule {
         functions: vec![diamond_ir()],
+        ..IrModule::default()
     };
     // Success is proven by the absence of an error; the certificate type keeps
     // its fields private, so it is not constructed directly here.
     assert!(verify_module(&ir).is_ok());
+}
+
+#[test]
+fn verifier_accepts_a_parameter_used_in_a_non_entry_block() {
+    // A parameter is defined at function entry, so it dominates every block,
+    // including one only reached through a branch arm. The dominator walk has to
+    // recognize the ancestor when it steps onto it; bailing out as soon as the
+    // walk reached the ancestor's depth would wrongly reject this.
+    //
+    //   block 0 (entry): c = 1; br c ? block 1 : block 2
+    //   block 1:         drop p; br block 3
+    //   block 2:         br block 3
+    //   block 3 (merge): return c
+    let branch = |then: BlockId, otherwise: BlockId| Terminator::CondBranch {
+        condition: ValueId(1),
+        then_target: then,
+        then_values: Vec::new(),
+        else_target: otherwise,
+        else_values: Vec::new(),
+    };
+    let function = IrFunction {
+        function_type: function_type(vec![ValueType::I32], vec![ValueType::I32]),
+        // Value 0 is the parameter; value 1 is the condition.
+        params: vec![ValueId(0)],
+        locals: Vec::new(),
+        values: (0..2)
+            .map(|id| IrValue {
+                id: ValueId(id),
+                value_type: ValueType::I32,
+            })
+            .collect(),
+        entry: BlockId(0),
+        blocks: vec![
+            super::BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                instrs: vec![IrInstr::ConstI32 {
+                    result: ValueId(1),
+                    value: 1,
+                }],
+                terminator: branch(BlockId(1), BlockId(2)),
+            },
+            super::BasicBlock {
+                id: BlockId(1),
+                params: Vec::new(),
+                // The parameter is read from a block the entry dominates.
+                instrs: vec![IrInstr::Drop { value: ValueId(0) }],
+                terminator: Terminator::Branch {
+                    target: BlockId(3),
+                    values: Vec::new(),
+                },
+            },
+            super::BasicBlock {
+                id: BlockId(2),
+                params: Vec::new(),
+                instrs: Vec::new(),
+                terminator: Terminator::Branch {
+                    target: BlockId(3),
+                    values: Vec::new(),
+                },
+            },
+            super::BasicBlock {
+                id: BlockId(3),
+                params: Vec::new(),
+                instrs: Vec::new(),
+                terminator: Terminator::Return(vec![ValueId(1)]),
+            },
+        ],
+    };
+    let ir = IrModule {
+        functions: vec![function],
+        ..IrModule::default()
+    };
+    let outcome = verify_module(&ir);
+    assert!(outcome.is_ok(), "verify rejected: {outcome:?}");
 }
 
 #[test]
@@ -2444,6 +3072,7 @@ fn verifier_rejects_a_use_that_does_not_dominate() {
     function.blocks[2].instrs = vec![IrInstr::Drop { value: ValueId(2) }];
     let ir = IrModule {
         functions: vec![function],
+        ..IrModule::default()
     };
     assert_eq!(
         verify_module(&ir),
@@ -2467,6 +3096,7 @@ fn verifier_rejects_a_dangling_branch_target() {
     function.blocks.truncate(1);
     let ir = IrModule {
         functions: vec![function],
+        ..IrModule::default()
     };
     assert_eq!(
         verify_module(&ir),
@@ -2484,6 +3114,7 @@ fn verifier_rejects_a_branch_arity_mismatch() {
     };
     let ir = IrModule {
         functions: vec![function],
+        ..IrModule::default()
     };
     assert_eq!(
         verify_module(&ir),
@@ -2502,6 +3133,7 @@ fn verifier_rejects_a_duplicate_block_id() {
     function.blocks[3].id = BlockId(0);
     let ir = IrModule {
         functions: vec![function],
+        ..IrModule::default()
     };
     assert_eq!(
         verify_module(&ir),
@@ -2606,4 +3238,57 @@ fn verified_module_keeps_its_payload_immutable() {
     let function = &verified.module().functions[0];
     assert_eq!(function.blocks[0].id, function.entry);
     assert_eq!(verified.certificate(), &verified.certificate().clone());
+}
+
+#[test]
+fn an_active_data_segment_becomes_part_of_the_memory_declaration() {
+    // The segments are the memory's initial contents, so they travel with the
+    // declaration and are kept in module order for overlapping writes.
+    let mut with_memory = module(Vec::new(), Vec::new(), vec![0x0b]);
+    with_memory.memories.push(tpt_wasm_format::Memory {
+        memory_type: tpt_wasm_types::MemoryType {
+            limits: tpt_wasm_types::Limits { min: 1, max: None },
+            memory64: false,
+        },
+    });
+    for (offset, bytes) in [(0i32, vec![1u8, 2]), (4, vec![9u8])] {
+        with_memory.data.push(tpt_wasm_format::DataSegment {
+            mode: tpt_wasm_format::DataMode::Active {
+                memory_index: 0,
+                offset: tpt_wasm_format::ConstExpr({
+                    let mut encoded = vec![0x41];
+                    let mut remaining = offset;
+                    loop {
+                        let byte = (remaining as u8) & 0x7f;
+                        remaining >>= 7;
+                        let sign = byte & 0x40 != 0;
+                        if (remaining == 0 && !sign) || (remaining == -1 && sign) {
+                            encoded.push(byte);
+                            break;
+                        }
+                        encoded.push(byte | 0x80);
+                    }
+                    encoded.push(0x0b);
+                    encoded
+                }),
+            },
+            data: bytes,
+        });
+    }
+    let lowered = lower_module(&validated(with_memory)).expect("segments should lower");
+    let memory = lowered.memory.expect("the module declares a memory");
+    assert_eq!(memory.min_pages, 1);
+    assert_eq!(
+        memory.segments,
+        vec![
+            super::IrDataSegment {
+                offset: 0,
+                bytes: vec![1, 2],
+            },
+            super::IrDataSegment {
+                offset: 4,
+                bytes: vec![9],
+            },
+        ]
+    );
 }
