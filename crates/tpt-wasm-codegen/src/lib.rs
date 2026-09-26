@@ -333,6 +333,21 @@ pub enum BaselineOp {
         global: u32,
         value: u32,
     },
+    /// Produce a null reference of the given kind.
+    RefNull {
+        slot: u32,
+        reference_type: tpt_wasm_types::ReferenceType,
+    },
+    /// Produce a reference to the function at this index in the function table.
+    RefFunc {
+        slot: u32,
+        function: u32,
+    },
+    /// 1 when the operand is a null reference, 0 otherwise.
+    RefIsNull {
+        result: u32,
+        value: u32,
+    },
 }
 
 /// One basic block of a lowered baseline function.
@@ -1217,6 +1232,33 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                         global: *global,
                         value,
                     });
+                }
+                IrInstr::RefNull {
+                    result,
+                    reference_type,
+                } => {
+                    // The result's declared type already pins the kind, so the
+                    // verifier has established the two agree.
+                    let slot = state.define(*result)?;
+                    ops.push(BaselineOp::RefNull {
+                        slot,
+                        reference_type: *reference_type,
+                    });
+                }
+                IrInstr::RefFunc { result, function } => {
+                    // The index was checked against the module's function table.
+                    let slot = state.define(*result)?;
+                    ops.push(BaselineOp::RefFunc {
+                        slot,
+                        function: *function,
+                    });
+                }
+                IrInstr::RefIsNull { result, value } => {
+                    // Either reference kind is accepted, so the operand is read
+                    // by slot rather than through a typed accessor.
+                    let value = state.slot(*value)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::RefIsNull { result, value });
                 } // Every IR instruction is lowered above. When the IR grows, this
                   // arm becomes reachable again and rejects the new instruction
                   // rather than silently dropping it; until then it is dead, so the
@@ -1841,6 +1883,46 @@ impl BaselineFunction {
                             Trap::HostFailure("baseline global index is out of range".into())
                         })?;
                         *slot = stored;
+                    }
+                    BaselineOp::RefNull {
+                        slot,
+                        reference_type,
+                    } => {
+                        slots[*slot as usize] =
+                            Some(Value::Ref(tpt_wasm_types::RefValue::Null(*reference_type)));
+                    }
+                    BaselineOp::RefFunc { slot, function } => {
+                        // The index addresses this module's function table, the
+                        // same space a direct `Call` dispatches through. A `Call`
+                        // resolves its target at run time and reports an index
+                        // outside the module as a host failure, so a reference to
+                        // a function this module does not carry is refused the
+                        // same way rather than producing a dangling reference.
+                        if usize::try_from(*function)
+                            .ok()
+                            .and_then(|index| state.functions.get(index))
+                            .is_none()
+                        {
+                            return Err(Trap::HostFailure(
+                                "baseline ref.func target is not in the module".into(),
+                            ));
+                        }
+                        slots[*slot as usize] =
+                            Some(Value::Ref(tpt_wasm_types::RefValue::FuncRef(*function)));
+                    }
+                    BaselineOp::RefIsNull { result, value } => {
+                        let reference = read_slot(&slots, *value)?;
+                        let is_null = match reference {
+                            Value::Ref(tpt_wasm_types::RefValue::Null(_)) => true,
+                            Value::Ref(tpt_wasm_types::RefValue::FuncRef(_))
+                            | Value::Ref(tpt_wasm_types::RefValue::ExternRef(_)) => false,
+                            other => {
+                                return Err(Trap::HostFailure(format!(
+                                    "baseline ref.is_null operand is not a reference: {other:?}"
+                                )))
+                            }
+                        };
+                        slots[*result as usize] = Some(Value::I32(is_null as i32));
                     }
                     BaselineOp::Branch { target, values } => {
                         next = Some((*target, values.clone()));
@@ -2591,8 +2673,9 @@ mod tests {
     use tpt_wasm_micro::instr::decode_body;
     use tpt_wasm_micro::machine::{Frame, Machine, Step};
     use tpt_wasm_micro::store::{Instance, Store};
-    use tpt_wasm_types::RefValue;
-    use tpt_wasm_types::{FunctionType, ResultType, Trap, Value, ValueType};
+    use tpt_wasm_types::{
+        FunctionType, RefValue, ReferenceType, ResultType, Trap, Value, ValueType,
+    };
 
     fn add_function() -> IrFunction {
         IrFunction {
@@ -3715,6 +3798,8 @@ mod tests {
             ValueType::I64 => Value::I64(0),
             ValueType::F32 => Value::F32(0),
             ValueType::F64 => Value::F64(0),
+            // A reference local starts null, the only zero a reference has.
+            ValueType::Ref(kind) => Value::Ref(RefValue::Null(kind)),
             other => panic!("unsupported local type in fixture: {other:?}"),
         }
     }
@@ -4503,6 +4588,171 @@ mod tests {
         assert_eq!(
             assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
             vec![Value::I32(42)]
+        );
+    }
+
+    /// `ref.null` with the given reference type, 0x70 being `funcref`.
+    fn ref_null(reference_type: u8) -> Vec<u8> {
+        vec![0xd0, reference_type]
+    }
+
+    /// `ref.is_null`, which turns any reference into an `i32`.
+    const REF_IS_NULL: u8 = 0xd1;
+
+    /// A module whose first function exercises a reference and returns an
+    /// `i32`, with a second function present so `ref.func 1` has something to
+    /// name.
+    fn reference_module(body: Vec<u8>) -> Module {
+        let mut module = module(Vec::new(), vec![ValueType::I32], body);
+        module.functions.push(Function {
+            type_index: 0,
+            locals: vec![],
+            body: const_i32(0).into_iter().chain([0x0b]).collect(),
+        });
+        module
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_ref_null() {
+        for (name, reference_type) in [("funcref", 0x70u8), ("externref", 0x6f)] {
+            let mut body = ref_null(reference_type);
+            body.push(REF_IS_NULL);
+            body.push(0x0b);
+            let module = reference_module(body);
+            assert_eq!(
+                assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+                vec![Value::I32(1)],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_ref_func() {
+        // `ref.func 1` names a real function, so the result is not null.
+        let mut body = vec![0xd2, 0x01];
+        body.push(REF_IS_NULL);
+        body.push(0x0b);
+        let module = reference_module(body);
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(0)]
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_a_funcref_returned_unchanged() {
+        // Returning the reference itself compares the two backends' value
+        // representations directly, not only the `i32` derived from it. A second
+        // type is added so `$target` keeps its own `i32` signature and does not
+        // have to satisfy the reference-typed one.
+        let mut module = reference_module(Vec::new());
+        module.types.push(FunctionType {
+            params: ResultType(Vec::new()),
+            results: ResultType(vec![ValueType::Ref(ReferenceType::FuncRef)]),
+        });
+        for (body, expected) in [
+            (
+                vec![0xd0, 0x70, 0x0b],
+                Value::Ref(RefValue::Null(ReferenceType::FuncRef)),
+            ),
+            (vec![0xd2, 0x00, 0x0b], Value::Ref(RefValue::FuncRef(0))),
+        ] {
+            module.functions[0].type_index = 1;
+            module.functions[0].body = body;
+            assert_eq!(
+                assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+                vec![expected]
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_a_reference_through_a_local() {
+        // A reference stored in a local and read back exercises `local.set` and
+        // `local.get` against a reference-typed slot.
+        let mut body = ref_null(0x70);
+        body.extend_from_slice(&[0x21, 0x00]); // local.set 0
+        body.extend_from_slice(&[0x20, 0x00]); // local.get 0
+        body.push(REF_IS_NULL);
+        body.push(0x0b);
+        let mut module = reference_module(body);
+        module.functions[0].locals = vec![tpt_wasm_format::LocalDecl {
+            count: 1,
+            value_type: ValueType::Ref(ReferenceType::FuncRef),
+        }];
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(1)]
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_ref_is_null_under_control_flow() {
+        // The null test decides which branch runs, so a `ref.is_null` that
+        // always answered the same way would take the wrong edge.
+        let mut body = ref_null(0x70);
+        body.push(REF_IS_NULL);
+        body.extend_from_slice(&[0x04, 0x7f]); // if (result i32)
+        body.extend(const_i32(10)); // then
+        body.push(0x05); // else
+        body.extend(const_i32(20));
+        body.push(0x0b); // end if
+        body.push(0x0b); // end function
+        let module = reference_module(body);
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(10)],
+            "a null reference takes the then arm"
+        );
+
+        // The same shape over a real function reference must take the other
+        // edge, so the two together pin the answer rather than just the edge.
+        let mut body = vec![0xd2, 0x00];
+        body.push(REF_IS_NULL);
+        body.extend_from_slice(&[0x04, 0x7f]); // if (result i32)
+        body.extend(const_i32(10)); // then
+        body.push(0x05); // else
+        body.extend(const_i32(20));
+        body.push(0x0b); // end if
+        body.push(0x0b); // end function
+        let module = reference_module(body);
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(20)],
+            "a non-null reference takes the else arm"
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_for_a_reference_through_a_block() {
+        // A `funcref` result on the block type is the block-parameter path: the
+        // value is carried on the branch edge into the merge block rather than
+        // left on a stack, so this covers a reference surviving control flow.
+        // The block's result is produced by its body, so the null is pushed
+        // inside the block rather than before it.
+        let mut body = vec![0x02, 0x70]; // block (result funcref)
+        body.extend(ref_null(0x70));
+        body.push(0x0b); // end block
+        body.push(REF_IS_NULL);
+        body.push(0x0b); // end function
+        let module = reference_module(body);
+        assert_eq!(
+            assert_runnable_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(1)]
+        );
+    }
+
+    #[test]
+    fn a_ref_func_to_a_missing_function_is_refused() {
+        // The index names no function. The validator is the first gate and
+        // rejects it, so the module never reaches lowering or execution.
+        let mut body = vec![0xd2, 0x09];
+        body.push(REF_IS_NULL);
+        body.push(0x0b);
+        assert_eq!(
+            tpt_wasm_validate::validate(reference_module(body)),
+            Err(tpt_wasm_validate::ValidationError::UnknownFunction(9))
         );
     }
 }

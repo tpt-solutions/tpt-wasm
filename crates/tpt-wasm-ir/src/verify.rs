@@ -696,6 +696,11 @@ fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
     match instruction {
         // Constants read nothing.
         ConstI32 { .. } | ConstI64 { .. } | ConstF32 { .. } | ConstF64 { .. } => Vec::new(),
+        // A reference type and a function index are both immediates, so these
+        // two read nothing either.
+        RefNull { .. } | RefFunc { .. } => Vec::new(),
+        // `ref.is_null` reads the reference it tests.
+        RefIsNull { value, .. } => vec![*value],
         // A get names its local; a set and tee read the stored value, and the
         // local they name is a pre-allocated slot rather than an operand.
         LocalGet { local, .. } => vec![*local],
@@ -804,6 +809,9 @@ fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
         | MemorySize { result }
         | MemoryGrow { result, .. }
         | GlobalGet { result, .. }
+        | RefNull { result, .. }
+        | RefFunc { result, .. }
+        | RefIsNull { result, .. }
         | ConstI32 { result, .. }
         | ConstI64 { result, .. }
         | ConstF32 { result, .. }
@@ -1509,6 +1517,51 @@ fn verify_instruction(
                 define_value(*result, *expected, function_index, values, defined)?;
             }
             Ok(())
+        }
+        super::IrInstr::RefNull {
+            result,
+            reference_type,
+        } => define_value(
+            *result,
+            ValueType::Ref(*reference_type),
+            function_index,
+            values,
+            defined,
+        ),
+        super::IrInstr::RefFunc { result, function } => {
+            // The index must name a function this module actually defines, the
+            // same requirement a direct `call` places on its target.
+            let exists = usize::try_from(*function)
+                .ok()
+                .and_then(|index| module.functions.get(index))
+                .is_some();
+            if !exists {
+                return Err(VerificationError::UnknownFunction(*function));
+            }
+            define_value(
+                *result,
+                ValueType::Ref(ReferenceType::FuncRef),
+                function_index,
+                values,
+                defined,
+            )
+        }
+        super::IrInstr::RefIsNull { result, value } => {
+            // Either reference kind is accepted, matching Wasm, so this checks
+            // that the operand is a reference rather than which one.
+            require_defined(*value, values, defined)?;
+            match value_type(*value, values)? {
+                ValueType::Ref(_) => {}
+                actual => {
+                    return Err(VerificationError::TypeMismatch {
+                        function: function_index,
+                        value: *value,
+                        expected: ValueType::Ref(ReferenceType::FuncRef),
+                        actual,
+                    })
+                }
+            }
+            define_value(*result, ValueType::I32, function_index, values, defined)
         }
     }
 }

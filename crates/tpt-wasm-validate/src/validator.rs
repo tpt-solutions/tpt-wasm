@@ -47,8 +47,10 @@ fn validate_types(types: &[FunctionType]) -> Result<(), ValidationError> {
             .iter()
             .chain(function_type.results.0.iter())
         {
-            if !value.is_mvp_numeric() {
-                return Err(ValidationError::UnsupportedFeature("non-MVP value type"));
+            if !value.is_supported() {
+                return Err(ValidationError::UnsupportedFeature(
+                    "unsupported value type",
+                ));
             }
         }
     }
@@ -158,8 +160,10 @@ fn validate_table_type(table_type: &TableType) -> Result<(), ValidationError> {
 }
 
 fn validate_global_type(global_type: GlobalType) -> Result<(), ValidationError> {
-    if !global_type.value_type.is_mvp_numeric() {
-        return Err(ValidationError::UnsupportedFeature("non-MVP global type"));
+    if !global_type.value_type.is_supported() {
+        return Err(ValidationError::UnsupportedFeature(
+            "unsupported global type",
+        ));
     }
     Ok(())
 }

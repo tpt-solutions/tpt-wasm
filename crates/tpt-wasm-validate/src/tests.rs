@@ -4,7 +4,7 @@
 //! Tests for module validation and the decode/validate boundary.
 
 use tpt_wasm_format::{ConstExpr, Export, ExportDesc, Function, Global, Module};
-use tpt_wasm_types::{FunctionType, GlobalType, ResultType, ValueType};
+use tpt_wasm_types::{FunctionType, GlobalType, ReferenceType, ResultType, ValueType};
 
 use super::{validate, ValidationError};
 
@@ -180,6 +180,103 @@ fn missing_function_end_is_rejected() {
         validate(module),
         Err(ValidationError::InvalidBody(_))
     ));
+}
+
+#[test]
+fn reference_instructions_are_validated() {
+    // `ref.null funcref; ref.is_null` leaves an `i32` for the result.
+    let body = vec![0xd0, 0x70, 0xd1, 0x0b];
+    assert!(validate(module_with_function(
+        function_type(vec![], vec![ValueType::I32]),
+        body
+    ))
+    .is_ok());
+
+    // `ref.func 0` names a real function, so it type-checks as a `funcref`.
+    let body = vec![0xd2, 0x00, 0xd1, 0x0b];
+    assert!(validate(module_with_function(
+        function_type(vec![], vec![ValueType::I32]),
+        body
+    ))
+    .is_ok());
+}
+
+#[test]
+fn a_ref_func_naming_no_function_is_rejected() {
+    let body = vec![0xd2, 0x07, 0xd1, 0x0b];
+    assert_eq!(
+        validate(module_with_function(
+            function_type(vec![], vec![ValueType::I32]),
+            body
+        )),
+        Err(ValidationError::UnknownFunction(7))
+    );
+}
+
+#[test]
+fn ref_is_null_requires_a_reference_operand() {
+    // `ref.is_null` accepts either reference kind but nothing else, so an
+    // `i32` operand is a type error rather than a silently coerced 0.
+    let body = vec![0x41, 0x00, 0xd1, 0x0b];
+    assert_eq!(
+        validate(module_with_function(
+            function_type(vec![], vec![ValueType::I32]),
+            body
+        )),
+        Err(ValidationError::TypeMismatch {
+            expected: "reference".into(),
+            actual: "i32".into(),
+        })
+    );
+}
+
+#[test]
+fn an_unknown_reference_type_immediate_is_rejected() {
+    // 0x71 is not a reference type, so `ref.null` cannot read one.
+    let body = vec![0xd0, 0x71, 0xd1, 0x0b];
+    assert!(matches!(
+        validate(module_with_function(
+            function_type(vec![], vec![ValueType::I32]),
+            body
+        )),
+        Err(ValidationError::InvalidBody(_))
+    ));
+}
+
+#[test]
+fn a_reference_may_appear_in_a_signature_and_a_local() {
+    // The reference instructions are only usable if a reference can be stored,
+    // so the type surface accepts `funcref` in a local and a result.
+    let signature = function_type(vec![], vec![ValueType::Ref(ReferenceType::FuncRef)]);
+    let module = Module {
+        types: vec![signature],
+        functions: vec![Function {
+            type_index: 0,
+            locals: vec![tpt_wasm_format::LocalDecl {
+                count: 1,
+                value_type: ValueType::Ref(ReferenceType::FuncRef),
+            }],
+            body: vec![0xd0, 0x70, 0x21, 0x00, 0x20, 0x00, 0x0b],
+        }],
+        ..Module::default()
+    };
+    assert!(validate(module).is_ok());
+}
+
+#[test]
+fn a_vector_type_is_still_rejected() {
+    // The reference instructions do not open the vector proposal: `v128` still
+    // has no instructions to move it, so the type stays out of the surface.
+    let vector = ValueType::V128;
+    assert_eq!(
+        validate(module_with_function(
+            function_type(vec![], vec![vector]),
+            vec![0x0b]
+        )),
+        Err(ValidationError::UnsupportedFeature(
+            "unsupported value type"
+        ))
+    );
 }
 
 #[test]

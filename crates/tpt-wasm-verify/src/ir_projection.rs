@@ -235,6 +235,12 @@ pub fn project_function_to_model(
             IrInstr::GlobalGet { .. } | IrInstr::GlobalSet { .. } => {
                 return Err(IrProjectionError::UnsupportedInstruction("global"))
             }
+            // The formal model has no reference values, so the reference
+            // instructions are rejected explicitly rather than projected as
+            // something that looks like a value they are not.
+            IrInstr::RefNull { .. } | IrInstr::RefFunc { .. } | IrInstr::RefIsNull { .. } => {
+                return Err(IrProjectionError::UnsupportedInstruction("reference"))
+            }
         });
     }
 

@@ -506,6 +506,27 @@ pub enum IrInstr {
         arguments: Vec<ValueId>,
         results: Vec<ValueId>,
     },
+    /// A null reference of the given kind.
+    ///
+    /// The kind is kept because `ref.null` names one, and a `funcref` null is
+    /// not interchangeable with an `externref` null at a typed boundary.
+    RefNull {
+        result: ValueId,
+        reference_type: ReferenceType,
+    },
+    /// A reference to the function at this index in the module's function table.
+    ///
+    /// The index is the same one a direct `Call` uses, so the two address a
+    /// function the same way.
+    RefFunc {
+        result: ValueId,
+        function: u32,
+    },
+    /// 1 when `value` is a null reference, 0 when it is not.
+    RefIsNull {
+        result: ValueId,
+        value: ValueId,
+    },
 }
 
 /// The width, signedness, and result type of one Wasm memory load.

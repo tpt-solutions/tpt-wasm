@@ -252,8 +252,10 @@ distinctly and like Micro; that a data segment lands at a requested non-zero
 offset and that a later segment overwrites an earlier one; that the fourteen
 loads and nine stores, `memory.size`, and `memory.grow` agree with Micro and
 trap out of bounds identically; that a memory instruction in a module with no
-memory traps; and that `global.get`/`global.set` read and write the same
-module-level slots in both backends.
+memory traps; that `global.get`/`global.set` read and write the same
+module-level slots in both backends; and that `ref.null`, `ref.func`, and
+`ref.is_null` agree with Micro, whether the reference is read back from a local,
+carried through a block result, returned unchanged, or used to pick a branch.
 
 Native x86-64/AArch64 code generation and executable-memory integration remain
 pending. `EngineMode::Baseline` is wired: the module is compiled through validate

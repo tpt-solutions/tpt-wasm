@@ -80,6 +80,9 @@ could affect linking, initialization, or observable behavior.
 | all nine stores | `Store` | Explicit width and operand type per operation. |
 | `memory.size`, `memory.grow` | `MemorySize`, `MemoryGrow` | `grow` yields the previous size or -1. |
 | `global.get`, `global.set` | `GlobalGet`, `GlobalSet` | Checked against the global's declared type and mutability. |
+| `ref.null` | `RefNull` | The named reference kind is kept, so a `funcref` null is not interchangeable with an `externref` null. |
+| `ref.func` | `RefFunc` | The index must name a function this module defines, the same requirement a direct `call` places on its target. |
+| `ref.is_null` | `RefIsNull` | Accepts a reference of either kind, as Wasm does, and produces an `i32`. |
 | `i32` eqz/eq/ne/lt_s/lt_u/gt_s/gt_u/le_s/le_u/ge_s/ge_u | `I32Eqz`, `I32Compare` | Comparisons produce `i32`; signed and unsigned ordering are explicit. |
 | `i64` eqz/eq/ne/lt_s/lt_u/gt_s/gt_u/le_s/le_u/ge_s/ge_u | `I64Eqz`, `I64Compare` | Comparisons produce `i32`; signed and unsigned ordering are explicit. |
 | `i32` clz/ctz/popcnt | `I32Unary` | Count leading/trailing zero bits and set bits. |
@@ -138,22 +141,23 @@ calls, `call_indirect` through an active element segment, `drop`, `select`,
 `nop`, structured control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`,
 `br_table` including the back edge and out-of-range default), the linear memory
 with all fourteen loads and nine stores plus `memory.size`/`memory.grow`,
-`global.get`/`global.set`, active data segments, explicit return, unreachable
-code, unsupported module state, and malformed hand-built IR.
+`global.get`/`global.set`, active data segments, the reference instructions
+(`ref.null`, `ref.func`, and `ref.is_null`, over a local, through a block result,
+returned unchanged, and deciding a branch), explicit return, unreachable code,
+unsupported module state, and malformed hand-built IR.
 
 ## Next lowering work
 
-Items 1 through 5 of the original plan are done: multi-block CFG construction
+Items 1 through 6 of the original plan are done: multi-block CFG construction
 with block parameters and dominance verification, defined direct calls,
-`call_indirect`, the linear memory, globals, and tables. What remains, in
-dependency order:
+`call_indirect`, the linear memory, globals, tables, and the reference
+instructions with an IR `funcref` value. What remains, in dependency order:
 
-1. reference instructions (`ref.null`, `ref.func`, `ref.is_null`) and an IR
-   `funcref` value;
-2. imported-function resolution, which unblocks the baseline's host boundary;
-3. explicit host-effect instructions, so a compiled module can call a granted
+1. imported-function resolution, which unblocks the baseline's host boundary;
+2. explicit host-effect instructions, so a compiled module can call a granted
    capability;
-4. passive and multiple element/data segments, and non-`funcref` tables.
+3. passive and multiple element/data segments, and non-`funcref` tables;
+4. `table.get`/`table.set`, completing the reference-types surface.
 
 Each addition requires an IR instruction form, verifier rule, lowering test,
 Micro differential test, and scope documentation before its tracker item can be

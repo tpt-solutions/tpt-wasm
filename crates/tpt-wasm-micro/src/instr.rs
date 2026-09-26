@@ -448,6 +448,10 @@ fn decode_block_type(reader: &mut BodyReader<'_>) -> Result<BlockType, InstrDeco
         0x7e => Ok(BlockType::Value(ValueType::I64)),
         0x7d => Ok(BlockType::Value(ValueType::F32)),
         0x7c => Ok(BlockType::Value(ValueType::F64)),
+        // A block may carry a reference result, which is what lets a `funcref`
+        // travel through a block's label.
+        0x70 => Ok(BlockType::Value(ValueType::Ref(RefType::FuncRef))),
+        0x6f => Ok(BlockType::Value(ValueType::Ref(RefType::ExternRef))),
         _ => Err(InstrDecodeError::InvalidBlockType),
     }
 }

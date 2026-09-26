@@ -6,7 +6,7 @@
 use std::fmt;
 
 use tpt_wasm_format::Function;
-use tpt_wasm_types::{FunctionType, Value, ValueType};
+use tpt_wasm_types::{FunctionType, ReferenceType, Value, ValueType};
 use tpt_wasm_validate::ValidatedModule;
 
 use super::{
@@ -341,6 +341,10 @@ pub(crate) fn read_block_type(
         0x7e => Ok(vec![ValueType::I64]),
         0x7d => Ok(vec![ValueType::F32]),
         0x7c => Ok(vec![ValueType::F64]),
+        // A block may carry a reference result, which is what lets a `funcref`
+        // travel through a block's label.
+        0x70 => Ok(vec![ValueType::Ref(ReferenceType::FuncRef)]),
+        0x6f => Ok(vec![ValueType::Ref(ReferenceType::ExternRef)]),
         // A non-negative s33 is a type index; anything else is malformed.
         other => Err(LoweringError::UnsupportedBlockType(i64::from(other))),
     }
@@ -903,8 +907,47 @@ fn lower_body(
             0x6a..=0x78 | 0x7c..=0x8a | 0x92..=0x98 | 0xa0..=0xa6 => {
                 lower_binary(opcode, state, builder)?
             }
+            0xd0 => {
+                let reference_type = read_reference_type(reader.byte()?)?;
+                let result = state.allocate(ValueType::Ref(reference_type))?;
+                builder.push(IrInstr::RefNull {
+                    result,
+                    reference_type,
+                });
+                state.push(result, ValueType::Ref(reference_type));
+            }
+            0xd1 => {
+                let value = state.pop_reference()?;
+                let result = state.allocate(ValueType::I32)?;
+                builder.push(IrInstr::RefIsNull { result, value });
+                state.push(result, ValueType::I32);
+            }
+            0xd2 => {
+                let index = reader.u32()?;
+                // The IR addresses a function by its index in this module's
+                // function table, and imports are already rejected, so the index
+                // must name a defined function.
+                if usize::try_from(index).map_or(true, |i| i >= module.functions.len()) {
+                    return Err(LoweringError::UnknownFunction(index));
+                }
+                let result = state.allocate(ValueType::Ref(ReferenceType::FuncRef))?;
+                builder.push(IrInstr::RefFunc {
+                    result,
+                    function: index,
+                });
+                state.push(result, ValueType::Ref(ReferenceType::FuncRef));
+            }
             _ => return Err(LoweringError::UnsupportedInstruction(opcode)),
         }
+    }
+}
+
+/// Read a reference type immediate: `funcref` is 0x70 and `externref` is 0x6f.
+fn read_reference_type(byte: u8) -> Result<ReferenceType, LoweringError> {
+    match byte {
+        0x70 => Ok(ReferenceType::FuncRef),
+        0x6f => Ok(ReferenceType::ExternRef),
+        _ => Err(LoweringError::UnsupportedFeature("reference type")),
     }
 }
 
@@ -1847,6 +1890,21 @@ impl LoweringState {
         let (id, actual) = self.stack.pop().ok_or(LoweringError::StackUnderflow)?;
         if actual != expected {
             return Err(LoweringError::TypeMismatch { expected, actual });
+        }
+        Ok(id)
+    }
+
+    /// Pop a value that must be a reference, of either kind.
+    ///
+    /// `ref.is_null` accepts both reference types, so the kind cannot be named
+    /// as the expected type the way [`LoweringState::pop`] does.
+    fn pop_reference(&mut self) -> Result<ValueId, LoweringError> {
+        let (id, actual) = self.stack.pop().ok_or(LoweringError::StackUnderflow)?;
+        if !matches!(actual, ValueType::Ref(_)) {
+            return Err(LoweringError::TypeMismatch {
+                expected: ValueType::Ref(ReferenceType::FuncRef),
+                actual,
+            });
         }
         Ok(id)
     }

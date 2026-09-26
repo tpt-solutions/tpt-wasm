@@ -9,13 +9,13 @@ use tpt_wasm_format::{Export, ExportDesc, Function, LocalDecl, Module};
 use tpt_wasm_micro::instr::decode_body;
 use tpt_wasm_micro::machine::{Frame, Machine, Step};
 use tpt_wasm_micro::store::{Instance as StoreInstance, Store};
-use tpt_wasm_types::{FunctionType, ResultType, Trap, Value, ValueType};
+use tpt_wasm_types::{FunctionType, RefValue, ReferenceType, ResultType, Trap, Value, ValueType};
 use tpt_wasm_validate::{ValidatedModule, Validator};
 
 use super::{
-    lower_and_verify, lower_module, verify_module, BlockId, FloatComparison, FloatConversion,
-    FloatTrunc, IntComparison, IntConversion, IntUnary, IrFunction, IrInstr, IrModule, IrValue,
-    LoweringError, Reinterpret, Terminator, ValueId, VerificationError,
+    lower_and_verify, lower_module, verify_module, BasicBlock, BlockId, FloatComparison,
+    FloatConversion, FloatTrunc, IntComparison, IntConversion, IntUnary, IrFunction, IrInstr,
+    IrModule, IrValue, LoweringError, Reinterpret, Terminator, ValueId, VerificationError,
 };
 
 fn function_type(params: Vec<ValueType>, results: Vec<ValueType>) -> FunctionType {
@@ -497,6 +497,31 @@ fn execute_ir_function(
                         .globals
                         .get_mut(*global as usize)
                         .ok_or_else(|| Trap::HostFailure("missing global".into()))? = stored;
+                }
+                IrInstr::RefNull {
+                    result,
+                    reference_type,
+                } => {
+                    values.insert(*result, Value::Ref(RefValue::Null(*reference_type)));
+                }
+                IrInstr::RefFunc { result, function } => {
+                    values.insert(*result, Value::Ref(RefValue::FuncRef(*function)));
+                }
+                IrInstr::RefIsNull { result, value } => {
+                    let is_null =
+                        match values.get(value).ok_or_else(|| {
+                            Trap::HostFailure("missing ref.is_null operand".into())
+                        })? {
+                            Value::Ref(RefValue::Null(_)) => true,
+                            Value::Ref(RefValue::FuncRef(_))
+                            | Value::Ref(RefValue::ExternRef(_)) => false,
+                            other => {
+                                return Err(Trap::HostFailure(format!(
+                                    "ref.is_null operand is not a reference: {other:?}"
+                                )))
+                            }
+                        };
+                    values.insert(*result, Value::I32(is_null as i32));
                 }
                 IrInstr::Load {
                     result,
@@ -2449,12 +2474,23 @@ fn unsupported_module_state_and_instructions_are_rejected() {
         read_block_type_bytes(&[0x00]),
         Err(LoweringError::UnsupportedBlockType(0))
     );
-    assert_eq!(
-        read_block_type_bytes(&[0x6f]),
-        Err(LoweringError::UnsupportedBlockType(0x6f))
-    );
     assert_eq!(read_block_type_bytes(&[0x40]), Ok(Vec::new()));
     assert_eq!(read_block_type_bytes(&[0x7f]), Ok(vec![ValueType::I32]));
+    // A block may carry a reference result, which is what lets a `funcref`
+    // travel through a label.
+    assert_eq!(
+        read_block_type_bytes(&[0x70]),
+        Ok(vec![ValueType::Ref(ReferenceType::FuncRef)])
+    );
+    assert_eq!(
+        read_block_type_bytes(&[0x6f]),
+        Ok(vec![ValueType::Ref(ReferenceType::ExternRef)])
+    );
+    // A still-unassigned byte is rejected rather than guessed at.
+    assert_eq!(
+        read_block_type_bytes(&[0x71]),
+        Err(LoweringError::UnsupportedBlockType(0x71))
+    );
 }
 
 #[test]
@@ -3290,5 +3326,135 @@ fn an_active_data_segment_becomes_part_of_the_memory_declaration() {
                 bytes: vec![9],
             },
         ]
+    );
+}
+
+#[test]
+fn reference_instructions_lower_to_the_ir() {
+    // `ref.null funcref; ref.is_null` must produce a `RefNull` and a
+    // `RefIsNull` over a `funcref`-typed value.
+    let nulled = module(
+        Vec::new(),
+        vec![ValueType::I32],
+        vec![0xd0, 0x70, 0xd1, 0x0b],
+    );
+    let ir = lower_module(&validated(nulled)).expect("references should lower");
+    let instrs = &ir.functions[0].blocks[0].instrs;
+    let (null, isnull) = (&instrs[0], &instrs[1]);
+    let (
+        IrInstr::RefNull {
+            result: null,
+            reference_type,
+        },
+        IrInstr::RefIsNull { value, .. },
+    ) = (null, isnull)
+    else {
+        panic!("expected RefNull then RefIsNull, got {null:?} and {isnull:?}");
+    };
+    assert_eq!(*reference_type, ReferenceType::FuncRef);
+    assert_eq!(
+        ir.functions[0]
+            .values
+            .iter()
+            .find(|v| v.id == *null)
+            .expect("the null is declared")
+            .value_type,
+        ValueType::Ref(ReferenceType::FuncRef)
+    );
+    assert_eq!(
+        ir.functions[0]
+            .values
+            .iter()
+            .find(|v| v.id == *value)
+            .expect("the tested value is declared")
+            .value_type,
+        ValueType::Ref(ReferenceType::FuncRef)
+    );
+}
+
+#[test]
+fn verifier_rejects_a_ref_func_naming_a_missing_function() {
+    // The IR is hand-built here so the verifier is exercised directly: the
+    // validator and the lowerer would both refuse this first.
+    let ir = IrModule {
+        functions: vec![IrFunction {
+            function_type: FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(vec![ValueType::Ref(ReferenceType::FuncRef)]),
+            },
+            params: Vec::new(),
+            locals: Vec::new(),
+            values: vec![IrValue {
+                id: ValueId(0),
+                value_type: ValueType::Ref(ReferenceType::FuncRef),
+            }],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                instrs: vec![IrInstr::RefFunc {
+                    result: ValueId(0),
+                    function: 5,
+                }],
+                terminator: Terminator::Return(vec![ValueId(0)]),
+            }],
+        }],
+        ..IrModule::default()
+    };
+    assert_eq!(
+        verify_module(&ir),
+        Err(VerificationError::UnknownFunction(5))
+    );
+}
+
+#[test]
+fn verifier_rejects_ref_is_null_over_a_non_reference() {
+    // `ref.is_null` takes either reference kind but nothing else, so an `i32`
+    // operand must not pass as a silently-true test.
+    let ir = IrModule {
+        functions: vec![IrFunction {
+            function_type: FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(vec![ValueType::I32]),
+            },
+            params: Vec::new(),
+            locals: Vec::new(),
+            values: vec![
+                IrValue {
+                    id: ValueId(0),
+                    value_type: ValueType::I32,
+                },
+                IrValue {
+                    id: ValueId(1),
+                    value_type: ValueType::I32,
+                },
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                instrs: vec![
+                    IrInstr::ConstI32 {
+                        result: ValueId(0),
+                        value: 7,
+                    },
+                    IrInstr::RefIsNull {
+                        result: ValueId(1),
+                        value: ValueId(0),
+                    },
+                ],
+                terminator: Terminator::Return(vec![ValueId(1)]),
+            }],
+        }],
+        ..IrModule::default()
+    };
+    assert_eq!(
+        verify_module(&ir),
+        Err(VerificationError::TypeMismatch {
+            function: 0,
+            value: ValueId(0),
+            expected: ValueType::Ref(ReferenceType::FuncRef),
+            actual: ValueType::I32,
+        })
     );
 }

@@ -149,6 +149,18 @@ impl ValueType {
     pub fn is_mvp_numeric(self) -> bool {
         matches!(self, Self::I32 | Self::I64 | Self::F32 | Self::F64)
     }
+
+    /// Returns whether this is a value type the validator accepts.
+    ///
+    /// The four MVP numeric types, plus the two reference types. `ref.null`,
+    /// `ref.func`, and `ref.is_null` are implemented, so a reference has to be
+    /// storable in a local, a global, and a signature for those instructions to
+    /// be usable at all. `V128` stays out: the vector proposal is not
+    /// implemented, and admitting the type without the instructions that move it
+    /// would let a module declare a value nothing can produce.
+    pub fn is_supported(self) -> bool {
+        self.is_mvp_numeric() || matches!(self, Self::Ref(_))
+    }
 }
 
 #[cfg(test)]

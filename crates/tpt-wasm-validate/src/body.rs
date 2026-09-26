@@ -4,7 +4,7 @@
 //! Checked MVP instruction validator internals.
 
 use tpt_wasm_format::Function;
-use tpt_wasm_types::{FunctionType, GlobalType, ValueType};
+use tpt_wasm_types::{FunctionType, GlobalType, RefType, ValueType};
 
 use super::{validator::ModuleContext, ValidationError};
 
@@ -174,6 +174,25 @@ fn mismatch(expected: ValueType, actual: Option<ValueType>) -> ValidationError {
     }
 }
 
+/// Pop a value that must be a reference, of either kind.
+///
+/// `ref.is_null` accepts both reference types, so unlike `pop_value` this
+/// cannot name the one expected type. A polymorphic operand in unreachable code
+/// stands for whatever the surrounding frame will supply, so it is accepted
+/// here and checked for real wherever it is produced.
+fn pop_reference(
+    stack: &mut Vec<Option<ValueType>>,
+    controls: &[ControlFrame],
+) -> Result<Option<ValueType>, ValidationError> {
+    match pop_value(stack, controls, None)? {
+        None | Some(ValueType::Ref(_)) => Ok(None),
+        Some(other) => Err(ValidationError::TypeMismatch {
+            expected: "reference".into(),
+            actual: type_name(other),
+        }),
+    }
+}
+
 fn pop_value(
     stack: &mut Vec<Option<ValueType>>,
     controls: &[ControlFrame],
@@ -228,6 +247,10 @@ fn block_type(reader: &mut Reader<'_>) -> Result<Vec<ValueType>, ValidationError
         0x7e => Ok(vec![ValueType::I64]),
         0x7d => Ok(vec![ValueType::F32]),
         0x7c => Ok(vec![ValueType::F64]),
+        // A block may carry a reference result, which is what lets a `funcref`
+        // travel through a block's label.
+        0x70 => Ok(vec![ValueType::Ref(RefType::FuncRef)]),
+        0x6f => Ok(vec![ValueType::Ref(RefType::ExternRef)]),
         _ => Err(ValidationError::InvalidBlockType),
     }
 }
@@ -305,8 +328,10 @@ pub(crate) fn validate_function(
     let mut locals = function_type.params.0.clone();
     let mut local_count = locals.len() as u64;
     for declaration in &function.locals {
-        if !declaration.value_type.is_mvp_numeric() {
-            return Err(ValidationError::UnsupportedFeature("non-MVP local type"));
+        if !declaration.value_type.is_supported() {
+            return Err(ValidationError::UnsupportedFeature(
+                "unsupported local type",
+            ));
         }
         local_count = local_count
             .checked_add(u64::from(declaration.count))
@@ -660,6 +685,47 @@ fn call_instruction(
     Ok(())
 }
 
+/// Read a reference type immediate: `funcref` is 0x70 and `externref` is 0x6f.
+fn reference_type(reader: &mut Reader<'_>) -> Result<RefType, ValidationError> {
+    match reader.byte()? {
+        0x70 => Ok(RefType::FuncRef),
+        0x6f => Ok(RefType::ExternRef),
+        other => Err(ValidationError::InvalidBody(format!(
+            "invalid reference type {other:#04x}"
+        ))),
+    }
+}
+
+/// Validate `ref.null`, `ref.is_null`, and `ref.func`.
+fn reference_instruction(
+    opcode: u8,
+    reader: &mut Reader<'_>,
+    stack: &mut Vec<Option<ValueType>>,
+    controls: &[ControlFrame],
+    module: &ModuleContext,
+) -> Result<(), ValidationError> {
+    match opcode {
+        0xd0 => {
+            push_value(stack, ValueType::Ref(reference_type(reader)?));
+        }
+        0xd1 => {
+            // Either reference kind is accepted, so only the reference-ness of
+            // the operand is checked here.
+            pop_reference(stack, controls)?;
+            push_value(stack, ValueType::I32);
+        }
+        0xd2 => {
+            // The index space counts imported and defined functions alike, so
+            // the module context is the authority on whether it exists.
+            let index = reader.u32()?;
+            function_type(index, module)?;
+            push_value(stack, ValueType::Ref(RefType::FuncRef));
+        }
+        _ => return Err(ValidationError::InvalidInstruction(opcode)),
+    }
+    Ok(())
+}
+
 fn constant_instruction(
     opcode: u8,
     reader: &mut Reader<'_>,
@@ -763,6 +829,7 @@ pub(crate) fn validate_instruction(
         }
         0x28..=0x40 => memory_instruction(opcode, reader, stack, controls, module),
         0x41..=0x44 => constant_instruction(opcode, reader, stack),
+        0xd0..=0xd2 => reference_instruction(opcode, reader, stack, controls, module),
         _ => numeric_instruction(opcode, stack, controls),
     }
 }

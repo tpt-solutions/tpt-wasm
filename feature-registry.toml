@@ -14,7 +14,13 @@ specification = "https://webassembly.github.io/spec/"
 mvp = "partial"
 
 # Phase 4 proposals (shipped in browsers)
-reference_types    = false
+# "partial", not true: `ref.null`, `ref.func`, and `ref.is_null` are decoded,
+# validated, lowered to the IR, and executed by both Micro and the baseline, and
+# `funcref`/`externref` are accepted in signatures, locals, globals, and block
+# result types. Still missing: `table.get`/`table.set` (0x25/0x26), an
+# `externref` table, passive and declarative element segments, and
+# `table.grow`/`table.size`/`table.fill`.
+reference_types    = "partial"
 bulk_memory        = false
 simd               = false
 multi_value        = false
@@ -67,8 +73,8 @@ mvp_verified = "partial"
 # mvp_compiled  — the portable baseline in tpt-wasm-codegen lowers and executes
 #   every instruction the IR can represent, and EngineMode::Baseline runs it at
 #   instantiation. Not `true`: there is no native x86-64/AArch64 backend, and
-#   references and host boundaries have no IR form.
-# mvp_differential — 51 tpt-wasm-codegen tests and 33 tpt-wasm-ir tests drive the
+#   host boundaries have no IR form.
+# mvp_differential — 58 tpt-wasm-codegen tests and 36 tpt-wasm-ir tests drive the
 #   real validate -> IR -> baseline pipeline and assert identical results and the
 #   same trap variant against Micro. Not `true`: the official spec suite and the
 #   reference-interpreter differential run do not execute yet.
@@ -78,11 +84,12 @@ mvp_verified = "partial"
 #   `Valid(Module)` implication, and the V4 IR projection is an executable hook,
 #   not a refinement proof.
 #
-# `reference_types` stays `false` even though tpt-wasm-micro has `RefNull`,
-# `RefIsNull`, and `RefFunc` instruction forms: the validator's opcode table
-# ends at 0xbf, so 0xd0-0xd2 are rejected as invalid instructions and a module
-# using them cannot reach the interpreter. The reference forms are unreachable
-# behind the validation stage by design.
+# `reference_types` was `false` on the grounds that the validator's opcode table
+# ended at 0xbf, so 0xd0-0xd2 were rejected and a module using them could not
+# reach the interpreter. That is no longer true: the validator now type-checks
+# those three opcodes, the IR lowers them, and both backends execute them. The
+# entry moved to "partial" rather than true, because `table.get`/`table.set`, an
+# `externref` table, and non-active element segments still have no form.
 
 [standards]
 wasm_core   = "3.0"

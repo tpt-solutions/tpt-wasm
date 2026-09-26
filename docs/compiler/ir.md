@@ -1,7 +1,7 @@
 # TPT-Wasm IR
 
 **Status:** M6 — typed IR, multi-block control flow, linear memory, globals,
-and tables implemented and verified
+tables, and references implemented and verified
 **Crate:** `tpt-wasm-ir`
 
 ## Position in pipeline
@@ -63,6 +63,7 @@ The implemented instruction set is:
 - all fourteen linear-memory loads and all nine stores, with an explicit width and
   sign/zero-extension per operation, plus `MemorySize` and `MemoryGrow`;
 - `GlobalGet` and `GlobalSet`;
+- `RefNull`, `RefFunc`, and `RefIsNull`, over a `ValueType::Ref` value;
 - return, trap, and unreachable terminators, and `Branch`/`CondBranch` to any
   block carrying values into its parameters.
 
@@ -90,6 +91,8 @@ no semantic effect.
   load/store width and operand type is checked against the access;
 - an unknown global or table index is rejected, and `global.set` on an immutable
   global is rejected;
+- a `ref.func` names a function the module defines, and a `ref.is_null` operand is
+  a reference of either kind rather than any value;
 - return arity, value types, and definitions match the function signature.
 
 Dominance is the reason a value defined in only one arm of a branch cannot be
@@ -114,17 +117,27 @@ The IR now *represents*, *lowers*, and *verifies* multi-block structured control
 flow: Wasm `block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, and `return`
 are lowered into the CFG. A loop label carries its header as the branch target
 and a distinct exit block, so a back edge and a fall-out are different edges. The
-linear memory, globals, tables, `call_indirect`, and active data segments are
-likewise lowered and verified.
+linear memory, globals, tables, `call_indirect`, active data segments, and the
+reference instructions are likewise lowered and verified.
+
+`ref.null`, `ref.func`, and `ref.is_null` lower to `RefNull`, `RefFunc`, and
+`RefIsNull` over a `ValueType::Ref` value. To make a reference storable, the
+validator admits `funcref` and `externref` in function signatures, locals, globals,
+and block result types; `v128` stays out, because the vector proposal has no
+instructions here to move it. A block may therefore carry a reference result, so
+a `funcref` travels through a label as a block parameter. The full
+reference-types proposal is still not implemented: there is no `table.get` or
+`table.set`, no `externref` table, and no passive or declarative element segment.
 
 What is still outside the IR, and rejected explicitly rather than dropped or
 approximated:
 
-- **References.** There is no `ref.null`, `ref.func`, or `ref.is_null` form.
 - **Explicit host boundaries.** There is no IR instruction for calling out to a
   host capability, so the baseline has no host boundary either.
 - **Imports.** `lower_module` rejects any module with imports, so the lowerer
   never produces a call it cannot resolve to a defined function.
+- **Remaining reference-types surface.** `table.get`/`table.set`, `externref`
+  tables, and non-active element segments have no IR form.
 
 Remaining numeric operations, a native backend, and imported-call resolution are
 tracked in [lowering.md](lowering.md) and the M7/M8 milestones.
