@@ -81,17 +81,35 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             imported_functions,
         )?);
     }
-    let globals = module
-        .globals
-        .iter()
-        .map(|global| {
-            Ok(IrGlobal {
-                value_type: global.global_type.value_type,
-                mutable: global.global_type.mutable,
-                init: read_const_expr(&global.init, global.global_type.value_type)?,
-            })
-        })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
+    // Globals and tables are listed in Wasm index order, imported entries first,
+    // exactly as the specification numbers them. Keeping the order means a
+    // `global.get`/`global.set`/`call_indirect` carries the index the module
+    // already used and the verifier needs no rebasing rule to interpret it.
+    let mut globals = Vec::with_capacity(module.imports.len() + module.globals.len());
+    for import in &module.imports {
+        if let tpt_wasm_format::ImportDesc::Global(global_type) = &import.desc {
+            globals.push(IrGlobal {
+                value_type: global_type.value_type,
+                mutable: global_type.mutable,
+                init: None,
+                import: Some(super::IrImportSource {
+                    module: import.module.clone(),
+                    name: import.name.clone(),
+                }),
+            });
+        }
+    }
+    for global in &module.globals {
+        globals.push(IrGlobal {
+            value_type: global.global_type.value_type,
+            mutable: global.global_type.mutable,
+            init: Some(read_const_expr(
+                &global.init,
+                global.global_type.value_type,
+            )?),
+            import: None,
+        });
+    }
     // MVP data segments are all active and all address memory 0, and their
     // offset must be a constant `i32`. They are kept in module order so that a
     // later segment overwrites an earlier one at the same address.
@@ -146,56 +164,84 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         }
         _ => return Err(LoweringError::UnsupportedFeature("multiple memories")),
     };
-    // MVP allows at most one table, and its contents come from a single active
-    // element segment whose offset must be a constant `i32`.
-    let tables = match module.tables.as_slice() {
-        [] => Vec::new(),
-        [only] => {
-            if only.table_type.element_type != tpt_wasm_types::ReferenceType::FuncRef {
-                return Err(LoweringError::UnsupportedFeature("non-funcref table"));
-            }
-            let active: Vec<&tpt_wasm_format::Element> = module
-                .elements
-                .iter()
-                .filter(|element| {
-                    matches!(element.mode, tpt_wasm_format::ElementMode::Active { .. })
-                })
-                .collect();
-            if active.len() > 1 {
-                return Err(LoweringError::UnsupportedFeature(
-                    "multiple element segments",
-                ));
-            }
-            let (init, offset) = match active.first() {
-                Some(element) => {
-                    let tpt_wasm_format::ElementMode::Active {
-                        table_index,
-                        offset,
-                    } = &element.mode
-                    else {
-                        unreachable!("filtered to active segments above");
-                    };
-                    if *table_index != 0 {
-                        return Err(LoweringError::UnsupportedFeature("non-zero table index"));
-                    }
-                    (
-                        lower_element_init(&element.init, imported_functions)?,
-                        element_segment_offset(offset)?,
-                    )
-                }
-                None => (Vec::new(), 0),
-            };
-            let elements = init;
-            vec![IrTable {
-                element_type: only.table_type.element_type,
-                min: only.table_type.limits.min,
-                max: only.table_type.limits.max,
-                elements,
+    // MVP allows at most one table in total, imported or defined, so the shape is
+    // decided by the two counts together rather than by the table section alone:
+    // a module that imports its table has no entry in the table *section* at all.
+    let imported_tables: Vec<&tpt_wasm_format::Import> = module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, tpt_wasm_format::ImportDesc::Table(_)))
+        .collect();
+    if imported_tables.len() + module.tables.len() > 1 {
+        return Err(LoweringError::UnsupportedFeature("multiple tables"));
+    }
+    // The element segment seeds whichever table there is, and is applied in this
+    // module's order, so an importing module's segment lands on the exporter's
+    // table after the exporter's own.
+    let active: Vec<&tpt_wasm_format::Element> = module
+        .elements
+        .iter()
+        .filter(|element| matches!(element.mode, tpt_wasm_format::ElementMode::Active { .. }))
+        .collect();
+    if active.len() > 1 {
+        return Err(LoweringError::UnsupportedFeature(
+            "multiple element segments",
+        ));
+    }
+    let (elements, offset) = match active.first() {
+        Some(element) => {
+            let tpt_wasm_format::ElementMode::Active {
+                table_index,
                 offset,
-            }]
+            } = &element.mode
+            else {
+                unreachable!("filtered to active segments above");
+            };
+            if *table_index != 0 {
+                return Err(LoweringError::UnsupportedFeature("non-zero table index"));
+            }
+            (
+                lower_element_init(&element.init, imported_functions)?,
+                element_segment_offset(offset)?,
+            )
         }
-        _ => return Err(LoweringError::UnsupportedFeature("multiple tables")),
+        None => (Vec::new(), 0),
     };
+    let mut tables = Vec::new();
+    for import in imported_tables {
+        let tpt_wasm_format::ImportDesc::Table(table_type) = import.desc else {
+            unreachable!("filtered to table imports above");
+        };
+        if table_type.element_type != tpt_wasm_types::ReferenceType::FuncRef {
+            return Err(LoweringError::UnsupportedFeature("non-funcref table"));
+        }
+        tables.push(IrTable {
+            element_type: table_type.element_type,
+            min: table_type.limits.min,
+            max: table_type.limits.max,
+            elements: elements.clone(),
+            offset,
+            import: Some(super::IrImportSource {
+                module: import.module.clone(),
+                name: import.name.clone(),
+            }),
+        });
+    }
+    for table in &module.tables {
+        if table.table_type.element_type != tpt_wasm_types::ReferenceType::FuncRef {
+            return Err(LoweringError::UnsupportedFeature("non-funcref table"));
+        }
+        tables.push(IrTable {
+            element_type: table.table_type.element_type,
+            min: table.table_type.limits.min,
+            max: table.table_type.limits.max,
+            // The last consumer, since MVP permits at most one table in total and
+            // so the loop above only runs when this one does not.
+            elements: elements.clone(),
+            offset,
+            import: None,
+        });
+    }
     Ok(IrModule {
         functions,
         imports,
@@ -229,19 +275,14 @@ fn element_segment_offset(expr: &tpt_wasm_format::ConstExpr) -> Result<u32, Lowe
 }
 
 fn reject_unsupported_module_state(module: &tpt_wasm_format::Module) -> Result<(), LoweringError> {
-    // Function imports are supported: they become `IrImport` entries and a
-    // `CallHost` crossing the host boundary. A memory import is also carried, as
-    // an `IrMemory` the embedder fills in, so a compiled module can share the
-    // exporting instance's memory. A table or global import has no such form and
-    // is still refused.
+    // Every import kind MVP defines is carried now: functions become `IrImport`
+    // entries plus a `CallHost`, a memory becomes an `IrMemory`, and a table or
+    // global occupies its own index in `IrModule::tables`/`IrModule::globals` for
+    // the embedder to fill in. What is left without a form is a tag import, which
+    // belongs to the exceptions proposal rather than to MVP.
     for import in &module.imports {
-        if !matches!(
-            import.desc,
-            tpt_wasm_format::ImportDesc::Function(_) | tpt_wasm_format::ImportDesc::Memory(_)
-        ) {
-            return Err(LoweringError::UnsupportedFeature(
-                "table and global imports",
-            ));
+        if matches!(import.desc, tpt_wasm_format::ImportDesc::Tag(_)) {
+            return Err(LoweringError::UnsupportedFeature("tag imports"));
         }
     }
     // A start function is module metadata rather than code, for the same reason
@@ -261,18 +302,13 @@ fn lower_imports(module: &tpt_wasm_format::Module) -> Result<Vec<super::IrImport
     let mut imports = Vec::new();
     for import in &module.imports {
         let tpt_wasm_format::ImportDesc::Function(type_index) = import.desc else {
-            // A memory import is not an `IrImport`: it carries no callable
-            // signature and becomes an `IrMemory` instead. Only *function*
-            // imports occupy a function index, so leaving them out of this list is
-            // what keeps a `CallHost` index addressing the right callee.
-            if matches!(import.desc, tpt_wasm_format::ImportDesc::Memory(_)) {
-                continue;
-            }
-            // Rejected by `reject_unsupported_module_state`; repeated here so
-            // this function stands on its own.
-            return Err(LoweringError::UnsupportedFeature(
-                "table and global imports",
-            ));
+            // A memory, table, or global import is not an `IrImport`: it carries
+            // no callable signature, and each becomes its own declaration in
+            // `IrModule::memory`, `IrModule::tables`, or `IrModule::globals`
+            // instead. Only *function* imports occupy a function index, so
+            // leaving the rest out of this list is what keeps a `CallHost` index
+            // addressing the right callee.
+            continue;
         };
         let function_type = module
             .types
@@ -1358,17 +1394,39 @@ fn lower_store(
     Ok(())
 }
 
+/// The declared type of the global a Wasm global index names.
+///
+/// Wasm numbers imported globals before defined ones, so the index splits against
+/// the import count exactly as a function index does. The same reasoning as
+/// `import_function_type` applies, and a module that mixes imported and defined
+/// globals has the defined ones shifted by however many it imports.
+fn global_type_at(
+    index: u32,
+    module: &tpt_wasm_format::Module,
+) -> Result<tpt_wasm_types::GlobalType, LoweringError> {
+    let mut seen = 0u32;
+    for import in &module.imports {
+        if let tpt_wasm_format::ImportDesc::Global(global_type) = import.desc {
+            if seen == index {
+                return Ok(global_type);
+            }
+            seen += 1;
+        }
+    }
+    module
+        .globals
+        .get(index as usize)
+        .map(|global| global.global_type)
+        .ok_or(LoweringError::UnknownGlobal(index))
+}
+
 fn lower_global_get(
     index: u32,
     module: &tpt_wasm_format::Module,
     state: &mut LoweringState,
     builder: &mut BodyBuilder,
 ) -> Result<(), LoweringError> {
-    let declaration = module
-        .globals
-        .get(index as usize)
-        .ok_or(LoweringError::UnknownGlobal(index))?;
-    let value_type = declaration.global_type.value_type;
+    let value_type = global_type_at(index, module)?.value_type;
     let result = state.allocate(value_type)?;
     builder.push(IrInstr::GlobalGet {
         result,
@@ -1384,14 +1442,11 @@ fn lower_global_set(
     state: &mut LoweringState,
     builder: &mut BodyBuilder,
 ) -> Result<(), LoweringError> {
-    let declaration = module
-        .globals
-        .get(index as usize)
-        .ok_or(LoweringError::UnknownGlobal(index))?;
-    if !declaration.global_type.mutable {
+    let global_type = global_type_at(index, module)?;
+    if !global_type.mutable {
         return Err(LoweringError::ImmutableGlobal(index));
     }
-    let value = state.pop(declaration.global_type.value_type)?;
+    let value = state.pop(global_type.value_type)?;
     builder.push(IrInstr::GlobalSet {
         global: index,
         value,

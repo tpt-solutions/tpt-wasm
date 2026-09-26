@@ -63,7 +63,10 @@
 //! `start.wast` and `func_ptrs.wast` are in the table below. Its globals, table,
 //! and memory are deliberately not installed: every file that needs them also
 //! needs a proposal, so installing them would buy nothing while letting a
-//! fabricated global stand in for a real one.
+//! fabricated global stand in for a real one. Table and global *imports* are
+//! implemented on both backends, even though no unblocked file needs them — they
+//! are core MVP, and "works but nothing tests it" is the worse of the two
+//! problems.
 
 use std::collections::HashMap;
 

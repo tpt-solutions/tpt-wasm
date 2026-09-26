@@ -1520,7 +1520,11 @@ impl BaselineMemory {
 pub struct BaselineModule {
     pub functions: Vec<BaselineFunction>,
     /// One table, holding optional function indices into `functions`.
-    table: Option<BaselineTable>,
+    /// The table this module holds, as a shared handle.
+    ///
+    /// A defined table is allocated and seeded here; an imported one is installed
+    /// by the embedder. Shared so an importing instance reaches the same table.
+    table: Option<SharedTable>,
     /// The module's function types, needed to check an indirect call's target.
     types: Vec<FunctionType>,
     memory: Option<SharedMemory>,
@@ -1531,6 +1535,18 @@ pub struct BaselineModule {
     /// segments write into the memory it imports, and they have to land after the
     /// exporter's own segments and before any function runs.
     pending_imported_memory: Option<tpt_wasm_ir::IrMemory>,
+    /// A table this module imports, awaiting the table the embedder shares.
+    ///
+    /// Held rather than discarded so its element segment can be applied the
+    /// moment the table arrives, the same way a memory's data segments are: an
+    /// importing module's active element segment writes into the table it
+    /// imports, after the exporter's own and before any function runs.
+    pending_imported_table: Option<tpt_wasm_ir::IrTable>,
+    /// The globals, in Wasm index order, as one handle each.
+    ///
+    /// An *imported* global's handle is installed by the embedder before any
+    /// function runs; a defined one is created here from its initializer. The
+    /// list is in Wasm order, so a `global.get`/`global.set` needs no rebasing.
     globals: SharedGlobals,
     /// The imported functions, in declaration order, that a `CallHost` names.
     imports: Vec<tpt_wasm_ir::IrImport>,
@@ -1550,15 +1566,25 @@ pub struct BaselineModule {
     max_call_depth: usize,
 }
 
-/// A baseline module's globals, shared with the store that holds the same values.
+/// One baseline global, shared with whoever else holds that same global.
 ///
-/// Sharing is required for the same reason a memory is shared: the store's
-/// `GlobalInstance` and the compiled code must not be able to disagree about a
-/// global's current value. When each kept a private copy, a `global.set` in a
-/// compiled function was invisible to `Instance::global` -- the reader saw the
-/// initializer forever -- and a `global` exported by one instance and imported by
-/// another would have been two unrelated values with one name.
-pub type SharedGlobals = Arc<Mutex<Vec<Value>>>;
+/// A handle per global rather than one handle for a `Vec` of them, because an
+/// imported global has to be *the exporter's* value rather than a copy of it: a
+/// `global.set` through either instance must be visible to the other, which a
+/// copied value cannot be. Sharing is required even without imports, because the
+/// store's `GlobalInstance` and the compiled code must not be able to disagree
+/// about a global's current value -- when each kept a private copy, a
+/// `global.set` in a compiled function was invisible to `Instance::global`,
+/// which reported the initializer forever.
+pub type SharedGlobal = Arc<Mutex<Value>>;
+
+/// A compiled module's globals, in Wasm index order.
+///
+/// `None` is a global that is imported and has not been given its handle yet,
+/// which the embedder must do before any function runs. A `Vec` of `Option`s
+/// rather than an `Option<Vec<_>>` because a module may import some globals and
+/// define others, and the two are interleaved by the Wasm index order.
+pub type SharedGlobals = Vec<Option<SharedGlobal>>;
 
 /// A baseline memory shared by every instance that imports or exports it.
 ///
@@ -1585,9 +1611,40 @@ fn lock_shared<T>(shared: &Arc<Mutex<T>>) -> Result<MutexGuard<'_, T>, BaselineE
 
 /// A table of optional function references, as MVP `funcref` tables hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BaselineTable {
+pub struct BaselineTable {
     /// `None` is a null reference, which `call_indirect` traps on.
     elements: Vec<Option<u32>>,
+}
+
+/// A baseline table shared by every instance that imports or exports it.
+///
+/// Shared for the same reason a memory is: an importing module must reach the
+/// *same* table the exporting instance holds, because a copy would pass every
+/// type check and then let an element segment or a `table.set` land where no
+/// other instance could see it.
+pub type SharedTable = Arc<Mutex<BaselineTable>>;
+
+/// Write a table's active element segment into it, in module order.
+///
+/// Order is the point, the same as for data segments: a later segment overwrites
+/// an earlier one at the same index, so they cannot be applied out of order.
+fn apply_element_segment(
+    table: &mut BaselineTable,
+    declaration: &tpt_wasm_ir::IrTable,
+) -> Result<(), CodegenError> {
+    for (position, entry) in declaration.elements.iter().enumerate() {
+        let slot = declaration.offset as usize + position;
+        // The validator bounds-checks the segment against the table, so a slot
+        // past the end here means the two disagree.
+        let cell = table
+            .elements
+            .get_mut(slot)
+            .ok_or(CodegenError::UnsupportedMemory(
+                "element segment does not fit the table",
+            ))?;
+        *cell = *entry;
+    }
+    Ok(())
 }
 
 impl fmt::Debug for BaselineModule {
@@ -1706,34 +1763,48 @@ impl BaselineModule {
             }
             None => (None, None),
         };
-        let table = match module.tables.first() {
+        // The table is a shared handle for the same reason the memory is: an
+        // importing module must reach the *same* table the exporter holds, since
+        // a copy would pass every type check and then let a `table.set` or an
+        // element segment land where no other instance can see it. A defined
+        // table is allocated and seeded here; an imported one is not allocated
+        // at all, and its element segment is held until the handle arrives.
+        let (table, pending_imported_table) = match module.tables.first() {
+            Some(declaration) if declaration.import.is_some() => (None, Some(declaration.clone())),
             Some(declaration) => {
                 let length = usize::try_from(declaration.min)
                     .map_err(|_| CodegenError::UnsupportedMemory("table size"))?;
-                let mut elements = vec![None; length];
-                for (position, entry) in declaration.elements.iter().enumerate() {
-                    let slot = declaration.offset as usize + position;
-                    // The validator bounds-checks the segment against the table,
-                    // so a slot past the end here means the two disagree.
-                    let cell = elements
-                        .get_mut(slot)
-                        .ok_or(CodegenError::UnsupportedMemory(
-                            "element segment does not fit the table",
-                        ))?;
-                    *cell = *entry;
-                }
-                Some(BaselineTable { elements })
+                let mut table = BaselineTable {
+                    elements: vec![None; length],
+                };
+                apply_element_segment(&mut table, declaration)?;
+                (Some(Arc::new(Mutex::new(table))), None)
             }
-            None => None,
+            None => (None, None),
         };
+        // One slot per global, in Wasm index order. A defined global gets a handle
+        // holding its initializer; an imported one is `None` until the embedder
+        // installs the exporter's handle. `None` rather than a placeholder value,
+        // because a global nobody declared a value for must not read as a global
+        // legitimately holding zero -- a read that somehow beat the import has to
+        // be refused, not answered.
+        let globals: Vec<Option<SharedGlobal>> = module
+            .globals
+            .iter()
+            .map(|declaration| {
+                declaration
+                    .init
+                    .clone()
+                    .map(|initial| Arc::new(Mutex::new(initial)))
+            })
+            .collect();
         Ok(Self {
             functions,
             table,
             types: module.types.clone(),
             memory,
-            globals: Arc::new(Mutex::new(
-                module.globals.iter().map(|g| g.init.clone()).collect(),
-            )),
+            globals,
+            pending_imported_table,
             imports: module.imports.clone(),
             host: None,
             pending_imported_memory,
@@ -1860,9 +1931,66 @@ impl BaselineModule {
         self
     }
 
-    /// The handle to this module's globals, for the store to share and read.
-    pub fn globals_handle(&self) -> SharedGlobals {
-        Arc::clone(&self.globals)
+    /// The handle to each of this module's globals, in Wasm index order.
+    ///
+    /// A `None` is a global this module imports; the embedder installs its handle
+    /// through `set_global_imports`, so a caller that wants to read or publish a
+    /// defined global finds it here at the same index the store uses.
+    pub fn globals_handles(&self) -> SharedGlobals {
+        self.globals.clone()
+    }
+
+    /// Supply the handles for the globals this module imports.
+    ///
+    /// Imported globals occupy the leading Wasm indices, so they fill the
+    /// leading `None` slots. Both the count and the positions are checked rather
+    /// than assumed: a mismatch between the handles passed and the imports
+    /// declared would otherwise leave a global silently reading nobody's value,
+    /// or install the wrong global's handle.
+    pub fn set_global_imports(&mut self, handles: Vec<SharedGlobal>) -> Result<(), CodegenError> {
+        let expected = self
+            .globals
+            .iter()
+            .take_while(|slot| slot.is_none())
+            .count();
+        if handles.len() != expected {
+            return Err(CodegenError::UnsupportedMemory(
+                "the number of installed global imports does not match the module's",
+            ));
+        }
+        for (slot, handle) in self.globals.iter_mut().zip(handles) {
+            *slot = Some(handle);
+        }
+        // No `None` may survive: that would be a global whose value is nobody's.
+        if self.globals.iter().any(Option::is_none) {
+            return Err(CodegenError::UnsupportedMemory(
+                "a global import was declared but not installed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Supply the table this module imports.
+    ///
+    /// The handle has to be the one the exporting instance holds, not a copy.
+    /// The importing module's own active element segment is applied here, before
+    /// any function can run and after the exporter's own, as required.
+    pub fn set_table(&mut self, table: SharedTable) -> Result<(), CodegenError> {
+        if let Some(declaration) = self.pending_imported_table.take() {
+            let mut guard = lock_shared(&table)
+                .map_err(|_| CodegenError::UnsupportedMemory("shared table is locked"))?;
+            apply_element_segment(&mut guard, &declaration)?;
+        }
+        self.table = Some(table);
+        Ok(())
+    }
+
+    /// The handle to this module's table, for an instance that imports it.
+    ///
+    /// `None` for a module that defines no table, and for one that imports a
+    /// table it has not been given yet.
+    pub fn table_handle(&self) -> Option<SharedTable> {
+        self.table.clone()
     }
 
     /// Lower a verified IR module and wrap it so it can be executed.
@@ -1887,17 +2015,22 @@ impl BaselineModule {
             Some(shared) => Some(lock_shared(shared)?),
             None => None,
         };
-        // The globals are locked for the whole execution for the same reason the
-        // memory is, and for the same reason they are shared with the store at
-        // all: a reader outside this call must not see half of a `global.set`.
-        let mut globals = lock_shared(&self.globals)?;
+        // The globals and the table are locked for the whole execution for the
+        // same reason the memory is, and for the same reason they are shared with
+        // the store at all: a reader outside this call must not see half of a
+        // `global.set`, and a `table.set` must not be split across observers.
+        let globals = self.globals.clone();
+        let mut table = match self.table.as_ref() {
+            Some(shared) => Some(lock_shared(shared)?),
+            None => None,
+        };
         let mut state = ExecState {
             functions,
             imports,
-            table: self.table.as_ref(),
+            table: table.as_deref_mut(),
             types: &self.types,
             memory: memory.as_deref_mut(),
-            globals: &mut globals,
+            globals: &globals,
             host: self.host.as_deref_mut(),
             // The entry call is itself a frame, exactly as Micro counts the
             // initial frame it pushes, so both backends run out of depth at the
@@ -1914,11 +2047,11 @@ struct ExecState<'a> {
     functions: &'a [BaselineFunction],
     /// The imported functions a `CallHost` names.
     imports: &'a [tpt_wasm_ir::IrImport],
-    table: Option<&'a BaselineTable>,
+    table: Option<&'a mut BaselineTable>,
     /// Module types, so an indirect call can check its target's signature.
     types: &'a [FunctionType],
     memory: Option<&'a mut BaselineMemory>,
-    globals: &'a mut Vec<Value>,
+    globals: &'a [Option<SharedGlobal>],
     /// The installed host boundary, absent when the embedder granted none.
     ///
     /// Bounded by `'static` rather than `'a`: the boundary is owned by the
@@ -2283,21 +2416,36 @@ impl BaselineFunction {
                         slots[*result as usize] = Some(Value::I32(memory.grow(delta)));
                     }
                     BaselineOp::GlobalGet { result, global } => {
-                        let value = state
+                        // An imported global whose handle has not arrived is
+                        // refused rather than read: the embedder has to install
+                        // every import before the first call, and a global with no
+                        // value is not a global holding zero.
+                        let handle = state
                             .globals
                             .get(*global as usize)
+                            .and_then(|slot| slot.as_ref())
                             .ok_or_else(|| {
                                 Trap::HostFailure("baseline global index is out of range".into())
-                            })?
+                            })?;
+                        let value = handle
+                            .lock()
+                            .map_err(|_| Trap::HostFailure("a shared global is locked".into()))?
                             .clone();
                         slots[*result as usize] = Some(value);
                     }
                     BaselineOp::GlobalSet { global, value } => {
                         let stored = read_slot(&slots, *value)?;
-                        let slot = state.globals.get_mut(*global as usize).ok_or_else(|| {
-                            Trap::HostFailure("baseline global index is out of range".into())
-                        })?;
-                        *slot = stored;
+                        let handle = state
+                            .globals
+                            .get(*global as usize)
+                            .and_then(|slot| slot.as_ref())
+                            .ok_or_else(|| {
+                                Trap::HostFailure("baseline global index is out of range".into())
+                            })?;
+                        *handle
+                            .lock()
+                            .map_err(|_| Trap::HostFailure("a shared global is locked".into()))? =
+                            stored;
                     }
                     BaselineOp::RefNull {
                         slot,
@@ -2451,7 +2599,10 @@ impl BaselineFunction {
                         arguments,
                         results,
                     } => {
-                        let table = state.table.ok_or_else(|| {
+                        // Re-borrowed rather than moved: the recursive call takes
+                        // `&mut state` again, and the table handle has to stay
+                        // available for the next instruction.
+                        let table = state.table.as_deref_mut().ok_or_else(|| {
                             Trap::HostFailure("baseline indirect call needs a table".into())
                         })?;
                         let index = i32_slot(&slots, *operand)? as u32;

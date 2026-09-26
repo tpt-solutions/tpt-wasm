@@ -139,7 +139,14 @@ impl ModuleState {
             memory,
             pages,
             max_pages,
-            globals: module.globals.iter().map(|g| g.init.clone()).collect(),
+            // An imported global has no value here; this test harness only builds
+            // modules that define every global they mention, so `None` is left as
+            // the zero it would never legitimately be in a real instance.
+            globals: module
+                .globals
+                .iter()
+                .map(|g| g.init.clone().unwrap_or(Value::I32(0)))
+                .collect(),
         }
     }
 
@@ -2497,7 +2504,9 @@ fn unsupported_module_state_and_instructions_are_rejected() {
     assert_eq!(lowered.globals.len(), 1);
     assert_eq!(lowered.globals[0].value_type, ValueType::I32);
     assert!(lowered.globals[0].mutable);
-    assert_eq!(lowered.globals[0].init, Value::I32(42));
+    assert_eq!(lowered.globals[0].init, Some(Value::I32(42)));
+    // The module defines this global, so it is not an import.
+    assert_eq!(lowered.globals[0].import, None);
 
     // Exports are metadata rather than code, so a module carrying them lowers
     // like any other. The runtime resolves them against the function table and

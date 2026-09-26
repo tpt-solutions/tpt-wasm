@@ -43,6 +43,11 @@ pub struct IrModule {
     /// one memory, and every memory instruction addresses memory 0.
     pub memory: Option<IrMemory>,
     /// Tables, in index order. MVP allows at most one table.
+    ///
+    /// An *imported* table occupies its own Wasm index here, before any defined
+    /// one, exactly as an imported function occupies a function index. Keeping
+    /// the list in Wasm index order is what lets `CallIndirect` name a table with
+    /// the index the module already used, with no rebasing anywhere.
     pub tables: Vec<IrTable>,
     /// The module's function types, in index order. A `call_indirect` names one
     /// of these rather than a function, so the signature is checked against the
@@ -78,6 +83,21 @@ pub struct IrTable {
     pub elements: Vec<Option<u32>>,
     /// Where those entries start in the table.
     pub offset: u32,
+    /// Where this table is imported from, when it is imported rather than defined.
+    ///
+    /// `Some` means the table belongs to the exporting instance and nothing is
+    /// allocated here: `min`/`max` are then the *import's* declaration, already
+    /// matched against the exporter, not what the table is sized from. An active
+    /// element segment addressing it still applies, to the exporter's table, in
+    /// this module's order.
+    pub import: Option<IrImportSource>,
+}
+
+/// Where a non-function import resolves: the module and field it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrImportSource {
+    pub module: String,
+    pub name: String,
 }
 
 /// One module-level global declaration.
@@ -85,8 +105,15 @@ pub struct IrTable {
 pub struct IrGlobal {
     pub value_type: ValueType,
     pub mutable: bool,
-    /// The value the global starts with, from its constant initializer.
-    pub init: Value,
+    /// The value a *defined* global starts with, from its constant initializer.
+    ///
+    /// `None` for an imported global, which has no initializer: the value lives
+    /// in the exporting instance. There is deliberately no placeholder value, so
+    /// a bug that reads it cannot look like a global legitimately holding zero.
+    pub init: Option<Value>,
+    /// Where this global is imported from, when it is imported rather than
+    /// defined. `None` for a defined global, and the two are always exclusive.
+    pub import: Option<IrImportSource>,
 }
 
 /// The module's linear memory declaration.

@@ -235,10 +235,36 @@ mvp_verified = "partial"
 # memory size: a compiled module kept its globals in a private Vec while the store
 # kept a second copy, so on Baseline Instance::global returned the initializer
 # forever and a compiled global.set was invisible to it. BaselineModule.globals is
-# now a SharedGlobals handle published per store address in the same registry the
-# memory uses, and Instance::global reads through whichever backend owns the value.
-# The test is written to run on both backends -- it was written for Micro first,
-# and the divergence was invisible until the loop over modes was added.
+# now one shared handle per global, published per store address in the same
+# registry the memory uses, and Instance::global reads through whichever backend
+# owns the value. The test is written to run on both backends -- it was written for
+# Micro first, and the divergence was invisible until the loop over modes was
+# added.
+#
+# Table and global *imports* were then built anyway, since they are core MVP with
+# no unblocked spec coverage -- the worse gap of the two. The IR lists globals and
+# tables in Wasm index order with imports first, so global.get/global.set/
+# call_indirect carry the index the module already used and the verifier needs no
+# rebasing rule; a global's init became Option<Value> so an imported one has no
+# value at all rather than a placeholder reading as a legitimate zero; and each
+# global became one shared handle, because an imported global has to be the
+# exporter's value and not a copy of it.
+#
+# One real divergence survives and is not patch-sized: a BaselineTable entry is an
+# index into the owning module's own function list, so a table entry written by
+# one module names nothing in a second, and a call_indirect through a shared table
+# recurses into the dispatcher instead of reaching the installed function. Micro
+# stores a store-wide function address and has no such limit. Fixing it means a
+# table entry must name an instance as well as an index -- a redesign of
+# IrTable::elements and of RefFunc resolution, with an ownership cycle between a
+# shared table and the module owning its functions. No spec file reaches it.
+#
+# Separately, RuntimeError::UnsupportedFeature for a failed lower_and_verify now
+# carries the underlying reason instead of the bare stage name "baseline
+# lowering". Naming the payload is what turned one vague message into the two
+# distinct real causes while this was being written: a stale `table and global
+# imports` rejection, and a global index resolved against the defined-globals
+# section rather than the combined list.
 #
 # Running that suite on the baseline found six more real bugs, all fixed, and
 # they are worth recording because five of them are in the lowering, which no

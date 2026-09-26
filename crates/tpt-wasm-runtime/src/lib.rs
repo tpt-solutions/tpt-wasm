@@ -252,14 +252,16 @@ struct RuntimeContext {
     /// finds it. Keyed by store address because that is what an import resolves
     /// to, and because it stays the same through any number of re-exports.
     baseline_memories: Arc<Mutex<HashMap<u32, tpt_wasm_codegen::SharedMemory>>>,
-    /// Baseline globals, keyed by the store address of the global they are, with
-    /// the index of that global within its module.
+    /// Baseline globals, keyed by the store address of the global they are.
     ///
-    /// A compiled module keeps its globals in a shared handle rather than a
-    /// private `Vec`, so the store and the compiled code cannot disagree about a
-    /// global's current value. Keyed by store address because that is what an
-    /// import resolves to and what a reader holds.
-    baseline_globals: Arc<Mutex<HashMap<u32, (tpt_wasm_codegen::SharedGlobals, u32)>>>,
+    /// A compiled module holds one handle per global, so the store and the
+    /// compiled code cannot disagree about a global's current value, and two
+    /// instances holding the same global address end up with the same handle.
+    /// Keyed by store address because that is what an import resolves to and what
+    /// a reader holds.
+    baseline_globals: Arc<Mutex<HashMap<u32, tpt_wasm_codegen::SharedGlobal>>>,
+    /// Baseline tables, keyed by the store address of the table they are.
+    baseline_tables: Arc<Mutex<HashMap<u32, tpt_wasm_codegen::SharedTable>>>,
 }
 
 impl RuntimeContext {
@@ -271,6 +273,7 @@ impl RuntimeContext {
             limits,
             baseline_memories: Arc::new(Mutex::new(HashMap::new())),
             baseline_globals: Arc::new(Mutex::new(HashMap::new())),
+            baseline_tables: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -313,12 +316,20 @@ fn lock_baseline_memories(
     memories.lock().map_err(|_| RuntimeError::StorePoisoned)
 }
 
-type BaselineGlobalMap = HashMap<u32, (tpt_wasm_codegen::SharedGlobals, u32)>;
+type BaselineGlobalMap = HashMap<u32, tpt_wasm_codegen::SharedGlobal>;
 
 fn lock_baseline_globals(
     globals: &Arc<Mutex<BaselineGlobalMap>>,
 ) -> Result<MutexGuard<'_, BaselineGlobalMap>, RuntimeError> {
     globals.lock().map_err(|_| RuntimeError::StorePoisoned)
+}
+
+type BaselineTableMap = HashMap<u32, tpt_wasm_codegen::SharedTable>;
+
+fn lock_baseline_tables(
+    tables: &Arc<Mutex<BaselineTableMap>>,
+) -> Result<MutexGuard<'_, BaselineTableMap>, RuntimeError> {
+    tables.lock().map_err(|_| RuntimeError::StorePoisoned)
 }
 
 #[derive(Clone)]
@@ -784,10 +795,23 @@ fn compile_baseline(
         .validate(module.clone())
         .map_err(RuntimeError::Validation)?;
     let verified = tpt_wasm_ir::lower_and_verify(&validated).map_err(|error| {
-        RuntimeError::UnsupportedFeature(match error {
-            tpt_wasm_ir::LowerAndVerifyError::Lowering(_) => "baseline lowering",
-            tpt_wasm_ir::LowerAndVerifyError::Verification(_) => "baseline verification",
-        })
+        // The reason is carried through, not replaced by a stage name: a module
+        // refused here is otherwise reported as a bare "baseline lowering", which
+        // says nothing about *what* is unsupported and makes every such refusal a
+        // guessing game. `Display` for these errors is the debug form, which names
+        // the variant and its payload -- and naming the payload is what turned
+        // "baseline lowering" into the two actual causes while this was written.
+        let reason = match error {
+            tpt_wasm_ir::LowerAndVerifyError::Lowering(error) => format!("lowering: {error}"),
+            tpt_wasm_ir::LowerAndVerifyError::Verification(error) => {
+                format!("verification: {error}")
+            }
+        };
+        // Leaked because the error variant holds a `&'static str` and the message
+        // is assembled here. These are one-off instantiation failures, not a hot
+        // path, and the alternative is widening a public error type to own a
+        // `String` for every caller.
+        RuntimeError::UnsupportedFeature(Box::leak(format!("baseline {reason}").into_boxed_str()))
     })?;
     let compiled = tpt_wasm_codegen::BaselineModule::lower(verified.module())
         .map_err(|_| RuntimeError::UnsupportedFeature("baseline code generation"))?;
@@ -1148,6 +1172,9 @@ fn instantiate_module(
     // its globals under the store address that global was allocated at, and by
     // the time the module is lowered `global_addrs` has moved into the instance.
     let baseline_global_addresses: Vec<u32> = global_addrs.clone();
+    // Captured for the same reason: the baseline publishes or installs its table
+    // handle under the store address that table was allocated at.
+    let baseline_table_address = table_addrs.first().copied();
 
     let store_instance = StoreInstance {
         module_types: module.types.clone(),
@@ -1221,18 +1248,72 @@ fn instantiate_module(
                 "a compiled memory with no store address",
             ));
         }
-        // Published the way the memory is: the store holds a `GlobalInstance` for
-        // every global, but a compiled module's values live in its shared handle,
-        // so a reader has to be able to find the handle backing each store
-        // address. Without this the two diverge -- a `global.set` inside a
-        // compiled function is invisible to `Instance::global`, which reports the
-        // initializer forever.
-        {
-            let shared = module.globals_handle();
-            let mut registry = lock_baseline_globals(&context.baseline_globals)?;
-            for (index, address) in baseline_global_addresses.iter().copied().enumerate() {
-                registry.insert(address, (Arc::clone(&shared), index as u32));
+        // The table, by the same rule as the memory: a defined one publishes its
+        // handle under the address it allocated, an imported one looks the
+        // handle up there and installs that same one. A copy would satisfy every
+        // type check and then let the importer's element segment land where the
+        // exporter could not see it.
+        if let Some(address) = baseline_table_address {
+            if let Some(shared) = module.table_handle() {
+                lock_baseline_tables(&context.baseline_tables)?.insert(address, shared);
+            } else {
+                let shared = lock_baseline_tables(&context.baseline_tables)?
+                    .get(&address)
+                    .cloned()
+                    .ok_or(RuntimeError::UnsupportedFeature(
+                        "a table imported in baseline mode that no instance in this store exports",
+                    ))?;
+                module.set_table(shared).map_err(|_| {
+                    RuntimeError::UnsupportedFeature("an imported table in baseline mode")
+                })?;
             }
+        } else if module.table_handle().is_some() {
+            return Err(RuntimeError::UnsupportedFeature(
+                "a compiled table with no store address",
+            ));
+        }
+        // Globals, one handle each, keyed by store address. A *defined* global
+        // publishes its handle so a reader and a later importer find the same
+        // value the compiled code uses; an *imported* one takes the exporter's
+        // handle instead, which is what makes a `global.set` through either
+        // instance visible to the other. Publishing rather than copying is the
+        // whole point: when each side kept its own copy, a compiled `global.set`
+        // was invisible to `Instance::global`, which reported the initializer
+        // forever.
+        {
+            let handles = module.globals_handles();
+            let mut registry = lock_baseline_globals(&context.baseline_globals)?;
+            let mut installed = Vec::with_capacity(handles.len());
+            for (slot, address) in handles.into_iter().zip(baseline_global_addresses) {
+                match slot {
+                    Some(owned) => {
+                        // A defined global: publish it so a reader or a later
+                        // importer finds the same value the compiled code uses.
+                        registry.insert(address, owned);
+                    }
+                    None => {
+                        // An imported global: take the exporter's handle, which
+                        // must already be published under this address. Copying
+                        // the value instead would make a `global.set` through
+                        // either instance invisible to the other.
+                        let shared = registry.get(&address).cloned().ok_or(
+                            RuntimeError::UnsupportedFeature(
+                                "a global imported in baseline mode that no instance in this \
+                                 store exports",
+                            ),
+                        )?;
+                        installed.push(shared);
+                    }
+                }
+            }
+            drop(registry);
+            // Only the imported globals go back; a defined one already holds the
+            // right handle. `set_global_imports` checks that the count matches the
+            // leading unset slots, so a mismatch is refused rather than leaving a
+            // global reading nobody's value.
+            module.set_global_imports(installed).map_err(|_| {
+                RuntimeError::UnsupportedFeature("a global import in baseline mode")
+            })?;
         }
     }
     if let Some(start) = start {
@@ -1301,21 +1382,19 @@ impl Instance {
             .get(*index as usize)
             .copied()
             .ok_or(RuntimeError::UnknownExport(name.to_owned()))?;
-        if let Some((shared, slot)) = lock_baseline_globals(&self.context.baseline_globals)?
+        let shared = lock_baseline_globals(&self.context.baseline_globals)?
             .get(&address)
-            .cloned()
-        {
+            .cloned();
+        if let Some(shared) = shared {
             let guard = shared.lock().map_err(|_| RuntimeError::StorePoisoned)?;
-            return guard
-                .get(slot as usize)
-                .cloned()
-                .ok_or(RuntimeError::UnknownExport(name.to_owned()));
+            return Ok((*guard).clone());
         }
         Ok(lock_store(&self.context.store)?
             .global(address)?
             .value
             .clone())
     }
+
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
         // In baseline mode the module is executed by its own compiled form
         // rather than by Micro, so the store lookup is not used at all.
@@ -2302,6 +2381,223 @@ mod tests {
             provider.call("load", Vec::new()).unwrap(),
             vec![Value::I32(42)]
         );
+    }
+
+    /// The compiled backend shares an imported global rather than copying it.
+    ///
+    /// A global import is an MVP import kind the baseline had to refuse, and it
+    /// fails the same way a memory import would have if copied: every type check
+    /// passes, and then a `global.set` through the importer is invisible to the
+    /// exporter. The test writes through the importer, reads back through the
+    /// exporter, and reads again from outside both modules, so a copy is caught
+    /// whichever side holds it.
+    #[test]
+    fn the_baseline_shares_an_imported_global() {
+        fn table_type() -> tpt_wasm_types::TableType {
+            tpt_wasm_types::TableType {
+                element_type: tpt_wasm_types::ReferenceType::FuncRef,
+                limits: tpt_wasm_types::Limits { min: 4, max: None },
+            }
+        }
+        fn global_type() -> GlobalType {
+            GlobalType {
+                value_type: ValueType::I32,
+                mutable: true,
+            }
+        }
+        // Provider: one table, one mutable global, and a `call_indirect` that
+        // reads an index only the importer will ever have filled in.
+        let provider = Module {
+            types: vec![i32_result_type()],
+            tables: vec![tpt_wasm_format::Table {
+                table_type: table_type(),
+                init: None,
+            }],
+            globals: vec![Global {
+                global_type: global_type(),
+                init: const_i32(1),
+            }],
+            functions: vec![
+                // global.get 0; end -- reads the shared global.
+                function(0, vec![0x23, 0x00, 0x0b]),
+            ],
+            exports: vec![
+                export("counter", ExportDesc::Global(0)),
+                export("read", ExportDesc::Function(0)),
+            ],
+            ..Module::default()
+        };
+        // Importer: imports both, and brings its own active element segment writing
+        // its own function 0 into the shared table at index 2. An element segment
+        // can only name the importing module's own functions, so the entry the
+        // provider later dispatches through is one only this module can install --
+        // which is what makes the dispatch a real test of sharing rather than of
+        // each side happening to agree.
+        let consumer = Module {
+            // Two types: `answer` returns an i32, `bump` returns nothing. Giving
+            // `bump` the `()->i32` type would be a stack underflow at `end` -- the
+            // validator working correctly, not a bug in this test.
+            types: vec![
+                i32_result_type(),
+                FunctionType {
+                    params: ResultType(Vec::new()),
+                    results: ResultType(Vec::new()),
+                },
+            ],
+            imports: vec![import(
+                "provider",
+                "counter",
+                ImportDesc::Global(global_type()),
+            )],
+            functions: vec![
+                // 42; unused by this test, but a module needs a body.
+                function(0, vec![0x41, 0x2a, 0x0b]),
+                // i32.const 9; global.set 0; end
+                function(1, vec![0x41, 0x09, 0x24, 0x00, 0x0b]),
+                // global.get 0; end
+                function(0, vec![0x23, 0x00, 0x0b]),
+            ],
+            exports: vec![
+                export("bump", ExportDesc::Function(1)),
+                export("peek", ExportDesc::Function(2)),
+            ],
+            ..Module::default()
+        };
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let config = Config {
+                engine_mode: mode,
+                ..Config::default()
+            };
+            let mut engine = Engine::new(config).unwrap();
+            let mut provider = engine
+                .instantiate(provider.clone())
+                .unwrap_or_else(|error| panic!("{mode:?} provider: {error}"));
+            engine
+                .linker_mut()
+                .define_instance("provider", &provider)
+                .unwrap();
+            let mut consumer = engine
+                .instantiate(consumer.clone())
+                .unwrap_or_else(|error| panic!("{mode:?} importer: {error}"));
+            // The importer writes the shared global; the exporter reads it back.
+            // A copy would satisfy every type check and lose the write.
+            consumer.call("bump", Vec::new()).unwrap();
+            assert_eq!(
+                provider.call("read", Vec::new()).unwrap(),
+                vec![Value::I32(9)],
+                "{mode:?} did not share the imported global"
+            );
+            // And a reader outside both modules agrees with them.
+            assert_eq!(
+                provider.global("counter").unwrap(),
+                Value::I32(9),
+                "{mode:?} reader saw a copy"
+            );
+            // The importer reads it too, which is the same handle from the other
+            // side: its own global index 0 *is* the provider's global.
+            assert_eq!(
+                consumer.call("peek", Vec::new()).unwrap(),
+                vec![Value::I32(9)],
+                "{mode:?} importer saw a copy"
+            );
+        }
+    }
+
+    /// A table import links, and the importer's element segment lands in it.
+    ///
+    /// This covers the *linkage* half only. Dispatching through a table that
+    /// another module wrote into is a further step the baseline cannot take yet:
+    /// a `BaselineTable` entry is an index into the owning module's own function
+    /// list, so a shared entry has no function to name from a second module. Micro
+    /// stores a store-wide function address and has no such limit, which is a real
+    /// divergence between the two backends. It is recorded in `todo.md` rather
+    /// than papered over here, and no spec file exercises it (the file that would,
+    /// `elem.wast`, also needs the bulk-memory proposal).
+    #[test]
+    fn a_table_import_links_and_carries_its_element_segment() {
+        fn table_type() -> tpt_wasm_types::TableType {
+            tpt_wasm_types::TableType {
+                element_type: tpt_wasm_types::ReferenceType::FuncRef,
+                limits: tpt_wasm_types::Limits { min: 4, max: None },
+            }
+        }
+        let provider = Module {
+            tables: vec![tpt_wasm_format::Table {
+                table_type: table_type(),
+                init: None,
+            }],
+            exports: vec![export("table", ExportDesc::Table(0))],
+            ..Module::default()
+        };
+        // The element segment writes at offset 3, so it fits a table of 4 and
+        // would be out of bounds for one of 3 -- the bounds check has to run
+        // against the *imported* table, not against anything the importer owns.
+        let consumer = Module {
+            // The element segment names function 0, so that function needs a type.
+            types: vec![i32_result_type()],
+            imports: vec![import("provider", "table", ImportDesc::Table(table_type()))],
+            elements: vec![tpt_wasm_format::Element {
+                element_type: tpt_wasm_types::ReferenceType::FuncRef,
+                init: tpt_wasm_format::ElementInit::FuncIndices(vec![0]),
+                mode: tpt_wasm_format::ElementMode::Active {
+                    table_index: 0,
+                    offset: const_i32(3),
+                },
+            }],
+            functions: vec![function(0, vec![0x41, 0x2a, 0x0b])],
+            ..Module::default()
+        };
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let config = Config {
+                engine_mode: mode,
+                ..Config::default()
+            };
+            let mut engine = Engine::new(config).unwrap();
+            let provider_instance = engine
+                .instantiate(provider.clone())
+                .unwrap_or_else(|error| panic!("{mode:?} provider: {error}"));
+            engine
+                .linker_mut()
+                .define_instance("provider", &provider_instance)
+                .unwrap();
+            engine
+                .instantiate(consumer.clone())
+                .unwrap_or_else(|error| panic!("{mode:?} importer: {error}"));
+            // The same segment must be refused against a table one entry shorter,
+            // which only holds if the bounds check saw the *imported* table's size
+            // rather than anything the importer allocated.
+            let narrow_provider = Module {
+                tables: vec![tpt_wasm_format::Table {
+                    table_type: tpt_wasm_types::TableType {
+                        element_type: tpt_wasm_types::ReferenceType::FuncRef,
+                        limits: tpt_wasm_types::Limits { min: 3, max: None },
+                    },
+                    init: None,
+                }],
+                exports: vec![export("table", ExportDesc::Table(0))],
+                ..Module::default()
+            };
+            let narrow = engine.instantiate(narrow_provider).unwrap();
+            engine
+                .linker_mut()
+                .define_instance("narrow", &narrow)
+                .unwrap();
+            let too_narrow = Module {
+                types: consumer.types.clone(),
+                imports: vec![import(
+                    "narrow",
+                    "table",
+                    ImportDesc::Table(tpt_wasm_types::TableType {
+                        element_type: tpt_wasm_types::ReferenceType::FuncRef,
+                        limits: tpt_wasm_types::Limits { min: 3, max: None },
+                    }),
+                )],
+                elements: consumer.elements.clone(),
+                functions: consumer.functions.clone(),
+                ..Module::default()
+            };
+            engine.instantiate(too_narrow).unwrap_err();
+        }
     }
 
     /// A start function may be an *imported* function.
