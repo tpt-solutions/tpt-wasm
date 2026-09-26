@@ -241,6 +241,9 @@ struct RuntimeContext {
     store: Arc<Mutex<Store>>,
     call_gate: Arc<Mutex<()>>,
     host_functions: Arc<Mutex<HashMap<String, Arc<dyn HostFunction>>>>,
+    /// The limits the store was built with, kept here so a caller that cannot
+    /// reach the store can still be told what the instance is bounded by.
+    limits: ResourceLimits,
 }
 
 impl RuntimeContext {
@@ -249,6 +252,7 @@ impl RuntimeContext {
             store: Arc::new(Mutex::new(Store::new(limits))),
             call_gate: Arc::new(Mutex::new(())),
             host_functions: Arc::new(Mutex::new(HashMap::new())),
+            limits,
         }
     }
 }
@@ -1122,6 +1126,11 @@ fn instantiate_module(
                 bindings: baseline_bindings,
             });
         }
+        // The baseline recurses to make a call, so it needs the same call-depth
+        // limit Micro reads from the store's limits. Sharing one number is what
+        // makes a runaway recursion trap identically on both backends instead of
+        // trapping in one and overflowing the host stack in the other.
+        module.set_max_call_depth(context.limits.max_call_depth);
     }
     if let Some(start) = start {
         // The start function runs on the same backend the instance will use, so

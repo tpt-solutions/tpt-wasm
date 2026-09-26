@@ -59,3 +59,22 @@ actually under test stays independent of the text encoder. `assert_invalid` and
 reasoning as `binary_format.rs`: they are written in the text format, and this
 harness does not re-derive a decode/validate outcome for text-format modules the
 way it does for `(module binary ...)`.
+
+The suite runs twice, once per execution backend, and both runs are held to the
+same asserted directive counts:
+
+- `core_spec_suite` decodes, validates, instantiates, and executes through
+  `EngineMode::Micro` — the interpreter.
+- `core_spec_suite_on_baseline` runs the identical directives through
+  `EngineMode::Baseline`, so every module is lowered to the TPT IR, verified,
+  code-generated into the portable baseline, and executed by it, and is held to
+  upstream's own expected values, NaN patterns, and traps rather than to
+  fixtures written beside the code under test.
+
+The two share everything between the decoded bytes and the compared result, so
+a directive that passes on one backend and fails on the other is a difference in
+execution rather than in the harness. Running the suite on the baseline is what
+surfaced the lowering defects recorded in `todo.md`; several of them — a loop's
+result being dropped, an `else` arm being lowered into a terminated block, dead
+code desynchronizing the body reader — were invisible to the hand-written
+fixtures and to the seeded differential generator.

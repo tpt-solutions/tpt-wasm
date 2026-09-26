@@ -22,10 +22,15 @@
 //! `assert_invalid`, `assert_unlinkable`, and the exception/thread/component
 //! directives -- are reported as [`CoreOutcome::Skipped`] rather than being
 //! silently ignored, so a suite's coverage is visible in its case list.
+//!
+//! [`run_core_suite_with`] chooses the execution backend, so the same directives
+//! can be run through `Micro` and through the compiled baseline. Everything
+//! between the decoded bytes and the compared result is identical either way, so
+//! a disagreement between the two is a disagreement about execution.
 
 use std::collections::HashMap;
 
-use tpt_wasm_runtime::{Config, Engine, Instance, RuntimeError};
+use tpt_wasm_runtime::{Config, Engine, EngineMode, Instance, RuntimeError};
 use tpt_wasm_types::{Trap, Value};
 
 use wast::core::{NanPattern, WastArgCore, WastRetCore};
@@ -58,12 +63,31 @@ pub struct CoreCase {
     pub outcome: CoreOutcome,
 }
 
-/// Parse and run every directive in a Core suite `.wast` source, in file order.
+/// Parse and run every directive in a Core suite `.wast` source, in file order,
+/// on the `Micro` backend.
+///
+/// Use [`run_core_suite_with`] to choose a different one; the two differ only in
+/// which backend executes the decoded bytes.
 pub fn run_core_suite(source: &str) -> Result<Vec<CoreCase>, String> {
+    run_core_suite_with(source, EngineMode::Micro)
+}
+
+/// Parse and run every directive in a Core suite `.wast` source, in file order,
+/// on the given backend.
+///
+/// The backend only decides how the decoded bytes are executed. Parsing the text,
+/// instantiating, and comparing the returned values against upstream's patterns
+/// are the same code either way, so a directive that passes on one backend and
+/// fails on the other is a difference in execution, not in the harness.
+pub fn run_core_suite_with(source: &str, mode: EngineMode) -> Result<Vec<CoreCase>, String> {
     let buf = ParseBuffer::new(source).map_err(|error| error.to_string())?;
     let wast: Wast = wast::parser::parse(&buf).map_err(|error| error.to_string())?;
 
-    let engine = Engine::new(Config::default()).expect("the default config always constructs");
+    let config = Config {
+        engine_mode: mode,
+        ..Config::default()
+    };
+    let engine = Engine::new(config).map_err(|error| error.to_string())?;
     let mut runner = Runner {
         engine,
         modules: Vec::new(),
@@ -133,9 +157,7 @@ impl Runner {
                             }
                             CoreOutcome::Instantiated
                         }
-                        Err(error) => {
-                            CoreOutcome::Failed(format!("instantiation failed: {error}"))
-                        }
+                        Err(error) => CoreOutcome::Failed(format!("instantiation failed: {error}")),
                     },
                 };
                 ("module", outcome)
@@ -199,9 +221,10 @@ impl Runner {
                 };
                 ("register", outcome)
             }
-            WastDirective::ModuleDefinition(_) => {
-                ("module_definition", CoreOutcome::Skipped("module_definition"))
-            }
+            WastDirective::ModuleDefinition(_) => (
+                "module_definition",
+                CoreOutcome::Skipped("module_definition"),
+            ),
             WastDirective::ModuleInstance { .. } => {
                 ("module_instance", CoreOutcome::Skipped("module_instance"))
             }
@@ -220,9 +243,10 @@ impl Runner {
                 "assert_invalid_custom",
                 CoreOutcome::Skipped("assert_invalid_custom"),
             ),
-            WastDirective::AssertUnlinkable { .. } => {
-                ("assert_unlinkable", CoreOutcome::Skipped("assert_unlinkable"))
-            }
+            WastDirective::AssertUnlinkable { .. } => (
+                "assert_unlinkable",
+                CoreOutcome::Skipped("assert_unlinkable"),
+            ),
             WastDirective::AssertException { .. } => {
                 ("assert_exception", CoreOutcome::Skipped("assert_exception"))
             }

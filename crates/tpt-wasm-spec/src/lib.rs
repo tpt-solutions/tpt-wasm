@@ -31,7 +31,7 @@
 mod core;
 mod wast;
 
-pub use core::{run_core_suite, CoreCase, CoreOutcome};
+pub use core::{run_core_suite, run_core_suite_with, CoreCase, CoreOutcome};
 pub use wast::{parse, Form, ParseError};
 
 /// The stage a module is rejected at.

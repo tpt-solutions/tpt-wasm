@@ -14,11 +14,21 @@
 //! `binary_format.rs` asserts assertion counts: a change in the vendored file,
 //! or a change in which directives this harness runs versus skips, changes
 //! coverage, and an unexplained change in coverage should fail the build
-//! rather than pass silently. `assert_invalid` and `assert_malformed` in these
+//! rather than pass silently. The counts are asserted on both execution
+//! backends, so a backend that quietly dropped a directive fails too.
+//! `assert_invalid` and `assert_malformed` in these
 //! files are all written in the text format and are counted as skipped (see
 //! `core.rs`); this suite does not (yet) re-derive the decode/validate outcome
 //! for a text-format module the way `binary_format.rs` does for the binary
 //! form.
+//!
+//! `core_spec_suite` runs the directives on `Micro` and
+//! `core_spec_suite_on_baseline` runs the identical directives on the compiled
+//! backend, so every module goes through `validate` -> `lower_and_verify` ->
+//! `BaselineModule::lower` -> the block-graph executor and is held to
+//! upstream's own expected values and traps. Everything between the decoded
+//! bytes and the compared result is the same code on both sides, so a
+//! disagreement is a disagreement about execution.
 //!
 //! Not every Core suite file is vendored yet. Left out, and why:
 //! - `conversions.wast` needs the saturating truncation instructions (the
@@ -44,7 +54,8 @@
 
 use std::collections::HashMap;
 
-use tpt_wasm_spec::{run_core_suite, CoreOutcome};
+use tpt_wasm_runtime::EngineMode;
+use tpt_wasm_spec::{run_core_suite_with, CoreOutcome};
 
 /// Each suite, with the exact count of every directive kind it contains.
 /// A directive kind absent from a suite's map is expected to occur zero times.
@@ -180,7 +191,11 @@ const SUITES: &[Suite] = &[
     Suite {
         name: "int_literals.wast",
         source: include_str!("../testdata/int_literals.wast"),
-        directives: &[("module", 1), ("assert_return", 30), ("assert_malformed", 20)],
+        directives: &[
+            ("module", 1),
+            ("assert_return", 30),
+            ("assert_malformed", 20),
+        ],
     },
     Suite {
         name: "float_exprs.wast",
@@ -190,7 +205,11 @@ const SUITES: &[Suite] = &[
     Suite {
         name: "float_literals.wast",
         source: include_str!("../testdata/float_literals.wast"),
-        directives: &[("module", 2), ("assert_return", 99), ("assert_malformed", 78)],
+        directives: &[
+            ("module", 2),
+            ("assert_return", 99),
+            ("assert_malformed", 78),
+        ],
     },
     Suite {
         name: "float_misc.wast",
@@ -211,11 +230,28 @@ const SUITES: &[Suite] = &[
 
 #[test]
 fn core_spec_suite() {
+    assert_suite_passes(EngineMode::Micro);
+}
+
+/// The same directives, on the compiled backend.
+///
+/// Every module is lowered to the TPT IR and code-generated into the portable
+/// baseline at instantiation, so this drives the whole `validate` -> `lower` ->
+/// `verify` -> `BaselineModule::lower` -> block-graph-executor path with upstream's
+/// own expected values and traps, rather than with fixtures written next to the
+/// code under test. The counts are re-asserted here so a backend that drops a
+/// directive fails rather than quietly shrinking its coverage.
+#[test]
+fn core_spec_suite_on_baseline() {
+    assert_suite_passes(EngineMode::Baseline);
+}
+
+fn assert_suite_passes(mode: EngineMode) {
     let mut failures: Vec<String> = Vec::new();
     let mut miscounted: Vec<String> = Vec::new();
 
     for suite in SUITES {
-        let cases = run_core_suite(suite.source)
+        let cases = run_core_suite_with(suite.source, mode)
             .unwrap_or_else(|error| panic!("{}: could not parse: {error}", suite.name));
 
         let mut actual_counts: HashMap<&str, usize> = HashMap::new();
@@ -255,12 +291,12 @@ fn core_spec_suite() {
 
     assert!(
         miscounted.is_empty(),
-        "directive counts changed, so coverage changed without a failure:\n{}",
+        "{mode:?}: directive counts changed, so coverage changed without a failure:\n{}",
         miscounted.join("\n")
     );
     assert!(
         failures.is_empty(),
-        "{} directive(s) did not run the way upstream requires:\n{}",
+        "{mode:?}: {} directive(s) did not run the way upstream requires:\n{}",
         failures.len(),
         failures.join("\n")
     );

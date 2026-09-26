@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use tpt_wasm_ir::{BlockId, IrFunction, IrInstr, Terminator, ValueId};
-use tpt_wasm_types::{FunctionType, Trap, Value, ValueType};
+use tpt_wasm_types::{FunctionType, ResourceLimits, Trap, Value, ValueType};
 
 /// Target architecture for code generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1527,6 +1527,14 @@ pub struct BaselineModule {
     /// record the same effects Micro does, and it is reachable only from the
     /// execution state that owns the call.
     host: Option<Box<dyn HostBoundary>>,
+    /// How many frames deep a call chain may get before it traps.
+    ///
+    /// The baseline executes a callee by recursing, so an unbounded call chain
+    /// would exhaust the *host* stack and abort the process rather than trap.
+    /// Wasm requires infinitely recursive code to exhaust a finite limit and
+    /// trap, and Micro enforces the same number from `ResourceLimits`, so the two
+    /// backends fail the same call the same way.
+    max_call_depth: usize,
 }
 
 /// A table of optional function references, as MVP `funcref` tables hold.
@@ -1545,6 +1553,7 @@ impl fmt::Debug for BaselineModule {
             .field("memory", &self.memory)
             .field("globals", &self.globals)
             .field("imports", &self.imports)
+            .field("max_call_depth", &self.max_call_depth)
             // The boundary itself is embedder state, so only whether one is
             // installed is reported.
             .field("host", &self.host.as_ref().map(|_| "installed"))
@@ -1663,6 +1672,9 @@ impl BaselineModule {
             globals: module.globals.iter().map(|g| g.init.clone()).collect(),
             imports: module.imports.clone(),
             host: None,
+            // The same default Micro starts from, so a module that recurses until
+            // it traps does so at the same depth on either backend.
+            max_call_depth: ResourceLimits::default().max_call_depth,
         })
     }
 
@@ -1683,6 +1695,17 @@ impl BaselineModule {
     /// so a compiled module cannot acquire a host capability by accident.
     pub fn set_host(&mut self, host: impl HostBoundary + 'static) -> &mut Self {
         self.host = Some(Box::new(host));
+        self
+    }
+
+    /// Bound how deep a call chain may get before it traps.
+    ///
+    /// The runtime sets this from the same `ResourceLimits` Micro reads, so a
+    /// module that recurses to the limit fails identically on both backends. The
+    /// limit counts the entry call as its first frame, so a limit of one admits
+    /// the call made from outside and refuses the one that call makes.
+    pub fn set_max_call_depth(&mut self, max_call_depth: usize) -> &mut Self {
+        self.max_call_depth = max_call_depth;
         self
     }
 
@@ -1710,6 +1733,11 @@ impl BaselineModule {
             memory: self.memory.as_mut(),
             globals: &mut self.globals,
             host: self.host.as_deref_mut(),
+            // The entry call is itself a frame, exactly as Micro counts the
+            // initial frame it pushes, so both backends run out of depth at the
+            // same call rather than differing by one.
+            depth: 1,
+            max_call_depth: self.max_call_depth,
         };
         functions[index].run(&mut state, args)
     }
@@ -1730,6 +1758,33 @@ struct ExecState<'a> {
     /// Bounded by `'static` rather than `'a`: the boundary is owned by the
     /// module, so the borrow only has to be as long as the execution.
     host: Option<&'a mut (dyn HostBoundary + 'static)>,
+    /// How many frames are live right now, including the entry call.
+    depth: usize,
+    /// The depth at which a further call traps instead of being made.
+    max_call_depth: usize,
+}
+
+impl ExecState<'_> {
+    /// Call a callee one frame deeper, or trap if that would pass the limit.
+    ///
+    /// The counter is balanced here rather than in the callers, so it is restored
+    /// whether the callee returns a value or a trap. Leaving it high on the trap
+    /// path would make every later call in the same execution look deeper than it
+    /// is, and a trap unwinds the whole execution, so nothing downstream would
+    /// correct it.
+    fn call(
+        &mut self,
+        callee: &BaselineFunction,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, BaselineError> {
+        if self.depth >= self.max_call_depth {
+            return Err(BaselineError::Trap(Trap::CallDepthExceeded));
+        }
+        self.depth += 1;
+        let returned = callee.run(self, args);
+        self.depth -= 1;
+        returned
+    }
 }
 
 impl BaselineFunction {
@@ -1759,6 +1814,9 @@ impl BaselineFunction {
             memory: None,
             globals: &mut Vec::new(),
             host: None,
+            // The entry call counts as a frame, as it does in `call`.
+            depth: 1,
+            max_call_depth: ResourceLimits::default().max_call_depth,
         };
         self.run(&mut state, args)
     }
@@ -2153,7 +2211,7 @@ impl BaselineFunction {
                         for slot in arguments {
                             call_args.push(read_slot(&slots, *slot)?);
                         }
-                        let returned = callee.run(state, call_args)?;
+                        let returned = state.call(callee, call_args)?;
                         if returned.len() != results.len() {
                             return Err(BaselineError::Trap(Trap::HostFailure(
                                 "baseline call result arity mismatch".into(),
@@ -2257,7 +2315,7 @@ impl BaselineFunction {
                         for slot in arguments {
                             call_args.push(read_slot(&slots, *slot)?);
                         }
-                        let returned = callee.run(state, call_args)?;
+                        let returned = state.call(callee, call_args)?;
                         if returned.len() != results.len() {
                             return Err(BaselineError::Trap(Trap::HostFailure(
                                 "baseline indirect call result arity mismatch".into(),
@@ -4180,6 +4238,70 @@ mod tests {
                 "argument {argument}"
             );
         }
+    }
+
+    /// A call chain deeper than the limit traps instead of exhausting the host
+    /// stack.
+    ///
+    /// The baseline runs a callee by recursing on the Rust stack, so without a
+    /// limit a runaway recursion aborts the process rather than trapping, which
+    /// is what the WebAssembly spec's `assert_exhaustion` cases require and what
+    /// keeps a hostile module from taking the embedder down with it.
+    #[test]
+    fn a_recursive_call_traps_at_the_call_depth_limit() {
+        // 0: call 0
+        let module = Module {
+            types: vec![FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(Vec::new()),
+            }],
+            functions: vec![Function {
+                type_index: 0,
+                locals: vec![],
+                body: vec![0x10, 0x00, 0x0b],
+            }],
+            ..Module::default()
+        };
+        let validated = tpt_wasm_validate::validate(module.clone()).expect("fixture must validate");
+        let verified = lower_and_verify(&validated).expect("fixture must lower and verify");
+
+        // A limit of one admits the entry call and refuses the one it makes, so
+        // this is the exact frame counting the shared limit has to get right.
+        let mut single = BaselineModule::lower(verified.module()).expect("codegen must accept it");
+        single.set_max_call_depth(1);
+        assert_eq!(
+            single.call(0, Vec::new()).unwrap_err(),
+            BaselineError::Trap(Trap::CallDepthExceeded)
+        );
+
+        // The default limit is finite too, so the same module still traps rather
+        // than recursing until the host stack is gone.
+        let mut deep = BaselineModule::lower(verified.module()).expect("codegen must accept it");
+        assert_eq!(
+            deep.call(0, Vec::new()).unwrap_err(),
+            BaselineError::Trap(Trap::CallDepthExceeded)
+        );
+    }
+
+    /// Both backends refuse a runaway call with the same trap.
+    #[test]
+    fn the_call_depth_limit_matches_micro() {
+        let module = Module {
+            types: vec![FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(Vec::new()),
+            }],
+            functions: vec![Function {
+                type_index: 0,
+                locals: vec![],
+                body: vec![0x10, 0x00, 0x0b],
+            }],
+            ..Module::default()
+        };
+        assert_eq!(
+            assert_module_matches_micro(&module, 0, Vec::new()),
+            Err(Trap::CallDepthExceeded)
+        );
     }
 
     #[test]

@@ -61,11 +61,11 @@ could affect linking, initialization, or observable behavior.
 | `unreachable` | `Terminator::Unreachable` | Trailing validated bytes are unreachable and ignored. |
 | `nop` | erased | No semantic effect. |
 | `end` | `Terminator::Return` | Requires exactly the declared result values. |
-| `return` | `Terminator::Return` | Requires exactly the declared result values. |
+| `return` | `Terminator::Return` | Takes the function's results off the top of the stack; anything left below them dies with the frame. |
 | `block` | `Branch` on a new block | The label's parameters become the target block's parameters. |
-| `loop` | `Branch` back to the header | The header is the branch target and the exit is a distinct block, so a back edge and a fall-out are different edges. |
-| `if`/`else` | `CondBranch` | Each arm ends with a branch; the merge block takes the label's parameters. |
-| `br` | `Branch` | Carries the label's values into the target's parameters. |
+| `loop` | `Branch` back to the header | The header is the branch target and the exit is a distinct block, so a back edge and a fall-out are different edges. A loop label carries the block's *parameters* — empty under MVP — while the block's *results* are delivered to the merge block by the fall-through edge, so the two are tracked separately. |
+| `if`/`else` | `CondBranch` | Each arm ends with a branch; the merge block takes the block's results as its parameters. An `else` is processed even when the `then` arm already reached a terminator, because the condition's false edge still reaches it. |
+| `br` | `Branch` | Carries the label's values into the target's parameters. Branching to a function's own label targets a dedicated exit block that returns, rather than the entry block, which would re-run the body. |
 | `br_if` | `CondBranch` | The condition and the label's values are consumed on both the taken and the fall-through path. |
 | `br_table` | a chain of `CondBranch` blocks | The selector is spilled to a synthesized local and re-read per comparison; the last label is the default reached by falling off the chain. |
 | `drop` | `Drop` | Removes one value from the lowering stack. |

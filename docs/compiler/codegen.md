@@ -81,6 +81,16 @@ Each callee allocates its own slot frame, so recursion and re-entrancy behave as
 they do in Wasm. A callee's arguments and results are type-checked against the
 slots, and a result of the wrong type is rejected rather than stored.
 
+A callee is run by recursing, so the call depth is bounded. `ExecState` counts
+the live frames — the entry call counts as one, exactly as the interpreter counts
+the frame it pushes — and a call past `max_call_depth` traps with
+`Trap::CallDepthExceeded` instead of being made. Without that bound a runaway
+recursion exhausts the *host* stack and aborts the process, which is a crash
+where WebAssembly requires a trap and a denial of service for anything embedding
+the engine. The limit defaults to `ResourceLimits::default().max_call_depth` and
+the runtime overrides it with the same number it gave the store, so the two
+backends run out of depth on the same call.
+
 ## Engine integration
 
 `EngineMode::Baseline` compiles a module through `validate` → IR → baseline at
@@ -89,9 +99,11 @@ the `Instance`, so its memory, table, and globals persist across calls exactly
 as the store-backed path does.
 
 A module the baseline cannot represent is refused at instantiation, not at call
-time, so a baseline instance is never left half-usable. The current gap is
-imports: they need a host boundary the baseline does not have yet, so a module
-that imports anything is rejected in baseline mode and still runs under Micro.
+time, so a baseline instance is never left half-usable. Imported *functions* lower
+to `CallHost` and run through the host boundary, which the runtime installs once
+the imports have resolved. The remaining gaps are cross-instance imports, and
+imported tables, memories, and globals; a module using one of those is rejected in
+baseline mode and still runs under Micro.
 
 Exports are metadata rather than code. The runtime resolves them against the
 module's own function table, so the IR does not carry them and lowering no

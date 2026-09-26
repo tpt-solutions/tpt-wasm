@@ -2820,20 +2820,24 @@ fn verifier_rejects_memory_use_in_a_module_without_memory() {
     let inner = module(Vec::new(), vec![ValueType::I32], vec![0x41, 0x00, 0x0b]);
     let mut ir = lower_module(&validated(inner)).unwrap();
     assert_eq!(ir.memory, None);
+    // A fresh id, so the forged value cannot collide with one lowering already
+    // defined. A collision would be reported as a duplicate value, which the
+    // verifier checks before the memory rule this test is about.
+    let fresh = ir.functions[0].values.len() as u32;
     ir.functions[0].blocks[0].instrs = vec![
         IrInstr::ConstI32 {
             result: ValueId(0),
             value: 0,
         },
         super::IrInstr::Load {
-            result: ValueId(1),
+            result: ValueId(fresh),
             address: ValueId(0),
             offset: 0,
             operation: super::MemoryLoad::I32,
         },
     ];
     ir.functions[0].values.push(IrValue {
-        id: ValueId(1),
+        id: ValueId(fresh),
         value_type: ValueType::I32,
     });
     assert_eq!(verify_module(&ir), Err(VerificationError::NoMemory));

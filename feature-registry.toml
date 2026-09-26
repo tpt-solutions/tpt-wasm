@@ -73,11 +73,7 @@ mvp_verified = "partial"
 # previously `false`, which understated the tree. What each one actually means
 # today:
 #
-# mvp_compiled  — the portable baseline in tpt-wasm-codegen lowers and executes
-#   every instruction the IR can represent, and EngineMode::Baseline runs it at
-#   instantiation, including through a host boundary for imported functions. Not
-#   `true`: there is no native x86-64/AArch64 backend.
-# mvp_differential — 63 tpt-wasm-codegen tests and 36 tpt-wasm-ir tests drive the
+# mvp_differential — 65 tpt-wasm-codegen tests and 36 tpt-wasm-ir tests drive the
 #   real validate -> IR -> baseline pipeline and assert identical results and the
 #   same trap variant against Micro, including host calls through one shared
 #   boundary. On top of the hand-written fixtures, a seeded generator builds
@@ -86,8 +82,14 @@ mvp_verified = "partial"
 #   them are compared per test run (250,000 swept locally), so agreement is a
 #   property of the pipeline over a program population rather than of the cases
 #   someone remembered to write. Extending the generator to control flow is what
-#   exposed the branch defects recorded below. Not `true`: the official spec
-#   suite and the reference-interpreter differential run do not execute yet.
+#   exposed the branch defects recorded below, and the official spec suite now
+#   runs the same comparison across 9,164 directives on both backends. Not
+#   `true`: the reference-interpreter differential does not execute yet.
+# mvp_compiled  — the portable baseline in tpt-wasm-codegen lowers and executes
+#   every instruction the IR can represent, and EngineMode::Baseline runs it at
+#   instantiation, including through a host boundary for imported functions, and
+#   now passes the same Core suite directives Micro does. Not `true`: there is no
+#   native x86-64/AArch64 backend.
 # mvp_verified — V0-V3 are machine-checked in Lean 4 with no `sorry` and no
 #   `axiom`. Not `true`: V1 is rule-to-interpreter agreement within the Lean
 #   model rather than Lean-to-Rust equality, V2 is not yet lifted to the
@@ -124,11 +126,44 @@ mvp_verified = "partial"
 # `mvp_tested` is `"partial"` rather than `false`: 24 Core suite files now run
 # through `crates/tpt-wasm-spec/tests/core_spec.rs`, driving 9,164 `invoke`/
 # `assert_return`/`assert_trap`/`assert_exhaustion` directives through the real
-# decode -> validate -> instantiate -> call pipeline on the Micro backend, with
-# exact NaN bit-pattern checking. Not `true`: roughly 65 Core suite files
-# (memory, tables, multi-module linking/imports, and several files blocked on
-# specific unimplemented proposals -- see `core_spec.rs`'s module doc) are not
-# vendored, and the baseline backend is not exercised by this harness.
+# decode -> validate -> instantiate -> call pipeline with exact NaN bit-pattern
+# checking -- once on the Micro backend and once on the compiled baseline, with
+# the same asserted counts either way, so a backend that dropped a directive
+# would fail rather than shrink its coverage. Not `true`: roughly 65 Core suite
+# files (memory, tables, multi-module linking/imports, and several files blocked
+# on specific unimplemented proposals -- see `core_spec.rs`'s module doc) are not
+# vendored.
+#
+# Running that suite on the baseline found six more real bugs, all fixed, and
+# they are worth recording because five of them are in the lowering, which no
+# hand-written fixture had reached:
+#   - The baseline recursed to make a call with no depth bound, so `call.wast`'s
+#     `runaway` exhausted the *host* stack and killed the process with
+#     STATUS_STACK_OVERFLOW. That is a crash where the spec requires a trap. It
+#     now refuses a call past `ResourceLimits::max_call_depth` with the same
+#     `Trap::CallDepthExceeded` Micro raises, and the runtime passes in the same
+#     limit, so both backends run out of depth on the same call.
+#   - A `loop`'s label carried the block type's results rather than its
+#     parameters, so a loop's result was dropped and the code after the loop read
+#     whatever the enclosing stack held. MVP block types have no parameters, so a
+#     loop label's type is empty; the results belong to the merge block.
+#   - An `else` was skipped when the `then` arm had already reached a
+#     terminator, so the whole `else` arm was lowered into the terminated `then`
+#     block and dropped: `if (c) (then br $done) (else <the work>)` did nothing,
+#     which turned `stack.wast`'s `fac-expr` into an endless loop.
+#   - A `block`/`loop`/`if` opened in unreachable code still popped an `if`'s
+#     condition off a stack that dead code never pushed onto, so any body with a
+#     construct after an `unreachable`, `br`, or `return` failed to lower.
+#   - Dead code did not consume instruction immediates. The body is one byte
+#     stream, so stepping over an `i32.const` without its constant left the next
+#     opcode being read from the middle of it and desynchronized every
+#     instruction after; nine whole suites failed to lower at all.
+#   - A dead `unreachable` overwrote the terminator of a block that had already
+#     branched or returned, replacing a still-taken branch with a trap that was
+#     not.
+# A branch to a function's own label also jumped back to the function's entry
+# block, re-running the body instead of returning, so `br_if` to the outermost
+# label was an endless loop. That label now targets a dedicated exit block.
 #
 # `sign_extension_ops` was `false` because the five opcodes (0xc0-0xc4) were not
 # implemented anywhere; running the new Core suite found this immediately, since

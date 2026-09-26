@@ -261,8 +261,18 @@ enum ControlKind {
 /// One entry of the structured-control stack tracked while lowering a body.
 struct ControlFrame {
     kind: ControlKind,
-    /// Types this label carries when a branch targets it.
+    /// Types a branch to this label carries.
+    ///
+    /// The block's results for a `block` or `if`, and its parameters for a `loop`
+    /// -- empty under MVP, which has no block parameters. See [`open_label`].
     label_types: Vec<ValueType>,
+    /// Types the body hands to the merge block when it falls off the end.
+    ///
+    /// The block's results in every case. This is what the fall-through edge
+    /// carries, and it is deliberately separate from `label_types`: for a `loop`
+    /// the two differ, because the label is re-entered with the block's
+    /// parameters while the fall-through leaves with its results.
+    result_types: Vec<ValueType>,
     /// Value-stack height on entry, restored when the label is left normally.
     stack_height: usize,
     /// For `if`, the block that begins the `else` arm.
@@ -279,6 +289,11 @@ struct ControlFrame {
     /// edge; collapsing the two would make falling off the end of a loop body
     /// jump back to the header instead of exiting.
     exit: BlockId,
+    /// True for a `block`, `loop`, or `if` that was opened in unreachable code.
+    ///
+    /// Such a construct contributes no blocks and no values, and is tracked only
+    /// so that its `else` and `end` match up. See [`open_label`].
+    dead: bool,
 }
 
 /// Accumulates the basic blocks of one function body.
@@ -395,12 +410,18 @@ pub(crate) fn read_block_type(
 }
 
 /// Push a label for `block`, `loop`, or `if` and start its body block.
+///
+/// `reachable` is false when the construct itself sits in unreachable code. It is
+/// then tracked but not built: the condition an `if` would pop was never lowered,
+/// so there is nothing on the stack to take it from, and the value stack must be
+/// left exactly as it was for the enclosing construct to read later.
 fn open_label(
     opcode: u8,
     reader: &mut BodyReader<'_>,
     state: &mut LoweringState,
     builder: &mut BodyBuilder,
     controls: &mut Vec<ControlFrame>,
+    reachable: bool,
 ) -> Result<(), LoweringError> {
     let block_type = read_block_type(reader)?;
     let kind = match opcode {
@@ -408,10 +429,37 @@ fn open_label(
         0x03 => ControlKind::Loop,
         _ => ControlKind::If,
     };
-    // A loop label carries the block's *parameters*, because a branch to a loop
-    // re-enters it. A block or `if` label carries its *results*, which are
-    // produced on the way out and delivered to the merge block's parameters.
-    let label_types = block_type.clone();
+    if !reachable {
+        // The block type still has to be read, which the line above did, so the
+        // body reader stays aligned with the byte stream. Nothing else happens:
+        // no blocks, no terminators, and no change to the value stack. The frame
+        // stays unreachable, because an unreachable `if` has an unreachable `else`
+        // arm too -- unlike an `if` whose `then` arm merely ended in a branch.
+        controls.push(ControlFrame {
+            kind,
+            label_types: Vec::new(),
+            result_types: Vec::new(),
+            stack_height: state.stack.len(),
+            else_block: None,
+            unreachable: true,
+            target: BlockId(0),
+            exit: BlockId(0),
+            dead: true,
+        });
+        return Ok(());
+    }
+    // A `block` or `if` label carries the block's *results*, because a branch that
+    // targets it is leaving and hands over what the block produces. A `loop` label
+    // carries the block's *parameters*, because a branch that targets it re-enters
+    // the loop with them. An MVP block type has no parameters, so a loop's label
+    // type is always empty: `br` to a loop carries nothing, and the loop's results
+    // reach the enclosing code by falling off the end of its body into the merge.
+    let result_types = block_type;
+    let label_types = if kind == ControlKind::Loop {
+        Vec::new()
+    } else {
+        result_types.clone()
+    };
     let stack_height = state.stack.len();
 
     // The condition is consumed first and becomes the two-way terminator that
@@ -434,20 +482,22 @@ fn open_label(
     // that block is a bare jump to the merge.
     let else_block = (kind == ControlKind::If).then(|| builder.allocate_block());
 
-    // The merge block receives the label's results as block parameters, so each
-    // arm supplies them on its outgoing edge. A loop's header takes the label
-    // values the same way.
-    let receiving = if kind == ControlKind::Loop {
-        header
-    } else {
-        merge
-    };
-    let mut params = Vec::with_capacity(label_types.len());
-    for value_type in &label_types {
-        params.push(state.allocate(*value_type)?);
+    // The merge block takes the label's results as block parameters, so falling
+    // off the end of the body supplies them on that outgoing edge, and a `br` to a
+    // `block` or `if` supplies the same values on its own edge.
+    //
+    // The header takes none. It is entered by the fall-through from the code
+    // before the construct, which carries nothing, and — for a loop — by the back
+    // edge of a `br` to the loop label, which also carries nothing, because a loop
+    // label's type is its parameters and an MVP block type has none. Giving the
+    // header the results instead would leave those two edges with the wrong arity
+    // and leave the merge with none, so the loop's results would be dropped and
+    // the code after the loop would read whatever the enclosing stack held.
+    let mut merge_params = Vec::with_capacity(result_types.len());
+    for value_type in &result_types {
+        merge_params.push(state.allocate(*value_type)?);
     }
-    let index = receiving.0 as usize;
-    builder.blocks[index].params = params;
+    builder.blocks[merge.0 as usize].params = merge_params;
 
     if let Some(condition) = condition {
         // The false edge goes to the `else` block, which supplies no values
@@ -473,11 +523,20 @@ fn open_label(
     controls.push(ControlFrame {
         kind,
         label_types,
+        result_types,
         stack_height,
         else_block,
         unreachable: false,
-        target: receiving,
+        target: if kind == ControlKind::Loop {
+            // A `br` to a loop re-enters its header, so that is the branch
+            // target; falling off the end of the body is the separate exit edge
+            // to the merge.
+            header
+        } else {
+            merge
+        },
         exit: merge,
+        dead: false,
     });
     Ok(())
 }
@@ -612,11 +671,13 @@ fn lower_branch_table(
         &ControlFrame {
             kind: ControlKind::Block,
             label_types: label_types.clone(),
+            result_types: Vec::new(),
             stack_height: 0,
             else_block: None,
             unreachable: false,
             target: BlockId(0),
             exit: BlockId(0),
+            dead: false,
         },
     )?;
 
@@ -712,6 +773,19 @@ fn close_label(
     if is_else && frame.kind != ControlKind::If {
         return Err(LoweringError::ElseWithoutIf);
     }
+    // A construct opened in unreachable code contributed no blocks and no values,
+    // so there is nothing to merge and nothing to restore. An `else` still leaves
+    // the `if` open, exactly as it does for a live one: the frame goes back so the
+    // matching `end` finds it. The `else_without_if` check above has already run, so
+    // an `else` in dead code still has to match an `if`.
+    if frame.dead {
+        if is_else {
+            let mut reopened = frame;
+            reopened.kind = ControlKind::Block;
+            controls.push(reopened);
+        }
+        return Ok(());
+    }
     // Control resumes at the label's exit block, which already carries the
     // label's results as block parameters. For a `block` or `if` the exit is
     // also the branch target; for a loop it is the block after the header.
@@ -737,12 +811,22 @@ fn close_label(
         let mut reopened = frame;
         reopened.kind = ControlKind::Block;
         reopened.unreachable = false;
+        // The reserved `else` block is now being filled, so it is no longer
+        // "reserved but unfilled" and the `end` must not fill it again. Leaving
+        // it set would make `end` treat it as unfilled again, and since an
+        // `Unreachable` terminator is the marker for a block that has not been
+        // filled, an `else` arm that really did end in `unreachable` would look
+        // unfilled and be overwritten with a bare jump -- silently replacing a
+        // trap with a fall-through, and handing the merge the wrong arity.
+        reopened.else_block = None;
         controls.push(reopened);
         builder.start_block(else_block);
         return Ok(());
     }
-    // A reserved but unfilled `else` block jumps straight to the merge. An `if`
-    // with no `else` has no results, so it supplies no values.
+    // A reserved but unfilled `else` block jumps straight to the merge. The
+    // `else` arm cleared `else_block` when it started, so this only fires for an
+    // `if` with no `else` at all — which under MVP has no results, and so supplies
+    // no values.
     if let Some(else_block) = else_block {
         if !builder.is_terminated_at(else_block) {
             builder.terminate_at(
@@ -755,10 +839,12 @@ fn close_label(
         }
     }
     // A completed arm carries the label's results to the merge block, which
-    // receives them as block parameters.
+    // receives them as block parameters. These are the block's *results*, not
+    // its label type: a `loop` whose body falls off the end leaves with its
+    // results even though a `br` to its label carries nothing.
     if !builder.is_terminated() {
-        let mut values = Vec::with_capacity(frame.label_types.len());
-        for expected in frame.label_types.iter().rev() {
+        let mut values = Vec::with_capacity(frame.result_types.len());
+        for expected in frame.result_types.iter().rev() {
             values.push(state.pop(*expected)?);
         }
         values.reverse();
@@ -794,15 +880,31 @@ fn lower_function(
     let (mut state, params, mut locals) = LoweringState::new(function, function_type)?;
     let mut reader = BodyReader::new(&function.body);
     let mut builder = BodyBuilder::new();
+    // A branch to the function's own label returns from the function, so that
+    // label cannot target the entry block: the entry is where the body starts,
+    // and jumping back to it would re-run the body instead of returning, which
+    // turns `br_if` to the outermost label into an endless loop. The label
+    // therefore targets a dedicated exit block whose only job is to hand the
+    // function's results back. A `return` and a fall off the end of the body
+    // return directly instead, so a straight-line function stays a single block
+    // and an exit block nothing branches to is simply never reached.
+    //
+    // The block is allocated here, before the body, because a branch inside the
+    // body has to name it; its parameters are filled in afterwards, once the
+    // body's values exist, so that adding the exit does not renumber the values
+    // the body already defined.
+    let exit = builder.allocate_block();
     // The function body is itself a label whose arity is the result arity.
     let mut controls: Vec<ControlFrame> = vec![ControlFrame {
         kind: ControlKind::Block,
         label_types: function_type.results.0.clone(),
+        result_types: function_type.results.0.clone(),
         stack_height: 0,
         else_block: None,
         unreachable: false,
-        target: BlockId(0),
+        target: exit,
         exit: BlockId(0),
+        dead: false,
     }];
     lower_body(
         &mut reader,
@@ -812,6 +914,14 @@ fn lower_function(
         &mut builder,
         &mut controls,
     )?;
+    // The exit block's parameters are the function's results, handed to it by
+    // whichever edge leaves the function, and it returns them unchanged.
+    let mut exit_params = Vec::with_capacity(function_type.results.0.len());
+    for value_type in &function_type.results.0 {
+        exit_params.push(state.allocate(*value_type)?);
+    }
+    builder.blocks[exit.0 as usize].params = exit_params.clone();
+    builder.terminate_at(exit, Terminator::Return(exit_params));
     // Lowering may have appended synthetic local slots for values that must
     // survive across basic blocks, such as a `br_table` selector. Those slots
     // are real locals, so they join the function's local list and are
@@ -865,6 +975,11 @@ fn lower_body(
                     // keeps that terminator; the `end` must not overwrite it.
                     if !builder.is_terminated() {
                         let results = state.return_values()?;
+                        // Falling off the end of the body returns directly rather
+                        // than branching to the exit block. Both are ways out; a
+                        // direct `Return` keeps a straight-line function a single
+                        // block, which is what lets it be projected into the
+                        // formal model.
                         builder.terminate(Terminator::Return(results));
                     }
                     return Ok(());
@@ -873,15 +988,29 @@ fn lower_body(
                 continue;
             }
             0x05 => {
-                // `else` begins the second arm of an `if`.
-                if !reachable {
-                    continue;
-                }
+                // `else` begins the second arm of an `if`, and it is handled even
+                // when the `then` arm is unreachable. The condition's false edge
+                // reaches the `else` arm whether or not the `then` arm ran to a
+                // terminator, so skipping it would drop code that is still
+                // reachable at run time -- an `if` whose `then` ends in `br` and
+                // whose `else` carries the work would silently do nothing.
+                // `close_label` already leaves a terminated `then` arm alone and
+                // starts the reserved `else` block, so the arm lowers normally.
                 close_label(state, builder, controls, true)?;
                 continue;
             }
             0x00 => {
-                builder.terminate(Terminator::Unreachable);
+                // `unreachable` traps, so it is a genuine terminator -- but only
+                // for a block that does not already have one. Once a block has
+                // branched away or returned, the rest of it is dead, and writing a
+                // second terminator over the first would replace a branch that is
+                // still taken with a trap that is not: `(block (result i32) (br 0
+                // (i32.const 1)) (unreachable))` would trap instead of returning
+                // 1. The deadness is still propagated, so later instructions stay
+                // dead.
+                if !builder.is_terminated() {
+                    builder.terminate(Terminator::Unreachable);
+                }
                 mark_unreachable(controls);
                 continue;
             }
@@ -912,13 +1041,18 @@ fn lower_body(
                 continue;
             }
             0x02..=0x04 => {
-                open_label(opcode, reader, state, builder, controls)?;
+                open_label(opcode, reader, state, builder, controls, reachable)?;
                 continue;
             }
             _ if !reachable => {
-                // Dead code: no value is produced, so nothing is lowered. The
-                // stack is left as-is because the frame's height is restored
-                // when the enclosing label closes.
+                // Dead code produces no values, so nothing is lowered and the
+                // value stack is left as-is; the enclosing label restores its
+                // height when it closes. The immediates still have to be
+                // consumed, though: the body is one byte stream, so stepping over
+                // an instruction without stepping over its immediates leaves the
+                // next opcode being read from the middle of this one and
+                // desynchronizes every instruction after it.
+                skip_immediates(opcode, reader)?;
                 continue;
             }
             0x01 => {}
@@ -1040,6 +1174,58 @@ fn lower_body(
             _ => return Err(LoweringError::UnsupportedInstruction(opcode)),
         }
     }
+}
+
+/// Step over the immediates of an instruction that is not being lowered.
+///
+/// Only the immediate bytes are read: the instruction sits in dead code, so
+/// nothing it computes is needed. They still have to be stepped over, because
+/// the body is a single byte stream and the next opcode is read from wherever
+/// this one ends.
+///
+/// The cases mirror the live arms of [`lower_body`], so an opcode this pass does
+/// not implement is reported the same way whether it is reached or dead, and an
+/// instruction the decoder cannot even read still fails the same way. The
+/// structured-control and `br_table` opcodes do not appear here because
+/// `lower_body` handles them before the dead-code arm is reached.
+fn skip_immediates(opcode: u8, reader: &mut BodyReader<'_>) -> Result<(), LoweringError> {
+    match opcode {
+        // No immediates: the control opcodes that can reach here, `drop`,
+        // `select`, `ref.is_null`, and every numeric opcode in 0x45..=0xc4.
+        0x00 | 0x01 | 0x05 | 0x0b | 0x0f | 0x1a | 0x1b | 0x45..=0xc4 | 0xd1 => {}
+        // A single index: a branch, a call, a local or global access, and
+        // `ref.func`.
+        0x0c | 0x0d | 0x10 | 0x20..=0x24 | 0xd2 => {
+            reader.u32()?;
+        }
+        0x11 => {
+            reader.u32()?; // type index
+            reader.u32()?; // table index
+        }
+        // Loads and stores share the `memarg` immediate.
+        0x28..=0x3e => {
+            reader.u32()?; // alignment hint, advisory and not carried
+            reader.u32()?; // static offset
+        }
+        // `memory.size`, `memory.grow`, and `ref.null` each carry one byte.
+        0x3f | 0x40 | 0xd0 => {
+            reader.byte()?;
+        }
+        0x41 => {
+            reader.i32()?;
+        }
+        0x42 => {
+            reader.i64()?;
+        }
+        0x43 => {
+            reader.f32()?;
+        }
+        0x44 => {
+            reader.f64()?;
+        }
+        other => return Err(LoweringError::UnsupportedInstruction(other)),
+    }
+    Ok(())
 }
 
 /// Read a reference type immediate: `funcref` is 0x70 and `externref` is 0x6f.
@@ -2121,12 +2307,18 @@ impl LoweringState {
         Ok(id)
     }
 
+    /// Take the function's results off the top of the stack for a `return`.
+    ///
+    /// The results are the *top* `result_types.len()` values, not the whole
+    /// stack. A `return` is valid with extra values below the results — Wasm pops
+    /// only what it needs and abandons the rest — so `(block (result i32)
+    /// (i32.const 6) (i32.const 9) (return))` is a valid body that discards the
+    /// 6. Requiring the stack to hold exactly the results would reject it, and
+    /// the block's own operand stack height is not the function's, so those
+    /// extras are normal rather than a sign of a malformed body.
     fn return_values(&mut self) -> Result<Vec<ValueId>, LoweringError> {
         if self.stack.len() < self.result_types.len() {
             return Err(LoweringError::StackUnderflow);
-        }
-        if self.stack.len() > self.result_types.len() {
-            return Err(LoweringError::UnexpectedValues);
         }
         let start = self.stack.len() - self.result_types.len();
         for (expected, (_, actual)) in self.result_types.iter().zip(&self.stack[start..]) {
@@ -2137,6 +2329,10 @@ impl LoweringState {
                 });
             }
         }
-        Ok(self.stack[start..].iter().map(|(id, _)| *id).collect())
+        let values = self.stack[start..].iter().map(|(id, _)| *id).collect();
+        // Everything below the results dies with the frame, so it is dropped here
+        // rather than left for the enclosing labels to read.
+        self.stack.clear();
+        Ok(values)
     }
 }
