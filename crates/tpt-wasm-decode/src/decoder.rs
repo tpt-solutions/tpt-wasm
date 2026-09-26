@@ -317,37 +317,93 @@ fn decode_start_section(reader: &mut Reader<'_>) -> Result<u32, DecodeError> {
 
 fn decode_element_section(reader: &mut Reader<'_>) -> Result<Vec<Element>, DecodeError> {
     reader.vector(|reader| {
-        if reader.byte()? != 0 {
-            return Err(DecodeError::UnsupportedElementSegmentKind);
-        }
-        let offset = const_expr(reader)?;
+        // An element segment begins with a kind byte selecting one of eight
+        // forms. The four forms whose entries are plain function indices are
+        // representable here; the four whose entries are `ref.func`/`ref.null`
+        // expressions would need an initializer that is not a list of indices,
+        // and are rejected rather than half-read.
+        let kind = reader.u32()?;
+        let (mode, element_type) = match kind {
+            // Active in table 0, no element kind byte.
+            0 => (
+                ElementMode::Active {
+                    table_index: 0,
+                    offset: const_expr(reader)?,
+                },
+                RefType::FuncRef,
+            ),
+            // Passive, declarative, and active-in-an-explicit-table all carry an
+            // element kind byte, which is a single `0x00` for a function segment.
+            1 | 3 => {
+                element_kind(reader)?;
+                (
+                    if kind == 1 {
+                        ElementMode::Passive
+                    } else {
+                        ElementMode::Declarative
+                    },
+                    RefType::FuncRef,
+                )
+            }
+            2 => {
+                let table_index = reader.u32()?;
+                let offset = const_expr(reader)?;
+                element_kind(reader)?;
+                (
+                    ElementMode::Active {
+                        table_index,
+                        offset,
+                    },
+                    RefType::FuncRef,
+                )
+            }
+            _ => return Err(DecodeError::UnsupportedElementSegmentKind),
+        };
         let init = reader.vector(Reader::u32)?;
         Ok(Element {
-            element_type: RefType::FuncRef,
-            mode: ElementMode::Active {
-                table_index: 0,
-                offset,
-            },
+            element_type,
+            mode,
             init,
         })
     })
 }
 
+/// Read the element kind byte, which must be `0x00` for a function segment.
+///
+/// This is one byte in the encoding, not a LEB, so it is read as a byte. The one
+/// value that is valid here is the zero byte; an `externref` segment would be a
+/// different byte, and no such segment is representable above.
+fn element_kind(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
+    if reader.byte()? != 0x00 {
+        return Err(DecodeError::UnsupportedElementSegmentKind);
+    }
+    Ok(())
+}
+
 fn decode_data_section(reader: &mut Reader<'_>) -> Result<Vec<DataSegment>, DecodeError> {
     reader.vector(|reader| {
-        if reader.byte()? != 0 {
-            return Err(DecodeError::UnsupportedDataSegmentKind);
-        }
-        let offset = const_expr(reader)?;
+        // A data segment begins with a kind byte, and all three forms are part of
+        // the core format: 0 is an active segment in memory 0, 1 is passive, and
+        // 2 is active in an explicitly named memory. The kind is read as a u32
+        // rather than a single byte so that a non-minimal encoding of a valid
+        // kind is accepted, which the core format allows; the check below is on
+        // the value, not on how it was spelled.
+        let kind = reader.u32()?;
+        let mode = match kind {
+            0 => DataMode::Active {
+                memory_index: 0,
+                offset: const_expr(reader)?,
+            },
+            1 => DataMode::Passive,
+            2 => DataMode::Active {
+                memory_index: reader.u32()?,
+                offset: const_expr(reader)?,
+            },
+            _ => return Err(DecodeError::UnsupportedDataSegmentKind),
+        };
         let length = reader.u32()? as usize;
         let data = reader.take(length)?.to_vec();
-        Ok(DataSegment {
-            mode: DataMode::Active {
-                memory_index: 0,
-                offset,
-            },
-            data,
-        })
+        Ok(DataSegment { mode, data })
     })
 }
 

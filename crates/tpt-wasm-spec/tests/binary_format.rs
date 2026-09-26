@@ -39,12 +39,32 @@ const SUITES: &[(&str, &str, usize)] = &[
 /// Until those two gaps are closed, this test must not gate the build — but it
 /// must also not be forgotten, which is why it is here and not deleted.
 /// Run every vendored suite.
+///
+/// The suites are all run before anything is asserted, so one test run reports
+/// every disagreement across every file rather than stopping at the first. A
+/// single run is the only practical way to triage a spec failure.
 #[test]
-#[ignore = "binary-leb128.wast needs the data segment form with an explicit kind byte, and function bodies parsed rather than kept as raw bytes"]
 fn binary_format_suite() {
+    let mut unlisted: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
     for (name, source, expected) in SUITES {
-        run_suite(name, source, *expected);
+        let (bad, rotten) = check_suite(name, source, *expected);
+        unlisted.extend(bad);
+        stale.extend(rotten);
     }
+    assert!(
+        unlisted.is_empty(),
+        "{} assertion(s) failed that are not a known gap:\n{}",
+        unlisted.len(),
+        unlisted.join("\n")
+    );
+    assert!(
+        stale.is_empty(),
+        "{} known gap(s) no longer fail, so they should be closed and removed \
+         from KNOWN_GAPS:\n{}",
+        stale.len(),
+        stale.join("\n")
+    );
 }
 
 /// A spec assertion this implementation is known not to satisfy yet.
@@ -65,18 +85,37 @@ struct KnownGap {
 }
 
 const KNOWN_GAPS: &[KnownGap] = &[
+    // --- bulk memory: the `fc` prefixed instructions and the data count section ---
     KnownGap {
         file: "binary.wast",
         line: 296,
-        missing: "the data count section (id 12) is rejected; it is only meaningful \
-                  alongside bulk-memory instructions, and this decoder has no \
-                  section for it",
+        missing: "the data count section (id 12) is rejected; it belongs with the \
+                  bulk-memory instructions, which are not implemented",
     },
+    KnownGap {
+        file: "binary.wast",
+        line: 302,
+        missing: "a module using `memory.init`/`data.drop` without a matching data \
+                  count section is accepted; the bulk-memory rules are not checked",
+    },
+    KnownGap {
+        file: "binary.wast",
+        line: 325,
+        missing: "the same missing data count section check, for `memory.copy`",
+    },
+    KnownGap {
+        file: "binary-leb128.wast",
+        line: 964,
+        missing: "a valid module using `memory.init`, `data.drop`, `memory.copy` and \
+                  `memory.fill` is rejected at validation; the `fc` opcode prefix \
+                  has no form in the validator",
+    },
+    // --- element segments whose entries are expressions ---
     KnownGap {
         file: "binary.wast",
         line: 401,
         missing: "an element segment whose entries are `ref.func` expressions is \
-                  rejected; only a plain function-index list is decoded",
+                  rejected; the initializer is a list of indices, not expressions",
     },
     KnownGap {
         file: "binary.wast",
@@ -84,27 +123,64 @@ const KNOWN_GAPS: &[KnownGap] = &[
         missing: "an element segment whose entries are `ref.null` expressions is \
                   rejected, for the same reason as the `ref.func` form",
     },
+    // --- function bodies are not parsed ---
     KnownGap {
         file: "binary.wast",
         line: 922,
-        missing: "a function body is only checked for a trailing `end` opcode, not \
-                  parsed, so a body whose blocks are left unbalanced is accepted",
+        missing: "a body is only checked for a trailing `end` opcode, not parsed, so \
+                  one whose blocks are left unbalanced is accepted",
     },
     KnownGap {
         file: "binary.wast",
         line: 1218,
-        missing: "an illegal opcode inside a function body is not rejected while \
-                  decoding; bodies are kept as raw bytes and the opcode is only \
-                  seen later, by the instruction decoder",
+        missing: "an illegal opcode inside a body is not rejected while decoding; \
+                  bodies are kept as raw bytes and seen later by Micro",
+    },
+    KnownGap {
+        file: "binary-leb128.wast",
+        line: 423,
+        missing: "an over-long LEB inside a body goes unseen, because the body is \
+                  never parsed; these are all the same gap",
+    },
+    KnownGap {
+        file: "binary-leb128.wast",
+        line: 442,
+        missing: "an over-long LEB inside a body goes unseen",
+    },
+    KnownGap {
+        file: "binary-leb128.wast",
+        line: 768,
+        missing: "an over-long LEB inside a body goes unseen",
+    },
+    KnownGap {
+        file: "binary-leb128.wast",
+        line: 786,
+        missing: "an over-long LEB inside a body goes unseen",
+    },
+    KnownGap {
+        file: "binary-leb128.wast",
+        line: 805,
+        missing: "an over-long LEB inside a body goes unseen",
+    },
+    KnownGap {
+        file: "binary-leb128.wast",
+        line: 824,
+        missing: "an over-long LEB inside a body goes unseen",
+    },
+    KnownGap {
+        file: "binary-leb128.wast",
+        line: 984,
+        missing: "an over-long LEB inside a body goes unseen",
     },
 ];
 
-/// Run every suite, checking each assertion and reporting what did not hold.
+/// Check one suite, returning the failures that are not known gaps and the
+/// known gaps that have stopped failing.
 ///
-/// The failures are matched against [`KNOWN_GAPS`] rather than panicking, so the
-/// suite stays meaningful while the gaps are open: anything unlisted is a
-/// regression, and anything listed that starts passing is stale.
-fn run_suite(name: &str, source: &str, expected_cases: usize) {
+/// Nothing is asserted here, so every suite can be run before anything is
+/// reported. Both directions matter: an unlisted failure is a regression, and a
+/// listed gap that now holds means the entry is stale and has been fixed.
+fn check_suite(name: &str, source: &str, expected_cases: usize) -> (Vec<String>, Vec<String>) {
     let parsed = cases(source).unwrap_or_else(|error| panic!("{name}: could not parse: {error}"));
     assert_eq!(
         parsed.len(),
@@ -113,9 +189,7 @@ fn run_suite(name: &str, source: &str, expected_cases: usize) {
          so coverage changed without a failure"
     );
 
-    let mut accepted = 0usize;
-    let mut rejected = 0usize;
-    let mut skipped = 0usize;
+    let (mut accepted, mut rejected, mut skipped) = (0usize, 0usize, 0usize);
     let mut unlisted: Vec<String> = Vec::new();
     let mut listed: Vec<usize> = Vec::new();
 
@@ -140,51 +214,42 @@ fn run_suite(name: &str, source: &str, expected_cases: usize) {
         if holds {
             continue;
         }
-        let gap = KNOWN_GAPS
+        let known = KNOWN_GAPS
             .iter()
-            .find(|gap| gap.file == name && gap.line == case.line);
-        match gap {
-            Some(_) => listed.push(case.line),
-            None => unlisted.push(format!(
-                "  line {}: {} (expected {:?}, got {:?})\n    upstream reason: {}\n    module: {}",
+            .any(|gap| gap.file == name && gap.line == case.line);
+        if known {
+            listed.push(case.line);
+        } else {
+            unlisted.push(format!(
+                "{name} line {}: {} (expected {:?}, got {:?})\n    upstream reason: {}\n    module: {}",
                 case.line,
                 case.directive,
                 case.expect,
                 outcome,
                 case.reason.as_deref().unwrap_or("(none)"),
                 hex(&case.module),
-            )),
+            ));
         }
     }
 
-    assert!(
-        unlisted.is_empty(),
-        "{name}: {} assertion(s) failed that are not a known gap:\n{}",
-        unlisted.len(),
-        unlisted.join("\n")
-    );
-
-    // A listed gap that now passes has been fixed, so the entry is stale.
     let stale: Vec<String> = KNOWN_GAPS
         .iter()
         .filter(|gap| gap.file == name && !listed.contains(&gap.line))
         .map(|gap| {
-            let line = gap.line;
-            format!("  line {line}: {missing}", missing = gap.missing)
+            format!(
+                "  {name} line {}: {missing}",
+                gap.line,
+                missing = gap.missing
+            )
         })
         .collect();
-    assert!(
-        stale.is_empty(),
-        "{name}: {} known gap(s) no longer fail, so they should be closed and \
-         removed from KNOWN_GAPS:\n{}",
-        stale.len(),
-        stale.join("\n")
-    );
 
     println!(
-        "{name}: {accepted} accepted, {rejected} rejected, {skipped} skipped, {} known gap(s)",
+        "{name}: {accepted} accepted, {rejected} rejected, {skipped} skipped, \
+         {} known gap(s)",
         listed.len()
     );
+    (unlisted, stale)
 }
 
 fn hex(bytes: &[u8]) -> String {

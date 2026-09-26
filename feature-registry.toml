@@ -107,6 +107,17 @@ mvp_verified = "partial"
 # blocks and branches, because the hand-written fixtures only branched to void
 # labels, where the two readings agree.
 #
+# `binary.wast` and `binary-leb128.wast` from the official suite now run in CI
+# through the real decoder and validator: 218 assertions, 49 modules accepted
+# and 154 rejected at the stage the spec requires, with 15 documented gaps.
+# Building that harness found four real decoder bugs, all fixed: a function body
+# did not have to end with the `end` opcode; declared local counts were not
+# summed; a data segment could only be written in the form with no kind byte;
+# and an element segment could only be active in table 0. The 15 remaining gaps
+# are two features rather than fifteen defects: the bulk-memory instructions
+# with their data count section, and function bodies being stored as raw bytes
+# instead of parsed.
+#
 # `br_table` was wrong in the same area for a different reason: the lowerer
 # popped the label's values before the selector, so the two were swapped and the
 # branch carried the selector while the dispatch compared the carried value. Any
