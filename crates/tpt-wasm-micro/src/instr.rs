@@ -209,6 +209,11 @@ pub enum Instr {
     I64ReinterpretF64,
     F32ReinterpretI32,
     F64ReinterpretI64,
+    I32Extend8S,
+    I32Extend16S,
+    I64Extend8S,
+    I64Extend16S,
+    I64Extend32S,
 }
 
 /// Block type for control instructions.
@@ -634,6 +639,11 @@ fn decode_numeric(opcode: u8) -> Result<Instr, InstrDecodeError> {
         0xbd => Instr::I64ReinterpretF64,
         0xbe => Instr::F32ReinterpretI32,
         0xbf => Instr::F64ReinterpretI64,
+        0xc0 => Instr::I32Extend8S,
+        0xc1 => Instr::I32Extend16S,
+        0xc2 => Instr::I64Extend8S,
+        0xc3 => Instr::I64Extend16S,
+        0xc4 => Instr::I64Extend32S,
         _ => return Err(InstrDecodeError::InvalidOpcode(opcode)),
     };
     Ok(instruction)

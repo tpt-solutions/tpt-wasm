@@ -218,6 +218,10 @@ pub fn project_function_to_model(
                 tpt_wasm_ir::FloatConversion::F64FromI64U => FloatConversion::F64FromI64U,
                 tpt_wasm_ir::FloatConversion::F64FromF32 => FloatConversion::F64FromF32,
             }),
+            // The formal model has no sign-extension instruction yet.
+            IrInstr::SignExtend { .. } => {
+                return Err(IrProjectionError::UnsupportedInstruction("sign_extend"))
+            }
             IrInstr::Call { function, .. } => Instruction::Call(*function),
             // The formal model has no tables, so an indirect call cannot be
             // projected: its target is a runtime table lookup.

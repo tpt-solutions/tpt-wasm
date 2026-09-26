@@ -163,6 +163,14 @@ fn value_type(reader: &mut Reader<'_>) -> Result<ValueType, DecodeError> {
         0x7e => Ok(ValueType::I64),
         0x7d => Ok(ValueType::F32),
         0x7c => Ok(ValueType::F64),
+        // A function type's params/results, a local declaration, and a global
+        // type all read a value type through this one function, so a `funcref`
+        // or `externref` here is what lets a function signature, a local, or a
+        // global carry a reference: without it, real spec-suite bytes for e.g.
+        // a `(global externref)` or a typed `select` failed to decode even
+        // though the validator has accepted these types since M6.
+        0x70 => Ok(ValueType::Ref(RefType::FuncRef)),
+        0x6f => Ok(ValueType::Ref(RefType::ExternRef)),
         byte => Err(DecodeError::UnsupportedValueType(byte)),
     }
 }
@@ -170,6 +178,7 @@ fn value_type(reader: &mut Reader<'_>) -> Result<ValueType, DecodeError> {
 fn reference_type(reader: &mut Reader<'_>) -> Result<RefType, DecodeError> {
     match reader.byte()? {
         0x70 => Ok(RefType::FuncRef),
+        0x6f => Ok(RefType::ExternRef),
         byte => Err(DecodeError::UnsupportedReferenceType(byte)),
     }
 }

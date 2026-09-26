@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 TPT Solutions
+
+//! Runs the vendored WebAssembly Core spec test suite through the real
+//! decode/validate/execute pipeline.
+//!
+//! `.wast` text is turned into bytes by the upstream `wast` crate; everything
+//! downstream -- decode, validate, instantiate, call, and comparing results --
+//! is tpt-wasm's own code. See `crates/tpt-wasm-spec/src/core.rs` for the
+//! executor and why that division keeps the decoder/interpreter the thing
+//! actually under test.
+//!
+//! Each suite's directive counts are asserted exactly, the same way
+//! `binary_format.rs` asserts assertion counts: a change in the vendored file,
+//! or a change in which directives this harness runs versus skips, changes
+//! coverage, and an unexplained change in coverage should fail the build
+//! rather than pass silently. `assert_invalid` and `assert_malformed` in these
+//! files are all written in the text format and are counted as skipped (see
+//! `core.rs`); this suite does not (yet) re-derive the decode/validate outcome
+//! for a text-format module the way `binary_format.rs` does for the binary
+//! form.
+//!
+//! Not every Core suite file is vendored yet. Left out, and why:
+//! - `conversions.wast` needs the saturating truncation instructions (the
+//!   `0xfc`-prefixed opcodes, `non_trapping_float_to_int`), not implemented.
+//! - `local_init.wast` needs non-nullable reference types (`(ref extern)`,
+//!   the typed-references/function-references proposal), not implemented.
+//! - `select.wast` declares a second table; MVP modules are limited to one,
+//!   and the multi-table relaxation is part of `reference_types`, which is
+//!   only partially implemented here.
+//! - `fac.wast`, `block.wast`, `loop.wast`, `if.wast`, and `br.wast` use
+//!   multi-value block types (`(block (result i32 i32) ...)`), which need a
+//!   type-index block type; only the single-result and empty forms decode
+//!   today (`multi_value`, not implemented).
+//! - `br_table.wast` uses a heap type this decoder does not recognize.
+//! - `global.wast` needs both the `spectest` host import module and
+//!   arithmetic inside a global initializer (`extended_const`), neither
+//!   implemented.
+//! - `token.wast` needs the `spectest` host import module and passive data
+//!   segments (bulk memory), neither implemented.
+//! - `names.wast` contains identifiers with bidirectional-control Unicode
+//!   characters that the `wast` crate's lexer refuses outright, before this
+//!   harness ever sees them.
+
+use std::collections::HashMap;
+
+use tpt_wasm_spec::{run_core_suite, CoreOutcome};
+
+/// Each suite, with the exact count of every directive kind it contains.
+/// A directive kind absent from a suite's map is expected to occur zero times.
+struct Suite {
+    name: &'static str,
+    source: &'static str,
+    directives: &'static [(&'static str, usize)],
+}
+
+const SUITES: &[Suite] = &[
+    Suite {
+        name: "i32.wast",
+        source: include_str!("../testdata/i32.wast"),
+        directives: &[
+            ("module", 1),
+            ("assert_return", 364),
+            ("assert_trap", 10),
+            ("assert_invalid", 83),
+            ("assert_malformed", 2),
+        ],
+    },
+    Suite {
+        name: "i64.wast",
+        source: include_str!("../testdata/i64.wast"),
+        directives: &[
+            ("module", 1),
+            ("assert_return", 374),
+            ("assert_trap", 10),
+            ("assert_invalid", 29),
+            ("assert_malformed", 2),
+        ],
+    },
+    Suite {
+        name: "f32.wast",
+        source: include_str!("../testdata/f32.wast"),
+        directives: &[
+            ("module", 1),
+            ("assert_return", 2500),
+            ("assert_invalid", 11),
+            ("assert_malformed", 2),
+        ],
+    },
+    Suite {
+        name: "f64.wast",
+        source: include_str!("../testdata/f64.wast"),
+        directives: &[
+            ("module", 1),
+            ("assert_return", 2500),
+            ("assert_invalid", 11),
+            ("assert_malformed", 2),
+        ],
+    },
+    Suite {
+        name: "const.wast",
+        source: include_str!("../testdata/const.wast"),
+        directives: &[
+            ("module", 402),
+            ("assert_return", 300),
+            ("assert_malformed", 76),
+        ],
+    },
+    Suite {
+        name: "local_get.wast",
+        source: include_str!("../testdata/local_get.wast"),
+        directives: &[("module", 1), ("assert_return", 19), ("assert_invalid", 16)],
+    },
+    Suite {
+        name: "local_set.wast",
+        source: include_str!("../testdata/local_set.wast"),
+        directives: &[("module", 1), ("assert_return", 19), ("assert_invalid", 33)],
+    },
+    Suite {
+        name: "local_tee.wast",
+        source: include_str!("../testdata/local_tee.wast"),
+        directives: &[("module", 1), ("assert_return", 55), ("assert_invalid", 42)],
+    },
+    Suite {
+        name: "nop.wast",
+        source: include_str!("../testdata/nop.wast"),
+        directives: &[("module", 1), ("assert_return", 83), ("assert_invalid", 4)],
+    },
+    Suite {
+        name: "unreachable.wast",
+        source: include_str!("../testdata/unreachable.wast"),
+        directives: &[("module", 1), ("assert_return", 5), ("assert_trap", 58)],
+    },
+    Suite {
+        name: "return.wast",
+        source: include_str!("../testdata/return.wast"),
+        directives: &[("module", 1), ("assert_return", 63), ("assert_invalid", 20)],
+    },
+    Suite {
+        name: "forward.wast",
+        source: include_str!("../testdata/forward.wast"),
+        directives: &[("module", 1), ("assert_return", 4)],
+    },
+    Suite {
+        name: "call.wast",
+        source: include_str!("../testdata/call.wast"),
+        directives: &[
+            ("module", 1),
+            ("assert_return", 69),
+            ("assert_invalid", 18),
+            ("assert_trap", 1),
+            ("assert_exhaustion", 2),
+        ],
+    },
+    Suite {
+        name: "br_if.wast",
+        source: include_str!("../testdata/br_if.wast"),
+        directives: &[("module", 1), ("assert_return", 88), ("assert_invalid", 30)],
+    },
+    Suite {
+        name: "labels.wast",
+        source: include_str!("../testdata/labels.wast"),
+        directives: &[("module", 1), ("assert_return", 25), ("assert_invalid", 3)],
+    },
+    Suite {
+        name: "stack.wast",
+        source: include_str!("../testdata/stack.wast"),
+        directives: &[("module", 2), ("assert_return", 5)],
+    },
+    Suite {
+        name: "switch.wast",
+        source: include_str!("../testdata/switch.wast"),
+        directives: &[("module", 1), ("assert_return", 26), ("assert_invalid", 1)],
+    },
+    Suite {
+        name: "int_exprs.wast",
+        source: include_str!("../testdata/int_exprs.wast"),
+        directives: &[("module", 19), ("assert_return", 75), ("assert_trap", 14)],
+    },
+    Suite {
+        name: "int_literals.wast",
+        source: include_str!("../testdata/int_literals.wast"),
+        directives: &[("module", 1), ("assert_return", 30), ("assert_malformed", 20)],
+    },
+    Suite {
+        name: "float_exprs.wast",
+        source: include_str!("../testdata/float_exprs.wast"),
+        directives: &[("module", 98), ("assert_return", 819), ("invoke", 10)],
+    },
+    Suite {
+        name: "float_literals.wast",
+        source: include_str!("../testdata/float_literals.wast"),
+        directives: &[("module", 2), ("assert_return", 99), ("assert_malformed", 78)],
+    },
+    Suite {
+        name: "float_misc.wast",
+        source: include_str!("../testdata/float_misc.wast"),
+        directives: &[("module", 1), ("assert_return", 470)],
+    },
+    Suite {
+        name: "traps.wast",
+        source: include_str!("../testdata/traps.wast"),
+        directives: &[("module", 4), ("assert_trap", 32)],
+    },
+    Suite {
+        name: "comments.wast",
+        source: include_str!("../testdata/comments.wast"),
+        directives: &[("module", 5), ("assert_return", 3)],
+    },
+];
+
+#[test]
+fn core_spec_suite() {
+    let mut failures: Vec<String> = Vec::new();
+    let mut miscounted: Vec<String> = Vec::new();
+
+    for suite in SUITES {
+        let cases = run_core_suite(suite.source)
+            .unwrap_or_else(|error| panic!("{}: could not parse: {error}", suite.name));
+
+        let mut actual_counts: HashMap<&str, usize> = HashMap::new();
+        for case in &cases {
+            *actual_counts.entry(case.directive).or_insert(0) += 1;
+            if let CoreOutcome::Failed(reason) = &case.outcome {
+                failures.push(format!("{} line {}: {reason}", suite.name, case.line));
+            }
+        }
+
+        let expected_total: usize = suite.directives.iter().map(|(_, count)| count).sum();
+        if cases.len() != expected_total {
+            miscounted.push(format!(
+                "{}: expected {expected_total} directive(s) total, found {}",
+                suite.name,
+                cases.len()
+            ));
+        }
+        for (directive, expected) in suite.directives {
+            let actual = actual_counts.get(directive).copied().unwrap_or(0);
+            if actual != *expected {
+                miscounted.push(format!(
+                    "{}: expected {expected} `{directive}` directive(s), found {actual}",
+                    suite.name
+                ));
+            }
+        }
+        for (directive, actual) in &actual_counts {
+            if !suite.directives.iter().any(|(name, _)| name == directive) {
+                miscounted.push(format!(
+                    "{}: found {actual} `{directive}` directive(s), none expected",
+                    suite.name
+                ));
+            }
+        }
+    }
+
+    assert!(
+        miscounted.is_empty(),
+        "directive counts changed, so coverage changed without a failure:\n{}",
+        miscounted.join("\n")
+    );
+    assert!(
+        failures.is_empty(),
+        "{} directive(s) did not run the way upstream requires:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

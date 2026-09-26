@@ -793,7 +793,8 @@ fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
         | IntConvert { value, .. }
         | Reinterpret { value, .. }
         | FloatConvert { value, .. }
-        | FloatTrunc { value, .. } => vec![*value],
+        | FloatTrunc { value, .. }
+        | SignExtend { value, .. } => vec![*value],
     }
 }
 
@@ -878,7 +879,8 @@ fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
         | IntConvert { result, .. }
         | Reinterpret { result, .. }
         | FloatConvert { result, .. }
-        | FloatTrunc { result, .. } => vec![*result],
+        | FloatTrunc { result, .. }
+        | SignExtend { result, .. } => vec![*result],
     }
 }
 
@@ -1229,6 +1231,15 @@ fn verify_instruction(
                 values,
                 defined,
             )
+        }
+        super::IrInstr::SignExtend {
+            result,
+            value,
+            operation,
+        } => {
+            let value_type = operation.value_type();
+            expect_defined_type(*value, value_type, function_index, values, defined)?;
+            define_value(*result, value_type, function_index, values, defined)
         }
         super::IrInstr::FloatConvert {
             result,

@@ -473,6 +473,13 @@ pub enum IrInstr {
         value: ValueId,
         operation: Reinterpret,
     },
+    /// Sign-extend a narrower stored width to the operand's full width,
+    /// leaving the type unchanged (`i32.extend8_s` and friends).
+    SignExtend {
+        result: ValueId,
+        value: ValueId,
+        operation: SignExtend,
+    },
     FloatConvert {
         result: ValueId,
         value: ValueId,
@@ -833,6 +840,40 @@ impl Reinterpret {
             Self::I64FromF64 => ValueType::I64,
             Self::F32FromI32 => ValueType::F32,
             Self::F64FromI64 => ValueType::F64,
+        }
+    }
+}
+
+/// A sign extension from a narrower stored width to the operand's own width.
+///
+/// Unlike [`IntUnary`], the operand and result width differ between `i32` and
+/// `i64` forms, and `Extend32S` has no `i32` counterpart, so this is its own
+/// enum rather than a variant shared across both `I32Unary` and `I64Unary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignExtend {
+    I32Extend8S,
+    I32Extend16S,
+    I64Extend8S,
+    I64Extend16S,
+    I64Extend32S,
+}
+
+impl SignExtend {
+    fn from_opcode(opcode: u8) -> Result<Self, LoweringError> {
+        match opcode {
+            0xc0 => Ok(Self::I32Extend8S),
+            0xc1 => Ok(Self::I32Extend16S),
+            0xc2 => Ok(Self::I64Extend8S),
+            0xc3 => Ok(Self::I64Extend16S),
+            0xc4 => Ok(Self::I64Extend32S),
+            _ => Err(LoweringError::InvalidOpcode(opcode)),
+        }
+    }
+
+    fn value_type(self) -> ValueType {
+        match self {
+            Self::I32Extend8S | Self::I32Extend16S => ValueType::I32,
+            Self::I64Extend8S | Self::I64Extend16S | Self::I64Extend32S => ValueType::I64,
         }
     }
 }

@@ -10,3 +10,6 @@ repository.workspace = true
 [dependencies]
 tpt-wasm-decode.workspace = true
 tpt-wasm-validate.workspace = true
+tpt-wasm-runtime.workspace = true
+tpt-wasm-types.workspace = true
+wast = { version = "259", default-features = false, features = ["wasm-module"] }

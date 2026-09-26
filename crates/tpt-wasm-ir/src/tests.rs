@@ -15,7 +15,8 @@ use tpt_wasm_validate::{ValidatedModule, Validator};
 use super::{
     lower_and_verify, lower_module, verify_module, BasicBlock, BlockId, FloatComparison,
     FloatConversion, FloatTrunc, IntComparison, IntConversion, IntUnary, IrFunction, IrInstr,
-    IrModule, IrValue, LoweringError, Reinterpret, Terminator, ValueId, VerificationError,
+    IrModule, IrValue, LoweringError, Reinterpret, SignExtend, Terminator, ValueId,
+    VerificationError,
 };
 
 fn function_type(params: Vec<ValueType>, results: Vec<ValueType>) -> FunctionType {
@@ -397,6 +398,30 @@ fn execute_ir_function(
                         Reinterpret::F64FromI64 => Value::F64(i64_value(values.get(value))? as u64),
                     };
                     values.insert(*result, reinterpreted);
+                }
+                IrInstr::SignExtend {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    let extended = match operation {
+                        SignExtend::I32Extend8S => {
+                            Value::I32((i32_value(values.get(value))? as i8) as i32)
+                        }
+                        SignExtend::I32Extend16S => {
+                            Value::I32((i32_value(values.get(value))? as i16) as i32)
+                        }
+                        SignExtend::I64Extend8S => {
+                            Value::I64((i64_value(values.get(value))? as i8) as i64)
+                        }
+                        SignExtend::I64Extend16S => {
+                            Value::I64((i64_value(values.get(value))? as i16) as i64)
+                        }
+                        SignExtend::I64Extend32S => {
+                            Value::I64((i64_value(values.get(value))? as i32) as i64)
+                        }
+                    };
+                    values.insert(*result, extended);
                 }
                 IrInstr::FloatConvert {
                     result,

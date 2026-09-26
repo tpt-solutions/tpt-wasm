@@ -260,6 +260,11 @@ pub enum BaselineOp {
         value: u32,
         operation: tpt_wasm_ir::Reinterpret,
     },
+    SignExtend {
+        result: u32,
+        value: u32,
+        operation: tpt_wasm_ir::SignExtend,
+    },
     FloatConvert {
         result: u32,
         value: u32,
@@ -1090,6 +1095,26 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     let value = state.expect(*value, source)?;
                     let result = state.define(*result)?;
                     ops.push(BaselineOp::Reinterpret {
+                        result,
+                        value,
+                        operation: *operation,
+                    });
+                }
+                IrInstr::SignExtend {
+                    result,
+                    value,
+                    operation,
+                } => {
+                    let value_type = match operation {
+                        tpt_wasm_ir::SignExtend::I32Extend8S
+                        | tpt_wasm_ir::SignExtend::I32Extend16S => ValueType::I32,
+                        tpt_wasm_ir::SignExtend::I64Extend8S
+                        | tpt_wasm_ir::SignExtend::I64Extend16S
+                        | tpt_wasm_ir::SignExtend::I64Extend32S => ValueType::I64,
+                    };
+                    let value = state.expect(*value, value_type)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::SignExtend {
                         result,
                         value,
                         operation: *operation,
@@ -1961,6 +1986,14 @@ impl BaselineFunction {
                         slots[*result as usize] =
                             Some(eval_reinterpret(&slots, *operation, *value)?);
                     }
+                    BaselineOp::SignExtend {
+                        result,
+                        value,
+                        operation,
+                    } => {
+                        slots[*result as usize] =
+                            Some(eval_sign_extend(&slots, *operation, *value)?);
+                    }
                     BaselineOp::FloatConvert {
                         result,
                         value,
@@ -2550,6 +2583,22 @@ fn eval_reinterpret(
         Reinterpret::I64FromF64 => Value::I64(f64_slot(slots, value)?.to_bits() as i64),
         Reinterpret::F32FromI32 => Value::F32(i32_slot(slots, value)? as u32),
         Reinterpret::F64FromI64 => Value::F64(i64_slot(slots, value)? as u64),
+    };
+    Ok(result)
+}
+
+fn eval_sign_extend(
+    slots: &[Option<Value>],
+    operation: tpt_wasm_ir::SignExtend,
+    value: u32,
+) -> Result<Value, Trap> {
+    use tpt_wasm_ir::SignExtend;
+    let result = match operation {
+        SignExtend::I32Extend8S => Value::I32((i32_slot(slots, value)? as i8) as i32),
+        SignExtend::I32Extend16S => Value::I32((i32_slot(slots, value)? as i16) as i32),
+        SignExtend::I64Extend8S => Value::I64((i64_slot(slots, value)? as i8) as i64),
+        SignExtend::I64Extend16S => Value::I64((i64_slot(slots, value)? as i16) as i64),
+        SignExtend::I64Extend32S => Value::I64((i64_slot(slots, value)? as i32) as i64),
     };
     Ok(result)
 }

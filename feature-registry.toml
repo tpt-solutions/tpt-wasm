@@ -24,7 +24,10 @@ reference_types    = "partial"
 bulk_memory        = false
 simd               = false
 multi_value        = false
-sign_extension_ops = false
+# The five sign-extension opcodes (0xc0-0xc4) are decoded, validated, lowered
+# to the IR, and executed by both Micro and the baseline; the Core suite's
+# i32.wast/i64.wast exercise them end to end.
+sign_extension_ops = true
 non_trapping_float_to_int = false
 
 # Phase 4 / shipping
@@ -117,6 +120,34 @@ mvp_verified = "partial"
 # are two features rather than fifteen defects: the bulk-memory instructions
 # with their data count section, and function bodies being stored as raw bytes
 # instead of parsed.
+#
+# `mvp_tested` is `"partial"` rather than `false`: 24 Core suite files now run
+# through `crates/tpt-wasm-spec/tests/core_spec.rs`, driving 9,164 `invoke`/
+# `assert_return`/`assert_trap`/`assert_exhaustion` directives through the real
+# decode -> validate -> instantiate -> call pipeline on the Micro backend, with
+# exact NaN bit-pattern checking. Not `true`: roughly 65 Core suite files
+# (memory, tables, multi-module linking/imports, and several files blocked on
+# specific unimplemented proposals -- see `core_spec.rs`'s module doc) are not
+# vendored, and the baseline backend is not exercised by this harness.
+#
+# `sign_extension_ops` was `false` because the five opcodes (0xc0-0xc4) were not
+# implemented anywhere; running the new Core suite found this immediately, since
+# `i32.wast`/`i64.wast` failed to instantiate at all. Now decoded, validated,
+# lowered to the IR (a new `SignExtend` op), and executed by both Micro and the
+# baseline.
+#
+# The Core suite found two more real bugs, both fixed:
+#   - `tpt-wasm-decode`'s `value_type()`/`reference_type()` only recognized the
+#     four numeric types (plus `funcref` for a table), so a function signature,
+#     local, global, or table with a `funcref`/`externref` type could not
+#     actually decode from real bytes -- despite the validator having accepted
+#     these types since M6. The validator's support was unreachable.
+#   - Micro's `branch()` used a block's result arity for every branch,
+#     including a branch back to a `loop`'s start, which should carry the
+#     loop's (here always zero) parameter arity instead. Any loop with a result
+#     type that branched back to its own top with no operand -- an ordinary
+#     shape, e.g. a loop that only produces a value on exit -- trapped with a
+#     spurious stack underflow.
 #
 # `br_table` was wrong in the same area for a different reason: the lowerer
 # popped the label's values before the selector, so the two were swapped and the

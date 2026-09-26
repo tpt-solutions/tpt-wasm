@@ -794,6 +794,8 @@ fn numeric_instruction(
         0xbd => ("convert", ValueType::F64, ValueType::I64),
         0xbe => ("convert", ValueType::I32, ValueType::F32),
         0xbf => ("convert", ValueType::I64, ValueType::F64),
+        0xc0 | 0xc1 => ("unary", ValueType::I32, ValueType::I32),
+        0xc2..=0xc4 => ("unary", ValueType::I64, ValueType::I64),
         _ => return Err(ValidationError::InvalidInstruction(opcode)),
     };
     match operation.0 {

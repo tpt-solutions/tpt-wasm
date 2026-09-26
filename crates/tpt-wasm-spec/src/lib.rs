@@ -28,8 +28,10 @@
 //! validation failure, and a decoder that accepts a module the validator should
 //! reject is a different defect from one that rejects a module outright.
 
+mod core;
 mod wast;
 
+pub use core::{run_core_suite, CoreCase, CoreOutcome};
 pub use wast::{parse, Form, ParseError};
 
 /// The stage a module is rejected at.

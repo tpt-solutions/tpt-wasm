@@ -12,7 +12,7 @@ use tpt_wasm_validate::ValidatedModule;
 use super::{
     BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
     IntConversion, IntUnary, IrDataSegment, IrFunction, IrGlobal, IrInstr, IrMemory, IrModule,
-    IrTable, IrValue, MemoryLoad, MemoryStore, Reinterpret, Terminator, ValueId,
+    IrTable, IrValue, MemoryLoad, MemoryStore, Reinterpret, SignExtend, Terminator, ValueId,
 };
 
 /// Errors produced while lowering a validated module.
@@ -998,6 +998,7 @@ fn lower_body(
             0xa7 | 0xac | 0xad => lower_int_conversion(opcode, state, builder)?,
             0xa8..=0xab | 0xae..=0xb1 => lower_float_trunc(opcode, state, builder)?,
             0xbc..=0xbf => lower_reinterpret(opcode, state, builder)?,
+            0xc0..=0xc4 => lower_sign_extend(opcode, state, builder)?,
             0xb2..=0xbb => lower_float_conversion(opcode, state, builder)?,
             0x8b..=0x91 => lower_float_unary(opcode, ValueType::F32, state, builder)?,
             0x99..=0x9f => lower_float_unary(opcode, ValueType::F64, state, builder)?,
@@ -1587,6 +1588,24 @@ fn lower_reinterpret(
         operation,
     });
     state.push(result, operation.result_type());
+    Ok(())
+}
+
+fn lower_sign_extend(
+    opcode: u8,
+    state: &mut LoweringState,
+    builder: &mut BodyBuilder,
+) -> Result<(), LoweringError> {
+    let operation = SignExtend::from_opcode(opcode)?;
+    let value_type = operation.value_type();
+    let value = state.pop(value_type)?;
+    let result = state.allocate(value_type)?;
+    builder.push(IrInstr::SignExtend {
+        result,
+        value,
+        operation,
+    });
+    state.push(result, value_type);
     Ok(())
 }
 

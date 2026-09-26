@@ -401,6 +401,11 @@ fn execute_instruction(machine: &mut Machine, instruction: crate::instr::Instr) 
         crate::instr::Instr::I64ReinterpretF64 => reinterpret_f64_to_i64(machine),
         crate::instr::Instr::F32ReinterpretI32 => reinterpret_i32_to_f32(machine),
         crate::instr::Instr::F64ReinterpretI64 => reinterpret_i64_to_f64(machine),
+        crate::instr::Instr::I32Extend8S => unary_i32(machine, |value| (value as i8) as i32),
+        crate::instr::Instr::I32Extend16S => unary_i32(machine, |value| (value as i16) as i32),
+        crate::instr::Instr::I64Extend8S => unary_i64(machine, |value| (value as i8) as i64),
+        crate::instr::Instr::I64Extend16S => unary_i64(machine, |value| (value as i16) as i64),
+        crate::instr::Instr::I64Extend32S => unary_i64(machine, |value| (value as i32) as i64),
         crate::instr::Instr::End => end_control(machine),
     }
 }
@@ -525,7 +530,16 @@ fn branch(machine: &mut Machine, depth: u32) -> Step {
     if control.kind == ControlKind::Function {
         return return_frame(machine);
     }
-    let arity = control.block_type_arity;
+    // A branch to a loop re-enters at its *start*, so it carries the loop's
+    // parameter arity, not its result arity. The current block-type
+    // representation has no independent param list, so that arity is always
+    // zero; a branch to a block or `if` carries its result arity instead,
+    // since that branch targets the construct's *end*.
+    let arity = if control.kind == ControlKind::Loop {
+        0
+    } else {
+        control.block_type_arity
+    };
     let Some(start) = machine.operand_stack.len().checked_sub(arity) else {
         return Step::Trap(Trap::HostFailure("branch result underflow".into()));
     };
