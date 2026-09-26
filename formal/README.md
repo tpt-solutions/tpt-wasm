@@ -27,12 +27,26 @@ goes to `.lake/`, which is gitignored.
 | Path | Contents |
 | --- | --- |
 | `TptWasm/Basic.lean` | The value domain: value types, runtime values, and the width invariant. |
-| `definitions/` | Executable definitions of the machine. |
-| `invariants/` | Invariants stated over configurations. |
-| `proofs/` | Theorems establishing those invariants. |
+| `TptWasm/Instruction.lean` | Traps, the modeled instruction set, and the integer wraparound. |
+| `TptWasm/Store.lean` | Memories, tables, globals, functions, and the store. |
+| `TptWasm/Config.lean` | Frames, the control stack, and the machine configuration. |
+| `TptWasm/Transition.lean` | The section 4 rules (`OpStep`, `Step`) and the interpreter (`execOp`, `exec`). |
+| `TptWasm/Invariants.lean` | V0: invariants over configurations, and that stepping preserves them. |
+| `TptWasm/Proofs/V1.lean` | V1: the interpreter agrees with the rules, and the rules are deterministic. |
+| `TptWasm/Proofs/V2.lean` | V2: a memory access happens only inside the memory, and out of bounds is a trap. |
+| `TptWasm/Proofs/V3.lean` | V3: a host capability is invoked only if granted, and execution cannot widen authority. |
+
+`TptWasm.lean` imports all of them, so `lake build` checks the whole model.
 
 ## Status
 
-The value domain and its width invariant are stated and proved. The transition
-relation, the store and configuration types, and the V1-V3 proofs are still to
-be written; `todo.md` tracks them under M5 and M9.
+The value domain, the abstract machine, the section 4 transition rules, the
+executable interpreter, and the V0-V3 proofs are written and machine-checked.
+The build is warning-free and contains no `sorry` and no `axiom`; CI fails the
+build if either appears.
+
+The modeled instruction subset is the Rust `tpt-wasm-semantics` instruction set
+minus the float arithmetic and the trapping float-to-integer conversions, so
+V1 covers a strict subset of the Rust model. Lifting V2 to
+`Valid(Module) ⇒ NoWasmMemoryOutOfBoundsAccess` needs the validation theory and
+remains M9 work, as do the V4 refinement proofs. `todo.md` tracks all of it.

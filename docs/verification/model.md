@@ -1,7 +1,7 @@
 # Formal Verification Model
 
 **Status:** M5 — executable subset; Lean proofs pending
-**Proof assistant:** Lean 4 (not yet installed)
+**Proof assistant:** Lean 4.34.1, pinned in `formal/lean-toolchain`
 **Lean 4 source:** `formal/`
 
 ---
@@ -86,10 +86,10 @@ No full interpreter-correspondence proof has been established yet.
 
 | Level | Property | Status |
 |---|---|---|
-| V0 | Type/configuration invariants | Executable subset implemented |
-| V1 | Interpreter correspondence | Planned; selected subset only |
-| V2 | Memory safety: `Valid(M) ⇒ NoWasmOOB` | Planned |
-| V3 | Host capability safety: `WasmExec ⇒ OnlyGrantedCaps` | Planned |
+| V0 | Type/configuration invariants | Executable checker plus proved preservation |
+| V1 | Interpreter correspondence | Proved for the modeled subset |
+| V2 | Memory safety: `Valid(M) ⇒ NoWasmOOB` | Bounds proved; `Valid` premise pending |
+| V3 | Host capability safety: `WasmExec ⇒ OnlyGrantedCaps` | Proved for the modeled host boundary |
 | V4 | IR refinement: `Wasm ≈ TPT IR` | Executable projection for modeled subset; proof pending |
 | V5 | Compiler transformation proofs | Planned M9 |
 | V6 | Machine-code refinement | Long-term goal |

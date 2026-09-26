@@ -186,8 +186,97 @@ pub enum Instruction {
     Reinterpret(ReinterpretOperation),
     FloatConvert(FloatConversion),
     FloatTrunc(FloatTrunc),
+    Load {
+        operation: LoadOperation,
+        memory: u32,
+        arg: MemArg,
+    },
+    Store {
+        operation: StoreOperation,
+        memory: u32,
+        arg: MemArg,
+    },
+    MemorySize(u32),
+    MemoryGrow(u32),
     Return,
     End,
+}
+
+/// A memory access immediate: an alignment hint and a static byte offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemArg {
+    pub align: u32,
+    pub offset: u32,
+}
+
+/// The fourteen MVP load operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadOperation {
+    I32,
+    I64,
+    F32,
+    F64,
+    I32From8S,
+    I32From8U,
+    I32From16S,
+    I32From16U,
+    I64From8S,
+    I64From8U,
+    I64From16S,
+    I64From16U,
+    I64From32S,
+    I64From32U,
+}
+
+impl LoadOperation {
+    /// Bytes touched by this load.
+    pub const fn width(self) -> u64 {
+        match self {
+            Self::I32From8S | Self::I32From8U | Self::I64From8S | Self::I64From8U => 1,
+            Self::I32From16S | Self::I32From16U | Self::I64From16S | Self::I64From16U => 2,
+            Self::I32 | Self::F32 | Self::I64From32S | Self::I64From32U => 4,
+            Self::I64 | Self::F64 => 8,
+        }
+    }
+}
+
+/// The nine MVP store operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOperation {
+    I32,
+    I64,
+    F32,
+    F64,
+    I32_8,
+    I32_16,
+    I64_8,
+    I64_16,
+    I64_32,
+}
+
+impl StoreOperation {
+    /// Bytes touched by this store.
+    pub const fn width(self) -> u64 {
+        match self {
+            Self::I32_8 | Self::I64_8 => 1,
+            Self::I32_16 | Self::I64_16 => 2,
+            Self::I32 | Self::F32 | Self::I64_32 => 4,
+            Self::I64 | Self::F64 => 8,
+        }
+    }
+
+    /// The operand type this store pops off the operand stack.
+    ///
+    /// Width and value type are independent: `i32.store8` writes one byte of an
+    /// `i32` operand, and `f64.store` writes eight bytes of an `f64` operand.
+    pub const fn value_type(self) -> ValueType {
+        match self {
+            Self::I32 | Self::I32_8 | Self::I32_16 => ValueType::I32,
+            Self::I64 | Self::I64_8 | Self::I64_16 | Self::I64_32 => ValueType::I64,
+            Self::F32 => ValueType::F32,
+            Self::F64 => ValueType::F64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,6 +632,80 @@ fn compare_i64(left: i64, right: i64, comparison: Comparison) -> i32 {
         Comparison::GeU => (left as u64) >= (right as u64),
     };
     result as i32
+}
+
+/// Reads `width` bytes at `address` in little-endian order.
+///
+/// Returns `None` when the access would leave the memory, so an out-of-bounds
+/// access never observes a byte and can be turned into a trap by the caller.
+fn read_le_bytes(bytes: &[u8], address: u64, width: u64) -> Option<u64> {
+    let end = address.checked_add(width)?;
+    if end > bytes.len() as u64 {
+        return None;
+    }
+    let mut result: u64 = 0;
+    for offset in 0..width {
+        result |= u64::from(bytes[(address + offset) as usize]) << (8 * offset);
+    }
+    Some(result)
+}
+
+/// Writes `width` bytes at `address` in little-endian order.
+///
+/// Returns `false` and leaves the memory untouched when the access would leave
+/// it, so a rejected store has no partial effect.
+fn write_le_bytes(bytes: &mut [u8], address: u64, width: u64, value: u64) -> bool {
+    let Some(end) = address.checked_add(width) else {
+        return false;
+    };
+    if end > bytes.len() as u64 {
+        return false;
+    }
+    for offset in 0..width {
+        bytes[(address + offset) as usize] = ((value >> (8 * offset)) & 0xff) as u8;
+    }
+    true
+}
+
+/// Interprets the low `width * 8` bits of `raw` as two's complement.
+fn sign_extend(raw: u64, width: u64) -> i64 {
+    let shift = 64 - width * 8;
+    ((raw << shift) as i64) >> shift
+}
+
+/// The value a completed load pushes, given the raw little-endian bits.
+fn loaded_value(operation: LoadOperation, raw: u64) -> Value {
+    match operation {
+        LoadOperation::I32 => Value::I32(raw as u32 as i32),
+        LoadOperation::I64 => Value::I64(raw as i64),
+        LoadOperation::F32 => Value::F32(raw as u32),
+        LoadOperation::F64 => Value::F64(raw),
+        LoadOperation::I32From8S => Value::I32(sign_extend(raw, 1) as i32),
+        LoadOperation::I32From8U => Value::I32(raw as u32 as i32),
+        LoadOperation::I32From16S => Value::I32(sign_extend(raw, 2) as i32),
+        LoadOperation::I32From16U => Value::I32(raw as u32 as i32),
+        LoadOperation::I64From8S => Value::I64(sign_extend(raw, 1)),
+        LoadOperation::I64From8U => Value::I64(raw as i64),
+        LoadOperation::I64From16S => Value::I64(sign_extend(raw, 2)),
+        LoadOperation::I64From16U => Value::I64(raw as i64),
+        LoadOperation::I64From32S => Value::I64(sign_extend(raw, 4)),
+        LoadOperation::I64From32U => Value::I64(raw as i64),
+    }
+}
+
+/// The raw bits a store writes for an operand.
+///
+/// No MVP store operation can carry a `V128` operand, so that arm is only
+/// reached by a caller that ignores the operation's operand type.
+fn stored_bits(value: &Value) -> u64 {
+    match value {
+        Value::I32(bits) => *bits as u32 as u64,
+        Value::I64(bits) => *bits as u64,
+        Value::F32(bits) => u64::from(*bits),
+        Value::F64(bits) => *bits,
+        Value::V128(bits) => u64::from(*bits as u32),
+        Value::Ref(_) => 0,
+    }
 }
 
 /// A frame in the abstract frame stack.
@@ -1282,6 +1445,77 @@ impl Configuration {
                     Err(trap) => return Ok(Transition::Trap(trap)),
                 },
             },
+            Instruction::Load {
+                operation,
+                memory,
+                arg,
+            } => {
+                let width = operation.width();
+                let address = self.pop_i32()? as u32 as u64 + u64::from(arg.offset);
+                let state = self
+                    .store
+                    .memories
+                    .get(memory as usize)
+                    .ok_or(ModelError::UnknownMemory(memory))?;
+                let Some(raw) = read_le_bytes(&state.bytes, address, width) else {
+                    return Ok(Transition::Trap(Trap::MemoryOutOfBounds));
+                };
+                self.push_value(loaded_value(operation, raw))?;
+            }
+            Instruction::Store {
+                operation,
+                memory,
+                arg,
+            } => {
+                let width = operation.width();
+                let value = self.pop_typed(operation.value_type())?;
+                let address = self.pop_i32()? as u32 as u64 + u64::from(arg.offset);
+                let state = self
+                    .store
+                    .memories
+                    .get_mut(memory as usize)
+                    .ok_or(ModelError::UnknownMemory(memory))?;
+                if !write_le_bytes(&mut state.bytes, address, width, stored_bits(&value)) {
+                    return Ok(Transition::Trap(Trap::MemoryOutOfBounds));
+                }
+            }
+            Instruction::MemorySize(memory) => {
+                let state = self
+                    .store
+                    .memories
+                    .get(memory as usize)
+                    .ok_or(ModelError::UnknownMemory(memory))?;
+                let pages = i32::try_from(state.pages())
+                    .map_err(|_| ModelError::LimitExceeded("memory page count exceeds i32"))?;
+                self.push_value(Value::I32(pages))?;
+            }
+            Instruction::MemoryGrow(memory) => {
+                let delta = self.pop_i32()?;
+                let previous = {
+                    let state = self
+                        .store
+                        .memories
+                        .get_mut(memory as usize)
+                        .ok_or(ModelError::UnknownMemory(memory))?;
+                    let current = state.pages();
+                    let requested = current.saturating_add(delta as u32 as u64);
+                    let maximum = state.max_pages.unwrap_or(u64::from(u16::MAX));
+                    match requested
+                        .checked_mul(PAGE_SIZE as u64)
+                        .filter(|length| *length <= usize::MAX as u64)
+                    {
+                        Some(length) if requested <= maximum => {
+                            state.bytes.resize(length as usize, 0);
+                            i32::try_from(current).map_err(|_| {
+                                ModelError::LimitExceeded("memory page count exceeds i32")
+                            })
+                        }
+                        // A refused growth is reported, not applied.
+                        _ => Ok(-1i32),
+                    }
+                }?;
+                self.push_value(Value::I32(previous))?;
+            }
             Instruction::Return | Instruction::End => {
                 let frame = self.pop_frame()?;
                 let expected_len = frame
@@ -1310,9 +1544,110 @@ mod tests {
     use super::{
         Comparison, Configuration, ControlFrame, ControlKind, FloatComparison, FloatConversion,
         FloatTrunc, FloatUnaryOperation, Frame, FunctionState, Instruction, IntegerConversion,
-        ModelError, ReinterpretOperation, Store, Transition, Trap, UnaryOperation,
+        LoadOperation, MemArg, MemoryState, ModelError, ReinterpretOperation, Store,
+        StoreOperation, Transition, Trap, UnaryOperation, PAGE_SIZE,
     };
     use tpt_wasm_types::{FunctionType, ResultType, Value, ValueType};
+
+    /// A single-function configuration whose store owns one memory of `pages`.
+    fn with_memory(pages: u64, max_pages: Option<u64>) -> Configuration {
+        let mut configuration = configuration();
+        configuration.store.memories = vec![MemoryState::new(pages, max_pages).unwrap()];
+        configuration
+    }
+
+    /// Steps the machine until it has consumed `count` instructions.
+    fn advance(configuration: Configuration, count: usize) -> Configuration {
+        (0..count).fold(configuration, |mut current, _| {
+            match current.step().unwrap() {
+                Transition::Step(next) => next,
+                other => panic!("unexpected transition: {other:?}"),
+            }
+        })
+    }
+
+    #[test]
+    fn memory_loads_and_stores_round_trip_in_the_model() {
+        // Store 0x0102_0304 little-endian at address 0, then read the same
+        // bytes back through a 32-bit load and through both 8-bit ends.
+        let mut configuration = with_memory(1, None);
+        configuration.store.functions[0].function_type.results =
+            ResultType(vec![ValueType::I32, ValueType::I32, ValueType::I32]);
+        configuration.frames[0].return_arity = 3;
+        configuration.store.functions[0].body = vec![
+            Instruction::I32Const(0),
+            Instruction::I32Const(0x0403_0201),
+            Instruction::Store {
+                operation: StoreOperation::I32,
+                memory: 0,
+                arg: MemArg {
+                    align: 2,
+                    offset: 0,
+                },
+            },
+            Instruction::I32Const(0),
+            Instruction::Load {
+                operation: LoadOperation::I32,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::I32Const(0),
+            Instruction::Load {
+                operation: LoadOperation::I32From8U,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::I32Const(3),
+            Instruction::Load {
+                operation: LoadOperation::I32From8U,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::End,
+        ];
+        assert_eq!(
+            advance(configuration, 9).step().unwrap(),
+            Transition::Return(vec![
+                Value::I32(0x0403_0201),
+                Value::I32(0x01),
+                Value::I32(0x04),
+            ])
+        );
+    }
+
+    #[test]
+    fn memory_sign_extends_narrow_loads() {
+        let mut configuration = with_memory(1, None);
+        configuration.store.memories[0].bytes[0] = 0xff;
+        configuration.store.functions[0].function_type.results =
+            ResultType(vec![ValueType::I32, ValueType::I32, ValueType::I64]);
+        configuration.frames[0].return_arity = 3;
+        configuration.store.functions[0].body = vec![
+            Instruction::I32Const(0),
+            Instruction::Load {
+                operation: LoadOperation::I32From8S,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::I32Const(0),
+            Instruction::Load {
+                operation: LoadOperation::I32From8U,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::I32Const(0),
+            Instruction::Load {
+                operation: LoadOperation::I64From8S,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::End,
+        ];
+        assert_eq!(
+            advance(configuration, 6).step().unwrap(),
+            Transition::Return(vec![Value::I32(-1), Value::I32(0xff), Value::I64(-1)])
+        );
+    }
 
     fn configuration_from_function(
         results: Vec<ValueType>,
@@ -1384,6 +1719,67 @@ mod tests {
     }
 
     #[test]
+    fn a_load_past_the_end_traps_without_reading() {
+        let mut configuration = with_memory(1, None);
+        // A 4-byte load at the last byte would cross the end of the memory.
+        configuration.store.functions[0].body = vec![
+            Instruction::I32Const((PAGE_SIZE - 1) as i32),
+            Instruction::Load {
+                operation: LoadOperation::I32,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::End,
+        ];
+        assert_eq!(
+            advance(configuration, 1).step().unwrap(),
+            Transition::Trap(Trap::MemoryOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn a_refused_store_traps_and_writes_nothing() {
+        let mut configuration = with_memory(1, None);
+        let last = PAGE_SIZE - 2;
+        configuration.store.functions[0].body = vec![
+            Instruction::I32Const(last as i32),
+            Instruction::I32Const(-1),
+            Instruction::Store {
+                operation: StoreOperation::I32,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::End,
+        ];
+        let mut configuration = advance(configuration, 2);
+        assert_eq!(
+            configuration.step().unwrap(),
+            Transition::Trap(Trap::MemoryOutOfBounds)
+        );
+        // A partially in-bounds store must not write the bytes it could reach.
+        let memory = &configuration.store.memories[0].bytes;
+        assert!(memory[last..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn a_store_at_the_last_valid_address_succeeds() {
+        let mut configuration = with_memory(1, None);
+        configuration.store.functions[0].body = vec![
+            Instruction::I32Const((PAGE_SIZE - 1) as i32),
+            Instruction::I32Const(0xab),
+            Instruction::Store {
+                operation: StoreOperation::I32_8,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::End,
+        ];
+        let mut configuration = advance(configuration, 2);
+        assert!(matches!(configuration.step().unwrap(), Transition::Step(_)));
+        assert_eq!(configuration.store.memories[0].bytes[PAGE_SIZE - 1], 0xab);
+    }
+
+    #[test]
     fn transitions_preserve_configuration_and_return_values() {
         let mut current = configuration();
         current = match current.step().unwrap() {
@@ -1401,6 +1797,124 @@ mod tests {
         assert_eq!(
             current.step().unwrap(),
             Transition::Return(vec![Value::I32(42)])
+        );
+    }
+
+    #[test]
+    fn a_static_offset_is_added_to_the_dynamic_address() {
+        let mut configuration = with_memory(1, None);
+        configuration.store.functions[0].function_type.results = ResultType(vec![ValueType::I32]);
+        configuration.frames[0].return_arity = 1;
+        configuration.store.functions[0].body = vec![
+            Instruction::I32Const(0),
+            Instruction::I32Const(7),
+            Instruction::Store {
+                operation: StoreOperation::I32_8,
+                memory: 0,
+                arg: MemArg {
+                    align: 0,
+                    offset: 4,
+                },
+            },
+            Instruction::I32Const(0),
+            Instruction::Load {
+                operation: LoadOperation::I32From8U,
+                memory: 0,
+                arg: MemArg {
+                    align: 0,
+                    offset: 4,
+                },
+            },
+            Instruction::End,
+        ];
+        assert_eq!(
+            advance(configuration, 5).step().unwrap(),
+            Transition::Return(vec![Value::I32(7)])
+        );
+    }
+
+    #[test]
+    fn memory_size_and_grow_report_the_previous_size() {
+        let mut configuration = with_memory(1, Some(2));
+        configuration.store.functions[0].function_type.results =
+            ResultType(vec![ValueType::I32; 4]);
+        configuration.frames[0].return_arity = 4;
+        configuration.store.functions[0].body = vec![
+            Instruction::MemorySize(0),
+            Instruction::I32Const(1),
+            Instruction::MemoryGrow(0),
+            Instruction::MemorySize(0),
+            Instruction::I32Const(4),
+            Instruction::MemoryGrow(0),
+            Instruction::End,
+        ];
+        let mut configuration = advance(configuration, 6);
+        // The second growth exceeds the declared maximum, so it is refused
+        // with -1 and leaves the memory at two pages.
+        assert_eq!(
+            configuration.step().unwrap(),
+            Transition::Return(vec![
+                Value::I32(1),
+                Value::I32(1),
+                Value::I32(2),
+                Value::I32(-1),
+            ])
+        );
+        assert_eq!(configuration.store.memories[0].bytes.len(), 2 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn an_unknown_memory_is_a_model_error_not_a_trap() {
+        let mut configuration = configuration();
+        configuration.store.functions[0].body = vec![Instruction::MemorySize(3), Instruction::End];
+        assert_eq!(
+            configuration.step().unwrap_err(),
+            ModelError::UnknownMemory(3)
+        );
+    }
+
+    #[test]
+    fn float_memory_accesses_preserve_exact_bits() {
+        let mut configuration = with_memory(1, None);
+        configuration.store.functions[0].function_type.results =
+            ResultType(vec![ValueType::F64, ValueType::F32]);
+        configuration.frames[0].return_arity = 2;
+        configuration.store.functions[0].body = vec![
+            Instruction::I32Const(0),
+            Instruction::F64Const((-0.0f64).to_bits()),
+            Instruction::Store {
+                operation: StoreOperation::F64,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::I32Const(0),
+            Instruction::Load {
+                operation: LoadOperation::F64,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            // A float payload survives a store and load through memory intact.
+            Instruction::I32Const(16),
+            Instruction::F32Const(f32::NAN.to_bits()),
+            Instruction::Store {
+                operation: StoreOperation::F32,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::I32Const(16),
+            Instruction::Load {
+                operation: LoadOperation::F32,
+                memory: 0,
+                arg: MemArg::default(),
+            },
+            Instruction::End,
+        ];
+        assert_eq!(
+            advance(configuration, 10).step().unwrap(),
+            Transition::Return(vec![
+                Value::F64((-0.0f64).to_bits()),
+                Value::F32(f32::NAN.to_bits()),
+            ])
         );
     }
 

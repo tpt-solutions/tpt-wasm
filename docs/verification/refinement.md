@@ -39,12 +39,16 @@ refinement proof and does not cover the full IR instruction set.
 The following remain pending:
 
 ```text
-FormalRule(op) ~= MicroStep(op)
+FormalRule(op) ~= MicroStep(op)   -- across the two languages
+Valid(Module) ==> NoWasmOOB       -- needs the validation theory
 Wasm ~= TPT IR
 TPT IR ~= Optimized IR
 Machine IR ~= Machine Code
 ```
 
-No full interpreter-correspondence proof or compiler refinement proof has been
-established. The Lean 4 definitions, transition rules, V1 proof harness, and
-V4 proof obligations remain future work.
+The Lean model proves `FormalRule(op) ~= execOp(op)` for the instruction subset
+it represents, which is the Rust model minus its float arithmetic and trapping
+conversions. That is a rule-to-interpreter result inside one formalization, not a
+proof that the Lean rules equal `Micro::step`; the two are separate
+implementations that are kept in step by hand and checked executably on the Rust
+side. The IR refinement obligations are unchanged and remain M9 work.

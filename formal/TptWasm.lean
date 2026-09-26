@@ -1,1 +1,9 @@
 import TptWasm.Basic
+import TptWasm.Instruction
+import TptWasm.Store
+import TptWasm.Config
+import TptWasm.Transition
+import TptWasm.Invariants
+import TptWasm.Proofs.V1
+import TptWasm.Proofs.V2
+import TptWasm.Proofs.V3

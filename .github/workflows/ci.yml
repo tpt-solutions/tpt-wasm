@@ -55,6 +55,29 @@ jobs:
           command: check
           arguments: --all-features
 
+  lean:
+    name: Lean 4 proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan
+        uses: elan-actions/elan@v1
+
+      # The model has no external dependencies, so the toolchain pinned in
+      # formal/lean-toolchain is all that is needed to check every proof.
+      - name: Build the formal model
+        working-directory: formal
+        run: lake build
+
+      - name: Fail on any `sorry` or `axiom`
+        working-directory: formal
+        run: |
+          if grep -rn --include='*.lean' -E '\bsorry\b|^ *axiom ' TptWasm TptWasm.lean; then
+            echo "::error::the formal model must not use sorry or axiom"
+            exit 1
+          fi
+
   spec-tests:
     name: WebAssembly spec tests
     runs-on: ubuntu-latest

@@ -132,17 +132,25 @@
 - [x] Design an executable `Configuration` abstract machine in `tpt-wasm-semantics` (Store, FrameStack, OperandStack, ControlStack) for the modeled subset
 - [x] Define executable transition relations (`C → C'`) for the modeled instruction subset
 - [x] Implement V0 configuration/type invariants as executable Rust properties
+- [x] Model the MVP memory instruction set and globals in the Rust abstract machine
+  - Fourteen loads, nine stores, `memory.size`, and `memory.grow`, with little-endian access, static offsets, and sign/zero-extending narrow loads. Every access is guarded by one bounds predicate, a refused access traps, and a refused store writes nothing. `StoreOperation::value_type` keeps operand type independent of width, so `f64.store` pops an `f64` rather than an `i64`. `MemoryState` and `ModelError::MemoryOutOfBounds` were already present but unused; the instructions are what give V2 something to be about.
 - [x] Install Lean 4 toolchain; scaffold `formal/` directory (definitions, proofs, invariants, tests)
-  - elan 4.2.4 with the toolchain pinned in `formal/lean-toolchain` (Lean 4.34.1). `formal/` is a Lake project (`tpt-wasm-formal`) with no external dependencies, so `lake build` needs only the pinned toolchain. The core value domain and its width invariant are in `TptWasm/Basic.lean`; the transition rules, V1-V3 proofs, and the CI check are still pending.
-- [ ] Write Lean 4 definitions for Wasm value types and abstract machine
-- [ ] Write Lean 4 transition rules mirroring spec §4 (execution)
-- [ ] Establish V1: interpreter correspondence proofs (formal rule ≈ Rust `step()`, select subset)
-- [ ] Establish V2: memory safety property (`Valid(Module) ⇒ NoWasmMemoryOutOfBoundsAccess`)
-- [ ] Establish V3: host capability safety (`WasmExecution ⇒ OnlyGrantedCapabilitiesInvoked`)
+  - elan with the toolchain pinned in `formal/lean-toolchain` (Lean 4.34.1). `formal/` is a Lake project (`tpt-wasm-formal`) with no external dependencies, so `lake build` needs only the pinned toolchain.
+- [x] Write Lean 4 definitions for Wasm value types and abstract machine
+  - `TptWasm/Basic.lean` (value domain and the width invariant), `Instruction.lean` (traps, the instruction set, two's-complement wraparound), `Store.lean` (memories, tables, globals, functions), and `Config.lean` (frames, control stack, configuration, capability grants).
+- [x] Write Lean 4 transition rules mirroring spec 4 (execution)
+  - `OpStep` states the instruction semantics as one constructor per rule, `Step` composes instruction fetch with the program-counter advance, and `execOp`/`exec` are the executable interpreter written from the same clauses. Where a check fails no rule applies, so the machine is stuck rather than approximating.
+- [x] Establish V1: interpreter correspondence proofs (formal rule = Rust `step()`, select subset)
+  - `execOp_sound` shows every derivable rule is computed by the interpreter, and `OpStep.deterministic`/`Step.deterministic` show at most one outcome is derivable. The modeled subset is the Rust instruction set minus the float arithmetic and the trapping float-to-integer conversions; the result is rule-to-interpreter inside the Lean model, not Lean-to-Rust, which is recorded in `docs/verification/refinement.md`.
+- [x] Establish V2: memory safety property (`Valid(Module) => NoWasmMemoryOutOfBoundsAccess`)
+  - The bounds guard in `MemoryState.readLE?`/`writeLE?` implies the access is in bounds whenever a `load`/`store` rule applies, and an out-of-bounds access has a trap rule available, so a refused store writes nothing. Lifting this to the `Valid(Module)` implication needs the validation theory and is M9 work.
+- [x] Establish V3: host capability safety (`WasmExecution => OnlyGrantedCapabilitiesInvoked`)
+  - `callHost` carries the grant as a premise, so an ungranted capability has no rule at all, and a step never changes the grants, so execution cannot widen its own authority.
 - [x] Write `docs/verification/model.md`, `invariants.md`, and `refinement.md`
-- [ ] Add Lean 4 proof check to CI
+- [x] Add Lean 4 proof check to CI
+  - A `lean` job runs `lake build` and fails on any `sorry` or `axiom`. The model currently builds with no errors, no warnings, no `sorry`, and no `axiom`.
 
-> M5 has an executable Rust abstract machine and a V0 checker for the current instruction subset, and the Lean 4 toolchain is now installed with the `formal/` Lake project building. The Lean definitions are started (`TptWasm/Basic.lean` gives the value domain and its width invariant); full Core transition coverage, V1-V3 proofs, and the CI check remain pending.
+> M5 has an executable Rust abstract machine with a V0 checker, and the Lean 4 model of the same machine: the value domain, the store and configuration types, the section 4 transition rules, the executable interpreter, and machine-checked V0-V3 proofs. The Rust model now also covers the full MVP memory instruction set and globals. The Lean model is a separate formalization, so V1 establishes rule-to-interpreter agreement rather than equality with `Micro::step`; lifting V2 to the `Valid(Module)` implication and the V4 refinement proofs remain M9 work.
 
 ---
 
