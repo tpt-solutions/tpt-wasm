@@ -5,7 +5,7 @@
 **Standard:** WebAssembly Core 3.0  
 **Repository:** https://github.com/tpt-solutions/tpt-wasm
 
-**Last verified against the working tree:** `cargo check --workspace --all-targets` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, and `cargo test --workspace` green at 251 passing tests (250 unit/integration tests plus one doc-test). Items are only marked `[x]` when the behavior is implemented and covered by a test; an item that is partially delivered stays `[ ]` with a sub-bullet recording exactly which part is done and why the rest is not.
+**Last verified against the working tree:** `cargo check --workspace --all-targets` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, and `cargo test --workspace` green at 253 passing tests (252 unit/integration tests plus one doc-test). Items are only marked `[x]` when the behavior is implemented and covered by a test; an item that is partially delivered stays `[ ]` with a sub-bullet recording exactly which part is done and why the rest is not.
 
 ---
 
@@ -213,8 +213,9 @@
 - [ ] Implement aarch64 backend stub
 - [ ] Pass all Wasm spec tests through the baseline compiler
 - [x] Establish Micro equivalence: `Micro(module) == Baseline(module)` for all test programs
-  - Established for every module the baseline can represent, driven through the real validate → IR → baseline pipeline rather than a hand-built IR. The 58 codegen tests assert identical results and traps against Micro, including the reference instructions returning a `funcref` unchanged, so the two backends' value representations are compared directly and not only through a derived `i32`. Extending this to the official spec suite is the separate item above, since that suite does not run yet.
-- [ ] Set up fuzz differential testing: random Wasm, compare Micro vs. Baseline output
+  - Established for every module the baseline can represent, driven through the real validate → IR → baseline pipeline rather than a hand-built IR. The codegen tests assert identical results and traps against Micro, including the reference instructions returning a `funcref` unchanged, so the two backends' value representations are compared directly and not only through a derived `i32`. Agreement also holds across 25,000 generated programs — see the fuzz differential item below. Extending this to the official spec suite is the separate item above, since that suite does not run yet.
+- [x] Set up fuzz differential testing: random Wasm, compare Micro vs. Baseline output
+  - A seeded generator builds whole programs — 12 instruction families across both widths and all four float/number types, with a mutable global and a page of memory as shared state — and each one is run through the real validate → IR → baseline pipeline and compared against Micro for both result values and the trap variant. 25,000 programs run in the ordinary test suite (~1.5s); 200,000 were swept locally with no divergence. A seed replays deterministically and every failure message carries the seed and the body bytes, so a divergence reproduces without an artifact. Still open: a structure-aware generator covering control flow and `call`/`call_indirect`, a `cargo-fuzz` target for the same comparison, and the reference-interpreter differential named below.
 - [x] Verify trap equivalence (same traps at same points)
   - Checked trap-by-trap against Micro for the whole represented surface: integer division and remainder, every `InvalidConversion` boundary in the float truncations, out-of-bounds memory access, `call_indirect` with an out-of-range index, a null entry, and a signature mismatch, a missing memory, and trap propagation out of a callee. Each baseline trap is asserted to be the same variant Micro raises at the same point.
 - [x] Verify host-effect equivalence

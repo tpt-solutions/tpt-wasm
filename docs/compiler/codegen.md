@@ -281,6 +281,28 @@ module-level slots in both backends; and that `ref.null`, `ref.func`, and
 `ref.is_null` agree with Micro, whether the reference is read back from a local,
 carried through a block result, returned unchanged, or used to pick a branch.
 
+### Generated programs
+
+The fixtures above are cases someone thought to write. On top of them, a seeded
+generator builds whole programs and checks each one the same way. It draws from
+twelve instruction families — integer, float, and bit-count operations at both
+widths, division and remainder with the sign variants distinguished, the
+non-trapping and trapping conversions — over a page of memory and one mutable
+global, and emits a result of the declared type. Each program goes through the
+real pipeline and is compared with Micro for both its value and its trap.
+
+The generator keeps its own shadow of the operand stack so it only emits an
+operation whose operands it actually produced; that is what lets it stay type
+correct without consulting the validator, and a `pop` that runs past the bottom
+is a bug rather than a malformed program. A seed replays deterministically, and
+a failure reports the seed and the body bytes, so a divergence reproduces
+without saving an artifact. Twenty-five thousand programs run as an ordinary
+test; the sweep has been taken to two hundred thousand locally.
+
+Not yet generated: control flow, `call`/`call_indirect`, and reference values.
+Those are covered by the hand-written fixtures above but not by the population
+the generator draws from.
+
 Native x86-64/AArch64 code generation and executable-memory integration remain
 pending. `EngineMode::Baseline` is wired: the module is compiled through validate
 to IR to baseline at instantiation and executed by the compiled form, and the

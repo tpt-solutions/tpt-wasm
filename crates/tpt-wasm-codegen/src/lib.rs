@@ -5206,4 +5206,421 @@ mod tests {
     fn a_refused_host_call_fails_in_both_backends() {
         assert_host_call_matches_micro(&host_calling_module(), true, true);
     }
+
+    /// A deterministic xorshift generator.
+    ///
+    /// The project forbids ambient randomness in execution, and a randomized
+    /// test needs the same discipline: every program is reproducible from its
+    /// seed alone, so a failure can be replayed without recording the input.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            // A zero state is a fixed point of xorshift, so it is avoided.
+            Self(seed | 1)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: u32) -> u32 {
+            (self.next_u64() >> 33) as u32 % bound.max(1)
+        }
+
+        fn bits32(&mut self) -> u32 {
+            (self.next_u64() >> 32) as u32
+        }
+
+        fn bits64(&mut self) -> u64 {
+            self.next_u64()
+        }
+    }
+
+    /// Builds one random but well-typed Wasm function body.
+    ///
+    /// The generator tracks the operand stack it is emitting against, so every
+    /// program it produces is valid by construction. That matters: a fuzzer that
+    /// mostly produced invalid modules would exercise the validator rather than
+    /// the two backends.
+    struct Generator {
+        rng: Rng,
+        body: Vec<u8>,
+        /// The value types currently on the operand stack.
+        stack: Vec<ValueType>,
+    }
+
+    /// The conversions that produce an `i32`, none of which can trap.
+    ///
+    /// A program has to end with an `i32` to be a usable fixture, and trapping on
+    /// the way out would replace the interesting part with a trap before the
+    /// program finished.
+    const TO_I32: &[(ValueType, &[u8])] = &[
+        (ValueType::I32, &[]),
+        (ValueType::I64, &[0xa7]),       // i32.wrap_i64
+        (ValueType::F32, &[0xbc]),       // i32.reinterpret_f32
+        (ValueType::F64, &[0xbd, 0xa7]), // i64.reinterpret_f64 then i32.wrap_i64
+    ];
+
+    impl Generator {
+        fn new(seed: u64) -> Self {
+            Self {
+                rng: Rng::new(seed),
+                body: Vec::new(),
+                stack: Vec::new(),
+            }
+        }
+
+        /// Push a constant of `value_type`. Float constants are written as raw
+        /// bits, so the generator reaches NaN payloads, infinities, subnormals,
+        /// and signed zeroes rather than only round decimal values.
+        fn push(&mut self, value_type: ValueType) {
+            match value_type {
+                ValueType::I32 => {
+                    self.body.push(0x41);
+                    self.body.extend(encode_i32(self.rng.bits32() as i32));
+                }
+                ValueType::I64 => {
+                    self.body.push(0x42);
+                    self.body.extend(encode_i64(self.rng.bits64() as i64));
+                }
+                ValueType::F32 => {
+                    self.body.push(0x43);
+                    self.body.extend(self.rng.bits32().to_le_bytes());
+                }
+                ValueType::F64 => {
+                    self.body.push(0x44);
+                    self.body.extend(self.rng.bits64().to_le_bytes());
+                }
+                other => panic!("the generator does not produce {other:?}"),
+            }
+            self.stack.push(value_type);
+        }
+
+        /// Pop `count` operands, asserting the generator's own stack discipline.
+        fn pop(&mut self, count: usize) {
+            for _ in 0..count {
+                self.stack
+                    .pop()
+                    .expect("the generator emitted more operands than it produced");
+            }
+        }
+
+        /// Push a specific `i32`, for a memory address or a divisor the program
+        /// chooses. Tracking the push is what keeps the generated stack in step
+        /// with the emitted one.
+        fn push_i32(&mut self, value: i32) {
+            self.body.push(0x41);
+            self.body.extend(encode_i32(value));
+            self.stack.push(ValueType::I32);
+        }
+
+        /// Push a specific `i64`, the 64-bit counterpart of [`Generator::push_i32`].
+        fn push_i64(&mut self, value: i64) {
+            self.body.push(0x42);
+            self.body.extend(encode_i64(value));
+            self.stack.push(ValueType::I64);
+        }
+
+        /// Emit a binary operation drawn from a contiguous opcode range.
+        fn binary(&mut self, operand: ValueType, first: u8, last: u8, result: ValueType) {
+            self.push(operand);
+            self.push(operand);
+            self.body
+                .push(first + self.rng.below(u32::from(last - first) + 1) as u8);
+            self.pop(2);
+            self.stack.push(result);
+        }
+
+        /// Emit a unary operation drawn from a contiguous opcode range.
+        fn unary(&mut self, operand: ValueType, first: u8, last: u8, result: ValueType) {
+            self.push(operand);
+            self.body
+                .push(first + self.rng.below(u32::from(last - first) + 1) as u8);
+            self.pop(1);
+            self.stack.push(result);
+        }
+
+        /// Emit a conversion that always succeeds.
+        fn convert(&mut self, from: ValueType, opcodes: &[u8], to: ValueType) {
+            self.push(from);
+            self.body.extend_from_slice(opcodes);
+            self.pop(1);
+            self.stack.push(to);
+        }
+
+        /// Push a float small enough that converting it to an integer cannot
+        /// trap, so a truncation is exercised on its real path rather than
+        /// ending the program at its first use.
+        fn push_truncatable(&mut self, value_type: ValueType) {
+            let small = (self.rng.below(2_001) as i32) - 1000;
+            match value_type {
+                ValueType::F32 => {
+                    self.body.push(0x43);
+                    self.body.extend((small as f32).to_bits().to_le_bytes());
+                }
+                ValueType::F64 => {
+                    self.body.push(0x44);
+                    self.body.extend((small as f64).to_bits().to_le_bytes());
+                }
+                other => panic!("{other:?} is not truncatable"),
+            }
+            self.stack.push(value_type);
+        }
+
+        /// Emit a float-to-integer truncation whose operand stays in range.
+        fn truncate(&mut self, from: ValueType, opcodes: &[u8], to: ValueType) {
+            self.push_truncatable(from);
+            self.body.extend_from_slice(opcodes);
+            self.pop(1);
+            self.stack.push(to);
+        }
+
+        /// Emit an integer division or remainder whose divisor is non-zero and
+        /// positive.
+        ///
+        /// A zero divisor traps and `i32::MIN / -1` overflows, so either would
+        /// end the program at the division instead of exercising the arithmetic.
+        fn divrem(&mut self, width32: bool, opcode: u8) {
+            let value_type = if width32 {
+                ValueType::I32
+            } else {
+                ValueType::I64
+            };
+            let divisor = 1 + i64::from(self.rng.below(0x3fff_ffff));
+            // Both operands are pushed through the tracked helpers, because the
+            // operation pops the dividend and the divisor together.
+            self.push(value_type);
+            if width32 {
+                self.push_i32(divisor as i32);
+            } else {
+                self.push_i64(divisor);
+            }
+            self.body.push(opcode);
+            self.pop(2);
+            self.stack.push(value_type);
+        }
+
+        /// Emit a store of a fresh value at an in-bounds address, then a load of
+        /// the same width at another, so the two backends must agree on what the
+        /// round trip observes.
+        fn memory_round_trip(&mut self, value_type: ValueType, store: u8, load: u8, align: u8) {
+            // The address stays low so every width remains inside one page. Both
+            // addresses go through `push_i32`, so the tracked stack matches the
+            // emitted one; a store pops the address and the value together.
+            let first = self.rng.below(1024) as i32;
+            self.push_i32(first);
+            self.push(value_type);
+            self.body.push(store);
+            self.body.push(align);
+            self.body.push(0x00); // offset
+            self.pop(2);
+            let second = self.rng.below(1024) as i32;
+            self.push_i32(second);
+            self.body.push(load);
+            self.body.push(align);
+            self.body.push(0x00); // offset
+            self.pop(1);
+            self.stack.push(value_type);
+        }
+
+        /// Add one random, well-typed step to the program.
+        ///
+        /// Every branch emits only operations whose operand types it supplies
+        /// itself, so the generated body is valid without a type-inference pass.
+        fn step(&mut self) {
+            match self.rng.below(14) {
+                0 => self.binary(ValueType::I32, 0x6a, 0x78, ValueType::I32),
+                1 => self.binary(ValueType::I32, 0x46, 0x4f, ValueType::I32),
+                2 => self.binary(ValueType::I64, 0x7c, 0x8a, ValueType::I64),
+                // 0x52, not 0x51: `i64.eqz` is unary, so a range starting there
+                // would emit an operation with the wrong operand arity.
+                3 => self.binary(ValueType::I64, 0x52, 0x5a, ValueType::I32),
+                4 => self.binary(ValueType::F32, 0x92, 0x98, ValueType::F32),
+                5 => self.binary(ValueType::F32, 0x5b, 0x60, ValueType::I32),
+                6 => self.binary(ValueType::F64, 0xa0, 0xa6, ValueType::F64),
+                7 => self.binary(ValueType::F64, 0x61, 0x66, ValueType::I32),
+                8 => self.unary(ValueType::F32, 0x8b, 0x91, ValueType::F32),
+                9 => self.unary(ValueType::F64, 0x99, 0x9f, ValueType::F64),
+                10 => {
+                    if self.rng.below(2) == 0 {
+                        // i32 div_s, div_u, rem_s, or rem_u. The opcode is drawn
+                        // first so the borrow ends before the call below.
+                        let opcode = 0x6d + self.rng.below(4) as u8;
+                        self.divrem(true, opcode);
+                    } else {
+                        // The i64 equivalents.
+                        let opcode = 0x7f + self.rng.below(4) as u8;
+                        self.divrem(false, opcode);
+                    }
+                }
+                11 => match self.rng.below(9) {
+                    // The bit-count operations, at both widths.
+                    0 => self.unary(ValueType::I32, 0x67, 0x69, ValueType::I32),
+                    1 => self.unary(ValueType::I64, 0x79, 0x7b, ValueType::I64),
+                    2 => self.convert(ValueType::I64, &[0xa7], ValueType::I32),
+                    3 => self.convert(ValueType::I32, &[0xac], ValueType::I64),
+                    4 => self.convert(ValueType::I32, &[0xad], ValueType::I64),
+                    5 => self.convert(ValueType::F64, &[0xb6], ValueType::F32),
+                    6 => self.convert(ValueType::F32, &[0xbb], ValueType::F64),
+                    7 => self.convert(ValueType::F32, &[0xbc], ValueType::I32),
+                    8 => self.convert(ValueType::I32, &[0xbe], ValueType::F32),
+                    _ => self.convert(ValueType::I64, &[0xbf], ValueType::F64),
+                },
+                12 => match self.rng.below(4) {
+                    0 => self.truncate(ValueType::F32, &[0xa8], ValueType::I32),
+                    1 => self.truncate(ValueType::F64, &[0xaa], ValueType::I32),
+                    2 => self.truncate(ValueType::F32, &[0xae], ValueType::I64),
+                    _ => self.truncate(ValueType::F64, &[0xb0], ValueType::I64),
+                },
+                _ => {
+                    if self.rng.below(2) == 0 {
+                        // A narrow store and load, whose sign extension differs.
+                        self.memory_round_trip(ValueType::I32, 0x3a, 0x2c, 0x00);
+                    } else {
+                        match self.rng.below(4) {
+                            0 => self.memory_round_trip(ValueType::I32, 0x36, 0x28, 0x02),
+                            1 => self.memory_round_trip(ValueType::I64, 0x37, 0x29, 0x03),
+                            2 => self.memory_round_trip(ValueType::F32, 0x38, 0x2a, 0x02),
+                            _ => self.memory_round_trip(ValueType::F64, 0x39, 0x2b, 0x03),
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Keep a mutable global in step with the values on the operand stack.
+        ///
+        /// A `global.set` is emitted only when the top of the tracked stack is the
+        /// global's type, and the value is read straight back, so a stale or
+        /// shared slot shows up as a divergence rather than passing by luck.
+        fn spill_to_global(&mut self) {
+            if self.stack.last().copied() != Some(ValueType::I32) {
+                return;
+            }
+            // The index immediate is required; without it the following byte would
+            // be read as the global index.
+            self.body.push(0x24);
+            self.body.push(0x00); // global.set 0
+            self.pop(1);
+            self.body.push(0x23);
+            self.body.push(0x00); // global.get 0
+            self.stack.push(ValueType::I32);
+        }
+
+        /// Drop everything above the bottom operand and convert it to the `i32`
+        /// the fixture's signature declares.
+        fn finish(mut self) -> Vec<u8> {
+            if self.stack.is_empty() {
+                self.push(ValueType::I32);
+            }
+            while self.stack.len() > 1 {
+                self.body.push(0x1a); // drop
+                self.pop(1);
+            }
+            let top = self.stack[0];
+            let conversion = TO_I32
+                .iter()
+                .find(|(from, _)| *from == top)
+                .expect("every generated type converts to an i32")
+                .1;
+            self.body.extend_from_slice(conversion);
+            self.body.push(0x0b); // end
+            self.body
+        }
+    }
+
+    /// The module a generated body is placed in: one function, one page of
+    /// memory, and one mutable global, so the generator can reach the memory and
+    /// global state both backends share.
+    fn generated_program(seed: u64) -> Module {
+        let mut generator = Generator::new(seed);
+        let steps = 3 + generator.rng.below(24);
+        for _ in 0..steps {
+            generator.step();
+            // Route an `i32` through the module-level global, so a stale or
+            // shared slot shows up as a divergence rather than passing by luck.
+            generator.spill_to_global();
+        }
+        let body = generator.finish();
+        let mut module = with_memory(Module {
+            types: vec![FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(vec![ValueType::I32]),
+            }],
+            functions: vec![Function {
+                type_index: 0,
+                locals: vec![],
+                body,
+            }],
+            ..Module::default()
+        });
+        // `global.get`/`global.set` round trip through the module-level slot the
+        // compiled instance owns, so a stale or shared global shows up as a
+        // divergence rather than passing by luck.
+        module.globals.push(tpt_wasm_format::Global {
+            global_type: tpt_wasm_types::GlobalType {
+                value_type: ValueType::I32,
+                mutable: true,
+            },
+            init: tpt_wasm_format::ConstExpr(vec![0x41, 0x00, 0x0b]),
+        });
+        module
+    }
+
+    /// Compile one generated program both ways and require the same outcome.
+    ///
+    /// Each stage reports separately, so a failure says whether the generator
+    /// produced something invalid, the pipeline rejected it, or the two backends
+    /// actually disagreed. The seed and the body bytes are in every message, so a
+    /// failure is reproducible without having saved an artifact.
+    fn assert_generated_matches_micro(seed: u64) {
+        let module = generated_program(seed);
+        let body = format!("{:02x?}", module.functions[0].body);
+        let validated = tpt_wasm_validate::validate(module.clone())
+            .unwrap_or_else(|error| panic!("seed {seed}: invalid module: {error:?}\n{body}"));
+        let verified = lower_and_verify(&validated)
+            .unwrap_or_else(|error| panic!("seed {seed}: did not lower: {error:?}\n{body}"));
+        let mut baseline = BaselineModule::lower(verified.module())
+            .unwrap_or_else(|error| panic!("seed {seed}: did not compile: {error:?}\n{body}"));
+        let baseline_result = baseline.call(0, Vec::new());
+        let micro_result = run_in_micro(&module, 0, Vec::new());
+        let from_baseline: Result<&[Value], Trap> = match &baseline_result {
+            Ok(values) => Ok(values),
+            Err(error) => Err(trap_of(error)),
+        };
+        let from_micro: Result<&[Value], Trap> = match &micro_result {
+            Ok(values) => Ok(values),
+            Err(trap) => Err(trap.clone()),
+        };
+        assert_eq!(
+            from_baseline, from_micro,
+            "seed {seed}: the backends disagreed\n{body}"
+        );
+    }
+
+    #[test]
+    fn baseline_matches_micro_over_generated_programs() {
+        // Enough programs to reach combinations the hand-written fixtures do
+        // not, while staying fast enough for ordinary `cargo test`.
+        for seed in 1..=25_000u64 {
+            assert_generated_matches_micro(seed);
+        }
+    }
+    #[test]
+    fn a_seed_replays_exactly() {
+        assert_eq!(
+            generated_program(99).functions[0].body,
+            generated_program(99).functions[0].body
+        );
+        assert_ne!(
+            generated_program(99).functions[0].body,
+            generated_program(100).functions[0].body
+        );
+    }
 }
