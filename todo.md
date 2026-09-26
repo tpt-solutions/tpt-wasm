@@ -5,7 +5,7 @@
 **Standard:** WebAssembly Core 3.0  
 **Repository:** https://github.com/tpt-solutions/tpt-wasm
 
-**Last verified against the working tree:** `cargo check --workspace --all-targets` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, and `cargo test --workspace` green at 255 passing tests (254 unit/integration tests plus one doc-test; one further test is `#[ignore]`d). Items are only marked `[x]` when the behavior is implemented and covered by a test; an item that is partially delivered stays `[ ]` with a sub-bullet recording exactly which part is done and why the rest is not.
+**Last verified against the working tree:** `cargo check --workspace --all-targets` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, and `cargo test --workspace` green at 258 passing tests (256 unit/integration tests plus one doc-test, and one further test is `#[ignore]`d with a recorded reason). Items are only marked `[x]` when the behavior is implemented and covered by a test; an item that is partially delivered stays `[ ]` with a sub-bullet recording exactly which part is done and why the rest is not.
 
 ---
 
@@ -50,6 +50,7 @@
 - [x] Add validation error tests (type mismatches, index out of range, etc.)
 - [x] Add an isolated cargo-fuzz decoder target and deterministic mutation corpus test
 - [ ] Run the official Wasm MVP binary-format spec tests
+  - Partially delivered in `crates/tpt-wasm-spec`. `binary.wast` and `binary-leb128.wast` are vendored unmodified (provenance and Apache-2.0 licensing in `testdata/PROVENANCE.md`) and run through the real decoder and validator, with the assertion counts asserted so a silent coverage change fails the build. `binary.wast` passes: 17 modules accepted, 105 rejected as malformed, 5 documented gaps. Building the harness found two real decoder bugs, both now fixed — a function body was not required to end with the `end` opcode, so a module whose body ran past its end decoded, and the declared local counts were not summed, so a module could declare more than 2^32-1 locals. Neither was reachable from the hand-written tests. The remaining 5 `binary.wast` gaps are a missing data-count section, element segments whose entries are `ref.func`/`ref.null` expressions, and two cases that need function bodies to be parsed rather than only checked for a trailing `end`. The full-suite test is currently `#[ignore]`d because `binary-leb128.wast` does not pass. The cause is *not* the LEB128 reader, which does accept padded encodings: it is the two gaps above reaching this file too. A data segment written as `01 80 00 41 00 0b 00` — an explicit segment-kind byte, here the non-minimal encoding of zero — has no form in the decoder, and an over-long LEB inside a *function body* goes unseen because bodies are kept as raw bytes and never parsed. Both are the gaps named above, not a third one. Still open: the data segment form, body parsing, the five `binary.wast` gaps, and the text-format core suite.
 - [x] Fuzz decoder with random byte inputs (cargo-fuzz or libfuzzer)
 
 > M1 currently covers the WebAssembly MVP structural format and static validation. The decoder has an isolated cargo-fuzz target and deterministic no-panic mutation coverage; the official MVP spec suite and a live fuzz campaign remain pending. Post-MVP proposals remain explicitly unsupported.

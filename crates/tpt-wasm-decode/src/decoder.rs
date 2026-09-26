@@ -371,8 +371,28 @@ fn decode_code_section(reader: &mut Reader<'_>) -> Result<Vec<CodeEntry>, Decode
                 value_type: value_type(reader)?,
             })
         })?;
+        // The declared local counts are a *sum*, and the spec caps that sum at
+        // 2^32-1. Each count is a u32 on its own, so a module can declare groups
+        // that individually fit and together overflow; allocating on the sum
+        // would be the point of failure, so it is rejected here instead.
+        let mut total: u64 = 0;
+        for decl in &locals {
+            total += u64::from(decl.count);
+            if total > u64::from(u32::MAX) {
+                return Err(DecodeError::TooManyLocals);
+            }
+        }
         let body = body_reader.take(body_reader.remaining())?.to_vec();
         body_reader.finish()?;
+        // A function body is an expression, and an expression must end with the
+        // `end` opcode. A body whose last byte is anything else would leave the
+        // interpreter running past the end of the function, so the structure is
+        // checked here rather than trusted to the executor. This does not parse
+        // the body: an illegal opcode in the middle is still caught later, by
+        // the instruction decoder.
+        if body.last() != Some(&0x0b) {
+            return Err(DecodeError::MissingEndOpcode);
+        }
         Ok((locals, body))
     })
 }

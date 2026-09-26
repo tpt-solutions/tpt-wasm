@@ -40,6 +40,11 @@ pub enum DecodeError {
     UnsupportedElementSegmentKind,
     UnsupportedDataSegmentKind,
     MismatchedCodeSection,
+    /// A function body does not end with the `end` opcode, so the body is not a
+    /// complete expression.
+    MissingEndOpcode,
+    /// The declared local counts of one function sum past 2^32-1.
+    TooManyLocals,
     Custom(String),
     UnsupportedFeature(&'static str),
 }

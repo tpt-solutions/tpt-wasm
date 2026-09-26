@@ -13,6 +13,7 @@ members = [
     "crates/tpt-wasm-resource",
     "crates/tpt-wasm-semantics",
     "crates/tpt-wasm-verify",
+    "crates/tpt-wasm-spec",
     "crates/tpt-wasm-ir",
     "crates/tpt-wasm-codegen",
     "crates/tpt-wasm-jit",
@@ -50,6 +51,7 @@ tpt-wasm-capability = { path = "crates/tpt-wasm-capability", version = "0.1.0" }
 tpt-wasm-resource = { path = "crates/tpt-wasm-resource", version = "0.1.0" }
 tpt-wasm-semantics = { path = "crates/tpt-wasm-semantics", version = "0.1.0" }
 tpt-wasm-verify   = { path = "crates/tpt-wasm-verify",   version = "0.1.0" }
+tpt-wasm-spec    = { path = "crates/tpt-wasm-spec",    version = "0.1.0" }
 tpt-wasm-ir       = { path = "crates/tpt-wasm-ir",       version = "0.1.0" }
 tpt-wasm-codegen  = { path = "crates/tpt-wasm-codegen",  version = "0.1.0" }
 tpt-wasm-jit      = { path = "crates/tpt-wasm-jit",      version = "0.1.0" }
