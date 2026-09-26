@@ -539,11 +539,30 @@ fn lower_branch(
             builder.terminate(Terminator::CondBranch {
                 condition,
                 then_target: target,
-                then_values: values,
+                then_values: values.clone(),
                 else_target: fallthrough,
-                else_values: Vec::new(),
+                // `br_if` is `[t* i32] -> [t*]`: the taken edge hands `t*` to the
+                // label and the fall-through keeps the same values, so both edges
+                // carry them. Passing none here would silently drop a value the
+                // fall-through still has to produce.
+                else_values: values.clone(),
             });
             builder.start_block(fallthrough);
+            // The fall-through block receives those values on its incoming edge, so
+            // it declares them as parameters. A parameter is a fresh value rather
+            // than the incoming one, which is what makes the join a phi: the
+            // predecessor supplies the old ids and the block body sees the new ones.
+            let mut params = Vec::with_capacity(values.len());
+            for expected in frame.label_types.iter() {
+                params.push(state.allocate(*expected)?);
+            }
+            builder.blocks[fallthrough.0 as usize].params = params.clone();
+            // The joined values are back on the operand stack for the fall-through,
+            // so the lowerer's own stack has to be restored to match. Without this
+            // the block would end one operand short of its declared result.
+            for (param, expected) in params.iter().zip(frame.label_types.iter()) {
+                state.push(*param, *expected);
+            }
         }
     }
     Ok(())

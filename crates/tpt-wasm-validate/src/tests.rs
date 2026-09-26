@@ -54,19 +54,39 @@ fn empty_module_is_valid() {
 }
 
 #[test]
-fn br_if_consumes_the_label_values_it_branches_with() {
+fn br_if_leaves_the_label_values_on_the_fall_through_path() {
     // `block (result i32) { 7; 0; br_if 0; 99 } end`
     //
-    // `br_if` pops the condition and the label's value on *both* paths, so the
-    // fall-through starts from an empty stack and may push a fresh `99` for the
-    // block's result. A validator that restores the popped value would see two
-    // values at the block's `end` and wrongly reject this module.
+    // `br_if l` has type `[t* i32] -> [t*]`: the taken edge hands `t*` to the
+    // label, and the fall-through keeps the same values. So after the `br_if` the
+    // block's `7` is still on the stack, and pushing another value for the
+    // block's result leaves two operands at the `end`. This module is invalid,
+    // and a validator that dropped the value instead of restoring it would
+    // wrongly accept it.
     let body = vec![
         0x02, 0x7f, // block (result i32)
         0x41, 0x07, // i32.const 7
         0x41, 0x00, // i32.const 0
         0x0d, 0x00, // br_if 0
         0x41, 0xe3, 0x00, // i32.const 99 (signed LEB128, two bytes)
+        0x0b, // end (block)
+        0x0b, // end (function)
+    ];
+    let module = module_with_function(function_type(vec![], vec![ValueType::I32]), body);
+    assert!(validate(module).is_err());
+}
+
+#[test]
+fn br_if_fall_through_may_reuse_the_value_it_carries() {
+    // The valid form of the shape above: the carried value is the block's result
+    // either way, so the fall-through drops it before producing a replacement.
+    let body = vec![
+        0x02, 0x7f, // block (result i32)
+        0x41, 0x07, // i32.const 7
+        0x41, 0x00, // i32.const 0
+        0x0d, 0x00, // br_if 0
+        0x1a, // drop
+        0x41, 0xe3, 0x00, // i32.const 99
         0x0b, // end (block)
         0x0b, // end (function)
     ];

@@ -511,11 +511,15 @@ fn control_instruction(
         0x0d => {
             pop_value(stack, controls, Some(ValueType::I32))?;
             let types = branch_types(reader, controls)?;
-            // `br_if` consumes the label's values on *both* paths: the branch
-            // hands them to the label, and the fall-through discards them. They
-            // are not pushed back, so the fall-through continues from a stack
-            // without them.
+            // `br_if l` has type `[t* i32] -> [t*]`. The taken path hands `t*` to
+            // the label, but the fall-through keeps them, so they are checked and
+            // then put back. Only an empty label type makes the two paths agree on
+            // the resulting stack, which is why this is invisible for a `br_if` to
+            // a void block and wrong for one that carries a value.
             pop_values(stack, controls, &types)?;
+            for value in types {
+                push_value(stack, value);
+            }
         }
         0x0e => {
             pop_value(stack, controls, Some(ValueType::I32))?;

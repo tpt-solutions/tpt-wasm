@@ -285,23 +285,47 @@ carried through a block result, returned unchanged, or used to pick a branch.
 
 The fixtures above are cases someone thought to write. On top of them, a seeded
 generator builds whole programs and checks each one the same way. It draws from
-twelve instruction families — integer, float, and bit-count operations at both
+eighteen instruction families — integer, float, and bit-count operations at both
 widths, division and remainder with the sign variants distinguished, the
-non-trapping and trapping conversions — over a page of memory and one mutable
-global, and emits a result of the declared type. Each program goes through the
-real pipeline and is compared with Micro for both its value and its trap.
+non-trapping and trapping conversions, memory round trips, `block` with a
+conditional branch, `if`/`else`, a counted `loop`, a direct `call`, and an
+indirect `call_indirect` — over a page of memory, one mutable global, a helper
+function, and a table seeded with that helper. Each program goes through the real
+pipeline and is compared with Micro for both its value and its trap.
 
 The generator keeps its own shadow of the operand stack so it only emits an
 operation whose operands it actually produced; that is what lets it stay type
 correct without consulting the validator, and a `pop` that runs past the bottom
-is a bug rather than a malformed program. A seed replays deterministically, and
-a failure reports the seed and the body bytes, so a divergence reproduces
-without saving an artifact. Twenty-five thousand programs run as an ordinary
-test; the sweep has been taken to two hundred thousand locally.
+is a bug rather than a malformed program. Each structured case restores the
+shadow at the block's entry height, and the `else` arm restarts from that height
+rather than continuing from the `then` arm, because the two are separate paths.
+A seed replays deterministically, and a failure reports the seed and the body
+bytes, so a divergence reproduces without saving an artifact. Twenty-five
+thousand programs run as an ordinary test; the sweep has been taken to two
+hundred fifty thousand locally.
 
-Not yet generated: control flow, `call`/`call_indirect`, and reference values.
-Those are covered by the hand-written fixtures above but not by the population
-the generator draws from.
+Not yet generated: reference values and `br_table`. Those are covered by the
+hand-written fixtures above but not by the population the generator draws from.
+
+#### What the generator found
+
+Extending the generator to control flow surfaced three defects that the
+hand-written fixtures had missed, all from one mistaken reading of `br_if`:
+
+- The **validator** dropped the label's values on the fall-through path instead
+  of restoring them, so it rejected every valid `br_if` to a label that carries
+  a value — and accepted the invalid mirror image. A test had encoded that
+  behavior as intended.
+- The **IR lowerer** gave the `br_if` fall-through edge no values at all, so a
+  value the fall-through still had to produce was silently lost.
+- The **`br_if_body` fixture** in this file's own test suite was invalid Wasm
+  that only validated because of the validator bug.
+
+The generator itself had three more, all the same shape — an instruction whose
+operands were emitted but not tracked on the shadow stack — plus a `call_indirect`
+that never pushed the callee's argument, and a counted `loop` that computed its
+decrement but never stored it back, so the counter never changed and the loop
+never terminated.
 
 Native x86-64/AArch64 code generation and executable-memory integration remain
 pending. `EngineMode::Baseline` is wired: the module is compiled through validate

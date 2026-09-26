@@ -78,12 +78,13 @@ mvp_verified = "partial"
 #   real validate -> IR -> baseline pipeline and assert identical results and the
 #   same trap variant against Micro, including host calls through one shared
 #   boundary. On top of the hand-written fixtures, a seeded generator builds
-#   whole programs and 25,000 of them are compared per test run (200,000 swept
-#   locally, no divergence), so agreement is a property of the pipeline over a
+#   whole programs — now including blocks, branches, if/else, a counted loop, and
+#   direct and indirect calls — and 25,000 of them are compared per test run
+#   (250,000 swept locally), so agreement is a property of the pipeline over a
 #   program population rather than of the cases someone remembered to write.
-#   Not `true`: the official spec suite and the reference-interpreter
-#   differential run do not execute yet, and the generator does not yet build
-#   control flow or calls.
+#   Extending the generator to control flow is what exposed the `br_if` defects
+#   recorded below. Not `true`: the official spec suite and the
+#   reference-interpreter differential run do not execute yet.
 # mvp_verified — V0-V3 are machine-checked in Lean 4 with no `sorry` and no
 #   `axiom`. Not `true`: V1 is rule-to-interpreter agreement within the Lean
 #   model rather than Lean-to-Rust equality, V2 is not yet lifted to the
@@ -96,6 +97,15 @@ mvp_verified = "partial"
 # those three opcodes, the IR lowers them, and both backends execute them. The
 # entry moved to "partial" rather than true, because `table.get`/`table.set`, an
 # `externref` table, and non-active element segments still have no form.
+#
+# `br_if` was treated as consuming its label's values on both paths, which is
+# wrong: `br_if l` has type `[t* i32] -> [t*]`, so the fall-through keeps them.
+# The validator rejected every module that branched to a value-carrying label,
+# the IR lowerer dropped the values on the fall-through edge, and one test had
+# recorded the wrong reading as intended behavior. All three are fixed. The
+# mistake was invisible until the differential generator started emitting
+# blocks and branches, because the hand-written fixtures only branched to void
+# labels, where the two readings agree.
 
 [standards]
 wasm_core   = "3.0"

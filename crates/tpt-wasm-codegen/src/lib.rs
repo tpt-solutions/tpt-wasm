@@ -3877,6 +3877,11 @@ mod tests {
         body.push(0x41);
         body.extend(encode_i32(condition));
         body.extend_from_slice(&[0x0d, 0x00]); // br_if 0
+                                               // `br_if` is `[t* i32] -> [t*]`, so the carried `7` stays on the stack
+                                               // whether or not the branch is taken. The fall-through therefore has to
+                                               // drop it before producing the other value, or the block would end with
+                                               // two operands.
+        body.push(0x1a); // drop
         body.push(0x41);
         body.extend(encode_i32(99));
         body.extend_from_slice(&[0x0b, 0x0b]); // end (block), end (function)
@@ -5253,6 +5258,11 @@ mod tests {
         body: Vec<u8>,
         /// The value types currently on the operand stack.
         stack: Vec<ValueType>,
+        /// How deeply control flow is currently nested.
+        ///
+        /// The structured steps below recurse into `step`, so this bounds the
+        /// nesting rather than letting a seed grow it without limit.
+        depth: u32,
     }
 
     /// The conversions that produce an `i32`, none of which can trap.
@@ -5273,6 +5283,7 @@ mod tests {
                 rng: Rng::new(seed),
                 body: Vec::new(),
                 stack: Vec::new(),
+                depth: 0,
             }
         }
 
@@ -5434,7 +5445,9 @@ mod tests {
         /// Every branch emits only operations whose operand types it supplies
         /// itself, so the generated body is valid without a type-inference pass.
         fn step(&mut self) {
-            match self.rng.below(14) {
+            // 19 rather than 14: the five control-flow and call cases below join
+            // the arithmetic families.
+            match self.rng.below(19) {
                 0 => self.binary(ValueType::I32, 0x6a, 0x78, ValueType::I32),
                 1 => self.binary(ValueType::I32, 0x46, 0x4f, ValueType::I32),
                 2 => self.binary(ValueType::I64, 0x7c, 0x8a, ValueType::I64),
@@ -5478,6 +5491,11 @@ mod tests {
                     2 => self.truncate(ValueType::F32, &[0xae], ValueType::I64),
                     _ => self.truncate(ValueType::F64, &[0xb0], ValueType::I64),
                 },
+                13 => self.if_else(),
+                14 => self.block_with_branch(),
+                15 => self.counted_loop(self.depth),
+                16 => self.call_helper(),
+                17 => self.call_indirect(),
                 _ => {
                     if self.rng.below(2) == 0 {
                         // A narrow store and load, whose sign extension differs.
@@ -5492,6 +5510,165 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// Discard everything above `height` on the tracked stack.
+        ///
+        /// A structured step must leave the operand stack as it found it, and
+        /// `drop` is how the generator gets there without asking the validator.
+        fn drop_to(&mut self, height: usize) {
+            while self.stack.len() > height {
+                self.body.push(0x1a); // drop
+                self.pop(1);
+            }
+        }
+
+        /// A `block` with a conditional branch out of it, carrying an `i32`.
+        ///
+        /// The branch is taken or not depending on the drawn condition, so both
+        /// the taken and the falling-through path are exercised, and the value
+        /// survives either way.
+        fn block_with_branch(&mut self) {
+            let result = ValueType::I32;
+            let height = self.stack.len();
+            self.body.push(0x02); // block
+            self.body.push(0x7f); // (result i32)
+            self.depth += 1;
+            if self.depth <= 2 && self.rng.below(2) == 0 {
+                self.step();
+                // The block's own result is pushed next, so whatever the nested
+                // step left has to go first: a block leaves exactly its result
+                // type, and `br_if` to it needs an `i32` on top.
+                self.drop_to(height);
+            }
+            self.push(result);
+            // The condition is drawn, not derived, so a branch is sometimes
+            // taken; both edges then have to agree between the backends.
+            let taken = i32::from(self.rng.below(2) == 0);
+            self.push_i32(taken);
+            self.body.push(0x0d); // br_if 0
+            self.body.push(0x00); // to the block's end
+            self.pop(1);
+            self.depth -= 1;
+            self.body.push(0x0b); // end
+            self.stack.truncate(height);
+            self.stack.push(result);
+        }
+
+        /// An `if`/`else` on a drawn condition, with an `i32` on each arm.
+        ///
+        /// Both arms leave exactly the block's result type, so the program stays
+        /// well typed whichever edge runs.
+        fn if_else(&mut self) {
+            let result = ValueType::I32;
+            let height = self.stack.len();
+            let condition = i32::from(self.rng.below(2) == 0);
+            self.push_i32(condition);
+            self.body.push(0x04); // if
+            self.body.push(0x7f); // (result i32)
+            self.depth += 1;
+            self.push(result);
+            self.body.push(0x05); // else
+                                  // The else arm is a *separate* path: it starts from the block's entry
+                                  // height, not from whatever the then arm left, so the tracked stack is
+                                  // reset to match the value stack the runtime will actually see. The
+                                  // same reset discards the `if` condition, which `if` itself consumed.
+            self.stack.truncate(height);
+            if self.depth <= 2 && self.rng.below(2) == 0 {
+                self.step();
+                self.drop_to(height);
+            }
+            self.push(result);
+            self.depth -= 1;
+            self.body.push(0x0b); // end
+            self.stack.truncate(height);
+            self.stack.push(result);
+        }
+
+        /// A counted `loop`: the body runs, then branches back while the counter
+        /// local is nonzero.
+        ///
+        /// The counter is seeded with a small bound, so the loop always
+        /// terminates. `local` is the index of the `i32` local reserved for it,
+        /// and each nesting level takes its own: a nested loop sharing the
+        /// outer's counter would zero it on the way out, leaving the outer loop
+        /// to count down through the whole `i32` range and never terminate.
+        fn counted_loop(&mut self, local: u32) {
+            let height = self.stack.len();
+            let bound = 1 + self.rng.below(6) as i32;
+            self.push_i32(bound);
+            self.body.push(0x21); // local.set
+            self.body.push(local as u8);
+            self.pop(1);
+            self.body.push(0x03); // loop
+            self.body.push(0x40); // (no result)
+            self.depth += 1;
+            if self.depth <= 2 && self.rng.below(2) == 0 {
+                self.step();
+                self.drop_to(height);
+            }
+            self.body.push(0x20); // local.get
+            self.body.push(local as u8);
+            self.body.push(0x41); // i32.const 1
+            self.body.push(0x01);
+            self.body.push(0x6b); // i32.sub
+            self.body.push(0x22); // local.tee
+            self.body.push(local as u8);
+            self.body.push(0x0d); // br_if 0
+            self.body.push(0x00); // to the loop header
+            self.depth -= 1;
+            self.body.push(0x0b); // end
+            self.stack.truncate(height);
+        }
+
+        /// A direct call to the generated module's helper function.
+        ///
+        /// The helper takes and returns an `i32`, so the argument and the result
+        /// both have to survive the call for the two backends to agree.
+        fn call_helper(&mut self) {
+            let height = self.stack.len();
+            self.push(ValueType::I32);
+            self.body.push(0x10); // call
+            self.body.push(0x01); // function 1, the helper
+            self.pop(1);
+            self.stack.push(ValueType::I32);
+            debug_assert!(self.stack.len() > height);
+        }
+
+        /// An indirect call through the table, against the generated module's
+        /// single entry.
+        ///
+        /// The index is usually in range and the declared type usually matches, so
+        /// a call often succeeds. The remaining draws reach the other three
+        /// outcomes: a null entry, an index past the end, and a declared type the
+        /// seeded entry does not have, which is a signature mismatch rather than an
+        /// invalid module.
+        fn call_indirect(&mut self) {
+            let choice = self.rng.below(6);
+            let (index, type_index) = match choice {
+                // The seeded entry, called with its own type: a real dispatch.
+                0 => (0, 0x01),
+                1 => (0, 0x01),
+                2 => (0, 0x01),
+                // A null entry, an index past the end of the table, and a
+                // declared type the entry does not have.
+                3 => (1, 0x01),
+                4 => (3, 0x01),
+                _ => (0, 0x00),
+            };
+            // Type 1 is `(i32) -> i32`, so that call needs an argument pushed
+            // *below* the table index; type 0 takes none. The argument count has
+            // to follow the declared type, or the call is missing an operand.
+            let arguments = usize::from(type_index == 0x01);
+            for _ in 0..arguments {
+                self.push(ValueType::I32);
+            }
+            self.push_i32(index);
+            self.body.push(0x11); // call_indirect
+            self.body.push(type_index);
+            self.body.push(0x00); // table 0
+            self.pop(arguments + 1);
+            self.stack.push(ValueType::I32);
         }
 
         /// Keep a mutable global in step with the values on the operand stack.
@@ -5513,9 +5690,11 @@ mod tests {
             self.stack.push(ValueType::I32);
         }
 
-        /// Drop everything above the bottom operand and convert it to the `i32`
-        /// the fixture's signature declares.
-        fn finish(mut self) -> Vec<u8> {
+        /// Drop everything above the bottom operand and report the type left on it.
+        ///
+        /// This is the body proper: the conversion and the final `end` that
+        /// `finish` appends are left off, so a caller can validate a prefix.
+        fn finish_prefix(mut self) -> (Vec<u8>, ValueType) {
             if self.stack.is_empty() {
                 self.push(ValueType::I32);
             }
@@ -5524,20 +5703,32 @@ mod tests {
                 self.pop(1);
             }
             let top = self.stack[0];
+            (self.body, top)
+        }
+
+        /// Drop everything above the bottom operand and convert it to the `i32`
+        /// the fixture's signature declares.
+        fn finish(self) -> Vec<u8> {
+            let (mut body, top) = self.finish_prefix();
             let conversion = TO_I32
                 .iter()
                 .find(|(from, _)| *from == top)
                 .expect("every generated type converts to an i32")
                 .1;
-            self.body.extend_from_slice(conversion);
-            self.body.push(0x0b); // end
-            self.body
+            body.extend_from_slice(conversion);
+            body.push(0x0b); // end
+            body
         }
     }
 
-    /// The module a generated body is placed in: one function, one page of
-    /// memory, and one mutable global, so the generator can reach the memory and
-    /// global state both backends share.
+    /// The module a generated body is placed in.
+    ///
+    /// The generated function is the entry point, alongside everything it can
+    /// reach: a page of memory, a mutable global, an `i32` local for the loop
+    /// counter, a helper function, and a table seeded with that same helper so an
+    /// indirect call can succeed. Giving the generated program that surface is
+    /// what lets the steps exercise calls and branches rather than only
+    /// arithmetic.
     fn generated_program(seed: u64) -> Module {
         let mut generator = Generator::new(seed);
         let steps = 3 + generator.rng.below(24);
@@ -5549,14 +5740,55 @@ mod tests {
         }
         let body = generator.finish();
         let mut module = with_memory(Module {
-            types: vec![FunctionType {
-                params: ResultType(Vec::new()),
-                results: ResultType(vec![ValueType::I32]),
+            types: vec![
+                // 0: the generated entry point.
+                FunctionType {
+                    params: ResultType(Vec::new()),
+                    results: ResultType(vec![ValueType::I32]),
+                },
+                // 1: the helper, shared by the direct and indirect call.
+                FunctionType {
+                    params: ResultType(vec![ValueType::I32]),
+                    results: ResultType(vec![ValueType::I32]),
+                },
+            ],
+            functions: vec![
+                Function {
+                    type_index: 0,
+                    // One `i32` local per nesting level, reserved for loop
+                    // counters. Locals are zero-initialized, so a loop that read
+                    // before writing would still terminate.
+                    locals: vec![tpt_wasm_format::LocalDecl {
+                        count: 4,
+                        value_type: ValueType::I32,
+                    }],
+                    body,
+                },
+                // 1: local.get 0; i32.const 3; i32.mul; i32.const 1; i32.add.
+                // Doubling and offsetting means a wrong argument, a wrong
+                // dispatch, or a shared call frame would all show up.
+                Function {
+                    type_index: 1,
+                    locals: vec![],
+                    body: vec![0x20, 0x00, 0x41, 0x03, 0x6c, 0x41, 0x01, 0x6a, 0x0b],
+                },
+            ],
+            tables: vec![tpt_wasm_format::Table {
+                table_type: tpt_wasm_types::TableType {
+                    element_type: tpt_wasm_types::ReferenceType::FuncRef,
+                    // Two entries, only the first of which is initialized, so an
+                    // index of 1 is a null entry and 2 or more is out of range.
+                    limits: tpt_wasm_types::Limits { min: 2, max: None },
+                },
+                init: None,
             }],
-            functions: vec![Function {
-                type_index: 0,
-                locals: vec![],
-                body,
+            elements: vec![tpt_wasm_format::Element {
+                element_type: tpt_wasm_types::RefType::FuncRef,
+                mode: tpt_wasm_format::ElementMode::Active {
+                    table_index: 0,
+                    offset: tpt_wasm_format::ConstExpr(vec![0x41, 0x00, 0x0b]),
+                },
+                init: vec![1],
             }],
             ..Module::default()
         });
@@ -5588,8 +5820,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("seed {seed}: did not lower: {error:?}\n{body}"));
         let mut baseline = BaselineModule::lower(verified.module())
             .unwrap_or_else(|error| panic!("seed {seed}: did not compile: {error:?}\n{body}"));
-        let baseline_result = baseline.call(0, Vec::new());
         let micro_result = run_in_micro(&module, 0, Vec::new());
+        let baseline_result = baseline.call(0, Vec::new());
         let from_baseline: Result<&[Value], Trap> = match &baseline_result {
             Ok(values) => Ok(values),
             Err(error) => Err(trap_of(error)),
@@ -5612,6 +5844,9 @@ mod tests {
             assert_generated_matches_micro(seed);
         }
     }
+
+    /// A seed has to pin one program, or a reported divergence could not be
+    /// replayed and the sweep would be testing the same program 25,000 times.
     #[test]
     fn a_seed_replays_exactly() {
         assert_eq!(
