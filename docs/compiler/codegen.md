@@ -242,5 +242,21 @@ non-trapping float conversions, and every float truncation trap boundary —
 including that `InvalidConversion`, not a panic, is raised for NaN, infinity,
 out-of-range magnitudes, and negative-to-unsigned conversions.
 
-Native x86-64/AArch64 code generation, executable-memory integration, and
-`EngineMode::Baseline` remain pending.
+Control-flow, memory, global, and table coverage runs through the same pipeline.
+It asserts a loop that only terminates if the back edge is followed, `br` carrying
+a value, `br_if` on both the taken and the falling-through path, and `if`/`else`
+on both edges; that a direct call forwards arguments and results; that an active
+element segment seeds the table and `call_indirect` forwards its arguments;
+that out-of-range, null, and signature-mismatched table entries each trap
+distinctly and like Micro; that a data segment lands at a requested non-zero
+offset and that a later segment overwrites an earlier one; that the fourteen
+loads and nine stores, `memory.size`, and `memory.grow` agree with Micro and
+trap out of bounds identically; that a memory instruction in a module with no
+memory traps; and that `global.get`/`global.set` read and write the same
+module-level slots in both backends.
+
+Native x86-64/AArch64 code generation and executable-memory integration remain
+pending. `EngineMode::Baseline` is wired: the module is compiled through validate
+to IR to baseline at instantiation and executed by the compiled form, and the
+compiled instance owns that module's memory, table, and globals so state persists
+across calls.

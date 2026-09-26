@@ -45,12 +45,12 @@ flexible_vectors   = false
 mvp_decoded = "partial"
 mvp_validated = "partial"
 mvp_executed = "partial"
-mvp_compiled = false
+mvp_compiled = "partial"
 mvp_tested = "partial"
 mvp_fuzzed = "partial"
-mvp_differential = false
-mvp_verified = false
-# For each feature above, track the implementation ladder:
+mvp_differential = "partial"
+mvp_verified = "partial"
+# Each feature above should also be tracked through this ladder:
 # decoded    = binary format understood by decoder
 # validated  = validation rules implemented
 # executed   = interpreter executes it
@@ -59,6 +59,30 @@ mvp_verified = false
 # fuzzed     = fuzz target exists
 # differential = differential test exists
 # verified   = formal property established
+#
+# The three `mvp_compiled`, `mvp_differential`, and `mvp_verified` entries were
+# previously `false`, which understated the tree. What each one actually means
+# today:
+#
+# mvp_compiled  — the portable baseline in tpt-wasm-codegen lowers and executes
+#   every instruction the IR can represent, and EngineMode::Baseline runs it at
+#   instantiation. Not `true`: there is no native x86-64/AArch64 backend, and
+#   references and host boundaries have no IR form.
+# mvp_differential — 51 tpt-wasm-codegen tests and 33 tpt-wasm-ir tests drive the
+#   real validate -> IR -> baseline pipeline and assert identical results and the
+#   same trap variant against Micro. Not `true`: the official spec suite and the
+#   reference-interpreter differential run do not execute yet.
+# mvp_verified — V0-V3 are machine-checked in Lean 4 with no `sorry` and no
+#   `axiom`. Not `true`: V1 is rule-to-interpreter agreement within the Lean
+#   model rather than Lean-to-Rust equality, V2 is not yet lifted to the
+#   `Valid(Module)` implication, and the V4 IR projection is an executable hook,
+#   not a refinement proof.
+#
+# `reference_types` stays `false` even though tpt-wasm-micro has `RefNull`,
+# `RefIsNull`, and `RefFunc` instruction forms: the validator's opcode table
+# ends at 0xbf, so 0xd0-0xd2 are rejected as invalid instructions and a module
+# using them cannot reach the interpreter. The reference forms are unreachable
+# behind the validation stage by design.
 
 [standards]
 wasm_core   = "3.0"
