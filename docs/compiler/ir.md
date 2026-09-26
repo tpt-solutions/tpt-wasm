@@ -64,6 +64,7 @@ The implemented instruction set is:
   sign/zero-extension per operation, plus `MemorySize` and `MemoryGrow`;
 - `GlobalGet` and `GlobalSet`;
 - `RefNull`, `RefFunc`, and `RefIsNull`, over a `ValueType::Ref` value;
+- `CallHost`, the single instruction that crosses the host boundary;
 - return, trap, and unreachable terminators, and `Branch`/`CondBranch` to any
   block carrying values into its parameters.
 
@@ -93,6 +94,8 @@ no semantic effect.
   global is rejected;
 - a `ref.func` names a function the module defines, and a `ref.is_null` operand is
   a reference of either kind rather than any value;
+- a `CallHost` names a declared import, and its argument and result arities and
+  types match that import's signature;
 - return arity, value types, and definitions match the function signature.
 
 Dominance is the reason a value defined in only one arm of a branch cannot be
@@ -132,10 +135,13 @@ reference-types proposal is still not implemented: there is no `table.get` or
 What is still outside the IR, and rejected explicitly rather than dropped or
 approximated:
 
-- **Explicit host boundaries.** There is no IR instruction for calling out to a
-  host capability, so the baseline has no host boundary either.
-- **Imports.** `lower_module` rejects any module with imports, so the lowerer
-  never produces a call it cannot resolve to a defined function.
+- **Host effects beyond a call.** `CallHost` invokes a granted capability, but
+  there is no instruction for observing an effect the embedder made visible, so
+  a compiled module cannot read a capability's state.
+- **Non-function imports.** An imported table, memory, or global has no
+  initializer the IR could carry, so `lower_module` refuses one.
+- **Cross-instance imports.** An import resolved to another Wasm instance rather
+  than a host function is a Wasm-to-Wasm call, which the baseline refuses.
 - **Remaining reference-types surface.** `table.get`/`table.set`, `externref`
   tables, and non-active element segments have no IR form.
 

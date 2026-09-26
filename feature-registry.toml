@@ -72,12 +72,13 @@ mvp_verified = "partial"
 #
 # mvp_compiled  — the portable baseline in tpt-wasm-codegen lowers and executes
 #   every instruction the IR can represent, and EngineMode::Baseline runs it at
-#   instantiation. Not `true`: there is no native x86-64/AArch64 backend, and
-#   host boundaries have no IR form.
-# mvp_differential — 58 tpt-wasm-codegen tests and 36 tpt-wasm-ir tests drive the
+#   instantiation, including through a host boundary for imported functions. Not
+#   `true`: there is no native x86-64/AArch64 backend.
+# mvp_differential — 61 tpt-wasm-codegen tests and 36 tpt-wasm-ir tests drive the
 #   real validate -> IR -> baseline pipeline and assert identical results and the
-#   same trap variant against Micro. Not `true`: the official spec suite and the
-#   reference-interpreter differential run do not execute yet.
+#   same trap variant against Micro, including host calls through one shared
+#   boundary. Not `true`: the official spec suite and the reference-interpreter
+#   differential run do not execute yet.
 # mvp_verified — V0-V3 are machine-checked in Lean 4 with no `sorry` and no
 #   `axiom`. Not `true`: V1 is rule-to-interpreter agreement within the Lean
 #   model rather than Lean-to-Rust equality, V2 is not yet lifted to the

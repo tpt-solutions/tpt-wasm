@@ -63,6 +63,10 @@ impl std::error::Error for LoweringError {}
 pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringError> {
     let module = &validated.module;
     reject_unsupported_module_state(module)?;
+    let imports = lower_imports(module)?;
+    // Wasm numbers imported functions before defined ones, so the count is what
+    // a `call` or `ref.func` index is resolved against.
+    let imported_functions = imports.len() as u32;
 
     let mut functions = Vec::with_capacity(module.functions.len());
     for function in &module.functions {
@@ -70,7 +74,12 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             .types
             .get(function.type_index as usize)
             .ok_or(LoweringError::UnknownType(function.type_index))?;
-        functions.push(lower_function(function, function_type, module)?);
+        functions.push(lower_function(
+            function,
+            function_type,
+            module,
+            imported_functions,
+        )?);
     }
     let globals = module
         .globals
@@ -165,6 +174,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
     };
     Ok(IrModule {
         functions,
+        imports,
         globals,
         memory,
         tables,
@@ -195,8 +205,13 @@ fn element_segment_offset(expr: &tpt_wasm_format::ConstExpr) -> Result<u32, Lowe
 }
 
 fn reject_unsupported_module_state(module: &tpt_wasm_format::Module) -> Result<(), LoweringError> {
-    if !module.imports.is_empty() {
-        return Err(LoweringError::UnsupportedFeature("imports"));
+    // Function imports are supported: they become `IrImport` entries and a
+    // `CallHost` crossing the host boundary. A table, memory, or global import
+    // has no initializer the IR could carry, so it is still refused.
+    for import in &module.imports {
+        if !matches!(import.desc, tpt_wasm_format::ImportDesc::Function(_)) {
+            return Err(LoweringError::UnsupportedFeature("non-function imports"));
+        }
     }
     if module.start.is_some() {
         return Err(LoweringError::UnsupportedFeature("start functions"));
@@ -204,6 +219,31 @@ fn reject_unsupported_module_state(module: &tpt_wasm_format::Module) -> Result<(
     // Exports are module metadata rather than code: the runtime resolves them
     // against the module's own function table, so the IR need not carry them.
     Ok(())
+}
+
+/// Collect the module's function imports, in declaration order.
+///
+/// This order is what the lowerer resolves a Wasm function index against: an
+/// index below this length is an import, and the rest address `IrModule::functions`.
+fn lower_imports(module: &tpt_wasm_format::Module) -> Result<Vec<super::IrImport>, LoweringError> {
+    let mut imports = Vec::new();
+    for import in &module.imports {
+        let tpt_wasm_format::ImportDesc::Function(type_index) = import.desc else {
+            // Rejected by `reject_unsupported_module_state`; repeated here so
+            // this function stands on its own.
+            return Err(LoweringError::UnsupportedFeature("non-function imports"));
+        };
+        let function_type = module
+            .types
+            .get(type_index as usize)
+            .ok_or(LoweringError::UnknownType(type_index))?;
+        imports.push(super::IrImport {
+            module: import.module.clone(),
+            name: import.name.clone(),
+            function_type: function_type.clone(),
+        });
+    }
+    Ok(imports)
 }
 
 /// The kind of structured construct a control frame was pushed for.
@@ -701,6 +741,7 @@ fn lower_function(
     function: &Function,
     function_type: &FunctionType,
     module: &tpt_wasm_format::Module,
+    imported_functions: u32,
 ) -> Result<IrFunction, LoweringError> {
     let (mut state, params, mut locals) = LoweringState::new(function, function_type)?;
     let mut reader = BodyReader::new(&function.body);
@@ -715,7 +756,14 @@ fn lower_function(
         target: BlockId(0),
         exit: BlockId(0),
     }];
-    lower_body(&mut reader, module, &mut state, &mut builder, &mut controls)?;
+    lower_body(
+        &mut reader,
+        module,
+        imported_functions,
+        &mut state,
+        &mut builder,
+        &mut controls,
+    )?;
     // Lowering may have appended synthetic local slots for values that must
     // survive across basic blocks, such as a `br_table` selector. Those slots
     // are real locals, so they join the function's local list and are
@@ -743,6 +791,7 @@ fn lower_function(
 fn lower_body(
     reader: &mut BodyReader<'_>,
     module: &tpt_wasm_format::Module,
+    imported_functions: u32,
     state: &mut LoweringState,
     builder: &mut BodyBuilder,
     controls: &mut Vec<ControlFrame>,
@@ -825,7 +874,7 @@ fn lower_body(
                 continue;
             }
             0x01 => {}
-            0x10 => lower_call(reader.u32()?, module, state, builder)?,
+            0x10 => lower_call(reader.u32()?, module, imported_functions, state, builder)?,
             0x11 => {
                 // `call_indirect` is a type index then a table index, followed on
                 // the stack by the arguments and finally the table index.
@@ -924,16 +973,23 @@ fn lower_body(
             }
             0xd2 => {
                 let index = reader.u32()?;
-                // The IR addresses a function by its index in this module's
-                // function table, and imports are already rejected, so the index
-                // must name a defined function.
-                if usize::try_from(index).map_or(true, |i| i >= module.functions.len()) {
+                // `ref.func` names the Wasm function index space, so an index
+                // below the import count would name an imported function. The IR
+                // addresses defined functions alone, so that case is refused
+                // rather than silently redirected at a different function.
+                if index < imported_functions {
+                    return Err(LoweringError::UnsupportedFeature(
+                        "reference to an imported function",
+                    ));
+                }
+                let defined = index - imported_functions;
+                if usize::try_from(defined).map_or(true, |i| i >= module.functions.len()) {
                     return Err(LoweringError::UnknownFunction(index));
                 }
                 let result = state.allocate(ValueType::Ref(ReferenceType::FuncRef))?;
                 builder.push(IrInstr::RefFunc {
                     result,
-                    function: index,
+                    function: defined,
                 });
                 state.push(result, ValueType::Ref(ReferenceType::FuncRef));
             }
@@ -1104,12 +1160,28 @@ pub(crate) fn read_const_expr(
 fn lower_call(
     function: u32,
     module: &tpt_wasm_format::Module,
+    imported_functions: u32,
     state: &mut LoweringState,
     builder: &mut BodyBuilder,
 ) -> Result<(), LoweringError> {
+    // Wasm numbers imported functions before defined ones. An index below the
+    // import count crosses the host boundary; the rest address the module's own
+    // functions, rebased so the IR needs only the defined ones.
+    if function < imported_functions {
+        let callee_type = import_function_type(function, module)?;
+        let arguments = pop_arguments(callee_type, state)?;
+        let results = allocate_results(callee_type, state)?;
+        builder.push(IrInstr::CallHost {
+            import: function,
+            arguments,
+            results,
+        });
+        return Ok(());
+    }
+    let defined = function - imported_functions;
     let callee = module
         .functions
-        .get(function as usize)
+        .get(defined as usize)
         .ok_or(LoweringError::UnknownFunction(function))?;
     let callee_type = module
         .types
@@ -1118,11 +1190,31 @@ fn lower_call(
     let arguments = pop_arguments(callee_type, state)?;
     let results = allocate_results(callee_type, state)?;
     builder.push(IrInstr::Call {
-        function,
+        function: defined,
         arguments,
         results,
     });
     Ok(())
+}
+
+/// The declared type of the `index`th function import, in declaration order.
+fn import_function_type(
+    index: u32,
+    module: &tpt_wasm_format::Module,
+) -> Result<&FunctionType, LoweringError> {
+    let mut seen = 0u32;
+    for import in &module.imports {
+        if let tpt_wasm_format::ImportDesc::Function(type_index) = import.desc {
+            if seen == index {
+                return module
+                    .types
+                    .get(type_index as usize)
+                    .ok_or(LoweringError::UnknownType(type_index));
+            }
+            seen += 1;
+        }
+    }
+    Err(LoweringError::UnknownFunction(index))
 }
 /// Pop the declared arguments, topmost first.
 fn pop_arguments(

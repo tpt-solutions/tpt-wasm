@@ -241,6 +241,12 @@ pub fn project_function_to_model(
             IrInstr::RefNull { .. } | IrInstr::RefFunc { .. } | IrInstr::RefIsNull { .. } => {
                 return Err(IrProjectionError::UnsupportedInstruction("reference"))
             }
+            // A host call is capability-gated, and the projection has no way to
+            // supply the grant, so it is refused rather than projected as a call
+            // that would appear unconditional.
+            IrInstr::CallHost { .. } => {
+                return Err(IrProjectionError::UnsupportedInstruction("host call"))
+            }
         });
     }
 

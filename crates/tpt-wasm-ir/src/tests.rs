@@ -589,6 +589,21 @@ fn execute_ir_function(
                         values.insert(*result, value);
                     }
                 }
+                IrInstr::CallHost {
+                    import,
+                    arguments,
+                    results,
+                } => {
+                    // This executable model has no host to call, so a host call
+                    // is refused rather than given an invented result. The
+                    // differential coverage for host effects lives in
+                    // tpt-wasm-codegen, which runs the real baseline and the real
+                    // Micro interpreter against the same boundary.
+                    let _ = (import, arguments, results);
+                    return Err(Trap::HostFailure(
+                        "this model has no host boundary for a host call".into(),
+                    ));
+                }
                 IrInstr::CallIndirect {
                     table,
                     operand,

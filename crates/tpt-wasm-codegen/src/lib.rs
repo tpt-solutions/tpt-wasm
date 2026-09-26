@@ -295,6 +295,16 @@ pub enum BaselineOp {
         arguments: Vec<u32>,
         results: Vec<u32>,
     },
+    /// Call an imported function through the host boundary.
+    ///
+    /// Execution needs a [`HostBoundary`], so a function containing a host call
+    /// can only be run by a module that has one installed.
+    CallHost {
+        /// Index into the module's imports.
+        import: u32,
+        arguments: Vec<u32>,
+        results: Vec<u32>,
+    },
     /// Indirect call: read `operand` from the table, then dispatch.
     CallIndirect {
         /// The expected signature, as an index into the module's types.
@@ -1155,6 +1165,28 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                         results: result_slots,
                     });
                 }
+                IrInstr::CallHost {
+                    import,
+                    arguments,
+                    results,
+                } => {
+                    // The import's signature was checked by the verifier; the
+                    // baseline only needs the argument and result slots, and
+                    // re-checks that the arity is self-consistent.
+                    let mut argument_slots = Vec::with_capacity(arguments.len());
+                    for id in arguments {
+                        argument_slots.push(state.slot(*id)?);
+                    }
+                    let mut result_slots = Vec::with_capacity(results.len());
+                    for id in results {
+                        result_slots.push(state.define(*id)?);
+                    }
+                    ops.push(BaselineOp::CallHost {
+                        import: *import,
+                        arguments: argument_slots,
+                        results: result_slots,
+                    });
+                }
                 IrInstr::CallIndirect {
                     type_index,
                     operand,
@@ -1450,7 +1482,10 @@ impl BaselineMemory {
 /// State is shared across calls exactly as it is in Wasm, so a callee observes
 /// the caller's stores and a `global.set` inside a callee is visible to the
 /// caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// This is `Debug` by hand rather than derived: the installed [`HostBoundary`] is
+/// embedder-owned mutable state, so it is neither comparable nor cloneable, and
+/// comparing two modules would have to ignore it anyway.
 pub struct BaselineModule {
     pub functions: Vec<BaselineFunction>,
     /// One table, holding optional function indices into `functions`.
@@ -1459,6 +1494,14 @@ pub struct BaselineModule {
     types: Vec<FunctionType>,
     memory: Option<BaselineMemory>,
     globals: Vec<Value>,
+    /// The imported functions, in declaration order, that a `CallHost` names.
+    imports: Vec<tpt_wasm_ir::IrImport>,
+    /// The installed host boundary, absent until an embedder provides one.
+    ///
+    /// `Box` rather than an `Arc` because the boundary is stateful: it has to
+    /// record the same effects Micro does, and it is reachable only from the
+    /// execution state that owns the call.
+    host: Option<Box<dyn HostBoundary>>,
 }
 
 /// A table of optional function references, as MVP `funcref` tables hold.
@@ -1466,6 +1509,79 @@ pub struct BaselineModule {
 struct BaselineTable {
     /// `None` is a null reference, which `call_indirect` traps on.
     elements: Vec<Option<u32>>,
+}
+
+impl fmt::Debug for BaselineModule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BaselineModule")
+            .field("functions", &self.functions.len())
+            .field("table", &self.table)
+            .field("types", &self.types)
+            .field("memory", &self.memory)
+            .field("globals", &self.globals)
+            .field("imports", &self.imports)
+            // The boundary itself is embedder state, so only whether one is
+            // installed is reported.
+            .field("host", &self.host.as_ref().map(|_| "installed"))
+            .finish()
+    }
+}
+
+/// A host function refused or failed.
+///
+/// Reported with the name the host is registered under and the host's own
+/// message, which is the shape the interpreter reports a host failure in. Keeping
+/// the two identical is what lets an embedder treat a compiled module and an
+/// interpreted one interchangeably.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCallFailure {
+    /// The name the host function is registered under.
+    pub name: String,
+    /// The host's own message.
+    pub message: String,
+}
+
+/// Why a baseline execution did not return.
+///
+/// A Wasm trap and a failed host call are different things: the first is the
+/// module's own fault, the second is the embedder refusing a capability. The
+/// interpreter reports them differently, so the baseline keeps them apart rather
+/// than flattening a refused capability into a module trap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaselineError {
+    /// The module trapped.
+    Trap(Trap),
+    /// A host function failed.
+    Host(HostCallFailure),
+}
+
+impl From<Trap> for BaselineError {
+    fn from(trap: Trap) -> Self {
+        Self::Trap(trap)
+    }
+}
+
+impl From<HostCallFailure> for BaselineError {
+    fn from(failure: HostCallFailure) -> Self {
+        Self::Host(failure)
+    }
+}
+
+/// The host boundary a compiled module calls imported functions through.
+///
+/// This is the only way the baseline reaches outside itself, so a host effect is
+/// always an explicit, grantable step rather than something a compiled module can
+/// do on its own. The embedder implements this against whatever authorizes calls;
+/// the runtime routes it through the same capability-mediated path the Micro
+/// interpreter uses, so both backends produce the same effects and failures.
+pub trait HostBoundary {
+    /// Invoke the host function an import names, or fail.
+    fn call(
+        &mut self,
+        module: &str,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, HostCallFailure>;
 }
 
 impl BaselineModule {
@@ -1520,7 +1636,29 @@ impl BaselineModule {
             types: module.types.clone(),
             memory,
             globals: module.globals.iter().map(|g| g.init.clone()).collect(),
+            imports: module.imports.clone(),
+            host: None,
         })
+    }
+
+    /// Rebase a Wasm function index onto this module's own function table.
+    ///
+    /// Wasm numbers imported functions first, so an index below the import count
+    /// names a host function with no counterpart here. `None` reports that,
+    /// rather than silently pointing at a different function.
+    pub fn defined_index(&self, wasm_index: u32) -> Option<usize> {
+        let defined = wasm_index.checked_sub(self.imports.len() as u32)?;
+        let index = usize::try_from(defined).ok()?;
+        (index < self.functions.len()).then_some(index)
+    }
+
+    /// Install the boundary that imported functions are called through.
+    ///
+    /// Without one, a `CallHost` traps rather than reaching outside the module,
+    /// so a compiled module cannot acquire a host capability by accident.
+    pub fn set_host(&mut self, host: impl HostBoundary + 'static) -> &mut Self {
+        self.host = Some(Box::new(host));
+        self
     }
 
     /// Lower a verified IR module and wrap it so it can be executed.
@@ -1529,21 +1667,24 @@ impl BaselineModule {
     }
 
     /// Call one function by index.
-    pub fn call(&mut self, index: usize, args: Vec<Value>) -> Result<Vec<Value>, Trap> {
+    pub fn call(&mut self, index: usize, args: Vec<Value>) -> Result<Vec<Value>, BaselineError> {
         if index >= self.functions.len() {
-            return Err(Trap::HostFailure(
+            return Err(BaselineError::Trap(Trap::HostFailure(
                 "baseline call target is not in the module".into(),
-            ));
+            )));
         }
         // `functions` is copied out so the callee borrow is independent of
         // `self`, which lets the recursive call take `&mut state` as well.
         let functions: &[BaselineFunction] = &self.functions;
+        let imports: &[tpt_wasm_ir::IrImport] = &self.imports;
         let mut state = ExecState {
             functions,
+            imports,
             table: self.table.as_ref(),
             types: &self.types,
             memory: self.memory.as_mut(),
             globals: &mut self.globals,
+            host: self.host.as_deref_mut(),
         };
         functions[index].run(&mut state, args)
     }
@@ -1552,11 +1693,18 @@ impl BaselineModule {
 /// Everything one execution shares: the callee table, the table, memory, globals.
 struct ExecState<'a> {
     functions: &'a [BaselineFunction],
+    /// The imported functions a `CallHost` names.
+    imports: &'a [tpt_wasm_ir::IrImport],
     table: Option<&'a BaselineTable>,
     /// Module types, so an indirect call can check its target's signature.
     types: &'a [FunctionType],
     memory: Option<&'a mut BaselineMemory>,
     globals: &'a mut Vec<Value>,
+    /// The installed host boundary, absent when the embedder granted none.
+    ///
+    /// Bounded by `'static` rather than `'a`: the boundary is owned by the
+    /// module, so the borrow only has to be as long as the execution.
+    host: Option<&'a mut (dyn HostBoundary + 'static)>,
 }
 
 impl BaselineFunction {
@@ -1564,7 +1712,7 @@ impl BaselineFunction {
     ///
     /// This has no module, so a function that calls, or that touches memory or
     /// globals, cannot run this way; use [`BaselineModule::call`].
-    pub fn execute(&self, args: Vec<Value>) -> Result<Vec<Value>, Trap> {
+    pub fn execute(&self, args: Vec<Value>) -> Result<Vec<Value>, BaselineError> {
         self.execute_with(&[], args)
     }
 
@@ -1576,23 +1724,31 @@ impl BaselineFunction {
         &self,
         functions: &[BaselineFunction],
         args: Vec<Value>,
-    ) -> Result<Vec<Value>, Trap> {
+    ) -> Result<Vec<Value>, BaselineError> {
         let functions: &[BaselineFunction] = functions;
         let mut state = ExecState {
             functions,
+            imports: &[],
             table: None,
             types: &[],
             memory: None,
             globals: &mut Vec::new(),
+            host: None,
         };
         self.run(&mut state, args)
     }
 
     /// Run this function against the module state, which is shared with any
     /// callee it invokes.
-    fn run(&self, state: &mut ExecState<'_>, args: Vec<Value>) -> Result<Vec<Value>, Trap> {
+    fn run(
+        &self,
+        state: &mut ExecState<'_>,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, BaselineError> {
         if args.len() != self.params.len() {
-            return Err(Trap::HostFailure("baseline argument arity mismatch".into()));
+            return Err(BaselineError::Trap(Trap::HostFailure(
+                "baseline argument arity mismatch".into(),
+            )));
         }
         let mut slots = vec![None; self.value_types.len()];
         for (slot, value) in self.params.iter().copied().zip(args) {
@@ -1829,13 +1985,15 @@ impl BaselineFunction {
                                     .get(*slot as usize)
                                     .and_then(Clone::clone)
                                     .ok_or_else(|| {
-                                        Trap::HostFailure("baseline return slot is empty".into())
+                                        BaselineError::Trap(Trap::HostFailure(
+                                            "baseline return slot is empty".into(),
+                                        ))
                                     })
                             })
                             .collect();
                     }
-                    BaselineOp::Trap(trap) => return Err(trap.clone()),
-                    BaselineOp::Unreachable => return Err(Trap::Unreachable),
+                    BaselineOp::Trap(trap) => return Err(BaselineError::Trap(trap.clone())),
+                    BaselineOp::Unreachable => return Err(BaselineError::Trap(Trap::Unreachable)),
                     BaselineOp::Load {
                         result,
                         address,
@@ -1903,9 +2061,9 @@ impl BaselineFunction {
                             .and_then(|index| state.functions.get(index))
                             .is_none()
                         {
-                            return Err(Trap::HostFailure(
+                            return Err(BaselineError::Trap(Trap::HostFailure(
                                 "baseline ref.func target is not in the module".into(),
-                            ));
+                            )));
                         }
                         slots[*slot as usize] =
                             Some(Value::Ref(tpt_wasm_types::RefValue::FuncRef(*function)));
@@ -1917,9 +2075,9 @@ impl BaselineFunction {
                             Value::Ref(tpt_wasm_types::RefValue::FuncRef(_))
                             | Value::Ref(tpt_wasm_types::RefValue::ExternRef(_)) => false,
                             other => {
-                                return Err(Trap::HostFailure(format!(
+                                return Err(BaselineError::Trap(Trap::HostFailure(format!(
                                     "baseline ref.is_null operand is not a reference: {other:?}"
-                                )))
+                                ))))
                             }
                         };
                         slots[*result as usize] = Some(Value::I32(is_null as i32));
@@ -1954,9 +2112,9 @@ impl BaselineFunction {
                             Trap::HostFailure("baseline call target is not in the module".into())
                         })?;
                         if callee.params.len() != arguments.len() {
-                            return Err(Trap::HostFailure(
+                            return Err(BaselineError::Trap(Trap::HostFailure(
                                 "baseline call argument arity mismatch".into(),
-                            ));
+                            )));
                         }
                         let mut call_args = Vec::with_capacity(arguments.len());
                         for slot in arguments {
@@ -1964,12 +2122,69 @@ impl BaselineFunction {
                         }
                         let returned = callee.run(state, call_args)?;
                         if returned.len() != results.len() {
-                            return Err(Trap::HostFailure(
+                            return Err(BaselineError::Trap(Trap::HostFailure(
                                 "baseline call result arity mismatch".into(),
-                            ));
+                            )));
                         }
                         for (slot, value) in results.iter().copied().zip(returned) {
                             check_value_type(&value, self.value_types[slot as usize])?;
+                            slots[slot as usize] = Some(value);
+                        }
+                    }
+                    BaselineOp::CallHost {
+                        import,
+                        arguments,
+                        results,
+                    } => {
+                        let declaration = state.imports.get(*import as usize).ok_or_else(|| {
+                            Trap::HostFailure("baseline host import is out of range".into())
+                        })?;
+                        let qualified = format!("{}::{}", declaration.module, declaration.name);
+                        // No boundary means the embedder granted no host
+                        // capability, so the call is refused rather than
+                        // resolved by guesswork. That is a host refusal rather
+                        // than the module trapping, so it is reported as one.
+                        let host = state.host.as_deref_mut().ok_or_else(|| {
+                            BaselineError::Host(HostCallFailure {
+                                name: qualified.clone(),
+                                message: "no host boundary was installed".into(),
+                            })
+                        })?;
+                        let mut call_args = Vec::with_capacity(arguments.len());
+                        for slot in arguments {
+                            call_args.push(read_slot(&slots, *slot)?);
+                        }
+                        let returned =
+                            host.call(&declaration.module, &declaration.name, call_args)?;
+                        // The import's declared result arity and types are
+                        // re-checked here: the host is outside the verified
+                        // module, so its return is not trusted. A host that
+                        // breaks its declared signature is reported as a host
+                        // failure, matching how the interpreter reports one.
+                        if returned.len() != results.len() {
+                            return Err(BaselineError::Host(HostCallFailure {
+                                name: qualified.clone(),
+                                message: format!(
+                                    "host returned {} results, the import declares {}",
+                                    returned.len(),
+                                    results.len()
+                                ),
+                            }));
+                        }
+                        for (position, expected) in
+                            declaration.function_type.results.0.iter().enumerate()
+                        {
+                            check_value_type(&returned[position], *expected).map_err(|trap| {
+                                BaselineError::Host(HostCallFailure {
+                                    name: qualified.clone(),
+                                    message: Trap::HostFailure(format!(
+                                        "host returned the wrong type for a result: {trap}"
+                                    ))
+                                    .to_string(),
+                                })
+                            })?;
+                        }
+                        for (slot, value) in results.iter().copied().zip(returned) {
                             slots[slot as usize] = Some(value);
                         }
                     }
@@ -2003,7 +2218,7 @@ impl BaselineFunction {
                             Trap::HostFailure("baseline indirect call type is unknown".into())
                         })?;
                         if &callee.function_type != expected {
-                            return Err(Trap::IndirectCallTypeMismatch);
+                            return Err(BaselineError::Trap(Trap::IndirectCallTypeMismatch));
                         }
                         let mut call_args = Vec::with_capacity(arguments.len());
                         for slot in arguments {
@@ -2011,9 +2226,9 @@ impl BaselineFunction {
                         }
                         let returned = callee.run(state, call_args)?;
                         if returned.len() != results.len() {
-                            return Err(Trap::HostFailure(
+                            return Err(BaselineError::Trap(Trap::HostFailure(
                                 "baseline indirect call result arity mismatch".into(),
-                            ));
+                            )));
                         }
                         for (slot, value) in results.iter().copied().zip(returned) {
                             check_value_type(&value, self.value_types[slot as usize])?;
@@ -2025,13 +2240,15 @@ impl BaselineFunction {
             // Bind the incoming values to the target block's parameter slots,
             // then continue from that block.
             let Some((target, values)) = next else {
-                return Err(Trap::HostFailure("baseline block has no terminator".into()));
+                return Err(BaselineError::Trap(Trap::HostFailure(
+                    "baseline block has no terminator".into(),
+                )));
             };
             let target_block = &self.blocks[target as usize];
             if target_block.params.len() != values.len() {
-                return Err(Trap::HostFailure(
+                return Err(BaselineError::Trap(Trap::HostFailure(
                     "baseline branch arity does not match target block".into(),
-                ));
+                )));
             }
             for (param, value) in target_block.params.iter().copied().zip(&values) {
                 let value = slots
@@ -2664,7 +2881,8 @@ fn compare_f64(left: f64, right: f64, comparison: tpt_wasm_ir::FloatComparison) 
 #[cfg(test)]
 mod tests {
     use super::{
-        lower_function, lower_module, BaselineModule, BaselineOp, CodegenError, I32BinaryOp,
+        lower_function, lower_module, BaselineError, BaselineModule, BaselineOp, CodegenError,
+        I32BinaryOp,
     };
     use tpt_wasm_format::{Element, ElementMode, Function, Module, Table};
     use tpt_wasm_ir::{
@@ -2812,12 +3030,32 @@ mod tests {
     ) -> Result<Vec<Value>, Trap> {
         let baseline = lower_body_with_locals(body, result, locals);
         let baseline_result = baseline.execute(Vec::new());
+        let micro_result = execute_micro_with_locals(body, 1, locals);
+        // The two backends report a trap through different types: Micro returns
+        // the trap, the baseline wraps it so a failed host call stays distinct.
+        // The trap itself has to be the same, which is what is compared here.
+        let from_baseline: Result<&[Value], Trap> = match &baseline_result {
+            Ok(values) => Ok(values),
+            Err(error) => Err(trap_of(error)),
+        };
+        let from_micro: Result<&[Value], Trap> = match &micro_result {
+            Ok(values) => Ok(values),
+            Err(trap) => Err(trap.clone()),
+        };
         assert_eq!(
-            baseline_result,
-            execute_micro_with_locals(body, 1, locals),
+            from_baseline, from_micro,
             "baseline and Micro diverged for {body:02x?}"
         );
-        baseline_result
+        baseline_result.map_err(|error| trap_of(&error))
+    }
+
+    /// Reduce a baseline failure to the trap a caller observes, so the two
+    /// backends' error shapes do not have to match in order to be compared.
+    fn trap_of(error: &BaselineError) -> Trap {
+        match error {
+            BaselineError::Trap(trap) => trap.clone(),
+            BaselineError::Host(failure) => Trap::HostFailure(failure.message.clone()),
+        }
     }
 
     /// Build a two-operand `i32` body: `i32.const left; i32.const right; op; end`.
@@ -3594,7 +3832,7 @@ mod tests {
         let baseline = lower_function(&trap).unwrap();
         assert_eq!(
             baseline.execute(Vec::new()),
-            Err(Trap::IntegerDivisionByZero)
+            Err(BaselineError::Trap(Trap::IntegerDivisionByZero))
         );
         assert_eq!(
             baseline.blocks[0].ops,
@@ -3820,11 +4058,19 @@ mod tests {
             BaselineModule::lower(verified.module()).expect("codegen must accept the module");
         let baseline_result = baseline.call(entry, args.clone());
         let micro_result = run_in_micro(module, entry, args);
+        let from_baseline: Result<&[Value], Trap> = match &baseline_result {
+            Ok(values) => Ok(values),
+            Err(error) => Err(trap_of(error)),
+        };
+        let from_micro: Result<&[Value], Trap> = match &micro_result {
+            Ok(values) => Ok(values),
+            Err(trap) => Err(trap.clone()),
+        };
         assert_eq!(
-            baseline_result, micro_result,
+            from_baseline, from_micro,
             "baseline and Micro diverged on the module"
         );
-        baseline_result
+        baseline_result.map_err(|error| trap_of(&error))
     }
 
     /// `$double` doubles its argument; the entry function calls it.
@@ -3963,7 +4209,7 @@ mod tests {
         let baseline = lower_module(verified.module()).unwrap();
         let error = baseline[0].execute(Vec::new()).unwrap_err();
         assert!(
-            matches!(error, Trap::HostFailure(ref message) if message.contains("call target")),
+            matches!(&error, BaselineError::Trap(Trap::HostFailure(message)) if message.contains("call target")),
             "unexpected error: {error:?}"
         );
     }
@@ -3983,17 +4229,53 @@ mod tests {
             super::BaselineModule::lower(verified.module()).expect("codegen must accept module");
         let baseline_result = baseline.call(entry, args.clone());
         let micro_result = run_in_micro(module, entry, args);
+        let from_baseline: Result<&[Value], Trap> = match &baseline_result {
+            Ok(values) => Ok(values),
+            Err(error) => Err(trap_of(error)),
+        };
+        let from_micro: Result<&[Value], Trap> = match &micro_result {
+            Ok(values) => Ok(values),
+            Err(trap) => Err(trap.clone()),
+        };
         assert_eq!(
-            baseline_result, micro_result,
+            from_baseline, from_micro,
             "baseline and Micro diverged on the runnable module"
         );
-        baseline_result
+        baseline_result.map_err(|error| trap_of(&error))
     }
 
     /// Run one function of a module in Micro with its memory and globals set up.
-    fn run_in_micro(module: &Module, entry: usize, args: Vec<Value>) -> Result<Vec<Value>, Trap> {
+    ///
+    /// `host` supplies any imported function, so a module that calls out reaches
+    /// the same boundary the baseline is given.
+    ///
+    /// A refused capability is reported as [`Trap::HostFailure`] carrying the
+    /// host's own message, which is the text the baseline's `Host` failure holds
+    /// too, so the two can be compared on what the host actually said.
+    fn run_in_micro_with_host(
+        module: &Module,
+        entry: usize,
+        args: Vec<Value>,
+        host: Option<Box<dyn super::HostBoundary>>,
+    ) -> Result<Vec<Value>, Trap> {
         let mut store = Store::default();
-        let mut func_addrs = Vec::with_capacity(module.functions.len());
+        // Imported functions come first in the Wasm index space and are resolved
+        // to host callbacks, exactly as the runtime resolves them.
+        let mut func_addrs = Vec::new();
+        for import in &module.imports {
+            let tpt_wasm_format::ImportDesc::Function(type_index) = import.desc else {
+                panic!("the Micro harness only resolves function imports");
+            };
+            let function_type = module.types[type_index as usize].clone();
+            let name = format!("{}::{}", import.module, import.name);
+            func_addrs.push(
+                store
+                    .add_host_function(function_type, name)
+                    .expect("fixture host function must install"),
+            );
+        }
+        // Defined functions start here in the Wasm index space.
+        let imported = func_addrs.len();
         for (index, function) in module.functions.iter().enumerate() {
             let function_type = module.types[function.type_index as usize].clone();
             let mut local_types = function_type.params.0.clone();
@@ -4001,7 +4283,7 @@ mod tests {
             let address = store
                 .add_wasm_function(
                     0,
-                    index as u32,
+                    (func_addrs.len() + index) as u32,
                     function_type,
                     decode_body(&function.body).expect("fixture body must decode"),
                     local_types,
@@ -4112,19 +4394,48 @@ mod tests {
         machine
             .push_frame(Frame::new(
                 instance,
-                entry as u32,
+                // The frame's function index is the Wasm index, so an importing
+                // module's first defined function is not function 0.
+                (imported + entry) as u32,
                 locals,
                 decode_body(&entry_function.body).expect("fixture body must decode"),
                 result_arity,
             ))
             .expect("entry frame must fit");
-        match machine.run() {
-            Step::Return(values) => Ok(values),
-            Step::Trap(trap) => Err(trap),
-            other => Err(Trap::HostFailure(format!(
-                "Micro did not finish: {other:?}"
-            ))),
+        // A host call is resumed here exactly as the runtime resumes it, so both
+        // backends reach the same boundary with the same arguments.
+        let mut host = host;
+        loop {
+            match machine.run() {
+                Step::Return(values) => return Ok(values),
+                Step::Trap(trap) => return Err(trap),
+                Step::HostCall(call) => {
+                    let boundary = host.as_deref_mut().ok_or_else(|| {
+                        Trap::HostFailure("the fixture declared no host boundary".into())
+                    })?;
+                    let mut parts = call.func_name.splitn(2, "::");
+                    let module_name = parts.next().unwrap_or_default();
+                    let field_name = parts.next().unwrap_or_default();
+                    // A refused capability is reported as a trap in this
+                    // harness, matching what the runtime surfaces to a caller.
+                    let results = boundary
+                        .call(module_name, field_name, call.args)
+                        .map_err(|failure| Trap::HostFailure(failure.message))?;
+                    machine.resume_host_call(results)?;
+                }
+                other => {
+                    return Err(Trap::HostFailure(format!(
+                        "Micro did not finish: {other:?}"
+                    )))
+                }
+            }
         }
+    }
+
+    /// Run a module in Micro with no host boundary, for fixtures that import
+    /// nothing.
+    fn run_in_micro(module: &Module, entry: usize, args: Vec<Value>) -> Result<Vec<Value>, Trap> {
+        run_in_micro_with_host(module, entry, args, None)
     }
 
     /// Decode a validated global initializer for the Micro driver. The trailing
@@ -4350,7 +4661,7 @@ mod tests {
         let function = lower_function(&verified.module().functions[0]).unwrap();
         let error = function.execute(Vec::new()).unwrap_err();
         assert!(
-            matches!(error, Trap::HostFailure(ref message) if message.contains("module memory")),
+            matches!(&error, BaselineError::Trap(Trap::HostFailure(message)) if message.contains("module memory")),
             "unexpected error: {error:?}"
         );
     }
@@ -4754,5 +5065,145 @@ mod tests {
             tpt_wasm_validate::validate(reference_module(body)),
             Err(tpt_wasm_validate::ValidationError::UnknownFunction(9))
         );
+    }
+
+    /// A host that records the calls it received, so the arguments a backend
+    /// passes can be compared, not only the result it gets back.
+    #[derive(Default)]
+    struct RecordingHost {
+        calls: Vec<(String, Vec<Value>)>,
+        /// Doubles the single `i32` argument, the usual host shape.
+        double: bool,
+        fail: bool,
+    }
+
+    impl super::HostBoundary for RecordingHost {
+        fn call(
+            &mut self,
+            module: &str,
+            name: &str,
+            args: Vec<Value>,
+        ) -> Result<Vec<Value>, super::HostCallFailure> {
+            let qualified = format!("{module}::{name}");
+            self.calls.push((qualified.clone(), args.clone()));
+            if self.fail {
+                return Err(super::HostCallFailure {
+                    name: qualified,
+                    message: "refused by the test host".into(),
+                });
+            }
+            let Value::I32(value) = args.first().cloned().unwrap_or(Value::I32(0)) else {
+                return Err(super::HostCallFailure {
+                    name: qualified,
+                    message: "the test host only takes an i32".into(),
+                });
+            };
+            let result = if self.double { value * 2 } else { value };
+            Ok(vec![Value::I32(result)])
+        }
+    }
+
+    /// A module importing `env::twice(i32) -> i32`, whose `run` calls it and
+    /// returns the result.
+    fn host_calling_module() -> Module {
+        let twice = FunctionType {
+            params: ResultType(vec![ValueType::I32]),
+            results: ResultType(vec![ValueType::I32]),
+        };
+        Module {
+            types: vec![twice.clone()],
+            imports: vec![tpt_wasm_format::Import {
+                module: "env".into(),
+                name: "twice".into(),
+                desc: tpt_wasm_format::ImportDesc::Function(0),
+            }],
+            functions: vec![Function {
+                type_index: 0,
+                locals: vec![],
+                // local.get 0; call 0 (the import); end
+                body: vec![0x20, 0x00, 0x10, 0x00, 0x0b],
+            }],
+            ..Module::default()
+        }
+    }
+
+    /// Run an importing module through both backends with the same host
+    /// behaviour, returning both results and both call logs.
+    fn assert_host_call_matches_micro(module: &Module, double: bool, fail: bool) {
+        let validated = tpt_wasm_validate::validate(module.clone()).expect("fixture must validate");
+        let verified = lower_and_verify(&validated).expect("fixture must lower and verify");
+        let mut baseline =
+            BaselineModule::lower(verified.module()).expect("codegen must accept it");
+        let baseline_host = RecordingHost {
+            double,
+            fail,
+            ..RecordingHost::default()
+        };
+        baseline.set_host(RefCellHost(baseline_host));
+        // The entry function is Wasm index 1: the import occupies index 0, and
+        // the baseline's own table starts at 0.
+        let baseline_result = baseline.call(0, vec![Value::I32(21)]);
+
+        let micro_host = RecordingHost {
+            double,
+            fail,
+            ..RecordingHost::default()
+        };
+        let micro_result = run_in_micro_with_host(
+            module,
+            0,
+            vec![Value::I32(21)],
+            Some(Box::new(RefCellHost(micro_host))),
+        );
+
+        // The success path is compared exactly. The failure path is compared on
+        // the host's own message: the baseline keeps a host failure distinct
+        // from a trap, while this harness reports Micro's as a trap, so the
+        // common part is the message the host itself produced.
+        let from_baseline: Result<String, String> = baseline_result
+            .as_ref()
+            .map(|values| format!("{values:?}"))
+            .map_err(|error| match error {
+                BaselineError::Host(failure) => failure.message.clone(),
+                BaselineError::Trap(trap) => format!("{trap:?}"),
+            });
+        let from_micro: Result<String, String> = micro_result
+            .as_ref()
+            .map(|values| format!("{values:?}"))
+            .map_err(|trap| match trap {
+                Trap::HostFailure(message) => message.clone(),
+                other => format!("{other:?}"),
+            });
+        assert_eq!(
+            from_baseline, from_micro,
+            "the two backends disagreed about the host call"
+        );
+    }
+
+    /// Lets the harness hand out `&mut` access to a host it also owns.
+    struct RefCellHost(RecordingHost);
+
+    impl super::HostBoundary for RefCellHost {
+        fn call(
+            &mut self,
+            module: &str,
+            name: &str,
+            args: Vec<Value>,
+        ) -> Result<Vec<Value>, super::HostCallFailure> {
+            self.0.call(module, name, args)
+        }
+    }
+
+    #[test]
+    fn baseline_and_micro_reach_the_same_host_result() {
+        // The host doubles the argument, so a call that did not cross the
+        // boundary, crossed it with the wrong argument, or dropped the result
+        // would all be caught.
+        assert_host_call_matches_micro(&host_calling_module(), true, false);
+    }
+
+    #[test]
+    fn a_refused_host_call_fails_in_both_backends() {
+        assert_host_call_matches_micro(&host_calling_module(), true, true);
     }
 }

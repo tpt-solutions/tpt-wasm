@@ -696,10 +696,6 @@ fn compile_baseline(
     if engine_mode != EngineMode::Baseline {
         return Ok(None);
     }
-    // Imports need a host boundary the baseline does not have yet.
-    if !module.imports.is_empty() {
-        return Err(RuntimeError::UnsupportedFeature("imports in baseline mode"));
-    }
     let validated = Validator::new()
         .validate(module.clone())
         .map_err(RuntimeError::Validation)?;
@@ -711,7 +707,95 @@ fn compile_baseline(
     })?;
     let compiled = tpt_wasm_codegen::BaselineModule::lower(verified.module())
         .map_err(|_| RuntimeError::UnsupportedFeature("baseline code generation"))?;
+    // The host boundary is installed by `instantiate_module`, once the imports
+    // have been resolved to callbacks. Until then a `CallHost` traps, so a
+    // compiled module cannot reach outside itself by accident.
     Ok(Some(compiled))
+}
+
+/// Routes a compiled module's host calls through the same capability-mediated
+/// path Micro uses.
+///
+/// Micro resolves an import to a callback registered under a synthesized name and
+/// the runtime invokes it through [`Instance::invoke_host_call`]. The baseline
+/// names its imports by module and field instead, so this maps each import back
+/// to that callback and reuses the same invocation, checks, and error reporting.
+/// Sharing the path is what makes host-effect equivalence between the two
+/// backends a property of the code rather than a coincidence of two tests.
+#[derive(Debug, Default)]
+struct BaselineHost {
+    /// Filled in by the runtime once the store context exists.
+    context: Option<RuntimeContext>,
+    /// One entry per import the baseline may call, mapping `module::name` to the
+    /// synthesized callback name Micro resolves it to.
+    bindings: Vec<(String, String)>,
+}
+
+impl tpt_wasm_codegen::HostBoundary for BaselineHost {
+    fn call(
+        &mut self,
+        module: &str,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, tpt_wasm_codegen::HostCallFailure> {
+        let context = self
+            .context
+            .clone()
+            .ok_or_else(|| tpt_wasm_codegen::HostCallFailure {
+                name: format!("{module}::{name}"),
+                message: "baseline host call has no runtime context".into(),
+            })?;
+        let wanted = format!("{module}::{name}");
+        let callback = self
+            .bindings
+            .iter()
+            .find(|(bound, _)| *bound == wanted)
+            .map(|(_, callback)| callback.clone())
+            .ok_or_else(|| tpt_wasm_codegen::HostCallFailure {
+                name: wanted,
+                message: "the import is not bound to a host function".into(),
+            })?;
+        // The failure is reported under the same registered name the
+        // interpreter uses, so an embedder sees one error shape from both
+        // backends.
+        let fail = |message: String| tpt_wasm_codegen::HostCallFailure {
+            name: callback.clone(),
+            message,
+        };
+        let instance = Instance {
+            index: 0,
+            exports: HashMap::new(),
+            execution: ExecutionConfig::default(),
+            baseline: None,
+            context,
+        };
+        let result = instance.invoke_host_call(&tpt_wasm_micro::machine::HostCall {
+            func_name: callback.clone(),
+            args,
+            expected_results: 0,
+        });
+        drop(instance);
+        // The interpreter's host failure is taken apart rather than stringified,
+        // so both backends report the same name and message instead of the same
+        // name wrapped in a second layer of prose.
+        result.map_err(|error| match error {
+            RuntimeError::HostFunction { name, message } => {
+                tpt_wasm_codegen::HostCallFailure { name, message }
+            }
+            other => fail(other.to_string()),
+        })
+    }
+}
+
+/// Report a baseline failure the way the interpreter reports the same failure.
+fn baseline_error(error: tpt_wasm_codegen::BaselineError) -> RuntimeError {
+    match error {
+        tpt_wasm_codegen::BaselineError::Trap(trap) => RuntimeError::Trap(trap),
+        tpt_wasm_codegen::BaselineError::Host(failure) => RuntimeError::HostFunction {
+            name: failure.name,
+            message: failure.message,
+        },
+    }
 }
 
 fn instantiate_module(
@@ -732,6 +816,10 @@ fn instantiate_module(
     let mut memory_addrs = Vec::new();
     let mut global_addrs = Vec::new();
     let mut pending_host_functions = Vec::new();
+    // Maps each import the baseline will call to the same synthesized callback
+    // name Micro resolves it to, so both backends reach one implementation.
+    let mut baseline_bindings: Vec<(String, String)> = Vec::new();
+    let baseline_mode = engine_mode == EngineMode::Baseline;
 
     for import in &module.imports {
         let definition = linker
@@ -765,9 +853,22 @@ fn instantiate_module(
                             store.add_host_function(expected.clone(), callback_name.clone())?;
                         func_addrs.push(address);
                         pending_host_functions
-                            .push((callback_name, definition.implementation.clone()));
+                            .push((callback_name.clone(), definition.implementation.clone()));
+                        // The baseline names its imports by module and field, so
+                        // record the pairing it will need to find this callback.
+                        baseline_bindings
+                            .push((format!("{}::{}", import.module, import.name), callback_name));
                     }
                     LinkerDefinition::Instance(export) => {
+                        // A cross-instance import is a Wasm-to-Wasm call, not a
+                        // host capability, so the baseline's host boundary cannot
+                        // express it. Refused here rather than failing later at
+                        // the call site with a less useful message.
+                        if baseline_mode {
+                            return Err(RuntimeError::UnsupportedFeature(
+                                "cross-instance imports in baseline mode",
+                            ));
+                        }
                         same_context(&context, export)?;
                         let ExternalKind::Function(actual) = &export.kind else {
                             return Err(incompatible(import, "definition is not a function"));
@@ -975,14 +1076,30 @@ fn instantiate_module(
         baseline,
         context: context.clone(),
     };
+    // The baseline's host boundary needs the resolved callbacks, which only exist
+    // once the import loop has run. It is installed here, before the start
+    // function, so a start function that calls a host function resolves too.
+    if let Some(module) = instance.baseline.as_mut() {
+        if !baseline_bindings.is_empty() {
+            module.set_host(BaselineHost {
+                context: Some(context.clone()),
+                bindings: baseline_bindings,
+            });
+        }
+    }
     if let Some(start) = start {
         // The start function runs on the same backend the instance will use, so
         // its effects are visible to later calls in baseline mode.
         match instance.baseline.as_mut() {
             Some(module) => {
-                module
-                    .call(start as usize, Vec::new())
-                    .map_err(RuntimeError::Trap)?;
+                // The start index is a Wasm function index, so it is rebased the
+                // same way an export is.
+                let index = module
+                    .defined_index(start)
+                    .ok_or(RuntimeError::UnsupportedFeature(
+                        "start function is an import in baseline mode",
+                    ))?;
+                module.call(index, Vec::new()).map_err(baseline_error)?;
             }
             None => {
                 let address = lock_store(&context.store)?
@@ -1023,15 +1140,30 @@ impl Instance {
     ///
     /// The baseline addresses functions by module index rather than by store
     /// address, so the export table is consulted directly.
+    ///
+    /// A Wasm function index counts imported functions first, while the
+    /// baseline's table holds only the module's own functions, so the index is
+    /// rebased. An export of an imported function has no baseline counterpart,
+    /// which is reported here rather than resolving to a different function.
     fn baseline_index(&self, name: &str) -> Result<usize, RuntimeError> {
-        match self.exports.get(name) {
-            Some(ExportDesc::Function(index)) => Ok(*index as usize),
-            Some(_) => Err(RuntimeError::TypeMismatch {
-                expected: "function export".into(),
-                actual: "non-function export".into(),
-            }),
-            None => Err(RuntimeError::UnknownExport(name.to_owned())),
-        }
+        let index = match self.exports.get(name) {
+            Some(ExportDesc::Function(index)) => *index,
+            Some(_) => {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: "function export".into(),
+                    actual: "non-function export".into(),
+                })
+            }
+            None => return Err(RuntimeError::UnknownExport(name.to_owned())),
+        };
+        let defined = self
+            .baseline
+            .as_ref()
+            .map(|module| module.defined_index(index))
+            .unwrap_or(None);
+        defined.ok_or(RuntimeError::UnsupportedFeature(
+            "export of an imported function in baseline mode",
+        ))
     }
 
     fn call_baseline(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
@@ -1040,7 +1172,7 @@ impl Instance {
             .baseline
             .as_mut()
             .expect("checked by the caller that dispatched here");
-        module.call(index, args).map_err(RuntimeError::Trap)
+        module.call(index, args).map_err(baseline_error)
     }
 
     pub fn store(&self) -> Result<MutexGuard<'_, Store>, RuntimeError> {
@@ -1889,20 +2021,88 @@ mod tests {
     }
 
     #[test]
-    fn baseline_mode_rejects_a_module_it_cannot_run() {
-        // Imports need a host boundary the baseline does not have, so the
-        // failure is reported at instantiation rather than at call time.
-        let engine = Engine::new(baseline_config()).unwrap();
-        let error = engine
-            .instantiate(host_calling_module())
-            .expect_err("an importing module should not compile");
+    fn baseline_mode_runs_a_host_calling_module() {
+        // A `CallHost` crosses the same capability-mediated path Micro uses, so
+        // the compiled module and the interpreter agree on the result.
+        let mut baseline = Engine::new(baseline_config()).unwrap();
+        baseline
+            .linker_mut()
+            .define_function("env", "answer", AnswerHost);
+        let mut micro = Engine::new(Config::default()).unwrap();
+        micro
+            .linker_mut()
+            .define_function("env", "answer", AnswerHost);
+        let expected = vec![Value::I32(42)];
+        let mut compiled = baseline.instantiate(host_calling_module()).unwrap();
+        let mut interpreted = micro.instantiate(host_calling_module()).unwrap();
+        assert_eq!(compiled.call("run", Vec::new()).unwrap(), expected);
+        assert_eq!(interpreted.call("run", Vec::new()).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_baseline_host_call_needs_a_resolved_import() {
+        // Instantiating without defining the import fails at link time, in both
+        // backends, rather than at call time.
+        for engine in [
+            Engine::new(baseline_config()).unwrap(),
+            Engine::new(Config::default()).unwrap(),
+        ] {
+            assert!(
+                matches!(
+                    engine.instantiate(host_calling_module()),
+                    Err(RuntimeError::MissingImport { .. })
+                ),
+                "an undefined import should fail at link time"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_host_call_reports_identically_in_both_backends() {
+        // A refused capability is not a module trap, and it is not reported as
+        // one. The two backends must produce the same error, name and message
+        // included, so an embedder can treat them interchangeably.
+        let mut baseline = Engine::new(baseline_config()).unwrap();
+        baseline
+            .linker_mut()
+            .define_function("env", "answer", FailingHost);
+        let mut micro = Engine::new(Config::default()).unwrap();
+        micro
+            .linker_mut()
+            .define_function("env", "answer", FailingHost);
+        let mut compiled = baseline.instantiate(host_calling_module()).unwrap();
+        let mut interpreted = micro.instantiate(host_calling_module()).unwrap();
+        let from_baseline = compiled.call("run", Vec::new()).unwrap_err();
+        let from_micro = interpreted.call("run", Vec::new()).unwrap_err();
         assert!(
-            matches!(
-                error,
-                RuntimeError::UnsupportedFeature("imports in baseline mode")
-            ),
-            "unexpected error: {error:?}"
+            matches!(&from_baseline, RuntimeError::HostFunction { .. }),
+            "a refused capability should be a host failure, not a trap: {from_baseline:?}"
         );
+        // `RuntimeError` is not `PartialEq`, so the two are compared as the
+        // text an embedder would log. Same shape, same name, same message.
+        assert_eq!(
+            from_baseline.to_string(),
+            from_micro.to_string(),
+            "the two backends reported the host failure differently"
+        );
+    }
+
+    #[test]
+    fn a_host_returning_the_wrong_type_is_rejected_in_both_backends() {
+        // The host is outside the verified module, so its return is checked
+        // against the declared signature in both backends.
+        let mut baseline = Engine::new(baseline_config()).unwrap();
+        baseline
+            .linker_mut()
+            .define_function("env", "answer", WrongResultHost);
+        let mut micro = Engine::new(Config::default()).unwrap();
+        micro
+            .linker_mut()
+            .define_function("env", "answer", WrongResultHost);
+        let mut compiled = baseline.instantiate(host_calling_module()).unwrap();
+        let mut interpreted = micro.instantiate(host_calling_module()).unwrap();
+        assert!(compiled.call("run", Vec::new()).is_err());
+        assert!(interpreted.call("run", Vec::new()).is_err());
     }
 
     #[test]

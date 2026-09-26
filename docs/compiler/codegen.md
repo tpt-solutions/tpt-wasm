@@ -39,6 +39,30 @@ stores, and a `global.set` inside a callee is visible to the caller.
 globals reports that it needs one rather than reading uninitialized data. Use
 `BaselineModule::lower` followed by `call`.
 
+## The host boundary
+
+A compiled module reaches outside itself through exactly one instruction,
+`CallHost`, and only through an installed `HostBoundary`. That is deliberate: a
+host effect is an explicit, grantable step, so a compiled module cannot acquire a
+capability the embedder did not hand it. Without a boundary, a `CallHost` is
+refused rather than resolved by guesswork.
+
+The host's return is not trusted. Its arity and types are re-checked against the
+import's declared signature, because the host is outside the verified module.
+
+A host failure is reported as `BaselineError::Host`, not as a Wasm trap. The two
+are different things: a trap is the module's own fault, while a host failure is
+the embedder refusing a capability. The interpreter already reports them
+differently, so the baseline keeps them apart rather than flattening one into the
+other. `tpt-wasm-runtime` maps `BaselineError::Host` back onto the same
+`RuntimeError::HostFunction` the interpreter produces, name and message
+included, so an embedder sees one error shape from both backends.
+
+The runtime routes the baseline's host calls through `Instance::invoke_host_call`,
+the same function the interpreter's `Step::HostCall` resumes through. Sharing
+that path is what makes host-effect equivalence a property of the code rather
+than a coincidence of two tests.
+
 Loads read little-endian bytes and apply the opcode's extension: a float load is a
 pure bit reinterpretation, so a NaN payload survives a round trip through memory,
 and an out-of-bounds access traps with `MemoryOutOfBounds` rather than reading

@@ -58,6 +58,8 @@ pub enum VerificationError {
     NotAFunctionTable(u32),
     /// A call naming a type index the module does not declare.
     UnknownType(u32),
+    /// A host call naming an import the module does not declare.
+    UnknownImport(u32),
     /// `global.set` naming a global declared immutable.
     ImmutableGlobal(u32),
     /// A memory instruction in a module that declares no memory.
@@ -714,6 +716,8 @@ fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
         } => vec![*condition, *left, *right],
         // A function index is not a value; only the arguments are read.
         Call { arguments, .. } => arguments.clone(),
+        // A host call reads its arguments too; the import index is an immediate.
+        CallHost { arguments, .. } => arguments.clone(),
         // An indirect call reads its arguments and its table-index operand.
         CallIndirect {
             arguments, operand, ..
@@ -798,6 +802,7 @@ fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
     use super::IrInstr::*;
     match instruction {
         Call { results, .. } => results.clone(),
+        CallHost { results, .. } => results.clone(),
         CallIndirect { results, .. } => results.clone(),
         // Neither a drop, a store, nor a `global.set` produces a new value.
         Drop { .. } | LocalSet { .. } | Store { .. } | GlobalSet { .. } => Vec::new(),
@@ -1392,6 +1397,41 @@ fn verify_instruction(
                 });
             }
             for (result, expected) in results.iter().zip(&callee.function_type.results.0) {
+                define_value(*result, *expected, function_index, values, defined)?;
+            }
+            Ok(())
+        }
+        super::IrInstr::CallHost {
+            import,
+            arguments,
+            results,
+        } => {
+            // The signature is checked here, against the import's declared type,
+            // so a host call cannot reach the boundary with the wrong arity or
+            // operand types even if the module is hand-built.
+            let declaration = module
+                .imports
+                .get(*import as usize)
+                .ok_or(VerificationError::UnknownImport(*import))?;
+            let callee_type = &declaration.function_type;
+            if arguments.len() != callee_type.params.0.len() {
+                return Err(VerificationError::CallArity {
+                    function: *import,
+                    expected: callee_type.params.0.len(),
+                    actual: arguments.len(),
+                });
+            }
+            for (argument, expected) in arguments.iter().zip(&callee_type.params.0) {
+                expect_defined_type(*argument, *expected, function_index, values, defined)?;
+            }
+            if results.len() != callee_type.results.0.len() {
+                return Err(VerificationError::CallResultArity {
+                    function: *import,
+                    expected: callee_type.results.0.len(),
+                    actual: results.len(),
+                });
+            }
+            for (result, expected) in results.iter().zip(&callee_type.results.0) {
                 define_value(*result, *expected, function_index, values, defined)?;
             }
             Ok(())

@@ -28,6 +28,13 @@ pub use verify::{
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IrModule {
     pub functions: Vec<IrFunction>,
+    /// Imported functions, in the order the module declares them.
+    ///
+    /// Wasm numbers imported functions before defined ones, so a Wasm function
+    /// index below this length names an import rather than a module function.
+    /// The lowerer resolves that split, so `Call` and `RefFunc` index
+    /// `functions` alone.
+    pub imports: Vec<IrImport>,
     /// Module-level globals, in index order. Keeping them here lets the verifier
     /// check a `global.get`/`global.set` against the declaration without the
     /// original Wasm module.
@@ -41,6 +48,17 @@ pub struct IrModule {
     /// of these rather than a function, so the signature is checked against the
     /// table entry's type at run time.
     pub types: Vec<FunctionType>,
+}
+
+/// One imported function: the host boundary a compiled module calls out through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrImport {
+    /// The module name the import resolves against, such as `env`.
+    pub module: String,
+    /// The field name within that module.
+    pub name: String,
+    /// The declared signature, which the call site and the embedder both check.
+    pub function_type: FunctionType,
 }
 
 /// One module-level table declaration and its initial contents.
@@ -461,6 +479,18 @@ pub enum IrInstr {
     },
     Call {
         function: u32,
+        arguments: Vec<ValueId>,
+        results: Vec<ValueId>,
+    },
+    /// Call an imported function, crossing the host boundary.
+    ///
+    /// This is the only way a compiled module reaches a host capability, so the
+    /// boundary is explicit in the IR rather than implied by a target index. The
+    /// signature is checked against the import's declared type, and the embedder
+    /// decides at run time whether to grant the call.
+    CallHost {
+        /// Index into `IrModule::imports`.
+        import: u32,
         arguments: Vec<ValueId>,
         results: Vec<ValueId>,
     },

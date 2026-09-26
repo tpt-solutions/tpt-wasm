@@ -32,7 +32,8 @@ expose an unverified intermediate module.
 
 The lowerer rejects a module containing:
 
-- imports, so a `call` always resolves to a defined function;
+- a table, memory, or global import, which has no initializer the IR could carry;
+  function imports are supported and become `IrImport` entries;
 - start functions;
 - passive data segments, and a non-zero data-segment memory index;
 - more than one active element segment, or a non-zero table index;
@@ -70,7 +71,7 @@ could affect linking, initialization, or observable behavior.
 | `drop` | `Drop` | Removes one value from the lowering stack. |
 | `select` | `Select` | Requires an i32 condition and two equal-typed numeric arms. |
 | `local.get`, `local.set`, `local.tee` | `LocalGet`, `LocalSet`, `LocalTee` | A local is one function-scoped slot with a stable value ID; `set` has no result and `tee` returns the stored value. |
-| `call` | `Call` | Direct calls to defined functions carry typed argument/result IDs; imported calls are rejected. |
+| `call` | `Call` | Direct calls to defined functions carry typed argument/result IDs. A Wasm index below the import count becomes a `CallHost` instead, because it names a host function. |
 | `call_indirect` | `CallIndirect` | Names a type rather than a function, so the signature is checked against the table entry at run time. |
 | `i32.const` | `ConstI32` | Allocates an `i32` result ID. |
 | `i64.const` | `ConstI64` | Allocates an `i64` result ID. |
@@ -83,6 +84,7 @@ could affect linking, initialization, or observable behavior.
 | `ref.null` | `RefNull` | The named reference kind is kept, so a `funcref` null is not interchangeable with an `externref` null. |
 | `ref.func` | `RefFunc` | The index must name a function this module defines, the same requirement a direct `call` places on its target. |
 | `ref.is_null` | `RefIsNull` | Accepts a reference of either kind, as Wasm does, and produces an `i32`. |
+| `call` to an imported function | `CallHost` | The only instruction that crosses the host boundary, so the boundary is explicit in the IR. |
 | `i32` eqz/eq/ne/lt_s/lt_u/gt_s/gt_u/le_s/le_u/ge_s/ge_u | `I32Eqz`, `I32Compare` | Comparisons produce `i32`; signed and unsigned ordering are explicit. |
 | `i64` eqz/eq/ne/lt_s/lt_u/gt_s/gt_u/le_s/le_u/ge_s/ge_u | `I64Eqz`, `I64Compare` | Comparisons produce `i32`; signed and unsigned ordering are explicit. |
 | `i32` clz/ctz/popcnt | `I32Unary` | Count leading/trailing zero bits and set bits. |
@@ -148,16 +150,17 @@ unsupported module state, and malformed hand-built IR.
 
 ## Next lowering work
 
-Items 1 through 6 of the original plan are done: multi-block CFG construction
+Items 1 through 7 of the original plan are done: multi-block CFG construction
 with block parameters and dominance verification, defined direct calls,
-`call_indirect`, the linear memory, globals, tables, and the reference
-instructions with an IR `funcref` value. What remains, in dependency order:
+`call_indirect`, the linear memory, globals, tables, the reference instructions
+with an IR `funcref` value, and imported-function resolution with an explicit
+`CallHost`. What remains, in dependency order:
 
-1. imported-function resolution, which unblocks the baseline's host boundary;
-2. explicit host-effect instructions, so a compiled module can call a granted
-   capability;
-3. passive and multiple element/data segments, and non-`funcref` tables;
-4. `table.get`/`table.set`, completing the reference-types surface.
+1. explicit host-*effect* instructions beyond a call, so a compiled module can
+   observe a granted capability's effects rather than only invoke it;
+2. passive and multiple element/data segments, and non-`funcref` tables;
+3. `table.get`/`table.set`, completing the reference-types surface;
+4. imported tables, memories, and globals.
 
 Each addition requires an IR instruction form, verifier rule, lowering test,
 Micro differential test, and scope documentation before its tracker item can be
