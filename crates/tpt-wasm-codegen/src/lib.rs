@@ -1615,7 +1615,7 @@ impl BaselineModule {
                 let length = usize::try_from(declaration.min)
                     .map_err(|_| CodegenError::UnsupportedMemory("table size"))?;
                 let mut elements = vec![None; length];
-                for (position, function) in declaration.elements.iter().enumerate() {
+                for (position, entry) in declaration.elements.iter().enumerate() {
                     let slot = declaration.offset as usize + position;
                     // The validator bounds-checks the segment against the table,
                     // so a slot past the end here means the two disagree.
@@ -1624,7 +1624,7 @@ impl BaselineModule {
                         .ok_or(CodegenError::UnsupportedMemory(
                             "element segment does not fit the table",
                         ))?;
-                    *cell = Some(*function);
+                    *cell = *entry;
                 }
                 Some(BaselineTable { elements })
             }
@@ -4367,12 +4367,14 @@ mod tests {
             let base = tpt_wasm_ir::const_expr_i32(offset)
                 .expect("test element offset must be a constant i32");
             let address = table_addrs[*table_index as usize];
-            for (position, function) in element.init.iter().enumerate() {
-                let target = func_addrs[*function as usize];
+            for (position, entry) in element_init_indices(element) {
+                // A `ref.null` entry leaves the slot empty rather than naming a
+                // function, which is what a `call_indirect` through it must see.
+                let cell = entry.map(|function| RefValue::FuncRef(func_addrs[function as usize]));
                 store
                     .table_mut(address)
                     .expect("test table should resolve")
-                    .elements[base as usize + position] = Some(RefValue::FuncRef(target));
+                    .elements[base as usize + position] = cell;
             }
         }
         let instance = store
@@ -4591,6 +4593,46 @@ mod tests {
         );
     }
 
+    /// The entries of an element segment as function indices, paired with their
+    /// position, where `None` is a `ref.null` that leaves the slot empty.
+    ///
+    /// This is the Micro-side fixture's own reading of the segment. It is
+    /// deliberately independent of the runtime's: if both are right, a null
+    /// entry is observed to be null, and if only the runtime is right, a
+    /// `call_indirect` through that slot would trap in one backend and not the
+    /// other.
+    fn element_init_indices(element: &tpt_wasm_format::Element) -> Vec<(usize, Option<u32>)> {
+        let entries: Vec<Option<u32>> = match &element.init {
+            tpt_wasm_format::ElementInit::FuncIndices(indices) => {
+                indices.iter().map(|index| Some(*index)).collect()
+            }
+            tpt_wasm_format::ElementInit::Expressions(expressions) => expressions
+                .iter()
+                .map(|expression| {
+                    // `ref.null t end` or `ref.func <leb> end`.
+                    assert_eq!(expression.0.last(), Some(&0x0b), "entry must end");
+                    match expression.0[0] {
+                        0xd0 => None,
+                        0xd2 => {
+                            let mut value = 0u32;
+                            let mut shift = 0;
+                            for byte in &expression.0[1..expression.0.len() - 1] {
+                                value |= u32::from(byte & 0x7f) << shift;
+                                if byte & 0x80 == 0 {
+                                    break;
+                                }
+                                shift += 7;
+                            }
+                            Some(value)
+                        }
+                        other => panic!("element entry is neither reference form: {other:#x}"),
+                    }
+                })
+                .collect(),
+        };
+        entries.into_iter().enumerate().collect()
+    }
+
     #[test]
     fn baseline_global_read_write_matches_micro() {
         let mut body = vec![0x23, 0x00];
@@ -4714,7 +4756,7 @@ mod tests {
                     // A constant `i32` offset of 1, as `i32.const 1; end`.
                     offset: tpt_wasm_format::ConstExpr(vec![0x41, 0x01, 0x0b]),
                 },
-                init: vec![1],
+                init: tpt_wasm_format::ElementInit::FuncIndices(vec![1]),
             }],
             ..Module::default()
         }
@@ -4751,6 +4793,40 @@ mod tests {
     }
 
     #[test]
+    fn an_element_written_as_a_null_expression_traps_like_micro() {
+        // The same dispatch, but the segment now spells its single entry as
+        // `ref.null funcref end` instead of a function index. Table index 1 is
+        // therefore written and null, where the index form left it holding
+        // `$double`. Both backends read the segment independently, so this only
+        // passes if each one really saw a null rather than a function index: an
+        // implementation that narrowed the expression to an index would call
+        // `$double` here and return 10.
+        let mut module = dispatch_module();
+        module.elements[0].init = tpt_wasm_format::ElementInit::Expressions(vec![
+            tpt_wasm_format::ConstExpr(vec![0xd0, 0x70, 0x0b]),
+        ]);
+        assert_eq!(
+            assert_module_matches_micro(&module, 0, Vec::new()),
+            Err(Trap::NullReference)
+        );
+    }
+
+    #[test]
+    fn an_element_written_as_a_ref_func_expression_dispatches_like_micro() {
+        // The mirror of the case above: the same segment written as
+        // `ref.func 1 end` names `$double` and must still dispatch, so the
+        // expression family is not simply rejected or read as null.
+        let mut module = dispatch_module();
+        module.elements[0].init = tpt_wasm_format::ElementInit::Expressions(vec![
+            tpt_wasm_format::ConstExpr(vec![0xd2, 0x01, 0x0b]),
+        ]);
+        assert_eq!(
+            assert_module_matches_micro(&module, 0, Vec::new()).unwrap(),
+            vec![Value::I32(10)]
+        );
+    }
+
+    #[test]
     fn an_indirect_call_with_the_wrong_type_traps_like_micro() {
         // Function 0 has type 0, but the call names type 1, so the entry's
         // signature does not match what the call requires. The segment is moved
@@ -4760,7 +4836,7 @@ mod tests {
             table_index: 0,
             offset: tpt_wasm_format::ConstExpr(vec![0x41, 0x00, 0x0b]),
         };
-        module.elements[0].init = vec![0];
+        module.elements[0].init = tpt_wasm_format::ElementInit::FuncIndices(vec![0]);
         module.functions[0].body = vec![0x41, 0x05, 0x41, 0x00, 0x11, 0x01, 0x00, 0x0b];
         assert_eq!(
             assert_module_matches_micro(&module, 0, Vec::new()),
@@ -5889,7 +5965,7 @@ mod tests {
                     table_index: 0,
                     offset: tpt_wasm_format::ConstExpr(vec![0x41, 0x00, 0x0b]),
                 },
-                init: vec![1],
+                init: tpt_wasm_format::ElementInit::FuncIndices(vec![1]),
             }],
             ..Module::default()
         });

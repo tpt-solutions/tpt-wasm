@@ -68,9 +68,15 @@ pub struct IrTable {
     pub element_type: ReferenceType,
     pub min: u64,
     pub max: Option<u64>,
-    /// Function indices from the module's active element segment.
-    pub elements: Vec<u32>,
-    /// Where those function indices start in the table.
+    /// The initial contents of the table, from the module's active element
+    /// segment.
+    ///
+    /// `Some` is a `ref.func` naming a function in this IR's index space and
+    /// `None` is a `ref.null`. A segment spelled as plain indices lowers to all
+    /// `Some`; one spelled as expressions may contain either, which is the whole
+    /// reason the two families cannot share one representation.
+    pub elements: Vec<Option<u32>>,
+    /// Where those entries start in the table.
     pub offset: u32,
 }
 

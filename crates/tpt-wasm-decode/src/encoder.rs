@@ -4,8 +4,8 @@
 //! Canonical WebAssembly MVP binary encoder.
 
 use tpt_wasm_format::{
-    ConstExpr, CustomSection, DataMode, DataSegment, Element, ElementMode, Export, ExportDesc,
-    Function, Global, Import, ImportDesc, Memory, Module, Table,
+    ConstExpr, CustomSection, DataMode, DataSegment, Element, ElementInit, ElementMode, Export,
+    ExportDesc, Function, Global, Import, ImportDesc, Memory, Module, Table,
 };
 use tpt_wasm_types::{FunctionType, GlobalType, Limits, MemoryType, RefType, TableType, ValueType};
 
@@ -222,12 +222,28 @@ fn write_element(element: &Element, output: &mut Vec<u8>) -> Result<(), EncodeEr
     if table_index != 0 {
         return Err(EncodeError::UnsupportedFeature("multiple tables"));
     }
-    output.push(0x00);
-    write_const_expr(offset, output)?;
-    write_vector(&element.init, output, |index, out| {
-        write_u32(*index, out);
-        Ok(())
-    })
+    // Both families are written in the form that carries them, so a segment
+    // decoded from the expression forms is re-encoded as those forms rather than
+    // being narrowed to indices, which would lose any `ref.null` entry. The kind
+    // byte comes first and selects which family the rest of the segment uses, so
+    // the offset is written exactly once either way.
+    match &element.init {
+        ElementInit::FuncIndices(indices) => {
+            output.push(0x00);
+            write_const_expr(offset, output)?;
+            write_vector(indices, output, |index, out| {
+                write_u32(*index, out);
+                Ok(())
+            })
+        }
+        ElementInit::Expressions(expressions) => {
+            output.push(0x04);
+            write_const_expr(offset, output)?;
+            write_vector(expressions, output, |expression, out| {
+                write_const_expr(expression, out)
+            })
+        }
+    }
 }
 
 fn write_data(data: &DataSegment, output: &mut Vec<u8>) -> Result<(), EncodeError> {

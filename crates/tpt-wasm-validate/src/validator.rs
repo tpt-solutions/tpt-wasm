@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use tpt_wasm_format::{ExportDesc, ImportDesc, Module};
+use tpt_wasm_format::{ElementInit, ExportDesc, ImportDesc, Module};
 use tpt_wasm_types::{FunctionType, GlobalType, Limits, RefType, TableType, ValueType};
 
 use super::{body, ValidationError};
@@ -234,10 +234,16 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
                 table_index: Some(*table_index),
                 offset: Some(offset),
             },
+            // A passive or declarative segment writes no table at instantiation
+            // and so has no table or offset to check. It is still validated: its
+            // entries must be well-formed references. Executing one is a
+            // separate matter, and the runtime reports that it is not yet
+            // supported rather than the module being treated as invalid.
             tpt_wasm_format::ElementMode::Passive | tpt_wasm_format::ElementMode::Declarative => {
-                return Err(ValidationError::UnsupportedFeature(
-                    "non-active element segments",
-                ))
+                ElementModeDetails {
+                    table_index: None,
+                    offset: None,
+                }
             }
         };
         if let Some(table_index) = table_index {
@@ -251,9 +257,26 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
         if let Some(offset) = offset {
             validate_const_expr(offset, ValueType::I32, context, false)?;
         }
-        for function in &element.init {
-            if *function as usize >= context.function_types.len() {
-                return Err(ValidationError::UnknownFunction(*function));
+        // The two families are validated differently. A plain index is checked
+        // against the function index space; an expression is a constant
+        // expression that must produce a reference of the segment's element type.
+        match &element.init {
+            ElementInit::FuncIndices(indices) => {
+                for function in indices {
+                    if *function as usize >= context.function_types.len() {
+                        return Err(ValidationError::UnknownFunction(*function));
+                    }
+                }
+            }
+            ElementInit::Expressions(expressions) => {
+                for expression in expressions {
+                    validate_const_expr(
+                        expression,
+                        ValueType::Ref(element.element_type),
+                        context,
+                        false,
+                    )?;
+                }
             }
         }
     }
@@ -312,6 +335,26 @@ fn validate_const_expr(
                 return Err(ValidationError::InvalidConstantExpression);
             }
             global.value_type
+        }
+        // The two reference-producing forms. `ref.null` carries the reference
+        // type it produces, so it must agree with the expected type rather than
+        // merely being well formed. `ref.func` names a function, which must
+        // exist in the index space; a `funcref` initializer that named an
+        // out-of-range index would otherwise produce a reference to nothing.
+        0xd0 => {
+            let actual = match reader.byte()? {
+                0x70 => RefType::FuncRef,
+                0x6f => RefType::ExternRef,
+                _ => return Err(ValidationError::InvalidConstantExpression),
+            };
+            ValueType::Ref(actual)
+        }
+        0xd2 => {
+            let index = reader.u32()?;
+            if index as usize >= context.function_types.len() {
+                return Err(ValidationError::UnknownFunction(index));
+            }
+            ValueType::Ref(RefType::FuncRef)
         }
         _ => return Err(ValidationError::InvalidConstantExpression),
     };

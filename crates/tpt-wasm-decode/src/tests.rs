@@ -4,8 +4,8 @@
 //! Tests for the structural WebAssembly MVP binary codec.
 
 use tpt_wasm_format::{
-    ConstExpr, CustomSection, DataMode, DataSegment, Element, ElementMode, Export, ExportDesc,
-    Function, Global, Import, ImportDesc, Memory, Module, Table,
+    ConstExpr, CustomSection, DataMode, DataSegment, Element, ElementInit, ElementMode, Export,
+    ExportDesc, Function, Global, Import, ImportDesc, Memory, Module, Table,
 };
 use tpt_wasm_types::{
     FunctionType, GlobalType, Limits, MemoryType, RefType, ResultType, TableType, ValueType,
@@ -84,7 +84,7 @@ fn sample_module() -> Module {
                 table_index: 0,
                 offset: const_i32(0),
             },
-            init: vec![1],
+            init: tpt_wasm_format::ElementInit::FuncIndices(vec![1]),
         }],
         data: vec![DataSegment {
             mode: DataMode::Active {
@@ -188,4 +188,155 @@ fn decoder_rejects_function_and_code_count_mismatch() {
     let mut bytes = Vec::from(*b"\0asm\x01\0\0\0");
     bytes.extend_from_slice(&[3, 2, 1, 0]);
     assert_eq!(decode(&bytes), Err(DecodeError::MismatchedCodeSection));
+}
+
+/// A one-segment element section holding exactly `payload`, which is the bytes
+/// after the section's own length and vector count.
+fn element_section(payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::from(*b"\0asm\x01\0\0\0");
+    let mut body = vec![0x09, (payload.len() + 1) as u8, 0x01];
+    body.extend_from_slice(payload);
+    bytes.extend_from_slice(&body);
+    bytes
+}
+
+#[test]
+fn every_element_segment_form_decodes_to_its_own_mode_and_family() {
+    // The core format has eight forms. Four spell their entries as function
+    // indices and four as constant expressions; the forms also differ in whether
+    // they are active, passive, or declarative, and in whether the table is
+    // named or implied to be table 0. Each is checked against what it encodes,
+    // because a form read as a different form of the same kind still decodes.
+    // `i32.const 0 end` is the offset; `ref.func 0 end` and `ref.null funcref end`
+    // are the two expression entries.
+    let offset = [0x41, 0x00, 0x0b];
+    let cases: &[(u8, &str, ElementMode, ElementInit)] = &[
+        // Active, table 0, no element kind byte, indices.
+        (
+            0,
+            "active in table 0, indices",
+            ElementMode::Active {
+                table_index: 0,
+                offset: ConstExpr(offset.to_vec()),
+            },
+            ElementInit::FuncIndices(vec![0]),
+        ),
+        // Passive, element kind byte, indices.
+        (
+            1,
+            "passive, indices",
+            ElementMode::Passive,
+            ElementInit::FuncIndices(vec![0]),
+        ),
+        // Active in an explicitly named table, indices.
+        (
+            2,
+            "active in table 0, indices, named",
+            ElementMode::Active {
+                table_index: 0,
+                offset: ConstExpr(offset.to_vec()),
+            },
+            ElementInit::FuncIndices(vec![0]),
+        ),
+        // Declarative, element kind byte, indices.
+        (
+            3,
+            "declarative, indices",
+            ElementMode::Declarative,
+            ElementInit::FuncIndices(vec![0]),
+        ),
+        // The same four, with a reference type and expression entries.
+        (
+            4,
+            "active in table 0, expressions",
+            ElementMode::Active {
+                table_index: 0,
+                offset: ConstExpr(offset.to_vec()),
+            },
+            ElementInit::Expressions(vec![ConstExpr(vec![0xd2, 0x00, 0x0b])]),
+        ),
+        (
+            5,
+            "passive, expressions",
+            ElementMode::Passive,
+            ElementInit::Expressions(vec![ConstExpr(vec![0xd0, 0x70, 0x0b])]),
+        ),
+        (
+            6,
+            "active in table 0, expressions, named",
+            ElementMode::Active {
+                table_index: 0,
+                offset: ConstExpr(offset.to_vec()),
+            },
+            ElementInit::Expressions(vec![ConstExpr(vec![0xd2, 0x00, 0x0b])]),
+        ),
+        (
+            7,
+            "declarative, expressions",
+            ElementMode::Declarative,
+            ElementInit::Expressions(vec![ConstExpr(vec![0xd0, 0x70, 0x0b])]),
+        ),
+    ];
+    for (kind, what, mode, init) in cases {
+        // The kind byte leads the segment and selects the shape of everything
+        // after it, so it is written first and the form-specific bytes follow.
+        let mut bytes = vec![*kind];
+        match kind {
+            // Active in table 0: the offset, then the entries. Form 0 has no
+            // element kind byte; form 4 implies `funcref` and so has none either.
+            0 | 4 => {
+                bytes.extend_from_slice(&offset);
+                bytes.push(1);
+                if *kind == 4 {
+                    bytes.extend_from_slice(&[0xd2, 0x00, 0x0b]);
+                } else {
+                    bytes.push(0);
+                }
+            }
+            // Passive and declarative: the element kind byte, then the entries.
+            1 | 3 => bytes.extend_from_slice(&[0x00, 0x01, 0x00]),
+            // Active in a named table: the index, the offset, the kind, entries.
+            2 => {
+                bytes.push(0x00);
+                bytes.extend_from_slice(&offset);
+                bytes.extend_from_slice(&[0x00, 0x01, 0x00]);
+            }
+            // The expression forms name their reference type where the index
+            // forms name their element kind.
+            5 | 7 => bytes.extend_from_slice(&[0x70, 0x01, 0xd0, 0x70, 0x0b]),
+            _ => {
+                bytes.push(0x00);
+                bytes.extend_from_slice(&offset);
+                bytes.extend_from_slice(&[0x70, 0x01, 0xd2, 0x00, 0x0b]);
+            }
+        }
+        let decoded = decode(&element_section(&bytes))
+            .unwrap_or_else(|error| panic!("form {kind} ({what}) did not decode: {error:?}"));
+        let element = &decoded.elements[0];
+        assert_eq!(&element.mode, mode, "form {kind} ({what}) mode");
+        assert_eq!(&element.init, init, "form {kind} ({what}) entries");
+    }
+}
+
+#[test]
+fn an_expression_segment_round_trips_without_losing_its_null() {
+    // A `ref.null` entry cannot be written as a function index, so an encoder
+    // that narrowed the segment to indices would silently turn a null slot into
+    // a call to function 0. The round trip has to preserve the family.
+    let mut module = sample_module();
+    module.elements = vec![Element {
+        element_type: RefType::FuncRef,
+        mode: ElementMode::Active {
+            table_index: 0,
+            offset: const_i32(0),
+        },
+        init: ElementInit::Expressions(vec![
+            ConstExpr(vec![0xd2, 0x00, 0x0b]),
+            ConstExpr(vec![0xd0, 0x70, 0x0b]),
+        ]),
+    }];
+    let bytes = encode(&module).unwrap();
+    let decoded = decode(&bytes).unwrap();
+    assert_eq!(decoded, module);
+    assert_eq!(encode(&decoded).unwrap(), bytes);
 }

@@ -7,8 +7,8 @@
 //! framing, but it does not resolve indices or check instruction types.
 
 use tpt_wasm_format::{
-    ConstExpr, CustomSection, DataMode, DataSegment, Element, ElementMode, Export, ExportDesc,
-    Function, Global, Import, ImportDesc, LocalDecl, Memory, Module, Table,
+    ConstExpr, CustomSection, DataMode, DataSegment, Element, ElementInit, ElementMode, Export,
+    ExportDesc, Function, Global, Import, ImportDesc, LocalDecl, Memory, Module, Table,
 };
 use tpt_wasm_types::{FunctionType, GlobalType, Limits, MemoryType, RefType, TableType, ValueType};
 
@@ -235,6 +235,16 @@ fn const_expr(reader: &mut Reader<'_>) -> Result<ConstExpr, DecodeError> {
             0x23 => {
                 let _ = reader.u32()?;
             }
+            // The two reference-producing forms. An element segment whose entries
+            // are expressions uses these, and a `ref.null` entry in particular is
+            // not an index at all, which is why these segments have their own
+            // representation rather than reusing a vector of function indices.
+            0xd0 => {
+                let _ = reference_type(reader)?;
+            }
+            0xd2 => {
+                let _ = reader.u32()?;
+            }
             opcode => return Err(DecodeError::InvalidOpcode(u32::from(opcode))),
         }
     }
@@ -318,12 +328,12 @@ fn decode_start_section(reader: &mut Reader<'_>) -> Result<u32, DecodeError> {
 fn decode_element_section(reader: &mut Reader<'_>) -> Result<Vec<Element>, DecodeError> {
     reader.vector(|reader| {
         // An element segment begins with a kind byte selecting one of eight
-        // forms. The four forms whose entries are plain function indices are
-        // representable here; the four whose entries are `ref.func`/`ref.null`
-        // expressions would need an initializer that is not a list of indices,
-        // and are rejected rather than half-read.
+        // forms. Forms 0-3 list plain function indices and carry an element kind
+        // byte, which must be `0x00`. Forms 4-7 list constant expressions and
+        // carry a reference type instead, so a segment can hold a null. The two
+        // families are read differently and kept apart in `ElementInit`.
         let kind = reader.u32()?;
-        let (mode, element_type) = match kind {
+        let (mode, element_type, expressions) = match kind {
             // Active in table 0, no element kind byte.
             0 => (
                 ElementMode::Active {
@@ -331,6 +341,7 @@ fn decode_element_section(reader: &mut Reader<'_>) -> Result<Vec<Element>, Decod
                     offset: const_expr(reader)?,
                 },
                 RefType::FuncRef,
+                false,
             ),
             // Passive, declarative, and active-in-an-explicit-table all carry an
             // element kind byte, which is a single `0x00` for a function segment.
@@ -343,6 +354,7 @@ fn decode_element_section(reader: &mut Reader<'_>) -> Result<Vec<Element>, Decod
                         ElementMode::Declarative
                     },
                     RefType::FuncRef,
+                    false,
                 )
             }
             2 => {
@@ -355,11 +367,51 @@ fn decode_element_section(reader: &mut Reader<'_>) -> Result<Vec<Element>, Decod
                         offset,
                     },
                     RefType::FuncRef,
+                    false,
+                )
+            }
+            // The expression forms, which name their reference type directly and
+            // so may be `externref` as well as `funcref`.
+            4 => (
+                ElementMode::Active {
+                    table_index: 0,
+                    offset: const_expr(reader)?,
+                },
+                RefType::FuncRef,
+                true,
+            ),
+            5 | 7 => {
+                let element_type = reference_type(reader)?;
+                (
+                    if kind == 5 {
+                        ElementMode::Passive
+                    } else {
+                        ElementMode::Declarative
+                    },
+                    element_type,
+                    true,
+                )
+            }
+            6 => {
+                let table_index = reader.u32()?;
+                let offset = const_expr(reader)?;
+                let element_type = reference_type(reader)?;
+                (
+                    ElementMode::Active {
+                        table_index,
+                        offset,
+                    },
+                    element_type,
+                    true,
                 )
             }
             _ => return Err(DecodeError::UnsupportedElementSegmentKind),
         };
-        let init = reader.vector(Reader::u32)?;
+        let init = if expressions {
+            ElementInit::Expressions(reader.vector(const_expr)?)
+        } else {
+            ElementInit::FuncIndices(reader.vector(Reader::u32)?)
+        };
         Ok(Element {
             element_type,
             mode,

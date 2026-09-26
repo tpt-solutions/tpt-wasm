@@ -25,24 +25,16 @@ const SUITES: &[(&str, &str, usize)] = &[
     ),
 ];
 
-/// The full suite, which currently does not pass.
-///
-/// This is `#[ignore]`d rather than deleted or weakened, and it is the honest
-/// state of the work: `binary.wast` passes, but `binary-leb128.wast` does not.
-/// Two decoder gaps reach that file, and neither is the LEB128 reader — it
-/// already accepts padded encodings. A data segment written with an explicit
-/// segment-kind byte has no form, and an over-long LEB inside a *function body*
-/// goes unseen because bodies are kept as raw bytes and never parsed.
-///
-/// The un-ignored tests below are the parts that are known to hold: the parser
-/// itself, and the two self-checks that the harness would notice a wrong answer.
-/// Until those two gaps are closed, this test must not gate the build — but it
-/// must also not be forgotten, which is why it is here and not deleted.
 /// Run every vendored suite.
 ///
 /// The suites are all run before anything is asserted, so one test run reports
 /// every disagreement across every file rather than stopping at the first. A
 /// single run is the only practical way to triage a spec failure.
+///
+/// This gates the build. The two assertions it does not yet satisfy are the
+/// `KNOWN_GAPS` below, both of which are the same unimplemented feature, so the
+/// list is what stands between "passes" and "does not pass" and cannot be
+/// widened without noticing: an unlisted failure fails the test.
 #[test]
 fn binary_format_suite() {
     let mut unlisted: Vec<String> = Vec::new();
@@ -85,9 +77,10 @@ struct KnownGap {
 }
 
 const KNOWN_GAPS: &[KnownGap] = &[
-    // Both remaining gaps are missing *features* rather than misdecoding: in each
-    // case the module is valid and this implementation refuses it. Nothing here
-    // is an undecodable module slipping through.
+    // The single remaining gap is a missing feature rather than a misdecoding: the
+    // module is valid and this implementation refuses it. Nothing undecodable
+    // slips through, and the two files' gaps are two assertions of the same
+    // feature.
     //
     // --- bulk memory: the `fc` prefixed instructions and the data count section ---
     KnownGap {
@@ -102,19 +95,6 @@ const KNOWN_GAPS: &[KnownGap] = &[
         missing: "a valid module using `memory.init`, `data.drop`, `memory.copy` and \
                   `memory.fill` is rejected at validation; the `fc` opcode prefix \
                   has no form in the validator",
-    },
-    // --- element segments whose entries are expressions ---
-    KnownGap {
-        file: "binary.wast",
-        line: 401,
-        missing: "an element segment whose entries are `ref.func` expressions is \
-                  rejected; the initializer is a list of indices, not expressions",
-    },
-    KnownGap {
-        file: "binary.wast",
-        line: 426,
-        missing: "an element segment whose entries are `ref.null` expressions is \
-                  rejected, for the same reason as the `ref.func` form",
     },
 ];
 

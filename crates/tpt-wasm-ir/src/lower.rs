@@ -146,7 +146,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
                     "multiple element segments",
                 ));
             }
-            let (elements, offset) = match active.first() {
+            let (init, offset) = match active.first() {
                 Some(element) => {
                     let tpt_wasm_format::ElementMode::Active {
                         table_index,
@@ -158,10 +158,14 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
                     if *table_index != 0 {
                         return Err(LoweringError::UnsupportedFeature("non-zero table index"));
                     }
-                    (element.init.clone(), element_segment_offset(offset)?)
+                    (
+                        lower_element_init(&element.init, imported_functions)?,
+                        element_segment_offset(offset)?,
+                    )
                 }
                 None => (Vec::new(), 0),
             };
+            let elements = init;
             vec![IrTable {
                 element_type: only.table_type.element_type,
                 min: only.table_type.limits.min,
@@ -1018,15 +1022,10 @@ fn lower_body(
             0xd2 => {
                 let index = reader.u32()?;
                 // `ref.func` names the Wasm function index space, so an index
-                // below the import count would name an imported function. The IR
-                // addresses defined functions alone, so that case is refused
-                // rather than silently redirected at a different function.
-                if index < imported_functions {
-                    return Err(LoweringError::UnsupportedFeature(
-                        "reference to an imported function",
-                    ));
-                }
-                let defined = index - imported_functions;
+                // below the import count would name an imported function, which
+                // the shared rebasing helper refuses for the same reason an
+                // element segment entry does.
+                let defined = defined_index(index, imported_functions)?;
                 if usize::try_from(defined).map_or(true, |i| i >= module.functions.len()) {
                     return Err(LoweringError::UnknownFunction(index));
                 }
@@ -1199,6 +1198,64 @@ pub(crate) fn read_const_expr(
         return Err(LoweringError::UnsupportedFeature("global initializer"));
     }
     Ok(value)
+}
+
+/// Lower an element segment's entries into the IR's table representation.
+///
+/// The two encoding families converge here. Plain indices are already function
+/// numbers in the module's index space, so they only need rebasing past the
+/// imports. An expression is either `ref.null`, which leaves the slot empty, or
+/// `ref.func`, which names a function and is rebased the same way.
+fn lower_element_init(
+    init: &tpt_wasm_format::ElementInit,
+    imported_functions: u32,
+) -> Result<Vec<Option<u32>>, LoweringError> {
+    match init {
+        tpt_wasm_format::ElementInit::FuncIndices(indices) => indices
+            .iter()
+            .map(|index| Ok(Some(defined_index(*index, imported_functions)?)))
+            .collect(),
+        tpt_wasm_format::ElementInit::Expressions(expressions) => expressions
+            .iter()
+            .map(|expression| read_table_init_expr(expression, imported_functions))
+            .collect(),
+    }
+}
+
+/// Read one `ref.null` or `ref.func` element initializer.
+fn read_table_init_expr(
+    expr: &tpt_wasm_format::ConstExpr,
+    imported_functions: u32,
+) -> Result<Option<u32>, LoweringError> {
+    let mut reader = BodyReader::new(&expr.0);
+    let entry = match reader.byte()? {
+        // `ref.null t`, which initializes the slot to null.
+        0xd0 => match reader.byte()? {
+            0x70 | 0x6f => None,
+            _ => return Err(LoweringError::UnsupportedFeature("element initializer")),
+        },
+        0xd2 => Some(defined_index(reader.u32()?, imported_functions)?),
+        _ => return Err(LoweringError::UnsupportedFeature("element initializer")),
+    };
+    if reader.byte()? != 0x0b || reader.remaining() != 0 {
+        return Err(LoweringError::UnsupportedFeature("element initializer"));
+    }
+    Ok(entry)
+}
+
+/// Rebase a module-level function index onto the IR's index space.
+///
+/// The IR numbers only the module's own functions and turns everything below the
+/// import count into a host call. A reference or a table entry has to name a
+/// concrete function of this module, so an index below that count is refused
+/// rather than redirected at a different function.
+fn defined_index(index: u32, imported_functions: u32) -> Result<u32, LoweringError> {
+    if index < imported_functions {
+        return Err(LoweringError::UnsupportedFeature(
+            "reference to an imported function",
+        ));
+    }
+    Ok(index - imported_functions)
 }
 
 fn lower_call(

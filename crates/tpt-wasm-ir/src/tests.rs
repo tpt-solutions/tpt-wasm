@@ -629,6 +629,7 @@ fn execute_ir_function(
                         .elements
                         .get(slot)
                         .copied()
+                        .flatten()
                         .ok_or(Trap::TableOutOfBounds)?;
                     let call_arguments = arguments
                         .iter()

@@ -95,7 +95,37 @@ pub enum ExportDesc {
 pub struct Element {
     pub element_type: RefType,
     pub mode: ElementMode,
-    pub init: Vec<u32>,
+    pub init: ElementInit,
+}
+
+/// How an element segment's entries are spelled.
+///
+/// The core format has two families of element segment. Four forms list plain
+/// function indices; the other four list constant expressions, which may produce
+/// a null reference and so are not expressible as an index. The two cannot share
+/// one representation without either losing `ref.null` or pretending a null is
+/// a function, so the family is recorded rather than flattened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElementInit {
+    /// The four forms whose entries are a vector of function indices.
+    FuncIndices(Vec<u32>),
+    /// The four forms whose entries are a vector of constant expressions, each
+    /// producing a reference of the segment's element type.
+    Expressions(Vec<ConstExpr>),
+}
+
+impl ElementInit {
+    /// How many entries the segment initializes.
+    pub fn len(&self) -> usize {
+        match self {
+            ElementInit::FuncIndices(indices) => indices.len(),
+            ElementInit::Expressions(expressions) => expressions.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

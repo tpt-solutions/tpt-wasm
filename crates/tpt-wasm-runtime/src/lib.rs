@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tpt_wasm_decode::{decode, DecodeError};
 
-use tpt_wasm_format::{ConstExpr, DataMode, ElementMode, ExportDesc, ImportDesc, Module};
+use tpt_wasm_format::{
+    ConstExpr, DataMode, ElementInit, ElementMode, ExportDesc, ImportDesc, Module,
+};
 use tpt_wasm_micro::execution::ExecutionConfig;
 use tpt_wasm_micro::instr::{decode_body, Instr};
 use tpt_wasm_micro::machine::{Frame, Machine, Step};
@@ -594,6 +596,22 @@ fn const_value(
     }
 }
 
+/// Read one element segment initializer as a module-level function index.
+///
+/// An inner `None` means a `ref.null`, which leaves the table slot null; an
+/// outer `None` means the expression was neither reference form and the caller
+/// must refuse it. The expression is read with Micro's own body decoder rather
+/// than a hand-rolled scan, so the index is decoded under the same rules as
+/// everywhere else, including a non-minimal encoding.
+fn element_entry(expr: &ConstExpr) -> Option<Option<u32>> {
+    let instructions = decode_body(&expr.0).ok()?;
+    match instructions.as_slice() {
+        [Instr::RefNull(_), Instr::End] => Some(None),
+        [Instr::RefFunc(index), Instr::End] => Some(Some(*index)),
+        _ => None,
+    }
+}
+
 fn const_i32(expr: &ConstExpr, store: &Store, global_addrs: &[u32]) -> Result<i32, RuntimeError> {
     match const_value(expr, store, global_addrs)? {
         Value::I32(value) => Ok(value),
@@ -1011,18 +1029,36 @@ fn instantiate_module(
             .get(*table_index as usize)
             .ok_or(RuntimeError::Store(StoreError::UnknownTable(*table_index)))?;
         let start = const_i32(offset, &store, &global_addrs)? as u32;
-        for (delta, function_index) in element.init.iter().enumerate() {
-            let address = *func_addrs
-                .get(*function_index as usize)
-                .ok_or(RuntimeError::Store(StoreError::UnknownFunction(
-                    *function_index,
-                )))?;
+        // The two families converge on the same slot writes, except that a
+        // `ref.null` entry leaves the slot null rather than naming a function.
+        let entries: Vec<Option<u32>> = match &element.init {
+            ElementInit::FuncIndices(indices) => indices.iter().map(|index| Some(*index)).collect(),
+            ElementInit::Expressions(expressions) => expressions
+                .iter()
+                .map(|expression| {
+                    element_entry(expression)
+                        .ok_or(RuntimeError::UnsupportedFeature("element initializer"))
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        for (delta, function_index) in entries.into_iter().enumerate() {
+            let value = match function_index {
+                // `ref.null`: the slot is left null, of the segment's element type.
+                None => RefValue::Null(element.element_type),
+                Some(function_index) => {
+                    let address =
+                        *func_addrs
+                            .get(function_index as usize)
+                            .ok_or(RuntimeError::Store(StoreError::UnknownFunction(
+                                function_index,
+                            )))?;
+                    RefValue::FuncRef(address)
+                }
+            };
             let index = start
                 .checked_add(delta as u32)
                 .ok_or(StoreError::TableOutOfBounds)?;
-            store
-                .table_mut(table_address)?
-                .set(index, RefValue::FuncRef(address))?;
+            store.table_mut(table_address)?.set(index, value)?;
         }
     }
     for segment in &module.data {
@@ -1793,7 +1829,7 @@ mod tests {
                     table_index: 0,
                     offset: const_i32(0),
                 },
-                init: vec![0],
+                init: tpt_wasm_format::ElementInit::FuncIndices(vec![0]),
             }],
             exports: vec![export("table", ExportDesc::Table(0))],
             ..Module::default()
