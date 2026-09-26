@@ -123,8 +123,8 @@ mvp_verified = "partial"
 # with their data count section, and function bodies being stored as raw bytes
 # instead of parsed.
 #
-# `mvp_tested` is `"partial"` rather than `false`: 34 Core suite files now run
-# through `crates/tpt-wasm-spec/tests/core_spec.rs`, driving 10,251 `invoke`/
+# `mvp_tested` is `"partial"` rather than `false`: 45 Core suite files now run
+# through `crates/tpt-wasm-spec/tests/core_spec.rs`, driving 16,075 `invoke`/
 # `assert_return`/`assert_trap`/`assert_exhaustion`/`register` directives through
 # the real decode -> validate -> instantiate -> call pipeline with exact NaN
 # bit-pattern checking -- once on the Micro backend and once on the compiled
@@ -171,9 +171,42 @@ mvp_verified = "partial"
 # growth, so an importer was matched against a stale size. The length now comes
 # from whichever backend owns the memory -- which is what makes the two backends
 # agree on what a memory is, precisely the question a cross-instance import asks.
-# memory_grow.wast now passes on both backends and joins the table (34 files,
-# 10,251 directives). Tables and globals are not shared this way yet, and the IR
-# still refuses to import them.
+# memory_grow.wast now passes on both backends and joins the table.
+#
+# The next batch stopped guessing which un-vendored files were blocked on what.
+# All 31 remaining Core candidates were downloaded and run against the harness,
+# and their per-file failure counts chose the order of work. Nine of them
+# (f32_cmp, f64_cmp, f32_bitwise, f64_bitwise -- 5,542 directives between them --
+# plus float_memory, type, custom, inline-module, and unreached-invalid) passed
+# on both backends untouched, so they went straight in; the probe is what showed
+# the float relation and bit-level operators, float round trips through memory,
+# and the validator's dead-code rules were already correct rather than merely
+# unexamined. The probe also isolated three real gaps, all fixed:
+#   - The harness never defined the `spectest` host module, so every Core file
+#     importing one could not link. It is the reference interpreter's own test
+#     fixture rather than part of WebAssembly, and its print functions exist only
+#     to be called and discarded, so they are defined as no-ops. Its globals,
+#     table, and memory are not defined, because this project still cannot import
+#     those.
+#   - The IR refused to lower any module with a start function, although the
+#     runtime already ran one on either backend. A start function is module
+#     metadata for the same reason exports are, so the refusal is simply gone;
+#     carrying it in the IR too would give the lowerer a second, redundant way
+#     to say the same thing.
+#   - The baseline resolved a start function's index against the module's
+#     *defined* functions only, refusing a module that nominates an IMPORTED
+#     function as its start -- which the specification allows, and which Wasm's
+#     ordering of imports first makes necessary. call_wasm_index does the split
+#     in one place. Verified by reverting the fix and confirming the new test
+#     fails, and only on the baseline.
+#   - The harness could not instantiate a module written inline inside a
+#     directive, nor read an exported global. The inline module now goes through
+#     the From<RuntimeError> conversion rather than being flattened to a string,
+#     so a start function that traps stays classified as a trap -- which is
+#     exactly what (assert_trap (module ... (start ...))) asserts. Instance::global
+#     reads the store, so a global.set that has already run is visible.
+# Eleven files and 5,824 directives later the Core suite is 45 files / 16,075
+# directives per backend, all passing on both.
 #
 # Running that suite on the baseline found six more real bugs, all fixed, and
 # they are worth recording because five of them are in the lowering, which no

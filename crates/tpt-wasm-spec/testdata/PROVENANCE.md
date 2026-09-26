@@ -31,6 +31,15 @@ These files are copied unmodified from the WebAssembly specification repository:
 | `memory_trap.wast` | Core suite: out-of-bounds loads and stores at and around the memory limit. |
 | `memory_redundancy.wast` | Core suite: that a store is visible to the next load rather than to a stale copy. |
 | `memory_grow.wast` | Core suite: `memory.grow` against the page limits, and a memory grown across three instances and re-imported twice, which is what exercises cross-instance memory sharing. |
+| `f32_cmp.wast`, `f64_cmp.wast` | Core suite: every `f32`/`f64` relation operator over its full edge-case set. |
+| `f32_bitwise.wast`, `f64_bitwise.wast` | Core suite: every `f32`/`f64` bit-level operator, including the `abs`/`neg`/`copysign` NaN rules. |
+| `float_memory.wast` | Core suite: float loads and stores, and the NaN canonicalization the specification requires on store. |
+| `type.wast` | Core suite: a module reaching a type index it does not define, and so cannot decode. |
+| `custom.wast` | Core suite: custom-section placement and contents, and that a module carrying one decodes and runs unchanged. |
+| `inline-module.wast` | Core suite: the bare `(module ...)` abbreviation, with no `$id` and nothing else in the file. |
+| `unreached-invalid.wast` | Core suite: the validator's rules for instructions that are unreachable but still have to validate. The file contains no module and no invocation at all. |
+| `start.wast` | Core suite: the start function, run at instantiation, including an *imported* start function and `(assert_trap (module ... (start ...)))`. |
+| `func_ptrs.wast` | Core suite: `ref.func` and `call_indirect` over function references, with `spectest` host imports. |
 
 All Core suite files above were vendored from revision
 `608711107b7f1edb13efd57b7d79b49477462d36` of the spec repository, fetched as raw
@@ -56,6 +65,13 @@ a memory publishes its handle; a module that imports one looks it up and
 installs the same handle, so a store through either is visible to both. Tables
 and globals are not yet shared this way, and the IR still refuses to import
 them.
+
+`spectest` is not a vendored file: it is the host module the reference
+interpreter's own test runner provides, and the Core suite's
+`(import "spectest" "print_i32")` directives resolve against the no-op
+functions `tests/core_spec.rs` installs. Its globals, table, and memory are
+*not* installed, because this project cannot yet import those — so a file needing
+them stays blocked rather than quietly passing against a fabricated global.
 
 ## License and provenance
 

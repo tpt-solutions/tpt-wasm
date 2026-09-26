@@ -30,33 +30,43 @@
 //! bytes and the compared result is the same code on both sides, so a
 //! disagreement is a disagreement about execution.
 //!
-//! Not every Core suite file is vendored yet. Left out, and why:
+//! Not every Core suite file is vendored yet. Rather than guess which files were
+//! blocked on what, every remaining candidate was downloaded and run against this
+//! harness, and these are the *measured* reasons, each one the error a single
+//! failing directive reports:
+//! - `block.wast`, `br.wast`, `fac.wast`, `func.wast`, `if.wast`, and
+//!   `loop.wast` use multi-value block types (`(block (result i32 i32) ...)`),
+//!   which need a type-index block type; only the single-result and empty forms
+//!   decode today (`multi_value`, not implemented). Each fails on its very first
+//!   module with `InvalidBlockType`.
 //! - `conversions.wast` needs the saturating truncation instructions (the
 //!   `0xfc`-prefixed opcodes, `non_trapping_float_to_int`), not implemented.
+//! - `data.wast` and `token.wast` need passive data segments (bulk memory);
+//!   `data.wast` fails on its second module with `passive data segments`.
+//! - `elem.wast` needs non-active element segments, and additionally fails on
+//!   the baseline alone (109 failures there against 87 on the interpreter),
+//!   because its element segments and `call_indirect` tables are not shared the
+//!   way a memory now is.
+//! - `br_table.wast` uses a heap type this decoder does not recognize.
+//! - `global.wast` needs arithmetic inside a global initializer
+//!   (`extended_const`), and `spectest`'s *globals*, which are not installed.
+//! - `table.wast` and `call_indirect.wast` declare a second table; MVP modules
+//!   are limited to one, and multi-table is part of `reference_types`.
+//! - `imports.wast` needs the tag section (the exceptions proposal), which this
+//!   decoder rejects outright with `InvalidSectionId(13)`.
+//! - `unwind.wast` is the exceptions proposal, and fails on the baseline alone.
 //! - `local_init.wast` needs non-nullable reference types (`(ref extern)`,
 //!   the typed-references/function-references proposal), not implemented.
-//! - `select.wast` declares a second table; MVP modules are limited to one,
-//!   and the multi-table relaxation is part of `reference_types`, which is
-//!   only partially implemented here.
-//! - `fac.wast`, `block.wast`, `loop.wast`, `if.wast`, and `br.wast` use
-//!   multi-value block types (`(block (result i32 i32) ...)`), which need a
-//!   type-index block type; only the single-result and empty forms decode
-//!   today (`multi_value`, not implemented).
-//! - `br_table.wast` uses a heap type this decoder does not recognize.
-//! - `global.wast` needs both the `spectest` host import module and
-//!   arithmetic inside a global initializer (`extended_const`), neither
-//!   implemented.
-//! - `token.wast` needs the `spectest` host import module and passive data
-//!   segments (bulk memory), neither implemented.
+//! - `select.wast` declares a second table, same as `table.wast`.
 //! - `names.wast` contains identifiers with bidirectional-control Unicode
 //!   characters that the `wast` crate's lexer refuses outright, before this
 //!   harness ever sees them.
-//! - Everything else not listed above and not already vendored -- the remaining
-//!   table, element, data, function, type, and start families -- needs table and
-//!   global *imports*, which the IR still refuses and which neither backend
-//!   shares yet, or one of the proposals above. `memory_grow.wast` was the same
-//!   case until cross-instance memory sharing landed; it now passes on both
-//!   backends and is in the table below. `todo.md` records the rest.
+//!
+//! `spectest`'s *functions* are installed (see `core.rs`), so a file blocked only
+//! on those now passes: `start.wast` and `func_ptrs.wast` are in the table below
+//! for that reason. What is left is table and global *imports*, which the IR
+//! still refuses and which neither backend shares yet, plus the proposals above.
+//! `todo.md` records the rest.
 
 use std::collections::HashMap;
 
@@ -319,6 +329,102 @@ const SUITES: &[Suite] = &[
             ("assert_trap", 7),
             ("assert_invalid", 9),
             ("register", 2),
+        ],
+    },
+    // The comparison and bitwise float operators, which between them are the
+    // bulk of the remaining MVP surface: every `f32`/`f64` relation and every
+    // bit-level operator, checked over their full edge-case sets.
+    Suite {
+        name: "f32_bitwise.wast",
+        source: include_str!("../testdata/f32_bitwise.wast"),
+        directives: &[("module", 1), ("assert_return", 360), ("assert_invalid", 3)],
+    },
+    Suite {
+        name: "f32_cmp.wast",
+        source: include_str!("../testdata/f32_cmp.wast"),
+        directives: &[
+            ("module", 1),
+            ("assert_return", 2400),
+            ("assert_invalid", 6),
+        ],
+    },
+    Suite {
+        name: "f64_bitwise.wast",
+        source: include_str!("../testdata/f64_bitwise.wast"),
+        directives: &[("module", 1), ("assert_return", 360), ("assert_invalid", 3)],
+    },
+    Suite {
+        name: "f64_cmp.wast",
+        source: include_str!("../testdata/f64_cmp.wast"),
+        directives: &[
+            ("module", 1),
+            ("assert_return", 2400),
+            ("assert_invalid", 6),
+        ],
+    },
+    // Float loads and stores over the memory, including the NaN payloads that
+    // have to survive a round trip through memory and the signalling-NaN
+    // canonicalization the specification requires on store.
+    Suite {
+        name: "float_memory.wast",
+        source: include_str!("../testdata/float_memory.wast"),
+        directives: &[("module", 6), ("assert_return", 60), ("invoke", 24)],
+    },
+    // A module that reaches a type it does not define, and so cannot decode.
+    Suite {
+        name: "type.wast",
+        source: include_str!("../testdata/type.wast"),
+        directives: &[("module", 1), ("assert_malformed", 2)],
+    },
+    // Custom sections: their placement, their contents, and that a module with
+    // one decodes and runs unchanged.
+    Suite {
+        name: "custom.wast",
+        source: include_str!("../testdata/custom.wast"),
+        directives: &[("module", 3), ("assert_malformed", 8)],
+    },
+    // The `(module ...)` abbreviation of a bare module, which this harness
+    // reaches through the `wast` crate's encoder rather than its own parser.
+    Suite {
+        name: "inline-module.wast",
+        source: include_str!("../testdata/inline-module.wast"),
+        directives: &[("module", 1)],
+    },
+    // Instructions that are unreachable but still have to *validate*: the
+    // validator's dead-code rules are the whole content of this file, and it
+    // has no module and no invocation at all.
+    Suite {
+        name: "unreached-invalid.wast",
+        source: include_str!("../testdata/unreached-invalid.wast"),
+        directives: &[("assert_invalid", 121)],
+    },
+    // The start function: run at instantiation, before any export is callable,
+    // and the `spectest` imports plus `(assert_trap (module ... (start ...)))`
+    // that make this file the reason the harness installs `spectest` and
+    // instantiates a module written inline inside a directive.
+    Suite {
+        name: "start.wast",
+        source: include_str!("../testdata/start.wast"),
+        directives: &[
+            ("module", 5),
+            ("invoke", 4),
+            ("assert_return", 6),
+            ("assert_trap", 1),
+            ("assert_invalid", 3),
+            ("assert_malformed", 1),
+        ],
+    },
+    // `ref.func` and `call_indirect` over them, with the `spectest` print
+    // imports that a module importing a host function has to link against.
+    Suite {
+        name: "func_ptrs.wast",
+        source: include_str!("../testdata/func_ptrs.wast"),
+        directives: &[
+            ("module", 3),
+            ("invoke", 1),
+            ("assert_return", 19),
+            ("assert_trap", 6),
+            ("assert_invalid", 7),
         ],
     },
 ];

@@ -1776,6 +1776,67 @@ impl BaselineModule {
         self.memory.clone()
     }
 
+    /// Call the function a Wasm function index names, whether that is one of
+    /// this module's own functions or an import.
+    ///
+    /// Wasm numbers imported functions before defined ones, so a raw index has
+    /// to be split against the import count. Keeping that split here means there
+    /// is one place that knows it, rather than a caller that has to remember to
+    /// subtract first -- the start function is the case that gets it wrong: a
+    /// module may nominate an *imported* function as its start, and treating
+    /// every start index as a defined one refuses a module the specification
+    /// allows.
+    pub fn call_wasm_index(
+        &mut self,
+        index: u32,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, BaselineError> {
+        if index < self.imports.len() as u32 {
+            // An imported function has no locals and no body: it is entirely a
+            // `CallHost`, so the arguments pass straight through the boundary.
+            return self.call_import(index, args);
+        }
+        let defined = self
+            .defined_index(index)
+            .ok_or(BaselineError::Trap(Trap::HostFailure(
+                "baseline call target is not in the module".into(),
+            )))?;
+        self.call(defined, args)
+    }
+
+    /// Call one of the module's imported functions through the host boundary.
+    fn call_import(&mut self, index: u32, args: Vec<Value>) -> Result<Vec<Value>, BaselineError> {
+        let declaration = self
+            .imports
+            .get(index as usize)
+            .ok_or(BaselineError::Trap(Trap::HostFailure(
+                "baseline host import is out of range".into(),
+            )))?
+            .clone();
+        let qualified = format!("{}::{}", declaration.module, declaration.name);
+        let host = self.host.as_deref_mut().ok_or_else(|| {
+            BaselineError::Host(HostCallFailure {
+                name: qualified,
+                message: "no host boundary was installed".into(),
+            })
+        })?;
+        let returned = host.call(&declaration.module, &declaration.name, args)?;
+        // The host is outside the verified module, so its return is not trusted:
+        // the arity it declared is what this accepts, and anything else is a
+        // host failure rather than a value the module would then compute on.
+        if returned.len() != declaration.function_type.results.0.len() {
+            return Err(BaselineError::Host(HostCallFailure {
+                name: format!("{}::{}", declaration.module, declaration.name),
+                message: format!(
+                    "the host returned {} value(s) but the import declares {}",
+                    returned.len(),
+                    declaration.function_type.results.0.len()
+                ),
+            }));
+        }
+        Ok(returned)
+    }
+
     /// Bound how deep a call chain may get before it traps.
     ///
     /// The runtime sets this from the same `ResourceLimits` Micro reads, so a

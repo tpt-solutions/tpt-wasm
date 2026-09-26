@@ -244,11 +244,12 @@ fn reject_unsupported_module_state(module: &tpt_wasm_format::Module) -> Result<(
             ));
         }
     }
-    if module.start.is_some() {
-        return Err(LoweringError::UnsupportedFeature("start functions"));
-    }
-    // Exports are module metadata rather than code: the runtime resolves them
-    // against the module's own function table, so the IR need not carry them.
+    // A start function is module metadata rather than code, for the same reason
+    // exports are: the runtime already has the Wasm module and runs the start
+    // function on whichever backend the instance will use, after the memory is
+    // wired and the host boundary is installed. Carrying it into the IR would
+    // give the lowerer a second, redundant way to say the same thing, and the two
+    // could disagree.
     Ok(())
 }
 

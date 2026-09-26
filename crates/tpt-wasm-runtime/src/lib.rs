@@ -1206,14 +1206,13 @@ fn instantiate_module(
         // its effects are visible to later calls in baseline mode.
         match instance.baseline.as_mut() {
             Some(module) => {
-                // The start index is a Wasm function index, so it is rebased the
-                // same way an export is.
-                let index = module
-                    .defined_index(start)
-                    .ok_or(RuntimeError::UnsupportedFeature(
-                        "start function is an import in baseline mode",
-                    ))?;
-                module.call(index, Vec::new()).map_err(baseline_error)?;
+                // The start index is a Wasm function index, which may name an
+                // *import*: a module is allowed to nominate a host function as
+                // its start. `call_wasm_index` does the split, so both halves
+                // run on the same backend the instance will use.
+                module
+                    .call_wasm_index(start, Vec::new())
+                    .map_err(baseline_error)?;
             }
             None => {
                 let address = lock_store(&context.store)?
@@ -1238,6 +1237,39 @@ impl Instance {
             .get(index as usize)
             .copied()
             .ok_or_else(|| RuntimeError::UnknownExport(name.to_owned()))
+    }
+
+    /// Read the current value of an exported global.
+    ///
+    /// Read from the store rather than from the module's declaration, because a
+    /// `global.set` inside any function that has run since instantiation is part
+    /// of what the global *is*. The value is copied out, so a caller cannot
+    /// reach the store's copy and hold it past the lock.
+    ///
+    /// The store holds the global on both backends. A compiled module keeps its
+    /// globals in the store like every other state; only its memory and function
+    /// bodies are its own, so this needs no baseline special case.
+    pub fn global(&self, name: &str) -> Result<Value, RuntimeError> {
+        let ExportDesc::Global(index) = self
+            .exports
+            .get(name)
+            .ok_or_else(|| RuntimeError::UnknownExport(name.to_owned()))?
+        else {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "global export".into(),
+                actual: "non-global export".into(),
+            });
+        };
+        let address = lock_store(&self.context.store)?
+            .instance(self.index)?
+            .global_addrs
+            .get(*index as usize)
+            .copied()
+            .ok_or(RuntimeError::UnknownExport(name.to_owned()))?;
+        Ok(lock_store(&self.context.store)?
+            .global(address)?
+            .value
+            .clone())
     }
 
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
@@ -1505,6 +1537,39 @@ mod tests {
 
         fn call(&self, _args: &[Value]) -> Result<Vec<Value>, String> {
             Ok(vec![Value::I32(42)])
+        }
+    }
+
+    /// A host function that only records that it was called.
+    ///
+    /// Used to check that something the engine was supposed to invoke really ran
+    /// -- a start function, for instance, which has no other observable effect
+    /// if it does nothing. The counter is shared with the assertion, so this
+    /// works on both backends from one engine rather than needing a probe module.
+    struct CountingHost {
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+        takes_i32: bool,
+    }
+
+    impl HostFunction for CountingHost {
+        fn function_type(&self) -> FunctionType {
+            if self.takes_i32 {
+                FunctionType {
+                    params: ResultType(vec![ValueType::I32]),
+                    results: ResultType(Vec::new()),
+                }
+            } else {
+                FunctionType {
+                    params: ResultType(Vec::new()),
+                    results: ResultType(Vec::new()),
+                }
+            }
+        }
+
+        fn call(&self, _args: &[Value]) -> Result<Vec<Value>, String> {
+            self.counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
         }
     }
 
@@ -2193,6 +2258,95 @@ mod tests {
             provider.call("load", Vec::new()).unwrap(),
             vec![Value::I32(42)]
         );
+    }
+
+    /// A start function may be an *imported* function.
+    ///
+    /// Wasm numbers imported functions first, so a start index below the import
+    /// count names a host function. The baseline resolved every start index
+    /// against the defined functions only and refused such a module, so a
+    /// perfectly valid module failed to instantiate on one backend and not the
+    /// other. This runs on both backends so the two cannot drift apart again.
+    #[test]
+    fn an_imported_function_may_be_the_start_function() {
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = Arc::clone(&counter);
+            // (func $note (import "env" "note")) ; (start 0)
+            // The start function must have type [] -> [], so the import takes no
+            // parameters; `start.wast` has exactly this shape against
+            // `spectest.print`.
+            let module = Module {
+                types: vec![FunctionType {
+                    params: ResultType(Vec::new()),
+                    results: ResultType(Vec::new()),
+                }],
+                imports: vec![import("env", "note", ImportDesc::Function(0))],
+                functions: vec![function(0, vec![0x10, 0x00, 0x0b])],
+                start: Some(0),
+                ..Module::default()
+            };
+            let config = Config {
+                engine_mode: mode,
+                ..Config::default()
+            };
+            let mut engine = Engine::new(config).unwrap();
+            engine.linker_mut().define_function(
+                "env",
+                "note",
+                CountingHost {
+                    counter: seen,
+                    takes_i32: false,
+                },
+            );
+            engine
+                .instantiate(module)
+                .unwrap_or_else(|error| panic!("{mode:?} refused an imported start: {error}"));
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{mode:?} did not run the imported start function"
+            );
+        }
+    }
+
+    /// A `global` export reads the value in the store, not the initializer.
+    ///
+    /// The distinction is the whole point: a `global.set` that has already run
+    /// is part of what the global is, and the spec suite checks that a later
+    /// `(get ...)` sees the earlier write. Reading the declaration instead
+    /// would always return the initializer.
+    #[test]
+    fn reading_a_global_export_sees_what_a_function_wrote() {
+        // (global $g (mut i32) (i32.const 1)) (func (global.set $g (i32.const 9)))
+        // (export "g" (global 0)) (export "set" (func 0))
+        let module = Module {
+            types: vec![
+                i32_result_type(),
+                FunctionType {
+                    params: ResultType(Vec::new()),
+                    results: ResultType(Vec::new()),
+                },
+            ],
+            globals: vec![Global {
+                global_type: GlobalType {
+                    value_type: ValueType::I32,
+                    mutable: true,
+                },
+                init: const_i32(1),
+            }],
+            functions: vec![function(1, vec![0x41, 0x09, 0x24, 0x00, 0x0b])],
+            exports: vec![
+                export("g", ExportDesc::Global(0)),
+                export("set", ExportDesc::Function(0)),
+            ],
+            ..Module::default()
+        };
+        let engine = Engine::new(Config::default()).unwrap();
+        let mut instance = engine.instantiate(module).unwrap();
+        assert_eq!(instance.global("g").unwrap(), Value::I32(1));
+        instance.call("set", Vec::new()).unwrap();
+        assert_eq!(instance.global("g").unwrap(), Value::I32(9));
     }
 
     #[test]

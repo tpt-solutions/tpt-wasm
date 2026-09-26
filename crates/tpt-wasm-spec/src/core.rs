@@ -27,11 +27,70 @@
 //! can be run through `Micro` and through the compiled baseline. Everything
 //! between the decoded bytes and the compared result is identical either way, so
 //! a disagreement between the two is a disagreement about execution.
+//!
+//! Several Core suite modules import from `spectest`, the host module the
+//! reference interpreter's own test runner supplies. Only its *functions* are
+//! defined here; its globals, table, and memory are not, because this project
+//! cannot yet import those. The print functions are the ones that exist purely
+//! to be called and to discard, so they are defined as no-ops: what the suite
+//! checks about them is that a module importing one links and runs, never what
+//! the call prints.
 
 use std::collections::HashMap;
 
-use tpt_wasm_runtime::{Config, Engine, EngineMode, Instance, RuntimeError};
-use tpt_wasm_types::{Trap, Value};
+use tpt_wasm_runtime::{Config, Engine, EngineMode, HostFunction, Instance, RuntimeError};
+use tpt_wasm_types::{FunctionType, ResultType, Trap, Value, ValueType};
+
+/// The `spectest` print functions, as `(name, parameter types)`.
+///
+/// The upstream `spectest` module defines these with exactly these signatures,
+/// and a module that imports one is checked against the signature at link time,
+/// so the parameter types are part of what is under test rather than a detail.
+const SPECTEST_PRINTS: &[(&str, &[ValueType])] = &[
+    ("print", &[]),
+    ("print_i32", &[ValueType::I32]),
+    ("print_i64", &[ValueType::I64]),
+    ("print_f32", &[ValueType::F32]),
+    ("print_f64", &[ValueType::F64]),
+    ("print_i32_f32", &[ValueType::I32, ValueType::F32]),
+    ("print_f64_f64", &[ValueType::F64, ValueType::F64]),
+];
+
+/// A `spectest` print function, which consumes its arguments and returns nothing.
+struct SpectestPrint {
+    parameters: &'static [ValueType],
+}
+
+impl HostFunction for SpectestPrint {
+    fn function_type(&self) -> FunctionType {
+        FunctionType {
+            params: ResultType(self.parameters.to_vec()),
+            results: ResultType(Vec::new()),
+        }
+    }
+
+    fn call(&self, args: &[Value]) -> Result<Vec<Value>, String> {
+        // Nothing is printed. The suite's assertions are on what the *module*
+        // does around the call, and a print has no observable effect on either
+        // backend, so a faithful no-op is also the only way the two backends can
+        // be compared against each other.
+        debug_assert_eq!(args.len(), self.parameters.len());
+        Ok(Vec::new())
+    }
+}
+
+/// Install the `spectest` functions a suite module may import.
+///
+/// Returns an error rather than panicking because a missing `spectest` import
+/// would otherwise be reported as a link failure and read as an engine bug.
+fn define_spectest(engine: &mut Engine) -> Result<(), String> {
+    for (name, parameters) in SPECTEST_PRINTS {
+        engine
+            .linker_mut()
+            .define_function("spectest", *name, SpectestPrint { parameters });
+    }
+    Ok(())
+}
 
 use wast::core::{NanPattern, WastArgCore, WastRetCore};
 use wast::parser::ParseBuffer;
@@ -87,7 +146,10 @@ pub fn run_core_suite_with(source: &str, mode: EngineMode) -> Result<Vec<CoreCas
         engine_mode: mode,
         ..Config::default()
     };
-    let engine = Engine::new(config).map_err(|error| error.to_string())?;
+    let mut engine = Engine::new(config).map_err(|error| error.to_string())?;
+    // Installed before any directive runs, so a module's very first `spectest`
+    // import links the way the reference interpreter's runner provides it.
+    define_spectest(&mut engine)?;
     let mut runner = Runner {
         engine,
         modules: Vec::new(),
@@ -307,12 +369,41 @@ impl Runner {
                 let module = invoke.module.map(|id| id.name().to_string());
                 self.invoke(module.as_deref(), invoke.name, &invoke.args)
             }
-            WastExecute::Wat(_) => Err(ExecFailure::Other(
-                "inline-module execution is not supported".into(),
-            )),
-            WastExecute::Get { .. } => Err(ExecFailure::Other(
-                "global `get` execution is not supported".into(),
-            )),
+            WastExecute::Wat(mut quote) => {
+                // A module written inline inside an `assert_trap` or
+                // `assert_return`, rather than as its own `module` directive. It
+                // still has to be encoded and instantiated for real, because
+                // what the directive asserts is a property of *instantiating*
+                // it: for `assert_trap` it is that the start function traps.
+                // The instance is kept as the current one so a following
+                // directive can address it, matching how a `module` directive
+                // behaves.
+                let bytes = quote
+                    .encode()
+                    .map_err(|error| ExecFailure::Other(format!("could not encode: {error}")))?;
+                // `?` rather than a `map_err` to a string, so that a start
+                // function that *traps* stays classified as a trap: the whole
+                // point of `(assert_trap (module ... (start $t)) ...)` is that
+                // the trap happens during instantiation, and flattening it into
+                // a message would make the directive report a link failure.
+                let instance = self.engine.instantiate_bytes(&bytes)?;
+                let index = self.modules.len();
+                self.modules.push(instance);
+                self.current = Some(index);
+                Ok(Vec::new())
+            }
+            WastExecute::Get { global, module, .. } => {
+                let module = module.map(|id| id.name().to_string());
+                let instance = self.resolve(module.as_deref())?;
+                // Reading the store's copy rather than the module's declaration:
+                // a `global.set` that has already run is part of the value, and
+                // `exports.wast` checks exactly that a later module sees the
+                // earlier one's writes.
+                let value = instance
+                    .global(global)
+                    .map_err(|error| ExecFailure::Other(error.to_string()))?;
+                Ok(vec![value])
+            }
         }
     }
 }
