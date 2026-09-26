@@ -48,20 +48,15 @@
 //!   implemented.
 //! - `token.wast` needs the `spectest` host import module and passive data
 //!   segments (bulk memory), neither implemented.
-//! - `memory_grow.wast` now passes completely on `Micro` — all 106 directives,
-//!   including a memory grown across three instances and re-imported twice. It
-//!   still cannot join the table because of the *baseline*: a compiled module
-//!   owns a private `BaselineMemory` rather than sharing the store's, so an
-//!   imported memory has nowhere to live, and the IR refuses non-function
-//!   imports. Left out whole rather than split, because the file has to stay
-//!   unmodified.
 //! - `names.wast` contains identifiers with bidirectional-control Unicode
 //!   characters that the `wast` crate's lexer refuses outright, before this
 //!   harness ever sees them.
 //! - Everything else not listed above and not already vendored -- the remaining
-//!   module, linking, import/export, and function/table families -- is blocked
-//!   on multi-module linking or on an unimplemented proposal, and is recorded in
-//!   `todo.md` rather than guessed at.
+//!   table, element, data, function, type, and start families -- needs table and
+//!   global *imports*, which the IR still refuses and which neither backend
+//!   shares yet, or one of the proposals above. `memory_grow.wast` was the same
+//!   case until cross-instance memory sharing landed; it now passes on both
+//!   backends and is in the table below. `todo.md` records the rest.
 
 use std::collections::HashMap;
 
@@ -312,6 +307,19 @@ const SUITES: &[Suite] = &[
         name: "memory_redundancy.wast",
         source: include_str!("../testdata/memory_redundancy.wast"),
         directives: &[("module", 1), ("assert_return", 4), ("invoke", 3)],
+    },
+    // `memory.grow` plus a memory grown across three instances and re-imported
+    // twice, which is what the shared-memory work in the baseline exists for.
+    Suite {
+        name: "memory_grow.wast",
+        source: include_str!("../testdata/memory_grow.wast"),
+        directives: &[
+            ("module", 8),
+            ("assert_return", 80),
+            ("assert_trap", 7),
+            ("assert_invalid", 9),
+            ("register", 2),
+        ],
     },
 ];
 

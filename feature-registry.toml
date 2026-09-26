@@ -123,8 +123,8 @@ mvp_verified = "partial"
 # with their data count section, and function bodies being stored as raw bytes
 # instead of parsed.
 #
-# `mvp_tested` is `"partial"` rather than `false`: 33 Core suite files now run
-# through `crates/tpt-wasm-spec/tests/core_spec.rs`, driving 10,145 `invoke`/
+# `mvp_tested` is `"partial"` rather than `false`: 34 Core suite files now run
+# through `crates/tpt-wasm-spec/tests/core_spec.rs`, driving 10,251 `invoke`/
 # `assert_return`/`assert_trap`/`assert_exhaustion`/`register` directives through
 # the real decode -> validate -> instantiate -> call pipeline with exact NaN
 # bit-pattern checking -- once on the Micro backend and once on the compiled
@@ -157,11 +157,23 @@ mvp_verified = "partial"
 #     from the store at resolution time now, and a memory reports its current
 #     page count. `ExternalKind` existed only to carry that snapshot and is gone,
 #     replaced by one accessor per kind so the stale value cannot come back.
-# With linking working, memory_grow.wast passes completely on Micro (all 106
-# directives, a memory grown across three instances and re-imported twice). It
-# still cannot join the shared table because of the baseline: a compiled module
-# owns a private `BaselineMemory` rather than sharing the store's, so an imported
-# memory has nowhere to live. That half is the next increment.
+# memory_grow.wast (106 directives) then passed entirely on Micro, and getting it
+# onto the baseline was a design change rather than a patch: a compiled module
+# owned a private `BaselineMemory`, so an imported memory had nowhere to live and
+# the two backends each mutated only their own copy. `IrMemory` now records
+# whether the memory is `imported`; a defined memory is allocated and published
+# as a `SharedMemory` handle that the runtime keeps keyed by store address, an
+# importing module looks that handle up and installs the same one, and `ExecState`
+# locks it for the duration of a call. Re-exports need no special case, because
+# the address is the original's however many times the memory is passed along.
+# That work exposed one more bug: the external type of an exported memory was read
+# from the store, which in baseline mode knows nothing about the compiled module's
+# growth, so an importer was matched against a stale size. The length now comes
+# from whichever backend owns the memory -- which is what makes the two backends
+# agree on what a memory is, precisely the question a cross-instance import asks.
+# memory_grow.wast now passes on both backends and joins the table (34 files,
+# 10,251 directives). Tables and globals are not shared this way yet, and the IR
+# still refuses to import them.
 #
 # Running that suite on the baseline found six more real bugs, all fixed, and
 # they are worth recording because five of them are in the lowering, which no

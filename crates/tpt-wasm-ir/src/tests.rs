@@ -2490,6 +2490,8 @@ fn unsupported_module_state_and_instructions_are_rejected() {
             min_pages: 2,
             max_pages: Some(4),
             segments: Vec::new(),
+            // The module declares this memory, so the embedder does not supply it.
+            imported: false,
         })
     );
     assert_eq!(lowered.globals.len(), 1);

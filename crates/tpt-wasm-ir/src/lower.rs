@@ -112,9 +112,28 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             bytes: segment.data.clone(),
         });
     }
-    let memory = match module.memories.as_slice() {
-        [] => None,
-        [only] => {
+    // A module either defines its memory or imports one, never both, and neither
+    // puts an entry in the memory *section* when the memory is imported. The
+    // declared limits of an imported memory are kept because they are the
+    // module's own declaration, but nothing is sized from them: the embedder
+    // supplies the memory, and it must be the very one the exporting instance
+    // holds, or a store through one instance would be invisible to the other.
+    // The data segments are the importing module's own and apply to the imported
+    // memory exactly as they would to a defined one, so they are carried either
+    // way and applied when the memory arrives.
+    let imported_memory = module.imports.iter().find_map(|import| match import.desc {
+        tpt_wasm_format::ImportDesc::Memory(memory_type) => Some(memory_type.limits),
+        _ => None,
+    });
+    let memory = match (module.memories.as_slice(), imported_memory) {
+        ([], Some(limits)) => Some(IrMemory {
+            min_pages: limits.min,
+            max_pages: limits.max,
+            segments,
+            imported: true,
+        }),
+        ([], None) => None,
+        ([only], _) => {
             if only.memory_type.memory64 {
                 return Err(LoweringError::UnsupportedFeature("64-bit memory"));
             }
@@ -122,6 +141,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
                 min_pages: only.memory_type.limits.min,
                 max_pages: only.memory_type.limits.max,
                 segments,
+                imported: false,
             })
         }
         _ => return Err(LoweringError::UnsupportedFeature("multiple memories")),
@@ -210,11 +230,18 @@ fn element_segment_offset(expr: &tpt_wasm_format::ConstExpr) -> Result<u32, Lowe
 
 fn reject_unsupported_module_state(module: &tpt_wasm_format::Module) -> Result<(), LoweringError> {
     // Function imports are supported: they become `IrImport` entries and a
-    // `CallHost` crossing the host boundary. A table, memory, or global import
-    // has no initializer the IR could carry, so it is still refused.
+    // `CallHost` crossing the host boundary. A memory import is also carried, as
+    // an `IrMemory` the embedder fills in, so a compiled module can share the
+    // exporting instance's memory. A table or global import has no such form and
+    // is still refused.
     for import in &module.imports {
-        if !matches!(import.desc, tpt_wasm_format::ImportDesc::Function(_)) {
-            return Err(LoweringError::UnsupportedFeature("non-function imports"));
+        if !matches!(
+            import.desc,
+            tpt_wasm_format::ImportDesc::Function(_) | tpt_wasm_format::ImportDesc::Memory(_)
+        ) {
+            return Err(LoweringError::UnsupportedFeature(
+                "table and global imports",
+            ));
         }
     }
     if module.start.is_some() {
@@ -233,9 +260,18 @@ fn lower_imports(module: &tpt_wasm_format::Module) -> Result<Vec<super::IrImport
     let mut imports = Vec::new();
     for import in &module.imports {
         let tpt_wasm_format::ImportDesc::Function(type_index) = import.desc else {
+            // A memory import is not an `IrImport`: it carries no callable
+            // signature and becomes an `IrMemory` instead. Only *function*
+            // imports occupy a function index, so leaving them out of this list is
+            // what keeps a `CallHost` index addressing the right callee.
+            if matches!(import.desc, tpt_wasm_format::ImportDesc::Memory(_)) {
+                continue;
+            }
             // Rejected by `reject_unsupported_module_state`; repeated here so
             // this function stands on its own.
-            return Err(LoweringError::UnsupportedFeature("non-function imports"));
+            return Err(LoweringError::UnsupportedFeature(
+                "table and global imports",
+            ));
         };
         let function_type = module
             .types

@@ -35,6 +35,15 @@ back edge.
 is shared across calls the way it is in Wasm: a callee observes the caller's
 stores, and a `global.set` inside a callee is visible to the caller.
 
+The memory is a `SharedMemory` handle rather than an owned value, because a
+module that *imports* a memory has to reach the same one the exporting instance
+holds, not a copy of it — a copy would pass every type check and then silently
+lose every write. `memory_handle` publishes the handle and `set_memory` installs
+one, which is how `tpt-wasm-runtime` wires a cross-instance import on this
+backend. The handle is locked for the duration of a call rather than per access,
+so the module sees its own stores and no observer can see a half-applied one.
+Globals and tables are not shared this way yet.
+
 `execute` and `execute_with` have no module, so a function that touches memory or
 globals reports that it needs one rather than reading uninitialized data. Use
 `BaselineModule::lower` followed by `call`.
@@ -119,7 +128,10 @@ construction.
 the freshly allocated memory before any function can run, so the ordering rule
 the specification requires is structural rather than incidental: a later segment
 overwrites an earlier one at the same address. Growth appends zeroed pages and
-leaves the segment's bytes untouched.
+leaves the segment's bytes untouched. An *imported* memory's segments are held
+rather than applied at construction — the memory does not exist yet — and are
+written by `set_memory` the moment it arrives, which is still before any function
+can run and after the exporting instance's own segments, as required.
 
 A segment that would not fit the declared memory is rejected as a lowering
 error. The validator already bounds-checks it, so reaching that arm means the two

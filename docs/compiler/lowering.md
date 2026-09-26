@@ -32,7 +32,7 @@ expose an unverified intermediate module.
 
 The lowerer rejects a module containing:
 
-- a table, memory, or global import, which has no initializer the IR could carry;
+- a table or global import, which has no initializer the IR could carry;
   function imports are supported and become `IrImport` entries;
 - start functions;
 - passive data segments, and a non-zero data-segment memory index;

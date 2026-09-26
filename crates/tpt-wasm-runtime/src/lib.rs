@@ -244,6 +244,14 @@ struct RuntimeContext {
     /// The limits the store was built with, kept here so a caller that cannot
     /// reach the store can still be told what the instance is bounded by.
     limits: ResourceLimits,
+    /// Baseline memories, keyed by the store address of the memory they are.
+    ///
+    /// A compiled module owns no memory of its own: it holds a shared handle, so
+    /// an instance that imports another's memory reaches the very same one. This
+    /// is where an exporting instance publishes its handle and an importing one
+    /// finds it. Keyed by store address because that is what an import resolves
+    /// to, and because it stays the same through any number of re-exports.
+    baseline_memories: Arc<Mutex<HashMap<u32, tpt_wasm_codegen::SharedMemory>>>,
 }
 
 impl RuntimeContext {
@@ -253,6 +261,7 @@ impl RuntimeContext {
             call_gate: Arc::new(Mutex::new(())),
             host_functions: Arc::new(Mutex::new(HashMap::new())),
             limits,
+            baseline_memories: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -285,6 +294,14 @@ fn lock_host_functions(
     functions: &Arc<Mutex<HostFunctionMap>>,
 ) -> Result<MutexGuard<'_, HostFunctionMap>, RuntimeError> {
     functions.lock().map_err(|_| RuntimeError::StorePoisoned)
+}
+
+type BaselineMemoryMap = HashMap<u32, tpt_wasm_codegen::SharedMemory>;
+
+fn lock_baseline_memories(
+    memories: &Arc<Mutex<BaselineMemoryMap>>,
+) -> Result<MutexGuard<'_, BaselineMemoryMap>, RuntimeError> {
+    memories.lock().map_err(|_| RuntimeError::StorePoisoned)
 }
 
 #[derive(Clone)]
@@ -663,17 +680,40 @@ fn external_table_type(store: &Store, address: u32) -> Result<TableType, Runtime
 }
 
 /// The external type of an exported memory.
-fn external_memory_type(store: &Store, address: u32) -> Result<MemoryType, RuntimeError> {
+///
+/// A memory instance's external type carries its *current* length, not the
+/// minimum it was declared with. A memory that has grown is externally larger
+/// than it was declared, and import matching compares that current size against
+/// the importer's declared minimum. Reporting the declared minimum instead
+/// refuses exactly the modules the specification means to allow: one module
+/// grows a memory, exports it, and another imports it requiring the size it is
+/// now.
+///
+/// The length is read from whichever backend actually owns the memory. In
+/// `Micro` mode that is the store; in `Baseline` mode it is the compiled
+/// module's shared memory, which the store's copy knows nothing about because a
+/// compiled module grows its own and never touches the store's. Reading the
+/// store either way would report a stale size in baseline mode, and the two
+/// backends would disagree about what a memory is -- which is exactly what a
+/// cross-instance import is asking.
+fn external_memory_type(
+    context: &RuntimeContext,
+    store: &Store,
+    address: u32,
+) -> Result<MemoryType, RuntimeError> {
+    if let Some(shared) = lock_baseline_memories(&context.baseline_memories)?.get(&address) {
+        let compiled = shared.lock().map_err(|_| RuntimeError::StorePoisoned)?;
+        return Ok(MemoryType {
+            limits: Limits {
+                min: u64::from(compiled.pages()),
+                max: compiled.max_pages(),
+            },
+            memory64: false,
+        });
+    }
     let memory = store.memory(address)?;
     Ok(MemoryType {
         limits: Limits {
-            // A memory instance's external type carries its *current* length, not
-            // the minimum it was declared with. A memory that has grown is
-            // externally larger than it was declared, and import matching compares
-            // that current size against the importer's declared minimum. Reporting
-            // the declared minimum instead refuses exactly the modules the
-            // specification means to allow: one module grows a memory, exports it,
-            // and another imports it requiring the size it is now.
             min: memory.pages(),
             max: memory.declared_max_pages,
         },
@@ -929,7 +969,7 @@ fn instantiate_module(
                     return Err(incompatible(import, "definition is not a memory"));
                 };
                 same_context(&context, export)?;
-                let actual = external_memory_type(&store, export.address)?;
+                let actual = external_memory_type(&context, &store, export.address)?;
                 if !limits_match(&actual.limits, &expected.limits) {
                     return Err(incompatible(
                         import,
@@ -1082,6 +1122,12 @@ fn instantiate_module(
             .write(address as u64, &segment.data)?;
     }
 
+    // Captured before `memory_addrs` moves into the store instance, because the
+    // baseline's memory wiring needs the address the module's memory 0 resolved
+    // to -- whether the module defined it or imported it, that is the same
+    // address, which is exactly why the two instances can share one memory.
+    let baseline_memory_address = memory_addrs.first().copied();
+
     let store_instance = StoreInstance {
         module_types: module.types.clone(),
         func_addrs,
@@ -1128,6 +1174,32 @@ fn instantiate_module(
         // makes a runaway recursion trap identically on both backends instead of
         // trapping in one and overflowing the host stack in the other.
         module.set_max_call_depth(context.limits.max_call_depth);
+        // A compiled module holds a shared handle to its memory rather than owning
+        // one, so that an instance importing another's memory reaches the same
+        // bytes. A module that defines its memory publishes the handle under the
+        // address it allocated; a module that imports one looks the handle up
+        // there and installs it. Re-exports need no special case: the address is
+        // the original's, so the handle is found under it however many times the
+        // memory has been passed along.
+        if let Some(address) = baseline_memory_address {
+            if let Some(shared) = module.memory_handle() {
+                lock_baseline_memories(&context.baseline_memories)?.insert(address, shared);
+            } else {
+                let shared = lock_baseline_memories(&context.baseline_memories)?
+                    .get(&address)
+                    .cloned()
+                    .ok_or(RuntimeError::UnsupportedFeature(
+                        "a memory imported in baseline mode that no instance in this store exports",
+                    ))?;
+                module.set_memory(shared).map_err(|_| {
+                    RuntimeError::UnsupportedFeature("an imported memory in baseline mode")
+                })?;
+            }
+        } else if module.memory_handle().is_some() {
+            return Err(RuntimeError::UnsupportedFeature(
+                "a compiled memory with no store address",
+            ));
+        }
     }
     if let Some(start) = start {
         // The start function runs on the same backend the instance will use, so
@@ -2043,6 +2115,80 @@ mod tests {
             vec![Value::I32(7)]
         );
         // The exporter sees the importer's write, so the two share one memory.
+        assert_eq!(
+            provider.call("load", Vec::new()).unwrap(),
+            vec![Value::I32(42)]
+        );
+    }
+
+    /// The compiled backend shares an imported memory rather than copying it.
+    ///
+    /// The baseline runs against its own `BaselineMemory`, not the store's, so a
+    /// module that imported a copy would satisfy every type check and then quietly
+    /// lose every write. Growing the memory through the exporter and storing
+    /// through the importer covers both halves: the grow has to be visible in the
+    /// size the importer is matched against, and the store in the memory the
+    /// exporter reads back.
+    #[test]
+    fn the_baseline_shares_an_imported_memory() {
+        fn memtype(min: u64) -> MemoryType {
+            MemoryType {
+                limits: Limits { min, max: None },
+                memory64: false,
+            }
+        }
+        let provider = Module {
+            types: vec![i32_result_type()],
+            memories: vec![Memory {
+                memory_type: memtype(1),
+            }],
+            functions: vec![
+                // i32.const 1; memory.grow; end
+                function(0, vec![0x41, 0x01, 0x40, 0x00, 0x0b]),
+                // i32.const 0; i32.load; end
+                function(0, vec![0x41, 0x00, 0x28, 0x02, 0x00, 0x0b]),
+            ],
+            exports: vec![
+                export("memory", ExportDesc::Memory(0)),
+                export("grow", ExportDesc::Function(0)),
+                export("load", ExportDesc::Function(1)),
+            ],
+            ..Module::default()
+        };
+        // The importer requires two pages, which is only the case if the grow the
+        // exporter already did is visible when this import is matched.
+        let consumer = Module {
+            types: vec![i32_result_type()],
+            imports: vec![import("provider", "memory", ImportDesc::Memory(memtype(2)))],
+            // i32.const 0; i32.const 42; i32.store; i32.const 7; end
+            functions: vec![function(
+                0,
+                vec![0x41, 0x00, 0x41, 42, 0x36, 0x02, 0x00, 0x41, 0x07, 0x0b],
+            )],
+            exports: vec![export("store", ExportDesc::Function(0))],
+            ..Module::default()
+        };
+        let config = Config {
+            engine_mode: EngineMode::Baseline,
+            ..Config::default()
+        };
+        let mut engine = Engine::new(config).unwrap();
+        let mut provider = engine.instantiate(provider).unwrap();
+        engine
+            .linker_mut()
+            .define_instance("provider", &provider)
+            .unwrap();
+        assert_eq!(
+            provider.call("grow", Vec::new()).unwrap(),
+            vec![Value::I32(1)]
+        );
+        let mut consumer = engine
+            .instantiate(consumer)
+            .expect("the baseline must share the memory the exporter grew");
+        assert_eq!(
+            consumer.call("store", Vec::new()).unwrap(),
+            vec![Value::I32(7)]
+        );
         assert_eq!(
             provider.call("load", Vec::new()).unwrap(),
             vec![Value::I32(42)]

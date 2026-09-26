@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tpt_wasm_ir::{BlockId, IrFunction, IrInstr, Terminator, ValueId};
 use tpt_wasm_types::{FunctionType, ResourceLimits, Trap, Value, ValueType};
@@ -1450,6 +1451,11 @@ impl BaselineMemory {
         u32::try_from(self.data.len() / PAGE_SIZE).unwrap_or(u32::MAX)
     }
 
+    /// The declared maximum page count, or `None` when the module set none.
+    pub fn max_pages(&self) -> Option<u64> {
+        self.max_pages
+    }
+
     /// Read `width` bytes little-endian, trapping if the access is out of bounds.
     fn read(&self, address: u64, width: u64) -> Result<u64, Trap> {
         let end = address.checked_add(width).ok_or(Trap::MemoryOutOfBounds)?;
@@ -1517,7 +1523,14 @@ pub struct BaselineModule {
     table: Option<BaselineTable>,
     /// The module's function types, needed to check an indirect call's target.
     types: Vec<FunctionType>,
-    memory: Option<BaselineMemory>,
+    memory: Option<SharedMemory>,
+    /// A memory this module imports, awaiting the memory the embedder shares.
+    ///
+    /// The declaration is held rather than discarded so its data segments can be
+    /// applied the moment the memory arrives: an importing module's own active
+    /// segments write into the memory it imports, and they have to land after the
+    /// exporter's own segments and before any function runs.
+    pending_imported_memory: Option<tpt_wasm_ir::IrMemory>,
     globals: Vec<Value>,
     /// The imported functions, in declaration order, that a `CallHost` names.
     imports: Vec<tpt_wasm_ir::IrImport>,
@@ -1535,6 +1548,29 @@ pub struct BaselineModule {
     /// trap, and Micro enforces the same number from `ResourceLimits`, so the two
     /// backends fail the same call the same way.
     max_call_depth: usize,
+}
+
+/// A baseline memory shared by every instance that imports or exports it.
+///
+/// Sharing is what makes a cross-instance import mean the same thing on this
+/// backend as on the interpreter's. A module that imports a memory must reach the
+/// *same* memory the exporting instance holds, not a copy of it: a store through
+/// one has to be visible to the other, and a grow through either has to change
+/// what both see. The handle is shared rather than owned for that reason.
+pub type SharedMemory = Arc<Mutex<BaselineMemory>>;
+
+/// Lock a shared memory for the duration of an execution.
+///
+/// A poisoned lock means a previous execution panicked while holding it, which
+/// this crate does not do; it is reported rather than papered over, because
+/// continuing would read a memory that may be half-updated.
+fn lock_shared(shared: &SharedMemory) -> Result<MutexGuard<'_, BaselineMemory>, BaselineError> {
+    shared.lock().map_err(|_| {
+        BaselineError::Host(HostCallFailure {
+            name: "baseline memory".to_owned(),
+            message: "a previous execution left the shared memory locked".to_owned(),
+        })
+    })
 }
 
 /// A table of optional function references, as MVP `funcref` tables hold.
@@ -1618,6 +1654,27 @@ pub trait HostBoundary {
     ) -> Result<Vec<Value>, HostCallFailure>;
 }
 
+/// Write a module's active data segments into a memory, in module order.
+///
+/// Order is the point: a later segment overwrites an earlier one at the same
+/// address, so they cannot be applied out of order or merged.
+fn apply_segments(
+    memory: &mut BaselineMemory,
+    segments: &[tpt_wasm_ir::IrDataSegment],
+) -> Result<(), CodegenError> {
+    for segment in segments {
+        let start = segment.offset as usize;
+        let end = start + segment.bytes.len();
+        if end > memory.data.len() {
+            return Err(CodegenError::UnsupportedMemory(
+                "data segment does not fit the memory",
+            ));
+        }
+        memory.data[start..end].copy_from_slice(&segment.bytes);
+    }
+    Ok(())
+}
+
 impl BaselineModule {
     /// Build a runnable module from a verified IR module and its lowered
     /// functions, which must be in the same order.
@@ -1625,24 +1682,19 @@ impl BaselineModule {
         module: &tpt_wasm_ir::IrModule,
         functions: Vec<BaselineFunction>,
     ) -> Result<Self, CodegenError> {
-        let memory = match module.memory.as_ref() {
+        // A defined memory is allocated here and shared by handle, so an instance
+        // that later imports it can be given the same memory. An imported memory
+        // is not allocated at all: the embedder supplies it, and the declaration
+        // is kept so its data segments can be applied on arrival.
+        let (memory, pending_imported_memory) = match module.memory.as_ref() {
+            Some(declaration) if declaration.imported => (None, Some(declaration.clone())),
             Some(declaration) => {
-                let mut memory = BaselineMemory::new(declaration.min_pages, declaration.max_pages)?;
-                // Active data segments are applied in module order, so a later
-                // segment overwrites an earlier one at the same address.
-                for segment in &declaration.segments {
-                    let start = segment.offset as usize;
-                    let end = start + segment.bytes.len();
-                    if end > memory.data.len() {
-                        return Err(CodegenError::UnsupportedMemory(
-                            "data segment does not fit the memory",
-                        ));
-                    }
-                    memory.data[start..end].copy_from_slice(&segment.bytes);
-                }
-                Some(memory)
+                let mut allocated =
+                    BaselineMemory::new(declaration.min_pages, declaration.max_pages)?;
+                apply_segments(&mut allocated, &declaration.segments)?;
+                (Some(Arc::new(Mutex::new(allocated))), None)
             }
-            None => None,
+            None => (None, None),
         };
         let table = match module.tables.first() {
             Some(declaration) => {
@@ -1672,6 +1724,7 @@ impl BaselineModule {
             globals: module.globals.iter().map(|g| g.init.clone()).collect(),
             imports: module.imports.clone(),
             host: None,
+            pending_imported_memory,
             // The same default Micro starts from, so a module that recurses until
             // it traps does so at the same depth on either backend.
             max_call_depth: ResourceLimits::default().max_call_depth,
@@ -1696,6 +1749,31 @@ impl BaselineModule {
     pub fn set_host(&mut self, host: impl HostBoundary + 'static) -> &mut Self {
         self.host = Some(Box::new(host));
         self
+    }
+
+    /// Supply the memory this module imports.
+    ///
+    /// The handle has to be the one the exporting instance holds, not a copy:
+    /// that is what makes a store through either visible to both. The importing
+    /// module's own active data segments are applied here, before any function
+    /// can run and after the exporter's own segments, which is the order the
+    /// specification requires.
+    pub fn set_memory(&mut self, memory: SharedMemory) -> Result<(), CodegenError> {
+        if let Some(declaration) = self.pending_imported_memory.take() {
+            let mut guard = lock_shared(&memory)
+                .map_err(|_| CodegenError::UnsupportedMemory("shared memory is locked"))?;
+            apply_segments(&mut guard, &declaration.segments)?;
+        }
+        self.memory = Some(memory);
+        Ok(())
+    }
+
+    /// The handle to this module's memory, for an instance that imports it.
+    ///
+    /// `None` for a module that defines no memory, and for one that imports a
+    /// memory it has not been given yet.
+    pub fn memory_handle(&self) -> Option<SharedMemory> {
+        self.memory.clone()
     }
 
     /// Bound how deep a call chain may get before it traps.
@@ -1725,12 +1803,18 @@ impl BaselineModule {
         // `self`, which lets the recursive call take `&mut state` as well.
         let functions: &[BaselineFunction] = &self.functions;
         let imports: &[tpt_wasm_ir::IrImport] = &self.imports;
+        // The memory is locked for the whole execution, not per access, so the
+        // module sees its own stores and no observer can see a half-applied one.
+        let mut memory = match self.memory.as_ref() {
+            Some(shared) => Some(lock_shared(shared)?),
+            None => None,
+        };
         let mut state = ExecState {
             functions,
             imports,
             table: self.table.as_ref(),
             types: &self.types,
-            memory: self.memory.as_mut(),
+            memory: memory.as_deref_mut(),
             globals: &mut self.globals,
             host: self.host.as_deref_mut(),
             // The entry call is itself a frame, exactly as Micro counts the

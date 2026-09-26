@@ -101,6 +101,14 @@ pub struct IrMemory {
     /// Applied at instantiation, before any function runs, so a later segment
     /// overwrites an earlier one at the same address.
     pub segments: Vec<IrDataSegment>,
+    /// True when the module imports its memory rather than defining it.
+    ///
+    /// The declared limits above are then the *import's* declaration, which the
+    /// import check has already matched against the exporting instance; they are
+    /// not what the memory is sized from. Nothing is allocated here: the embedder
+    /// supplies the memory, and it has to be the same one the exporter holds so
+    /// that a store through either is visible to both.
+    pub imported: bool,
 }
 
 /// One active data segment: bytes written at `offset` when the module starts.

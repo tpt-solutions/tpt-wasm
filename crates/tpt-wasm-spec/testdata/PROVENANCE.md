@@ -30,6 +30,7 @@ These files are copied unmodified from the WebAssembly specification repository:
 | `memory_size.wast` | Core suite: `memory.size` against declared minimum and maximum. |
 | `memory_trap.wast` | Core suite: out-of-bounds loads and stores at and around the memory limit. |
 | `memory_redundancy.wast` | Core suite: that a store is visible to the next load rather than to a stale copy. |
+| `memory_grow.wast` | Core suite: `memory.grow` against the page limits, and a memory grown across three instances and re-imported twice, which is what exercises cross-instance memory sharing. |
 
 All Core suite files above were vendored from revision
 `608711107b7f1edb13efd57b7d79b49477462d36` of the spec repository, fetched as raw
@@ -44,17 +45,17 @@ and re-checking the assertion counts in `tests/binary_format.rs` and the
 directive counts in `tests/core_spec.rs`, which are asserted so that a silent
 change in coverage fails the build.
 
-`memory_grow.wast` is deliberately *not* vendored: all 106 of its directives
-pass on the `Micro` backend, including a memory grown across three instances and
-re-imported twice, but the last section imports a memory across instances, which
-a compiled module cannot express — it owns a private `BaselineMemory` rather than
-sharing the store's. The file is left out whole rather than split, because it has
-to stay unmodified; `tests/core_spec.rs` records the reason in full.
-
-The `register` directive does wire a module's exports into the engine's `Linker`
-via `Linker::define_instance`, which is what makes a later module's cross-instance
+The `register` directive wires a module's exports into the engine's `Linker` via
+`Linker::define_instance`, which is what makes a later module's cross-instance
 import resolve and share the same store memory, table, and globals. That wiring
-is the interpreter's; the compiled backend's half of it is not done yet.
+works on both backends. It needed a real design change on the compiled one: a
+compiled module cannot own a memory privately and still let another instance
+import it, so `BaselineModule` holds a `SharedMemory` handle and the runtime
+keeps a registry of those handles keyed by store address. A module that defines
+a memory publishes its handle; a module that imports one looks it up and
+installs the same handle, so a store through either is visible to both. Tables
+and globals are not yet shared this way, and the IR still refuses to import
+them.
 
 ## License and provenance
 
