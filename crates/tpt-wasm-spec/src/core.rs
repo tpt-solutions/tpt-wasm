@@ -214,8 +214,23 @@ impl Runner {
                 };
                 let outcome = match index {
                     Some(index) => {
-                        self.named.insert(name.to_string(), index);
-                        CoreOutcome::Instantiated
+                        // Recording the name alone would leave a later module's
+                        // import unresolved, because imports are resolved through
+                        // the engine's `Linker` and nothing was put there. Wiring
+                        // the instance's exports in is what makes `register` mean
+                        // anything: the next module that imports `name` links
+                        // against this one, sharing the same store memory, table,
+                        // and globals rather than getting a copy.
+                        let linked = self
+                            .engine
+                            .linker_mut()
+                            .define_instance(name, &self.modules[index]);
+                        if let Err(error) = linked {
+                            CoreOutcome::Failed(format!("register failed: {error}"))
+                        } else {
+                            self.named.insert(name.to_string(), index);
+                            CoreOutcome::Instantiated
+                        }
                     }
                     None => CoreOutcome::Failed("register: no module to register".to_string()),
                 };

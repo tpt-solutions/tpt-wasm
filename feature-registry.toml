@@ -136,14 +136,32 @@ mvp_verified = "partial"
 #
 # The memory family (address, align, endianness, load, store, memory, memory_size,
 # memory_trap, memory_redundancy -- 981 directives) was added next and found no
-# defects at all: the loads and stores, `memory.size`, active data segments, the
-# advisory `memarg` alignment hint, little-endian ordering, and the
-# out-of-bounds trap rules were already correct on both backends. That is a
+# defect in the memory instructions themselves: the loads and stores, memory.size,
+# active data segments, the advisory memarg alignment hint, little-endian ordering,
+# and the out-of-bounds trap rules were already correct on both backends. That is a
 # result worth stating plainly, because the previous three batches each found
-# several. It did isolate one blocker: `memory_grow.wast` imports a memory across
-# instances, which needs `register` wired into the engine's `Linker` and a
-# baseline that shares its memory with the store rather than owning a private
-# `BaselineMemory`, so that file stays out until linking exists.
+# several. It did isolate one blocker -- memory_grow.wast, whose last section
+# imports a memory across instances -- and following that up found two more real
+# bugs, both fixed:
+#   - The spec harness's `register` directive only recorded a name in its own map
+#     and put nothing in the engine's `Linker`, so a later module's import could
+#     never resolve. `Linker::define_instance` already existed and was already
+#     exercised by the runtime's own tests; the harness simply never called it.
+#     Every cross-instance import the Core suite uses was therefore unrunnable.
+#   - An exported memory's external type reported the minimum it was declared
+#     with rather than its current length, and was snapshotted into the Linker at
+#     registration time. WebAssembly matches an import against the exporting
+#     instance's type when the *importing* module is instantiated, so a module
+#     that grew a memory, exported it, and had another import it requiring the
+#     size it was now was refused as an incompatible import. The type is read
+#     from the store at resolution time now, and a memory reports its current
+#     page count. `ExternalKind` existed only to carry that snapshot and is gone,
+#     replaced by one accessor per kind so the stale value cannot come back.
+# With linking working, memory_grow.wast passes completely on Micro (all 106
+# directives, a memory grown across three instances and re-imported twice). It
+# still cannot join the shared table because of the baseline: a compiled module
+# owns a private `BaselineMemory` rather than sharing the store's, so an imported
+# memory has nowhere to live. That half is the next increment.
 #
 # Running that suite on the baseline found six more real bugs, all fixed, and
 # they are worth recording because five of them are in the lowering, which no

@@ -44,11 +44,17 @@ and re-checking the assertion counts in `tests/binary_format.rs` and the
 directive counts in `tests/core_spec.rs`, which are asserted so that a silent
 change in coverage fails the build.
 
-`memory_grow.wast` is deliberately *not* vendored: its `memory.grow` directives
-pass, but its last section imports a memory across module instances, which needs
-linking this harness does not perform and a baseline that shares its memory with
-the store. The file is left out whole rather than split, because it has to stay
-unmodified; `tests/core_spec.rs` records the reason in full.
+`memory_grow.wast` is deliberately *not* vendored: all 106 of its directives
+pass on the `Micro` backend, including a memory grown across three instances and
+re-imported twice, but the last section imports a memory across instances, which
+a compiled module cannot express — it owns a private `BaselineMemory` rather than
+sharing the store's. The file is left out whole rather than split, because it has
+to stay unmodified; `tests/core_spec.rs` records the reason in full.
+
+The `register` directive does wire a module's exports into the engine's `Linker`
+via `Linker::define_instance`, which is what makes a later module's cross-instance
+import resolve and share the same store memory, table, and globals. That wiring
+is the interpreter's; the compiled backend's half of it is not done yet.
 
 ## License and provenance
 

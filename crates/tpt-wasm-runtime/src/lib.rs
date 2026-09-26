@@ -302,26 +302,17 @@ impl fmt::Debug for LinkerDefinition {
     }
 }
 
-#[derive(Clone, Debug)]
-enum ExternalKind {
-    Function(FunctionType),
-    Table(TableType),
-    Memory(MemoryType),
-    Global(GlobalType),
-}
-
+/// A reference to something another instance in the same context exports.
 #[derive(Clone)]
 struct ExternalExport {
     context: RuntimeContext,
     address: u32,
-    kind: ExternalKind,
 }
 
 impl fmt::Debug for ExternalExport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExternalExport")
             .field("address", &self.address)
-            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -376,12 +367,18 @@ impl Linker {
         let mut registered = Vec::with_capacity(instance.exports.len());
         for (name, desc) in &instance.exports {
             let address = export_address(&store, instance.index, *desc)?;
+            // Only the address is recorded. The external *type* is deliberately
+            // not captured here: WebAssembly matches an import against the
+            // exporting instance's type at the moment the importing module is
+            // instantiated, and a memory's type includes its current length, which
+            // can change between one module registering the export and the next
+            // importing it. A snapshot taken now would be stale by then, so the
+            // type is read from the store when an import is resolved.
             registered.push((
                 name.clone(),
                 LinkerDefinition::Instance(ExternalExport {
                     context: instance.context.clone(),
                     address,
-                    kind: external_kind(&store, address, *desc)?,
                 }),
             ));
         }
@@ -643,42 +640,50 @@ fn export_address(
     )))
 }
 
-fn external_kind(
-    store: &Store,
-    address: u32,
-    desc: ExportDesc,
-) -> Result<ExternalKind, RuntimeError> {
-    match desc {
-        ExportDesc::Function(_) => {
-            let function_type = match store.function(address)? {
-                tpt_wasm_micro::store::FuncInstance::Wasm(function) => function.func_type.clone(),
-                tpt_wasm_micro::store::FuncInstance::Host(function) => function.func_type.clone(),
-            };
-            Ok(ExternalKind::Function(function_type))
-        }
-        ExportDesc::Table(_) => {
-            let table = store.table(address)?;
-            Ok(ExternalKind::Table(TableType {
-                element_type: table.element_type,
-                limits: Limits {
-                    min: u64::from(table.min_elements),
-                    max: table.declared_max_elements.map(u64::from),
-                },
-            }))
-        }
-        ExportDesc::Memory(_) => {
-            let memory = store.memory(address)?;
-            Ok(ExternalKind::Memory(MemoryType {
-                limits: Limits {
-                    min: memory.min_pages,
-                    max: memory.declared_max_pages,
-                },
-                memory64: false,
-            }))
-        }
-        ExportDesc::Global(_) => Ok(ExternalKind::Global(store.global(address)?.global_type)),
-        ExportDesc::Tag(_) => Err(RuntimeError::UnsupportedFeature("tags")),
-    }
+/// The external type of an exported function.
+fn external_function_type(store: &Store, address: u32) -> Result<FunctionType, RuntimeError> {
+    Ok(match store.function(address)? {
+        tpt_wasm_micro::store::FuncInstance::Wasm(function) => function.func_type.clone(),
+        tpt_wasm_micro::store::FuncInstance::Host(function) => function.func_type.clone(),
+    })
+}
+
+/// The external type of an exported table.
+fn external_table_type(store: &Store, address: u32) -> Result<TableType, RuntimeError> {
+    let table = store.table(address)?;
+    Ok(TableType {
+        element_type: table.element_type,
+        limits: Limits {
+            // A table's length is fixed for its lifetime -- there is no `table.grow`
+            // in MVP -- so its declared minimum is its current size.
+            min: u64::from(table.min_elements),
+            max: table.declared_max_elements.map(u64::from),
+        },
+    })
+}
+
+/// The external type of an exported memory.
+fn external_memory_type(store: &Store, address: u32) -> Result<MemoryType, RuntimeError> {
+    let memory = store.memory(address)?;
+    Ok(MemoryType {
+        limits: Limits {
+            // A memory instance's external type carries its *current* length, not
+            // the minimum it was declared with. A memory that has grown is
+            // externally larger than it was declared, and import matching compares
+            // that current size against the importer's declared minimum. Reporting
+            // the declared minimum instead refuses exactly the modules the
+            // specification means to allow: one module grows a memory, exports it,
+            // and another imports it requiring the size it is now.
+            min: memory.pages(),
+            max: memory.declared_max_pages,
+        },
+        memory64: false,
+    })
+}
+
+/// The external type of an exported global.
+fn external_global_type(store: &Store, address: u32) -> Result<GlobalType, RuntimeError> {
+    Ok(store.global(address)?.global_type)
 }
 
 fn limits_match(actual: &Limits, expected: &Limits) -> bool {
@@ -892,10 +897,8 @@ fn instantiate_module(
                             ));
                         }
                         same_context(&context, export)?;
-                        let ExternalKind::Function(actual) = &export.kind else {
-                            return Err(incompatible(import, "definition is not a function"));
-                        };
-                        if actual != expected {
+                        let actual = external_function_type(&store, export.address)?;
+                        if &actual != expected {
                             return Err(incompatible(
                                 import,
                                 format!("expected {expected:?}, got {actual:?}"),
@@ -910,9 +913,7 @@ fn instantiate_module(
                     return Err(incompatible(import, "definition is not a table"));
                 };
                 same_context(&context, export)?;
-                let ExternalKind::Table(actual) = &export.kind else {
-                    return Err(incompatible(import, "definition is not a table"));
-                };
+                let actual = external_table_type(&store, export.address)?;
                 if actual.element_type != expected.element_type
                     || !limits_match(&actual.limits, &expected.limits)
                 {
@@ -928,9 +929,7 @@ fn instantiate_module(
                     return Err(incompatible(import, "definition is not a memory"));
                 };
                 same_context(&context, export)?;
-                let ExternalKind::Memory(actual) = &export.kind else {
-                    return Err(incompatible(import, "definition is not a memory"));
-                };
+                let actual = external_memory_type(&store, export.address)?;
                 if !limits_match(&actual.limits, &expected.limits) {
                     return Err(incompatible(
                         import,
@@ -944,10 +943,8 @@ fn instantiate_module(
                     return Err(incompatible(import, "definition is not a global"));
                 };
                 same_context(&context, export)?;
-                let ExternalKind::Global(actual) = &export.kind else {
-                    return Err(incompatible(import, "definition is not a global"));
-                };
-                if actual != expected {
+                let actual = external_global_type(&store, export.address)?;
+                if &actual != expected {
                     return Err(incompatible(
                         import,
                         format!("expected {expected:?}, got {actual:?}"),
@@ -1925,6 +1922,131 @@ mod tests {
             result,
             Err(RuntimeError::IncompatibleImport { .. })
         ));
+    }
+
+    /// An exported memory's external type is its *current* size, and it is read
+    /// when the import resolves rather than when the export was registered.
+    ///
+    /// A memory that has grown is externally larger than it was declared, and
+    /// import matching compares that current size against the importer's declared
+    /// minimum. Reporting the declared minimum, or snapshotting the type at
+    /// registration time, both refuse the module the specification means to
+    /// allow: one module grows a memory and exports it, and another imports it
+    /// requiring the size it is now. The register happens *before* the grow here
+    /// on purpose, which is the order the spec suite uses.
+    #[test]
+    fn an_exported_memory_reports_its_current_size_at_import_time() {
+        fn memtype(min: u64) -> MemoryType {
+            MemoryType {
+                limits: Limits { min, max: None },
+                memory64: false,
+            }
+        }
+        let provider = Module {
+            types: vec![i32_result_type()],
+            memories: vec![Memory {
+                memory_type: memtype(1),
+            }],
+            // i32.const 1; memory.grow; end
+            functions: vec![function(0, vec![0x41, 0x01, 0x40, 0x00, 0x0b])],
+            exports: vec![
+                export("memory", ExportDesc::Memory(0)),
+                export("grow", ExportDesc::Function(0)),
+            ],
+            ..Module::default()
+        };
+        // Requires a memory of at least 2 pages, which is what the provider's
+        // memory has become by the time this is instantiated.
+        let consumer = Module {
+            types: vec![i32_result_type()],
+            imports: vec![import("provider", "memory", ImportDesc::Memory(memtype(2)))],
+            // memory.size; end
+            functions: vec![function(0, vec![0x3f, 0x00, 0x0b])],
+            exports: vec![export("size", ExportDesc::Function(0))],
+            ..Module::default()
+        };
+        let mut engine = Engine::new(Config::default()).unwrap();
+        let mut provider = engine.instantiate(provider).unwrap();
+        engine
+            .linker_mut()
+            .define_instance("provider", &provider)
+            .unwrap();
+        assert_eq!(
+            provider.call("grow", Vec::new()).unwrap(),
+            vec![Value::I32(1)]
+        );
+        let mut consumer = engine
+            .instantiate(consumer)
+            .expect("an imported memory must match its current size, not its declared minimum");
+        assert_eq!(
+            consumer.call("size", Vec::new()).unwrap(),
+            vec![Value::I32(2)]
+        );
+    }
+
+    /// An imported memory is the exporting instance's memory, not a copy of it.
+    ///
+    /// A store through the importer has to be visible to the exporter, and a grow
+    /// through either has to change what the other sees. A copy would satisfy
+    /// every type check and then quietly lose the write, which is the failure
+    /// this is here to catch.
+    #[test]
+    fn an_imported_memory_is_shared_rather_than_copied() {
+        let provider = Module {
+            types: vec![i32_result_type()],
+            memories: vec![Memory {
+                memory_type: MemoryType {
+                    limits: Limits { min: 1, max: None },
+                    memory64: false,
+                },
+            }],
+            // i32.const 0; i32.load; end -- reads the first four bytes.
+            functions: vec![function(0, vec![0x41, 0x00, 0x28, 0x02, 0x00, 0x0b])],
+            exports: vec![
+                export("memory", ExportDesc::Memory(0)),
+                export("load", ExportDesc::Function(0)),
+            ],
+            ..Module::default()
+        };
+        let consumer = Module {
+            types: vec![i32_result_type()],
+            imports: vec![import(
+                "provider",
+                "memory",
+                ImportDesc::Memory(MemoryType {
+                    limits: Limits { min: 1, max: None },
+                    memory64: false,
+                }),
+            )],
+            // i32.const 0; i32.const 42; i32.store; i32.const 7; end
+            functions: vec![function(
+                0,
+                vec![0x41, 0x00, 0x41, 42, 0x36, 0x02, 0x00, 0x41, 0x07, 0x0b],
+            )],
+            exports: vec![export("store", ExportDesc::Function(0))],
+            ..Module::default()
+        };
+        let mut engine = Engine::new(Config::default()).unwrap();
+        let mut provider = engine.instantiate(provider).unwrap();
+        engine
+            .linker_mut()
+            .define_instance("provider", &provider)
+            .unwrap();
+        // The memory starts zeroed.
+        assert_eq!(
+            provider.call("load", Vec::new()).unwrap(),
+            vec![Value::I32(0)]
+        );
+        let mut consumer = engine.instantiate(consumer).unwrap();
+        assert_eq!(
+            consumer.call("store", Vec::new()).unwrap(),
+            vec![Value::I32(7)]
+        );
+        // The exporter sees the importer's write, so the two share one memory.
+        assert_eq!(
+            provider.call("load", Vec::new()).unwrap(),
+            vec![Value::I32(42)]
+        );
     }
 
     #[test]

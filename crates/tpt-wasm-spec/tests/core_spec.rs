@@ -48,14 +48,13 @@
 //!   implemented.
 //! - `token.wast` needs the `spectest` host import module and passive data
 //!   segments (bulk memory), neither implemented.
-//! - `memory_grow.wast` is mostly MVP `memory.grow`, and those 101 directives
-//!   pass, but its last section imports a memory from a module registered by an
-//!   earlier `register`. That needs two things this harness and the baseline do
-//!   not have together: the `register` directive has to wire the named module's
-//!   exports into the engine's `Linker` so a later module's import resolves, and
-//!   the baseline's compiled module owns its own `BaselineMemory` rather than
-//!   sharing the store's, so an imported memory has nowhere to live. It is left
-//!   out whole rather than split, because the file has to stay unmodified.
+//! - `memory_grow.wast` now passes completely on `Micro` — all 106 directives,
+//!   including a memory grown across three instances and re-imported twice. It
+//!   still cannot join the table because of the *baseline*: a compiled module
+//!   owns a private `BaselineMemory` rather than sharing the store's, so an
+//!   imported memory has nowhere to live, and the IR refuses non-function
+//!   imports. Left out whole rather than split, because the file has to stay
+//!   unmodified.
 //! - `names.wast` contains identifiers with bidirectional-control Unicode
 //!   characters that the `wast` crate's lexer refuses outright, before this
 //!   harness ever sees them.
