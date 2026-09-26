@@ -83,7 +83,7 @@ mvp_verified = "partial"
 #   property of the pipeline over a program population rather than of the cases
 #   someone remembered to write. Extending the generator to control flow is what
 #   exposed the branch defects recorded below, and the official spec suite now
-#   runs the same comparison across 9,164 directives on both backends. Not
+#   runs the same comparison across 10,145 directives on both backends. Not
 #   `true`: the reference-interpreter differential does not execute yet.
 # mvp_compiled  — the portable baseline in tpt-wasm-codegen lowers and executes
 #   every instruction the IR can represent, and EngineMode::Baseline runs it at
@@ -123,16 +123,27 @@ mvp_verified = "partial"
 # with their data count section, and function bodies being stored as raw bytes
 # instead of parsed.
 #
-# `mvp_tested` is `"partial"` rather than `false`: 24 Core suite files now run
-# through `crates/tpt-wasm-spec/tests/core_spec.rs`, driving 9,164 `invoke`/
-# `assert_return`/`assert_trap`/`assert_exhaustion` directives through the real
-# decode -> validate -> instantiate -> call pipeline with exact NaN bit-pattern
-# checking -- once on the Micro backend and once on the compiled baseline, with
-# the same asserted counts either way, so a backend that dropped a directive
-# would fail rather than shrink its coverage. Not `true`: roughly 65 Core suite
-# files (memory, tables, multi-module linking/imports, and several files blocked
-# on specific unimplemented proposals -- see `core_spec.rs`'s module doc) are not
-# vendored.
+# `mvp_tested` is `"partial"` rather than `false`: 33 Core suite files now run
+# through `crates/tpt-wasm-spec/tests/core_spec.rs`, driving 10,145 `invoke`/
+# `assert_return`/`assert_trap`/`assert_exhaustion`/`register` directives through
+# the real decode -> validate -> instantiate -> call pipeline with exact NaN
+# bit-pattern checking -- once on the Micro backend and once on the compiled
+# baseline, with the same asserted counts either way, so a backend that dropped a
+# directive would fail rather than shrink its coverage. Not `true`: the remaining
+# table, element, data, function, type, import/export, start, and linking families
+# are not vendored, and several files are blocked on specific unimplemented
+# proposals -- see `core_spec.rs`'s module doc, which records each file's reason.
+#
+# The memory family (address, align, endianness, load, store, memory, memory_size,
+# memory_trap, memory_redundancy -- 981 directives) was added next and found no
+# defects at all: the loads and stores, `memory.size`, active data segments, the
+# advisory `memarg` alignment hint, little-endian ordering, and the
+# out-of-bounds trap rules were already correct on both backends. That is a
+# result worth stating plainly, because the previous three batches each found
+# several. It did isolate one blocker: `memory_grow.wast` imports a memory across
+# instances, which needs `register` wired into the engine's `Linker` and a
+# baseline that shares its memory with the store rather than owning a private
+# `BaselineMemory`, so that file stays out until linking exists.
 #
 # Running that suite on the baseline found six more real bugs, all fixed, and
 # they are worth recording because five of them are in the lowering, which no

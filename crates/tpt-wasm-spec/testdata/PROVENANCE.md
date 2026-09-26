@@ -22,17 +22,33 @@ These files are copied unmodified from the WebAssembly specification repository:
 | `float_exprs.wast`, `float_literals.wast`, `float_misc.wast` | Core suite: floating-point edge-case expressions, literal encodings, and miscellaneous float behavior. |
 | `traps.wast` | Core suite: trap conditions not covered by the per-type instruction files. |
 | `comments.wast` | Core suite: comment syntax in the text format. |
+| `address.wast` | Core suite: effective-address computation, the static offset, and the `i32` wrap at the 32-bit boundary. |
+| `align.wast` | Core suite: the `memarg` alignment hint, which is advisory and must not change a result or reject an encoding. |
+| `endianness.wast` | Core suite: the little-endian byte order of every load and store width. |
+| `load.wast`, `store.wast` | Core suite: the full MVP load and store instruction set, including zero- and sign-extension. |
+| `memory.wast` | Core suite: `memory.size`, `memory.grow`, and the active data segment forms, including the inline `(memory (data ...))` abbreviation. |
+| `memory_size.wast` | Core suite: `memory.size` against declared minimum and maximum. |
+| `memory_trap.wast` | Core suite: out-of-bounds loads and stores at and around the memory limit. |
+| `memory_redundancy.wast` | Core suite: that a store is visible to the next load rather than to a stale copy. |
 
 All Core suite files above were vendored from revision
-`608711107b7f1edb13efd57b7d79b49477462d36` of the spec repository. `binary.wast`
-and `binary-leb128.wast` predate this note; their revision was not recorded when
-they were added.
+`608711107b7f1edb13efd57b7d79b49477462d36` of the spec repository, fetched as raw
+bytes over HTTPS and checked against that revision rather than retyped, because
+these files are the thing under test and a transcription error in them would
+show up as a spurious failure. `binary.wast` and `binary-leb128.wast` predate
+this note; their revision was not recorded when they were added.
 
 They are vendored rather than fetched so that a test run needs no network and
 always exercises exactly these bytes. Re-vendoring means copying the files again
 and re-checking the assertion counts in `tests/binary_format.rs` and the
 directive counts in `tests/core_spec.rs`, which are asserted so that a silent
 change in coverage fails the build.
+
+`memory_grow.wast` is deliberately *not* vendored: its `memory.grow` directives
+pass, but its last section imports a memory across module instances, which needs
+linking this harness does not perform and a baseline that shares its memory with
+the store. The file is left out whole rather than split, because it has to stay
+unmodified; `tests/core_spec.rs` records the reason in full.
 
 ## License and provenance
 

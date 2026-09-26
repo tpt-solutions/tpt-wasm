@@ -48,9 +48,21 @@
 //!   implemented.
 //! - `token.wast` needs the `spectest` host import module and passive data
 //!   segments (bulk memory), neither implemented.
+//! - `memory_grow.wast` is mostly MVP `memory.grow`, and those 101 directives
+//!   pass, but its last section imports a memory from a module registered by an
+//!   earlier `register`. That needs two things this harness and the baseline do
+//!   not have together: the `register` directive has to wire the named module's
+//!   exports into the engine's `Linker` so a later module's import resolves, and
+//!   the baseline's compiled module owns its own `BaselineMemory` rather than
+//!   sharing the store's, so an imported memory has nowhere to live. It is left
+//!   out whole rather than split, because the file has to stay unmodified.
 //! - `names.wast` contains identifiers with bidirectional-control Unicode
 //!   characters that the `wast` crate's lexer refuses outright, before this
 //!   harness ever sees them.
+//! - Everything else not listed above and not already vendored -- the remaining
+//!   module, linking, import/export, and function/table families -- is blocked
+//!   on multi-module linking or on an unimplemented proposal, and is recorded in
+//!   `todo.md` rather than guessed at.
 
 use std::collections::HashMap;
 
@@ -225,6 +237,82 @@ const SUITES: &[Suite] = &[
         name: "comments.wast",
         source: include_str!("../testdata/comments.wast"),
         directives: &[("module", 5), ("assert_return", 3)],
+    },
+    // The memory family. Nothing here is blocked on an unimplemented proposal:
+    // the loads, stores, `memory.size`/`memory.grow`, active data segments, and
+    // the byte-order and trap rules are all MVP and all implemented on both
+    // backends, so these files were simply untested against upstream.
+    Suite {
+        name: "address.wast",
+        source: include_str!("../testdata/address.wast"),
+        directives: &[
+            ("module", 4),
+            ("assert_return", 206),
+            ("assert_trap", 49),
+            ("assert_invalid", 1),
+        ],
+    },
+    Suite {
+        name: "align.wast",
+        source: include_str!("../testdata/align.wast"),
+        directives: &[
+            ("module", 25),
+            ("assert_return", 47),
+            ("assert_trap", 1),
+            ("assert_invalid", 44),
+            ("assert_malformed", 48),
+        ],
+    },
+    Suite {
+        name: "endianness.wast",
+        source: include_str!("../testdata/endianness.wast"),
+        directives: &[("module", 1), ("assert_return", 68)],
+    },
+    Suite {
+        name: "load.wast",
+        source: include_str!("../testdata/load.wast"),
+        directives: &[
+            ("module", 1),
+            ("assert_return", 37),
+            ("assert_invalid", 46),
+            ("assert_malformed", 13),
+        ],
+    },
+    Suite {
+        name: "store.wast",
+        source: include_str!("../testdata/store.wast"),
+        directives: &[
+            ("module", 1),
+            ("assert_return", 9),
+            ("assert_invalid", 51),
+            ("assert_malformed", 7),
+        ],
+    },
+    Suite {
+        name: "memory.wast",
+        source: include_str!("../testdata/memory.wast"),
+        directives: &[
+            ("module", 11),
+            ("assert_return", 53),
+            ("assert_invalid", 22),
+            ("assert_malformed", 3),
+            ("module_definition", 1),
+        ],
+    },
+    Suite {
+        name: "memory_size.wast",
+        source: include_str!("../testdata/memory_size.wast"),
+        directives: &[("module", 4), ("assert_return", 36), ("assert_invalid", 2)],
+    },
+    Suite {
+        name: "memory_trap.wast",
+        source: include_str!("../testdata/memory_trap.wast"),
+        directives: &[("module", 2), ("assert_return", 10), ("assert_trap", 170)],
+    },
+    Suite {
+        name: "memory_redundancy.wast",
+        source: include_str!("../testdata/memory_redundancy.wast"),
+        directives: &[("module", 1), ("assert_return", 4), ("invoke", 3)],
     },
 ];
 
