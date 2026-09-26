@@ -252,6 +252,14 @@ struct RuntimeContext {
     /// finds it. Keyed by store address because that is what an import resolves
     /// to, and because it stays the same through any number of re-exports.
     baseline_memories: Arc<Mutex<HashMap<u32, tpt_wasm_codegen::SharedMemory>>>,
+    /// Baseline globals, keyed by the store address of the global they are, with
+    /// the index of that global within its module.
+    ///
+    /// A compiled module keeps its globals in a shared handle rather than a
+    /// private `Vec`, so the store and the compiled code cannot disagree about a
+    /// global's current value. Keyed by store address because that is what an
+    /// import resolves to and what a reader holds.
+    baseline_globals: Arc<Mutex<HashMap<u32, (tpt_wasm_codegen::SharedGlobals, u32)>>>,
 }
 
 impl RuntimeContext {
@@ -262,6 +270,7 @@ impl RuntimeContext {
             host_functions: Arc::new(Mutex::new(HashMap::new())),
             limits,
             baseline_memories: Arc::new(Mutex::new(HashMap::new())),
+            baseline_globals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -302,6 +311,14 @@ fn lock_baseline_memories(
     memories: &Arc<Mutex<BaselineMemoryMap>>,
 ) -> Result<MutexGuard<'_, BaselineMemoryMap>, RuntimeError> {
     memories.lock().map_err(|_| RuntimeError::StorePoisoned)
+}
+
+type BaselineGlobalMap = HashMap<u32, (tpt_wasm_codegen::SharedGlobals, u32)>;
+
+fn lock_baseline_globals(
+    globals: &Arc<Mutex<BaselineGlobalMap>>,
+) -> Result<MutexGuard<'_, BaselineGlobalMap>, RuntimeError> {
+    globals.lock().map_err(|_| RuntimeError::StorePoisoned)
 }
 
 #[derive(Clone)]
@@ -1127,6 +1144,10 @@ fn instantiate_module(
     // to -- whether the module defined it or imported it, that is the same
     // address, which is exactly why the two instances can share one memory.
     let baseline_memory_address = memory_addrs.first().copied();
+    // Captured for the same reason: the baseline publishes a handle for each of
+    // its globals under the store address that global was allocated at, and by
+    // the time the module is lowered `global_addrs` has moved into the instance.
+    let baseline_global_addresses: Vec<u32> = global_addrs.clone();
 
     let store_instance = StoreInstance {
         module_types: module.types.clone(),
@@ -1200,6 +1221,19 @@ fn instantiate_module(
                 "a compiled memory with no store address",
             ));
         }
+        // Published the way the memory is: the store holds a `GlobalInstance` for
+        // every global, but a compiled module's values live in its shared handle,
+        // so a reader has to be able to find the handle backing each store
+        // address. Without this the two diverge -- a `global.set` inside a
+        // compiled function is invisible to `Instance::global`, which reports the
+        // initializer forever.
+        {
+            let shared = module.globals_handle();
+            let mut registry = lock_baseline_globals(&context.baseline_globals)?;
+            for (index, address) in baseline_global_addresses.iter().copied().enumerate() {
+                registry.insert(address, (Arc::clone(&shared), index as u32));
+            }
+        }
     }
     if let Some(start) = start {
         // The start function runs on the same backend the instance will use, so
@@ -1241,14 +1275,15 @@ impl Instance {
 
     /// Read the current value of an exported global.
     ///
-    /// Read from the store rather than from the module's declaration, because a
-    /// `global.set` inside any function that has run since instantiation is part
-    /// of what the global *is*. The value is copied out, so a caller cannot
-    /// reach the store's copy and hold it past the lock.
+    /// Read the current value of an exported global, from the owner of the value
+    /// rather than from the module's declaration, because a `global.set` inside
+    /// any function that has run since instantiation is part of what the global
+    /// *is*. The value is copied out, so a caller cannot reach the owner's copy
+    /// and hold it past the lock.
     ///
-    /// The store holds the global on both backends. A compiled module keeps its
-    /// globals in the store like every other state; only its memory and function
-    /// bodies are its own, so this needs no baseline special case.
+    /// A compiled module keeps its globals in a shared handle, and the store's
+    /// `GlobalInstance` is only the one Micro executes against, so this reads
+    /// whichever backend actually owns the global.
     pub fn global(&self, name: &str) -> Result<Value, RuntimeError> {
         let ExportDesc::Global(index) = self
             .exports
@@ -1266,12 +1301,21 @@ impl Instance {
             .get(*index as usize)
             .copied()
             .ok_or(RuntimeError::UnknownExport(name.to_owned()))?;
+        if let Some((shared, slot)) = lock_baseline_globals(&self.context.baseline_globals)?
+            .get(&address)
+            .cloned()
+        {
+            let guard = shared.lock().map_err(|_| RuntimeError::StorePoisoned)?;
+            return guard
+                .get(slot as usize)
+                .cloned()
+                .ok_or(RuntimeError::UnknownExport(name.to_owned()));
+        }
         Ok(lock_store(&self.context.store)?
             .global(address)?
             .value
             .clone())
     }
-
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
         // In baseline mode the module is executed by its own compiled form
         // rather than by Micro, so the store lookup is not used at all.
@@ -2342,11 +2386,21 @@ mod tests {
             ],
             ..Module::default()
         };
-        let engine = Engine::new(Config::default()).unwrap();
-        let mut instance = engine.instantiate(module).unwrap();
-        assert_eq!(instance.global("g").unwrap(), Value::I32(1));
-        instance.call("set", Vec::new()).unwrap();
-        assert_eq!(instance.global("g").unwrap(), Value::I32(9));
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let config = Config {
+                engine_mode: mode,
+                ..Config::default()
+            };
+            let engine = Engine::new(config).unwrap();
+            let mut instance = engine.instantiate(module.clone()).unwrap();
+            assert_eq!(instance.global("g").unwrap(), Value::I32(1), "{mode:?}");
+            instance.call("set", Vec::new()).unwrap();
+            assert_eq!(
+                instance.global("g").unwrap(),
+                Value::I32(9),
+                "{mode:?} read a copy the compiled code never wrote"
+            );
+        }
     }
 
     #[test]

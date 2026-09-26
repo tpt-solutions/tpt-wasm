@@ -42,7 +42,10 @@ lose every write. `memory_handle` publishes the handle and `set_memory` installs
 one, which is how `tpt-wasm-runtime` wires a cross-instance import on this
 backend. The handle is locked for the duration of a call rather than per access,
 so the module sees its own stores and no observer can see a half-applied one.
-Globals and tables are not shared this way yet.
+Globals are shared the same way, as a `SharedGlobals` handle: a compiled module
+that kept its own `Vec` of globals would diverge from the store's copy, and a
+`global.set` in a compiled function would be invisible to any reader outside the
+module. Tables are not shared this way yet.
 
 `execute` and `execute_with` have no module, so a function that touches memory or
 globals reports that it needs one rather than reading uninitialized data. Use

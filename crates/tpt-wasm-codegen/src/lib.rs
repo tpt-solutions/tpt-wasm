@@ -1531,7 +1531,7 @@ pub struct BaselineModule {
     /// segments write into the memory it imports, and they have to land after the
     /// exporter's own segments and before any function runs.
     pending_imported_memory: Option<tpt_wasm_ir::IrMemory>,
-    globals: Vec<Value>,
+    globals: SharedGlobals,
     /// The imported functions, in declaration order, that a `CallHost` names.
     imports: Vec<tpt_wasm_ir::IrImport>,
     /// The installed host boundary, absent until an embedder provides one.
@@ -1550,6 +1550,16 @@ pub struct BaselineModule {
     max_call_depth: usize,
 }
 
+/// A baseline module's globals, shared with the store that holds the same values.
+///
+/// Sharing is required for the same reason a memory is shared: the store's
+/// `GlobalInstance` and the compiled code must not be able to disagree about a
+/// global's current value. When each kept a private copy, a `global.set` in a
+/// compiled function was invisible to `Instance::global` -- the reader saw the
+/// initializer forever -- and a `global` exported by one instance and imported by
+/// another would have been two unrelated values with one name.
+pub type SharedGlobals = Arc<Mutex<Vec<Value>>>;
+
 /// A baseline memory shared by every instance that imports or exports it.
 ///
 /// Sharing is what makes a cross-instance import mean the same thing on this
@@ -1564,11 +1574,11 @@ pub type SharedMemory = Arc<Mutex<BaselineMemory>>;
 /// A poisoned lock means a previous execution panicked while holding it, which
 /// this crate does not do; it is reported rather than papered over, because
 /// continuing would read a memory that may be half-updated.
-fn lock_shared(shared: &SharedMemory) -> Result<MutexGuard<'_, BaselineMemory>, BaselineError> {
+fn lock_shared<T>(shared: &Arc<Mutex<T>>) -> Result<MutexGuard<'_, T>, BaselineError> {
     shared.lock().map_err(|_| {
         BaselineError::Host(HostCallFailure {
-            name: "baseline memory".to_owned(),
-            message: "a previous execution left the shared memory locked".to_owned(),
+            name: "baseline shared state".to_owned(),
+            message: "a previous execution left it locked".to_owned(),
         })
     })
 }
@@ -1721,7 +1731,9 @@ impl BaselineModule {
             table,
             types: module.types.clone(),
             memory,
-            globals: module.globals.iter().map(|g| g.init.clone()).collect(),
+            globals: Arc::new(Mutex::new(
+                module.globals.iter().map(|g| g.init.clone()).collect(),
+            )),
             imports: module.imports.clone(),
             host: None,
             pending_imported_memory,
@@ -1848,6 +1860,11 @@ impl BaselineModule {
         self
     }
 
+    /// The handle to this module's globals, for the store to share and read.
+    pub fn globals_handle(&self) -> SharedGlobals {
+        Arc::clone(&self.globals)
+    }
+
     /// Lower a verified IR module and wrap it so it can be executed.
     pub fn lower(module: &tpt_wasm_ir::IrModule) -> Result<Self, CodegenError> {
         Self::new(module, lower_module(module)?)
@@ -1870,13 +1887,17 @@ impl BaselineModule {
             Some(shared) => Some(lock_shared(shared)?),
             None => None,
         };
+        // The globals are locked for the whole execution for the same reason the
+        // memory is, and for the same reason they are shared with the store at
+        // all: a reader outside this call must not see half of a `global.set`.
+        let mut globals = lock_shared(&self.globals)?;
         let mut state = ExecState {
             functions,
             imports,
             table: self.table.as_ref(),
             types: &self.types,
             memory: memory.as_deref_mut(),
-            globals: &mut self.globals,
+            globals: &mut globals,
             host: self.host.as_deref_mut(),
             // The entry call is itself a frame, exactly as Micro counts the
             // initial frame it pushes, so both backends run out of depth at the

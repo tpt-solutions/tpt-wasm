@@ -208,6 +208,38 @@ mvp_verified = "partial"
 # Eleven files and 5,824 directives later the Core suite is 45 files / 16,075
 # directives per backend, all passing on both.
 #
+# That left one question the earlier passes had only guessed at: is anything still
+# blocked on an MVP gap rather than a proposal? Every remaining candidate was run
+# and its DISTINCT failure reasons collected. The answer is no -- the Core suite is
+# complete for MVP, and every un-vendored file needs at least one post-MVP
+# proposal. The blockers, by file:
+#   multi_value        block, br, fac, func, if, loop       (6; all InvalidBlockType)
+#   reference_types    table, call_indirect, exports,       (multi-table, externref,
+#                      select, elem, br_table                and unrecognized heap types)
+#   bulk_memory        data, token, elem                    (passive segments)
+#   non_trapping_...   conversions                          (0xfc saturating truncs)
+#   extended_const     global                               (0x6c in initializers)
+#   exceptions         imports, unwind                      (tag section)
+#   typed_references   local_init                           ((ref null extern))
+# `names.wast` is rejected by the `wast` crate's own lexer before this harness
+# sees it. So the remaining Core-suite work is proposal work, tracked per proposal
+# in this file, and there is no separate "finish MVP" item behind them.
+#
+# Two things this retired as false leads. `spectest`'s globals, table, and memory
+# are deliberately not installed: every file wanting them also wants a proposal,
+# so installing them buys no coverage while letting a fabricated global stand in
+# for a real one. And a global or table *import* is not on the critical path --
+# the only files wanting one (imports, elem, global) need a proposal regardless.
+#
+# Writing the global test did turn up a real bug, the same shape as the stale
+# memory size: a compiled module kept its globals in a private Vec while the store
+# kept a second copy, so on Baseline Instance::global returned the initializer
+# forever and a compiled global.set was invisible to it. BaselineModule.globals is
+# now a SharedGlobals handle published per store address in the same registry the
+# memory uses, and Instance::global reads through whichever backend owns the value.
+# The test is written to run on both backends -- it was written for Micro first,
+# and the divergence was invisible until the loop over modes was added.
+#
 # Running that suite on the baseline found six more real bugs, all fixed, and
 # they are worth recording because five of them are in the lowering, which no
 # hand-written fixture had reached:

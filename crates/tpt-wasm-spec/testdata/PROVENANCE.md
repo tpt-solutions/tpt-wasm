@@ -70,8 +70,13 @@ them.
 interpreter's own test runner provides, and the Core suite's
 `(import "spectest" "print_i32")` directives resolve against the no-op
 functions `tests/core_spec.rs` installs. Its globals, table, and memory are
-*not* installed, because this project cannot yet import those — so a file needing
-them stays blocked rather than quietly passing against a fabricated global.
+*not* installed, because every remaining file that needs them also needs a
+post-MVP proposal — installing them would buy no coverage while letting a
+fabricated global stand in for a real one.
+
+Every file in the Core suite whose *only* requirement is MVP is vendored here.
+Each file that is not has its blocker listed in `tests/core_spec.rs`, measured by
+running it rather than remembered.
 
 ## License and provenance
 

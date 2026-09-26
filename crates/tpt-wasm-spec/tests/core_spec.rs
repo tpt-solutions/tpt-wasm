@@ -30,43 +30,40 @@
 //! bytes and the compared result is the same code on both sides, so a
 //! disagreement is a disagreement about execution.
 //!
-//! Not every Core suite file is vendored yet. Rather than guess which files were
-//! blocked on what, every remaining candidate was downloaded and run against this
-//! harness, and these are the *measured* reasons, each one the error a single
-//! failing directive reports:
-//! - `block.wast`, `br.wast`, `fac.wast`, `func.wast`, `if.wast`, and
-//!   `loop.wast` use multi-value block types (`(block (result i32 i32) ...)`),
-//!   which need a type-index block type; only the single-result and empty forms
-//!   decode today (`multi_value`, not implemented). Each fails on its very first
-//!   module with `InvalidBlockType`.
-//! - `conversions.wast` needs the saturating truncation instructions (the
-//!   `0xfc`-prefixed opcodes, `non_trapping_float_to_int`), not implemented.
-//! - `data.wast` and `token.wast` need passive data segments (bulk memory);
-//!   `data.wast` fails on its second module with `passive data segments`.
-//! - `elem.wast` needs non-active element segments, and additionally fails on
-//!   the baseline alone (109 failures there against 87 on the interpreter),
-//!   because its element segments and `call_indirect` tables are not shared the
-//!   way a memory now is.
-//! - `br_table.wast` uses a heap type this decoder does not recognize.
-//! - `global.wast` needs arithmetic inside a global initializer
-//!   (`extended_const`), and `spectest`'s *globals*, which are not installed.
-//! - `table.wast` and `call_indirect.wast` declare a second table; MVP modules
-//!   are limited to one, and multi-table is part of `reference_types`.
-//! - `imports.wast` needs the tag section (the exceptions proposal), which this
-//!   decoder rejects outright with `InvalidSectionId(13)`.
-//! - `unwind.wast` is the exceptions proposal, and fails on the baseline alone.
-//! - `local_init.wast` needs non-nullable reference types (`(ref extern)`,
-//!   the typed-references/function-references proposal), not implemented.
-//! - `select.wast` declares a second table, same as `table.wast`.
+//! Not every Core suite file is vendored yet, and the reason is now measured
+//! rather than remembered: every remaining candidate was downloaded and run
+//! against this harness, and **every one of them is blocked on at least one
+//! post-MVP proposal**. There is no remaining MVP gap in the Core suite -- what is
+//! left is proposal work, tracked per-proposal in `feature-registry.toml`. The
+//! blocker behind each file, as the error a single failing directive reports:
+//! - `multi_value` -- a type-index block type (`(block (result i32 i32) ...)`).
+//!   Only the empty and single-result forms decode today. Six files:
+//!   `block.wast`, `br.wast`, `fac.wast`, `func.wast`, `if.wast`, `loop.wast`,
+//!   each failing on its first module with `InvalidBlockType`. This is the
+//!   largest remaining cluster by file count.
+//! - `reference_types` (multi-table and `externref`) -- `table.wast`,
+//!   `call_indirect.wast`, `exports.wast`, `select.wast` need more than one
+//!   table (`MVP modules may contain at most one table`); `table.wast`,
+//!   `elem.wast`, and `br_table.wast` also need a non-`funcref` table or a
+//!   heap type this decoder does not recognize.
+//! - `bulk_memory` -- `data.wast` and `token.wast` need passive data segments
+//!   (`passive data segments`); `elem.wast` needs non-active element segments.
+//! - `non_trapping_float_to_int` -- `conversions.wast` needs the saturating
+//!   `0xfc`-prefixed truncations (`InvalidInstruction(252)`).
+//! - `extended_const` -- `global.wast` needs arithmetic inside a global
+//!   initializer (`InvalidOpcode(108)`), and `spectest`'s globals.
+//! - `exceptions` -- `imports.wast` needs the tag section
+//!   (`InvalidSectionId(13)`); `unwind.wast` is the proposal outright.
+//! - `typed_references` -- `local_init.wast` needs `(ref null extern)`.
 //! - `names.wast` contains identifiers with bidirectional-control Unicode
 //!   characters that the `wast` crate's lexer refuses outright, before this
 //!   harness ever sees them.
 //!
-//! `spectest`'s *functions* are installed (see `core.rs`), so a file blocked only
-//! on those now passes: `start.wast` and `func_ptrs.wast` are in the table below
-//! for that reason. What is left is table and global *imports*, which the IR
-//! still refuses and which neither backend shares yet, plus the proposals above.
-//! `todo.md` records the rest.
+//! `spectest`'s *functions* are installed (see `core.rs`), which is why
+//! `start.wast` and `func_ptrs.wast` are in the table below. Its globals, table,
+//! and memory are deliberately not installed: every file that needs them also
+//! needs a proposal, so installing them would buy nothing while letting a
+//! fabricated global stand in for a real one.
 
 use std::collections::HashMap;
 
