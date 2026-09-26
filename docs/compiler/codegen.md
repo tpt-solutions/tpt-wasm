@@ -285,13 +285,15 @@ carried through a block result, returned unchanged, or used to pick a branch.
 
 The fixtures above are cases someone thought to write. On top of them, a seeded
 generator builds whole programs and checks each one the same way. It draws from
-eighteen instruction families — integer, float, and bit-count operations at both
-widths, division and remainder with the sign variants distinguished, the
+twenty-two instruction families — integer, float, and bit-count operations at
+both widths, division and remainder with the sign variants distinguished, the
 non-trapping and trapping conversions, memory round trips, `block` with a
-conditional branch, `if`/`else`, a counted `loop`, a direct `call`, and an
-indirect `call_indirect` — over a page of memory, one mutable global, a helper
-function, and a table seeded with that helper. Each program goes through the real
-pipeline and is compared with Micro for both its value and its trap.
+conditional branch, `if`/`else`, a counted `loop`, a direct `call`, an indirect
+`call_indirect`, a `br_table` over two nested blocks, and the reference
+instructions both directly and carried out of a block — over a page of memory,
+one mutable global, a helper function, and a table seeded with that helper. Each
+program goes through the real pipeline and is compared with Micro for both its
+value and its trap.
 
 The generator keeps its own shadow of the operand stack so it only emits an
 operation whose operands it actually produced; that is what lets it stay type
@@ -304,13 +306,13 @@ bytes, so a divergence reproduces without saving an artifact. Twenty-five
 thousand programs run as an ordinary test; the sweep has been taken to two
 hundred fifty thousand locally.
 
-Not yet generated: reference values and `br_table`. Those are covered by the
-hand-written fixtures above but not by the population the generator draws from.
+Not yet generated: multi-value block results. Everything else in the represented
+surface is covered by the population.
 
 #### What the generator found
 
-Extending the generator to control flow surfaced three defects that the
-hand-written fixtures had missed, all from one mistaken reading of `br_if`:
+Extending the generator to control flow surfaced defects that the hand-written
+fixtures had missed, all from one mistaken reading of `br_if`:
 
 - The **validator** dropped the label's values on the fall-through path instead
   of restoring them, so it rejected every valid `br_if` to a label that carries
@@ -321,11 +323,29 @@ hand-written fixtures had missed, all from one mistaken reading of `br_if`:
 - The **`br_if_body` fixture** in this file's own test suite was invalid Wasm
   that only validated because of the validator bug.
 
-The generator itself had three more, all the same shape — an instruction whose
-operands were emitted but not tracked on the shadow stack — plus a `call_indirect`
-that never pushed the callee's argument, and a counted `loop` that computed its
-decrement but never stored it back, so the counter never changed and the loop
-never terminated.
+The mistake was invisible until the generator started emitting blocks and
+branches, because every hand-written fixture branched only to void labels, where
+the two readings agree.
+
+Adding `br_table` found two more in the comparison chain the lowerer builds for
+it, one of them a plain misreading of the instruction's own type:
+
+- The lowerer popped the **label values before the selector**, but `br_table` is
+  `[t* i32] -> [t*]`, so the selector is on top. The two were silently swapped,
+  so the branch carried the selector and the dispatch compared the carried
+  value. Any selector differing from the value it carried therefore branched to
+  the wrong label. A hand-written fixture had used a selector equal to its
+  carried value, so the swap was invisible there too.
+- Each arm of the chain passed no values on its fall-through edge, and later arms
+  named values that did not dominate them. The values are now threaded through as
+  each block's parameters.
+
+The generator itself had four more: a `call_indirect` that never pushed the
+callee's argument; a counted `loop` that computed its decrement but never stored
+it back, so the counter never changed and the loop never terminated; a nested
+loop sharing the outer's counter local, leaving it at zero and counting down
+through the whole `i32` range; and an `else` arm continuing from the `then` arm's
+stack instead of restarting at the block's entry height.
 
 Native x86-64/AArch64 code generation and executable-memory integration remain
 pending. `EngineMode::Baseline` is wired: the module is compiled through validate

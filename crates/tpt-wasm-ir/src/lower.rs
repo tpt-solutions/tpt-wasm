@@ -597,6 +597,12 @@ fn lower_branch_table(
         }
         label_types = frame.label_types.clone();
     }
+    // `br_table l* lN` has type `[t* i32] -> [t*]`, so the selector is the top of
+    // the stack and comes off *before* the label's values. Popping them the other
+    // way round silently swaps the two: the branch then carries the selector and
+    // the dispatch tests the carried value, which is wrong for every selector
+    // that is not equal to the value it carries.
+    let selector = state.pop(ValueType::I32)?;
     let values = pop_label_values(
         state,
         &ControlFrame {
@@ -609,7 +615,6 @@ fn lower_branch_table(
             exit: BlockId(0),
         },
     )?;
-    let selector = state.pop(ValueType::I32)?;
 
     // The comparison chain is a sequence of blocks, and the selector is only
     // defined in the first of them. A later block is not dominated by that
@@ -626,6 +631,13 @@ fn lower_branch_table(
     // the last gets a two-way branch: a match goes to that label, and a miss
     // continues the chain. The last index is the default, reached by falling
     // off the end of the chain, so it gets a plain branch.
+    // The values an arm hands to its label must be the ones that dominate that
+    // arm. The first block can use the values popped above, but every block after
+    // it is reached only through the previous comparison, so the values are
+    // threaded along as each block's parameters. Handing an arm the originals
+    // would name a value that does not dominate it, and dropping them on the
+    // fall-through edge would leave the remaining arms with nothing to branch.
+    let mut carried = values;
     for index in 0..labels.len() {
         let default = index + 1 == labels.len();
         // The default arm never falls through, so it needs no extra block.
@@ -648,24 +660,37 @@ fn lower_branch_table(
             comparison: IntComparison::Eq,
         });
         let target = label_frame(controls, labels[index])?.target;
+        // The fall-through block receives the values on its incoming edge, so it
+        // declares them as parameters. Fresh ids are what make that join a phi.
+        let mut params = Vec::with_capacity(label_types.len());
+        if fallthrough.is_some() {
+            for expected in label_types.iter() {
+                params.push(state.allocate(*expected)?);
+            }
+        }
         let terminator = match fallthrough {
             // The default arm is a plain branch: anything reaching here either
             // matched no index or the selector was out of range.
             None => Terminator::Branch {
                 target,
-                values: values.clone(),
+                values: carried.clone(),
             },
             Some(fallthrough) => Terminator::CondBranch {
                 condition: matched,
                 then_target: target,
-                then_values: values.clone(),
+                then_values: carried.clone(),
                 else_target: fallthrough,
-                else_values: Vec::new(),
+                else_values: carried.clone(),
             },
         };
         builder.terminate(terminator);
         if let Some(fallthrough) = fallthrough {
+            builder.blocks[fallthrough.0 as usize].params = params.clone();
             builder.start_block(fallthrough);
+            for (param, expected) in params.iter().zip(label_types.iter()) {
+                state.push(*param, *expected);
+            }
+            carried = params;
         }
     }
     mark_unreachable(controls);

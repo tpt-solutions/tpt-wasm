@@ -74,17 +74,17 @@ mvp_verified = "partial"
 #   every instruction the IR can represent, and EngineMode::Baseline runs it at
 #   instantiation, including through a host boundary for imported functions. Not
 #   `true`: there is no native x86-64/AArch64 backend.
-# mvp_differential — 62 tpt-wasm-codegen tests and 36 tpt-wasm-ir tests drive the
+# mvp_differential — 63 tpt-wasm-codegen tests and 36 tpt-wasm-ir tests drive the
 #   real validate -> IR -> baseline pipeline and assert identical results and the
 #   same trap variant against Micro, including host calls through one shared
 #   boundary. On top of the hand-written fixtures, a seeded generator builds
-#   whole programs — now including blocks, branches, if/else, a counted loop, and
-#   direct and indirect calls — and 25,000 of them are compared per test run
-#   (250,000 swept locally), so agreement is a property of the pipeline over a
-#   program population rather than of the cases someone remembered to write.
-#   Extending the generator to control flow is what exposed the `br_if` defects
-#   recorded below. Not `true`: the official spec suite and the
-#   reference-interpreter differential run do not execute yet.
+#   whole programs — blocks, branches, if/else, a counted loop, direct and
+#   indirect calls, a br_table, and the reference instructions — and 25,000 of
+#   them are compared per test run (250,000 swept locally), so agreement is a
+#   property of the pipeline over a program population rather than of the cases
+#   someone remembered to write. Extending the generator to control flow is what
+#   exposed the branch defects recorded below. Not `true`: the official spec
+#   suite and the reference-interpreter differential run do not execute yet.
 # mvp_verified — V0-V3 are machine-checked in Lean 4 with no `sorry` and no
 #   `axiom`. Not `true`: V1 is rule-to-interpreter agreement within the Lean
 #   model rather than Lean-to-Rust equality, V2 is not yet lifted to the
@@ -106,6 +106,14 @@ mvp_verified = "partial"
 # mistake was invisible until the differential generator started emitting
 # blocks and branches, because the hand-written fixtures only branched to void
 # labels, where the two readings agree.
+#
+# `br_table` was wrong in the same area for a different reason: the lowerer
+# popped the label's values before the selector, so the two were swapped and the
+# branch carried the selector while the dispatch compared the carried value. Any
+# selector differing from the value it carries therefore reached the wrong label,
+# and the hand-written fixture had used a selector equal to its carried value.
+# Each arm of the comparison chain also passed no values on its fall-through
+# edge, and later arms named values that did not dominate them. Both are fixed.
 
 [standards]
 wasm_core   = "3.0"

@@ -5445,9 +5445,9 @@ mod tests {
         /// Every branch emits only operations whose operand types it supplies
         /// itself, so the generated body is valid without a type-inference pass.
         fn step(&mut self) {
-            // 19 rather than 14: the five control-flow and call cases below join
-            // the arithmetic families.
-            match self.rng.below(19) {
+            // 22 rather than 19: `br_table` and the two reference cases join the
+            // control-flow and call families.
+            match self.rng.below(22) {
                 0 => self.binary(ValueType::I32, 0x6a, 0x78, ValueType::I32),
                 1 => self.binary(ValueType::I32, 0x46, 0x4f, ValueType::I32),
                 2 => self.binary(ValueType::I64, 0x7c, 0x8a, ValueType::I64),
@@ -5496,6 +5496,9 @@ mod tests {
                 15 => self.counted_loop(self.depth),
                 16 => self.call_helper(),
                 17 => self.call_indirect(),
+                18 => self.branch_table(),
+                19 => self.reference_is_null(),
+                20 => self.reference_through_a_block(),
                 _ => {
                     if self.rng.below(2) == 0 {
                         // A narrow store and load, whose sign extension differs.
@@ -5671,6 +5674,104 @@ mod tests {
             self.stack.push(ValueType::I32);
         }
 
+        /// A `br_table` over two nested blocks that both carry an `i32`.
+        ///
+        /// Every label of a `br_table` must have the same arity, so the two blocks
+        /// are declared with the same result type and the table's two targets plus
+        /// its default are drawn from them. The selector is drawn rather than
+        /// derived, so an out-of-range index takes the default and both the
+        /// in-range and the default edge are exercised.
+        fn branch_table(&mut self) {
+            let result = ValueType::I32;
+            let height = self.stack.len();
+            self.body.push(0x02); // block
+            self.body.push(0x7f); // (result i32)
+            self.body.push(0x02); // block
+            self.body.push(0x7f); // (result i32), the same arity
+            self.depth += 1;
+            self.push(result);
+            // The selector is drawn from 0..=2 against two labels, so the third
+            // draw falls past the end and takes the default.
+            let selector = self.rng.below(3) as i32;
+            self.push_i32(selector);
+            self.body.push(0x0e); // br_table
+            self.body.push(0x02); // two labels
+            self.body.push(0x00); // label 0: the inner block
+            self.body.push(0x01); // label 1: the outer block
+            self.body.push(0x01); // default: the outer block
+            self.pop(2); // the selector and the carried value
+            self.depth -= 1;
+            self.body.push(0x0b); // end (inner)
+            self.body.push(0x0b); // end (outer)
+                                  // A `br_table` is unconditional, so nothing after it runs: both
+                                  // blocks are left with the carried `i32` and nothing else.
+            self.stack.truncate(height);
+            self.stack.push(result);
+        }
+
+        /// A reference value reduced to the `i32` the fixture's signature wants.
+        ///
+        /// A `null` of either reference type, and a `ref.func` naming the
+        /// generated entry point itself, are each tested with `ref.is_null`. The
+        /// non-null case matters as much as the null one: only a real function
+        /// address distinguishes a correct `ref.func` from a fabricated one.
+        fn reference_is_null(&mut self) {
+            match self.rng.below(3) {
+                // ref.null func, ref.null extern, then ref.is_null.
+                0 => {
+                    self.body.push(0xd0);
+                    self.body.push(0x70); // func
+                }
+                1 => {
+                    self.body.push(0xd0);
+                    self.body.push(0x6f); // extern
+                }
+                // ref.func 0, naming the generated function itself.
+                _ => {
+                    self.body.push(0xd2);
+                    self.body.push(0x00);
+                }
+            }
+            self.stack.push(ValueType::Ref(ReferenceType::FuncRef));
+            self.body.push(0xd1); // ref.is_null
+            self.pop(1);
+            self.stack.push(ValueType::I32);
+        }
+
+        /// A `funcref` carried out of a block, then reduced to an `i32`.
+        ///
+        /// This is the two reference features at once: the block's result type is
+        /// a reference, and the value is moved by a branch rather than by falling
+        /// off the end, so a reference has to survive both a taken and an
+        /// untaken branch.
+        fn reference_through_a_block(&mut self) {
+            let height = self.stack.len();
+            self.body.push(0x02); // block
+            self.body.push(0x70); // (result funcref)
+            self.depth += 1;
+            // The null the fall-through starts from.
+            self.body.push(0xd0);
+            self.body.push(0x70); // ref.null func
+            self.stack.push(ValueType::Ref(ReferenceType::FuncRef));
+            self.depth -= 1;
+            let taken = i32::from(self.rng.below(2) == 0);
+            self.push_i32(taken);
+            self.body.push(0x0d); // br_if 0
+            self.body.push(0x00);
+            self.pop(1);
+            // The fall-through replaces the null with a real function reference.
+            self.body.push(0x1a); // drop
+            self.body.push(0xd2); // ref.func
+            self.body.push(0x00);
+            self.stack.push(ValueType::Ref(ReferenceType::FuncRef));
+            self.body.push(0x0b); // end
+            self.stack.truncate(height);
+            self.stack.push(ValueType::Ref(ReferenceType::FuncRef));
+            self.body.push(0xd1); // ref.is_null
+            self.pop(1);
+            self.stack.push(ValueType::I32);
+        }
+
         /// Keep a mutable global in step with the values on the operand stack.
         ///
         /// A `global.set` is emitted only when the top of the tracked stack is the
@@ -5834,6 +5935,24 @@ mod tests {
             from_baseline, from_micro,
             "seed {seed}: the backends disagreed\n{body}"
         );
+    }
+
+    /// The smallest `br_table` that the generator emits, checked directly so a
+    /// disagreement is attributed to the construct rather than to a whole program.
+    #[test]
+    fn br_table_over_two_nested_blocks_matches_micro() {
+        for selector in 0..4i32 {
+            let mut body = vec![0x02, 0x7f, 0x02, 0x7f];
+            body.extend(const_i32(7));
+            body.extend(const_i32(selector));
+            body.extend_from_slice(&[0x0e, 0x02, 0x00, 0x01, 0x01, 0x0b, 0x0b, 0x0b]);
+            let module = module(Vec::new(), vec![ValueType::I32], body);
+            assert_eq!(
+                assert_matches_micro(&module.functions[0].body, ValueType::I32).unwrap(),
+                vec![Value::I32(7)],
+                "selector {selector}"
+            );
+        }
     }
 
     #[test]
