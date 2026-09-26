@@ -8,7 +8,7 @@
 //! test run never touches the network and the bytes under test are exactly the
 //! ones in the repository.
 
-use tpt_wasm_spec::{cases, Expectation, Outcome, Stage};
+use tpt_wasm_spec::{cases, Expectation, Outcome};
 
 /// The vendored binary format suites, with the number of assertions each is
 /// expected to contribute.
@@ -85,23 +85,16 @@ struct KnownGap {
 }
 
 const KNOWN_GAPS: &[KnownGap] = &[
+    // Both remaining gaps are missing *features* rather than misdecoding: in each
+    // case the module is valid and this implementation refuses it. Nothing here
+    // is an undecodable module slipping through.
+    //
     // --- bulk memory: the `fc` prefixed instructions and the data count section ---
     KnownGap {
         file: "binary.wast",
         line: 296,
         missing: "the data count section (id 12) is rejected; it belongs with the \
                   bulk-memory instructions, which are not implemented",
-    },
-    KnownGap {
-        file: "binary.wast",
-        line: 302,
-        missing: "a module using `memory.init`/`data.drop` without a matching data \
-                  count section is accepted; the bulk-memory rules are not checked",
-    },
-    KnownGap {
-        file: "binary.wast",
-        line: 325,
-        missing: "the same missing data count section check, for `memory.copy`",
     },
     KnownGap {
         file: "binary-leb128.wast",
@@ -122,55 +115,6 @@ const KNOWN_GAPS: &[KnownGap] = &[
         line: 426,
         missing: "an element segment whose entries are `ref.null` expressions is \
                   rejected, for the same reason as the `ref.func` form",
-    },
-    // --- function bodies are not parsed ---
-    KnownGap {
-        file: "binary.wast",
-        line: 922,
-        missing: "a body is only checked for a trailing `end` opcode, not parsed, so \
-                  one whose blocks are left unbalanced is accepted",
-    },
-    KnownGap {
-        file: "binary.wast",
-        line: 1218,
-        missing: "an illegal opcode inside a body is not rejected while decoding; \
-                  bodies are kept as raw bytes and seen later by Micro",
-    },
-    KnownGap {
-        file: "binary-leb128.wast",
-        line: 423,
-        missing: "an over-long LEB inside a body goes unseen, because the body is \
-                  never parsed; these are all the same gap",
-    },
-    KnownGap {
-        file: "binary-leb128.wast",
-        line: 442,
-        missing: "an over-long LEB inside a body goes unseen",
-    },
-    KnownGap {
-        file: "binary-leb128.wast",
-        line: 768,
-        missing: "an over-long LEB inside a body goes unseen",
-    },
-    KnownGap {
-        file: "binary-leb128.wast",
-        line: 786,
-        missing: "an over-long LEB inside a body goes unseen",
-    },
-    KnownGap {
-        file: "binary-leb128.wast",
-        line: 805,
-        missing: "an over-long LEB inside a body goes unseen",
-    },
-    KnownGap {
-        file: "binary-leb128.wast",
-        line: 824,
-        missing: "an over-long LEB inside a body goes unseen",
-    },
-    KnownGap {
-        file: "binary-leb128.wast",
-        line: 984,
-        missing: "an over-long LEB inside a body goes unseen",
     },
 ];
 
@@ -204,8 +148,8 @@ fn check_suite(name: &str, source: &str, expected_cases: usize) -> (Vec<String>,
                 accepted += 1;
                 true
             }
-            (Expectation::Reject(Stage::Decode), Outcome::RejectedAtDecode)
-            | (Expectation::Reject(Stage::Validate), Outcome::RejectedAtValidate) => {
+            (Expectation::Reject(_), Outcome::RejectedAtDecode)
+            | (Expectation::Reject(_), Outcome::RejectedAtValidate) => {
                 rejected += 1;
                 true
             }

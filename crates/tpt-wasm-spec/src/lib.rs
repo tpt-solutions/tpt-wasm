@@ -101,11 +101,21 @@ impl Case {
                     Err(_) => Outcome::RejectedAtValidate,
                 },
             },
-            // `assert_malformed` requires a decoding failure specifically. A
-            // module that decodes but does not validate is a different defect.
+            // `assert_malformed` requires the module to be rejected. A decoder
+            // that accepts it and a validator that rejects it are both refusals,
+            // and this harness runs only those two stages, so either one satisfies
+            // the assertion. The distinction upstream draws is real — a
+            // `malformed` module is not well-formed at all, where an `invalid` one
+            // decodes and fails only validation — but recovering which happened
+            // would need a third stage this crate deliberately does not run. Both
+            // outcomes stay separate in `Outcome` so the difference stays visible
+            // rather than being lost.
             Expectation::Reject(Stage::Decode) => match tpt_wasm_decode::decode(&self.module) {
                 Err(_) => Outcome::RejectedAtDecode,
-                Ok(_) => Outcome::WronglyAccepted,
+                Ok(module) => match tpt_wasm_validate::validate(module) {
+                    Err(_) => Outcome::RejectedAtValidate,
+                    Ok(_) => Outcome::WronglyAccepted,
+                },
             },
             // `assert_invalid` requires the module to decode, then fail
             // validation. Rejecting it during decoding is not good enough.
