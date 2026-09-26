@@ -103,6 +103,17 @@ the engine. The limit defaults to `ResourceLimits::default().max_call_depth` and
 the runtime overrides it with the same number it gave the store, so the two
 backends run out of depth on the same call.
 
+`ResourceLimits::max_execution_steps` bounds the *work* rather than the depth, and
+is enforced the same way on both backends. `ExecState` holds one `StepBudget`
+shared by every frame of an execution, not one per frame — a fresh allowance per
+call would let a recursive function run forever — and `charge` is called once per
+instruction, *before* the instruction runs, from the single place that dispatches
+ops so no new variant can skip it. Charging first is what makes the two backends
+exhaust the same budget at the same instruction rather than one apart. `None` is
+the default and means unbounded, which is a deliberate choice rather than an
+omission: the limit is the embedder's to set, and a module that does not terminate
+runs until the host stops it.
+
 ## Engine integration
 
 `EngineMode::Baseline` compiles a module through `validate` → IR → baseline at

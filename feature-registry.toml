@@ -259,6 +259,13 @@ mvp_verified = "partial"
 # IrTable::elements and of RefFunc resolution, with an ownership cycle between a
 # shared table and the module owning its functions. No spec file reaches it.
 #
+# Separately, ResourceLimits::max_execution_steps was honoured by Micro and ignored
+# entirely by the baseline, so an embedder asking for an instruction bound got it
+# on one backend only. The baseline now carries the same budget, shared by every
+# frame of an execution rather than per frame (a fresh allowance per call would
+# let a recursive function run forever), and charges it before each instruction so
+# the trap lands on the same instruction either way.
+#
 # Separately, RuntimeError::UnsupportedFeature for a failed lower_and_verify now
 # carries the underlying reason instead of the bare stage name "baseline
 # lowering". Naming the payload is what turned one vague message into the two

@@ -1222,6 +1222,11 @@ fn instantiate_module(
         // makes a runaway recursion trap identically on both backends instead of
         // trapping in one and overflowing the host stack in the other.
         module.set_max_call_depth(context.limits.max_call_depth);
+        // The instruction budget, for the same reason and from the same limits.
+        // Without this the compiled backend would run a module that Micro stops,
+        // which is a resource-limit divergence rather than a difference in
+        // execution: the embedder asked for a bound and only got it on one backend.
+        module.set_max_execution_steps(context.limits.max_execution_steps);
         // A compiled module holds a shared handle to its memory rather than owning
         // one, so that an instance importing another's memory reaches the same
         // bytes. A module that defines its memory publishes the handle under the
@@ -1589,11 +1594,11 @@ mod tests {
     use tpt_wasm_decode::encode;
     use tpt_wasm_format::{
         ConstExpr, DataMode, DataSegment, Export, ExportDesc, Function, Global, Import, ImportDesc,
-        Memory, Module, Table,
+        LocalDecl, Memory, Module, Table,
     };
     use tpt_wasm_types::{
-        FunctionType, GlobalType, Limits, MemoryType, RefType, ResultType, TableType, Value,
-        ValueType,
+        FunctionType, GlobalType, Limits, MemoryType, RefType, ResourceLimits, ResultType,
+        TableType, Trap, Value, ValueType,
     };
 
     fn i32_result_type() -> FunctionType {
@@ -2598,6 +2603,105 @@ mod tests {
             };
             engine.instantiate(too_narrow).unwrap_err();
         }
+    }
+
+    /// Both backends enforce the instruction budget, and at the same instruction.
+    ///
+    /// `max_execution_steps` used to be honoured by Micro and silently ignored by
+    /// the baseline, so an embedder asking for a bound got it on one backend only,
+    /// and a module that did not terminate simply kept running on the other. The
+    /// two also have to agree on *where* the budget runs out, not merely that they
+    /// run out: charging an instruction before it executes is what makes the trap
+    /// land on the same one rather than one instruction apart.
+    #[test]
+    fn both_backends_enforce_the_instruction_budget() {
+        // A long but *finite* loop, so that a regression fails an assertion rather
+        // than hanging: with the budget ignored this runs to completion and the
+        // assertions below report the missing trap, where an endless loop would
+        // simply never return and leave CI waiting rather than reporting.
+        //   (local $i i32)
+        //   (loop (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        //         (br_if 0 (i32.lt_u (local.get $i) (i32.const 1000))))
+        let module = Module {
+            types: vec![FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(Vec::new()),
+            }],
+            functions: vec![Function {
+                type_index: 0,
+                locals: vec![LocalDecl {
+                    count: 1,
+                    value_type: ValueType::I32,
+                }],
+                // The body starts at the first instruction: locals are declared by
+                // the `locals` field, not as bytes here.
+                body: vec![
+                    0x41, 0x00, // i32.const 0
+                    0x21, 0x00, // local.set 0
+                    0x03, 0x40, // loop, no result
+                    0x20, 0x00, // local.get 0
+                    0x41, 0x01, // i32.const 1
+                    0x6a, // i32.add
+                    0x21, 0x00, // local.set 0
+                    0x20, 0x00, // local.get 0
+                    0x41, 0xe8, 0x07, // i32.const 1000, signed LEB
+                    0x49, // i32.lt_u
+                    0x0d, 0x00, // br_if 0 -- back to the loop header
+                    0x0b, // end (loop)
+                    0x0b, // end (function)
+                ],
+            }],
+            exports: vec![export("count", ExportDesc::Function(0))],
+            ..Module::default()
+        };
+        for budget in [1u64, 2, 3, 5, 10, 100, 5_000] {
+            for mode in [EngineMode::Micro, EngineMode::Baseline] {
+                let config = Config {
+                    engine_mode: mode,
+                    limits: ResourceLimits {
+                        max_execution_steps: Some(budget),
+                        ..ResourceLimits::default()
+                    },
+                    ..Config::default()
+                };
+                let engine = Engine::new(config).unwrap();
+                let mut instance = engine
+                    .instantiate(module.clone())
+                    .unwrap_or_else(|error| panic!("{mode:?} budget {budget}: {error}"));
+                // Matched rather than compared, so the assertion reports *which*
+                // outcome arrived instead of requiring the whole result to be
+                // `PartialEq`.
+                match instance.call("count", Vec::new()) {
+                    Err(RuntimeError::Trap(Trap::StepsExhausted)) => {}
+                    other => {
+                        panic!("{mode:?} budget {budget}: expected StepsExhausted, got {other:?}")
+                    }
+                }
+            }
+        }
+        // A budget above what the loop needs lets it finish on both backends.
+        // Without this the test could pass by trapping on every budget, including
+        // one nothing should have reached.
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let config = Config {
+                engine_mode: mode,
+                limits: ResourceLimits {
+                    max_execution_steps: Some(1_000_000),
+                    ..ResourceLimits::default()
+                },
+                ..Config::default()
+            };
+            let engine = Engine::new(config).unwrap();
+            let mut instance = engine.instantiate(module.clone()).unwrap();
+            instance
+                .call("count", Vec::new())
+                .unwrap_or_else(|error| panic!("{mode:?} did not finish the loop: {error}"));
+        }
+        // The default is *no* budget, which means unbounded: a module that never
+        // terminates then runs until the host stops it. Deliberately not asserted,
+        // because asserting it means running a call that cannot return. It is a
+        // property of `ResourceLimits::default`, and it is why an embedder that does
+        // not trust its modules has to set one.
     }
 
     /// A start function may be an *imported* function.

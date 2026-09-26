@@ -1564,6 +1564,14 @@ pub struct BaselineModule {
     /// trap, and Micro enforces the same number from `ResourceLimits`, so the two
     /// backends fail the same call the same way.
     max_call_depth: usize,
+    /// The instruction budget for this execution, shared by every frame.
+    ///
+    /// `None` leaves execution unbounded, which is the default and is *not* the
+    /// same as a limit: an endless loop then runs until the host gives out rather
+    /// than trapping at a point the embedder chose. Micro reads the same number
+    /// from the same `ResourceLimits` and charges it the same way, so a module that
+    /// exhausts its budget does so at the same instruction either way.
+    max_execution_steps: Option<u64>,
 }
 
 /// One baseline global, shared with whoever else holds that same global.
@@ -1811,6 +1819,7 @@ impl BaselineModule {
             // The same default Micro starts from, so a module that recurses until
             // it traps does so at the same depth on either backend.
             max_call_depth: ResourceLimits::default().max_call_depth,
+            max_execution_steps: ResourceLimits::default().max_execution_steps,
         })
     }
 
@@ -1931,6 +1940,16 @@ impl BaselineModule {
         self
     }
 
+    /// Bound how many instructions one execution may retire.
+    ///
+    /// Set from the same `ResourceLimits` Micro reads, and charged the same way,
+    /// so a module that exhausts its budget traps at the same instruction on both
+    /// backends. `None` is unbounded, which is the default.
+    pub fn set_max_execution_steps(&mut self, max_execution_steps: Option<u64>) -> &mut Self {
+        self.max_execution_steps = max_execution_steps;
+        self
+    }
+
     /// The handle to each of this module's globals, in Wasm index order.
     ///
     /// A `None` is a global this module imports; the embedder installs its handle
@@ -2037,6 +2056,10 @@ impl BaselineModule {
             // same call rather than differing by one.
             depth: 1,
             max_call_depth: self.max_call_depth,
+            steps: &mut StepBudget {
+                limit: self.max_execution_steps,
+                retired: 0,
+            },
         };
         functions[index].run(&mut state, args)
     }
@@ -2061,6 +2084,36 @@ struct ExecState<'a> {
     depth: usize,
     /// The depth at which a further call traps instead of being made.
     max_call_depth: usize,
+    /// The instruction budget for this execution, and what is left of it.
+    ///
+    /// Shared by every frame rather than per frame, so the budget bounds the whole
+    /// execution the way an embedder means it to -- a recursive function cannot get
+    /// a fresh allowance per call and run forever.
+    steps: &'a mut StepBudget,
+}
+
+/// The instruction budget shared by every frame of one execution.
+struct StepBudget {
+    limit: Option<u64>,
+    retired: u64,
+}
+
+impl StepBudget {
+    /// Charge one instruction, or refuse the execution.
+    ///
+    /// Checked *before* the instruction runs, so the count is of instructions that
+    /// were allowed to start. That matches Micro, where `step` compares the counter
+    /// against the limit and then increments; doing it the other way round would
+    /// let the two backends exhaust the same budget one instruction apart.
+    fn charge(&mut self) -> Result<(), Trap> {
+        if let Some(limit) = self.limit {
+            if self.retired >= limit {
+                return Err(Trap::StepsExhausted);
+            }
+        }
+        self.retired = self.retired.saturating_add(1);
+        Ok(())
+    }
 }
 
 impl ExecState<'_> {
@@ -2116,6 +2169,10 @@ impl BaselineFunction {
             // The entry call counts as a frame, as it does in `call`.
             depth: 1,
             max_call_depth: ResourceLimits::default().max_call_depth,
+            steps: &mut StepBudget {
+                limit: ResourceLimits::default().max_execution_steps,
+                retired: 0,
+            },
         };
         self.run(&mut state, args)
     }
@@ -2148,6 +2205,10 @@ impl BaselineFunction {
             let block = &self.blocks[current as usize];
             let mut next: Option<(u32, Vec<u32>)> = None;
             for op in &block.ops {
+                // Charged before the instruction runs, and once per instruction,
+                // matching what Micro's `step` counts. Charged here rather than at
+                // each op so no variant can be added that skips it.
+                state.steps.charge()?;
                 match op {
                     BaselineOp::ConstI32 { slot, value } => {
                         slots[*slot as usize] = Some(Value::I32(*value));
