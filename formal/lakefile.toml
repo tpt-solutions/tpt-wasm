@@ -1,0 +1,8 @@
+name = "tpt-wasm-formal"
+version = "0.1.0"
+defaultTargets = ["TptWasm"]
+
+# No external dependencies: the model is stated directly in Lean 4's core
+# library, so `lake build` needs nothing beyond the pinned toolchain.
+[[lean_lib]]
+name = "TptWasm"

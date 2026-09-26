@@ -2431,15 +2431,15 @@ fn unsupported_module_state_and_instructions_are_rejected() {
     assert!(lowered.globals[0].mutable);
     assert_eq!(lowered.globals[0].init, Value::I32(42));
 
+    // Exports are metadata rather than code, so a module carrying them lowers
+    // like any other. The runtime resolves them against the function table and
+    // the IR need not carry them.
     let mut with_export = module(Vec::new(), Vec::new(), vec![0x0b]);
     with_export.exports.push(Export {
         name: "run".into(),
         desc: ExportDesc::Function(0),
     });
-    assert_eq!(
-        lower_module(&validated(with_export)),
-        Err(LoweringError::UnsupportedFeature("exports"))
-    );
+    assert!(lower_module(&validated(with_export)).is_ok());
 
     // A block type index needs the multi-value representation and is rejected
     // by lowering rather than approximated. The validator only accepts the MVP

@@ -57,6 +57,25 @@ Each callee allocates its own slot frame, so recursion and re-entrancy behave as
 they do in Wasm. A callee's arguments and results are type-checked against the
 slots, and a result of the wrong type is rejected rather than stored.
 
+## Engine integration
+
+`EngineMode::Baseline` compiles a module through `validate` → IR → baseline at
+instantiation and executes the compiled form. The compiled module is owned by
+the `Instance`, so its memory, table, and globals persist across calls exactly
+as the store-backed path does.
+
+A module the baseline cannot represent is refused at instantiation, not at call
+time, so a baseline instance is never left half-usable. The current gap is
+imports: they need a host boundary the baseline does not have yet, so a module
+that imports anything is rejected in baseline mode and still runs under Micro.
+
+Exports are metadata rather than code. The runtime resolves them against the
+module's own function table, so the IR does not carry them and lowering no
+longer rejects a module for having some.
+
+`EngineMode::Optimizing` remains unimplemented and is still refused at engine
+construction.
+
 ## Active data segments
 
 `IrMemory::segments` carries the module's active data segments as

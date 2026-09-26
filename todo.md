@@ -132,7 +132,8 @@
 - [x] Design an executable `Configuration` abstract machine in `tpt-wasm-semantics` (Store, FrameStack, OperandStack, ControlStack) for the modeled subset
 - [x] Define executable transition relations (`C → C'`) for the modeled instruction subset
 - [x] Implement V0 configuration/type invariants as executable Rust properties
-- [ ] Install Lean 4 toolchain; scaffold `formal/` directory (definitions, proofs, invariants, tests)
+- [x] Install Lean 4 toolchain; scaffold `formal/` directory (definitions, proofs, invariants, tests)
+  - elan 4.2.4 with the toolchain pinned in `formal/lean-toolchain` (Lean 4.34.1). `formal/` is a Lake project (`tpt-wasm-formal`) with no external dependencies, so `lake build` needs only the pinned toolchain. The core value domain and its width invariant are in `TptWasm/Basic.lean`; the transition rules, V1-V3 proofs, and the CI check are still pending.
 - [ ] Write Lean 4 definitions for Wasm value types and abstract machine
 - [ ] Write Lean 4 transition rules mirroring spec §4 (execution)
 - [ ] Establish V1: interpreter correspondence proofs (formal rule ≈ Rust `step()`, select subset)
@@ -141,7 +142,7 @@
 - [x] Write `docs/verification/model.md`, `invariants.md`, and `refinement.md`
 - [ ] Add Lean 4 proof check to CI
 
-> M5 has an executable Rust abstract machine and V0 checker for the current instruction subset. Lean tooling, full Core transition coverage, and V1–V3 proofs remain pending.
+> M5 has an executable Rust abstract machine and a V0 checker for the current instruction subset, and the Lean 4 toolchain is now installed with the `formal/` Lake project building. The Lean definitions are started (`TptWasm/Basic.lean` gives the value domain and its width invariant); full Core transition coverage, V1-V3 proofs, and the CI check remain pending.
 
 ---
 
@@ -188,7 +189,8 @@
 - [x] Extend the portable baseline to raw-bit reinterpretation and to the non-trapping float conversions, preserving NaN payloads and signed zeros
 - [x] Extend the portable baseline to the trapping float truncations with Wasm-exact `InvalidConversion` boundaries (NaN, infinity, out-of-range, negative-to-unsigned)
 - [ ] Implement simple lowering pipeline: IR → machine IR → native (x86_64 first)
-- [ ] Wire `EngineMode::Baseline` to codegen backend in `Engine`
+- [x] Wire `EngineMode::Baseline` to codegen backend in `Engine`
+  - The module is compiled through validate to IR to baseline at instantiation and executed by the compiled form. A module the baseline cannot represent is refused at instantiation rather than left half-usable; imports are the current gap, since they need a host boundary the baseline does not have yet.
 - [ ] Implement aarch64 backend stub
 - [ ] Pass all Wasm spec tests through the baseline compiler
 - [ ] Establish Micro equivalence: `Micro(module) == Baseline(module)` for all test programs
@@ -196,7 +198,7 @@
 - [ ] Verify trap equivalence (same traps at same points)
 - [ ] Verify host-effect equivalence
 
-> M7 now has a deterministic portable baseline slice with independent execution and Micro differential coverage for the full straight-line MVP instruction set that the IR represents: constants and every arithmetic, comparison, and bit-count operation at all four widths; `drop`, `select`, and `local.get`/`set`/`tee` over zero-initialized slots; non-trapping integer width and signedness conversions; raw-bit reinterpretation; the non-trapping float conversions; and the trapping float truncations; plus multi-block control flow — `Branch` and `CondBranch` terminators, block parameters bound by incoming edges, and a block-graph executor that follows back edges. IEEE 754 behavior is reproduced exactly, and differential tests drive the real validate → IR → baseline pipeline asserting identical results and traps bit-for-bit, including NaN canonicalization, NaN-payload preservation across reinterpretation, signed-zero `min`/`max`, ties-to-even rounding, every `InvalidConversion` boundary, and a loop that only terminates if the back edge is followed. Direct calls, the full MVP memory instruction set (fourteen loads, nine stores, `memory.size`, `memory.grow`), and `global.get`/`global.set` are now lowered and executed, with module-level memory and global state shared across calls. Tables and active element segments are now lowered and executed as well: an active segment seeds the table, and `call_indirect` resolves the index, distinguishes an out-of-range index from a null entry, and checks the entry's signature against the type the call names. Active data segments are lowered and applied at instantiation as well. References, native x86-64/AArch64 code generation, executable-memory integration, and `EngineMode::Baseline` remain pending.
+> M7 now has a deterministic portable baseline slice with independent execution and Micro differential coverage for the full straight-line MVP instruction set that the IR represents: constants and every arithmetic, comparison, and bit-count operation at all four widths; `drop`, `select`, and `local.get`/`set`/`tee` over zero-initialized slots; non-trapping integer width and signedness conversions; raw-bit reinterpretation; the non-trapping float conversions; and the trapping float truncations; plus multi-block control flow — `Branch` and `CondBranch` terminators, block parameters bound by incoming edges, and a block-graph executor that follows back edges. IEEE 754 behavior is reproduced exactly, and differential tests drive the real validate → IR → baseline pipeline asserting identical results and traps bit-for-bit, including NaN canonicalization, NaN-payload preservation across reinterpretation, signed-zero `min`/`max`, ties-to-even rounding, every `InvalidConversion` boundary, and a loop that only terminates if the back edge is followed. Direct calls, the full MVP memory instruction set (fourteen loads, nine stores, `memory.size`, `memory.grow`), and `global.get`/`global.set` are now lowered and executed, with module-level memory and global state shared across calls. Tables and active element segments are now lowered and executed as well: an active segment seeds the table, and `call_indirect` resolves the index, distinguishes an out-of-range index from a null entry, and checks the entry's signature against the type the call names. Active data segments are lowered and applied at instantiation as well. `EngineMode::Baseline` is now wired into the runtime: the module is compiled through IR to the portable baseline at instantiation and executed by it, with the compiled instance owning that module's memory, table, and globals so state persists across calls. Baseline and Micro are checked to agree on the same module. References, native x86-64/AArch64 code generation, and executable-memory integration remain pending.
 
 
 ---

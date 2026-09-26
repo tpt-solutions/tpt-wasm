@@ -201,9 +201,8 @@ fn reject_unsupported_module_state(module: &tpt_wasm_format::Module) -> Result<(
     if module.start.is_some() {
         return Err(LoweringError::UnsupportedFeature("start functions"));
     }
-    if !module.exports.is_empty() {
-        return Err(LoweringError::UnsupportedFeature("exports"));
-    }
+    // Exports are module metadata rather than code: the runtime resolves them
+    // against the module's own function table, so the IR need not carry them.
     Ok(())
 }
 

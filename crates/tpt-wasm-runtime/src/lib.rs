@@ -412,7 +412,13 @@ impl Linker {
         let context = self
             .instance_context()?
             .unwrap_or_else(|| RuntimeContext::new(limits));
-        instantiate_module(validated.module, self, context, execution)
+        instantiate_module(
+            validated.module,
+            self,
+            context,
+            execution,
+            EngineMode::Micro,
+        )
     }
 }
 
@@ -426,8 +432,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: Config) -> Result<Self, RuntimeError> {
-        if config.engine_mode != EngineMode::Micro {
-            return Err(RuntimeError::UnsupportedFeature("non-micro engine mode"));
+        // The optimizing engine is not implemented. Baseline is a complete
+        // execution backend and is accepted; see `instantiate_validated`.
+        if config.engine_mode == EngineMode::Optimizing {
+            return Err(RuntimeError::UnsupportedFeature("optimizing engine mode"));
         }
         if !config.features.mvp || config.features.non_mvp_enabled() {
             return Err(RuntimeError::UnsupportedFeature(
@@ -476,6 +484,7 @@ impl Engine {
             &self.linker,
             self.context.clone(),
             execution,
+            self.config.engine_mode,
         )
     }
 
@@ -538,6 +547,11 @@ pub struct Instance {
     pub index: u32,
     pub exports: HashMap<String, ExportDesc>,
     pub execution: ExecutionConfig,
+    /// The compiled baseline module, when the engine runs in baseline mode.
+    ///
+    /// It owns that module's memory, table, and globals, so a call through it
+    /// observes and mutates the same state the previous call left behind.
+    baseline: Option<tpt_wasm_codegen::BaselineModule>,
     context: RuntimeContext,
 }
 
@@ -670,12 +684,47 @@ fn same_context(context: &RuntimeContext, export: &ExternalExport) -> Result<(),
     }
 }
 
+/// Compile a module to the portable baseline, when the engine asks for it.
+///
+/// Returns `None` in micro mode, so the store-backed path is used unchanged.
+/// A module the baseline cannot represent is reported here rather than failing
+/// later, so a baseline instance is never left half-usable.
+fn compile_baseline(
+    module: &Module,
+    engine_mode: EngineMode,
+) -> Result<Option<tpt_wasm_codegen::BaselineModule>, RuntimeError> {
+    if engine_mode != EngineMode::Baseline {
+        return Ok(None);
+    }
+    // Imports need a host boundary the baseline does not have yet.
+    if !module.imports.is_empty() {
+        return Err(RuntimeError::UnsupportedFeature("imports in baseline mode"));
+    }
+    let validated = Validator::new()
+        .validate(module.clone())
+        .map_err(RuntimeError::Validation)?;
+    let verified = tpt_wasm_ir::lower_and_verify(&validated).map_err(|error| {
+        RuntimeError::UnsupportedFeature(match error {
+            tpt_wasm_ir::LowerAndVerifyError::Lowering(_) => "baseline lowering",
+            tpt_wasm_ir::LowerAndVerifyError::Verification(_) => "baseline verification",
+        })
+    })?;
+    let compiled = tpt_wasm_codegen::BaselineModule::lower(verified.module())
+        .map_err(|_| RuntimeError::UnsupportedFeature("baseline code generation"))?;
+    Ok(Some(compiled))
+}
+
 fn instantiate_module(
     module: Module,
     linker: &Linker,
     context: RuntimeContext,
     execution: ExecutionConfig,
+    engine_mode: EngineMode,
 ) -> Result<Instance, RuntimeError> {
+    // Compiled first, while the module is still whole: the instantiation below
+    // takes its sections apart, after which it can no longer be borrowed.
+    let baseline = compile_baseline(&module, engine_mode)?;
+    let start = module.start;
     let _call_gate = lock_call_gate(&context.call_gate)?;
     let mut store = lock_store(&context.store)?.clone();
     let mut func_addrs = Vec::new();
@@ -923,16 +972,28 @@ fn instantiate_module(
         index: allocated_index,
         exports,
         execution,
+        baseline,
         context: context.clone(),
     };
-    if let Some(start) = module.start {
-        let address = lock_store(&context.store)?
-            .instance(instance.index)?
-            .func_addrs
-            .get(start as usize)
-            .copied()
-            .ok_or(RuntimeError::Store(StoreError::UnknownFunction(start)))?;
-        instance.call_address_locked(address, Vec::new())?;
+    if let Some(start) = start {
+        // The start function runs on the same backend the instance will use, so
+        // its effects are visible to later calls in baseline mode.
+        match instance.baseline.as_mut() {
+            Some(module) => {
+                module
+                    .call(start as usize, Vec::new())
+                    .map_err(RuntimeError::Trap)?;
+            }
+            None => {
+                let address = lock_store(&context.store)?
+                    .instance(instance.index)?
+                    .func_addrs
+                    .get(start as usize)
+                    .copied()
+                    .ok_or(RuntimeError::Store(StoreError::UnknownFunction(start)))?;
+                instance.call_address_locked(address, Vec::new())?;
+            }
+        }
     }
     Ok(instance)
 }
@@ -949,8 +1010,37 @@ impl Instance {
     }
 
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
+        // In baseline mode the module is executed by its own compiled form
+        // rather than by Micro, so the store lookup is not used at all.
+        if self.baseline.is_some() {
+            return self.call_baseline(name, args);
+        }
         let address = self.get_function(name)?;
         self.call_address(address, args)
+    }
+
+    /// Resolve a Wasm export by name.
+    ///
+    /// The baseline addresses functions by module index rather than by store
+    /// address, so the export table is consulted directly.
+    fn baseline_index(&self, name: &str) -> Result<usize, RuntimeError> {
+        match self.exports.get(name) {
+            Some(ExportDesc::Function(index)) => Ok(*index as usize),
+            Some(_) => Err(RuntimeError::TypeMismatch {
+                expected: "function export".into(),
+                actual: "non-function export".into(),
+            }),
+            None => Err(RuntimeError::UnknownExport(name.to_owned())),
+        }
+    }
+
+    fn call_baseline(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
+        let index = self.baseline_index(name)?;
+        let module = self
+            .baseline
+            .as_mut()
+            .expect("checked by the caller that dispatched here");
+        module.call(index, args).map_err(RuntimeError::Trap)
     }
 
     pub fn store(&self) -> Result<MutexGuard<'_, Store>, RuntimeError> {
@@ -1094,7 +1184,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use super::{Config, Engine, HostFunction, RuntimeError};
+    use super::{Config, Engine, EngineMode, HostFunction, RuntimeError};
     use tpt_wasm_decode::encode;
     use tpt_wasm_format::{
         ConstExpr, DataMode, DataSegment, Export, ExportDesc, Function, Global, Import, ImportDesc,
@@ -1686,5 +1776,158 @@ mod tests {
             target.instantiate(consumer),
             Err(RuntimeError::ForeignStore)
         ));
+    }
+
+    /// A module exercising the constructs the baseline supports: a direct call,
+    /// a global, and a memory with a data segment.
+    fn baseline_module() -> Module {
+        Module {
+            types: vec![
+                i32_result_type(),
+                FunctionType {
+                    params: ResultType(Vec::new()),
+                    results: ResultType(vec![ValueType::I32]),
+                },
+                FunctionType {
+                    params: ResultType(vec![ValueType::I32]),
+                    results: ResultType(vec![ValueType::I32]),
+                },
+            ],
+            functions: vec![
+                // 0: (param i32) (result i32) call 1; local.get 0; i32.add
+                Function {
+                    type_index: 2,
+                    locals: Vec::new(),
+                    body: vec![0x10, 0x01, 0x20, 0x00, 0x6a, 0x0b],
+                },
+                // 1: (result i32) i32.const 0; i32.load
+                Function {
+                    type_index: 1,
+                    locals: Vec::new(),
+                    body: vec![0x41, 0x00, 0x28, 0x02, 0x00, 0x0b],
+                },
+            ],
+            memories: vec![Memory {
+                memory_type: MemoryType {
+                    limits: Limits { min: 1, max: None },
+                    memory64: false,
+                },
+            }],
+            globals: vec![Global {
+                global_type: GlobalType {
+                    value_type: ValueType::I32,
+                    mutable: false,
+                },
+                init: ConstExpr(vec![0x41, 0x00, 0x0b]),
+            }],
+            data: vec![DataSegment {
+                mode: DataMode::Active {
+                    memory_index: 0,
+                    offset: ConstExpr(vec![0x41, 0x00, 0x0b]),
+                },
+                data: vec![0x2a, 0x00, 0x00, 0x00],
+            }],
+            exports: vec![Export {
+                name: "run".into(),
+                desc: ExportDesc::Function(0),
+            }],
+            ..Module::default()
+        }
+    }
+
+    fn baseline_config() -> Config {
+        Config {
+            engine_mode: EngineMode::Baseline,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn baseline_mode_runs_a_module_through_the_public_api() {
+        let engine = Engine::new(baseline_config()).expect("baseline mode should be accepted");
+        let mut instance = engine
+            .instantiate(baseline_module())
+            .expect("the module should compile to baseline code");
+        // The callee reads the data segment through a global, so a wrong path
+        // in any one of memory, globals, calls, or exports shows up here.
+        assert_eq!(
+            instance.call("run", vec![Value::I32(100)]).unwrap(),
+            vec![Value::I32(142)]
+        );
+    }
+
+    #[test]
+    fn baseline_and_micro_agree_on_the_same_module() {
+        let module = baseline_module();
+        let mut baseline = Engine::new(baseline_config())
+            .unwrap()
+            .instantiate(module.clone())
+            .unwrap();
+        let mut micro = Engine::new(Config::default())
+            .unwrap()
+            .instantiate(module)
+            .unwrap();
+        for argument in [0, 1, -3, 7] {
+            let args = vec![Value::I32(argument)];
+            assert_eq!(
+                baseline.call("run", args.clone()).unwrap(),
+                micro.call("run", args).unwrap(),
+                "argument {argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_state_persists_across_calls() {
+        // The module's memory is owned by the compiled instance, so a store in
+        // one call must be visible to the next.
+        let engine = Engine::new(baseline_config()).unwrap();
+        let mut instance = engine.instantiate(baseline_module()).unwrap();
+        let first = instance.call("run", vec![Value::I32(5)]).unwrap();
+        let second = instance.call("run", vec![Value::I32(5)]).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn baseline_mode_rejects_a_module_it_cannot_run() {
+        // Imports need a host boundary the baseline does not have, so the
+        // failure is reported at instantiation rather than at call time.
+        let engine = Engine::new(baseline_config()).unwrap();
+        let error = engine
+            .instantiate(host_calling_module())
+            .expect_err("an importing module should not compile");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::UnsupportedFeature("imports in baseline mode")
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_export_is_reported_in_baseline_mode() {
+        let engine = Engine::new(baseline_config()).unwrap();
+        let mut instance = engine.instantiate(baseline_module()).unwrap();
+        assert!(matches!(
+            instance.call("missing", Vec::new()),
+            Err(RuntimeError::UnknownExport(_))
+        ));
+    }
+
+    #[test]
+    fn the_optimizing_engine_is_still_refused() {
+        let error = Engine::new(Config {
+            engine_mode: EngineMode::Optimizing,
+            ..Config::default()
+        })
+        .expect_err("the optimizing engine is not implemented");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::UnsupportedFeature("optimizing engine mode")
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 }
