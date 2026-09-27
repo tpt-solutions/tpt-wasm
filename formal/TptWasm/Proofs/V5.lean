@@ -136,17 +136,17 @@ the goal close: both a constant and the arithmetic instruction it replaces emit
 nothing.
 -/
 theorem foldable_inert (cs : List (ValueId × Value)) (i i' : Instr) (s : State)
-    (h : foldable i cs = some i') :
+    (h : foldable s cs i = some i') :
     bodyTrace [i] s = bodyTrace [i'] s := by
   cases i with
-  | constI32 r v => simp [foldable] at h
-  | constI64 r v => simp [foldable] at h
+  | constI32 r v => simp_all [foldable]
+  | constI64 r v => simp_all [foldable]
   | binI32 r op l rr =>
-    cases hl : Constants.lookup cs l with
-    | none => simp [foldable, hl] at h
+    cases hl : Constants.constant cs s l with
+    | none => simp_all [foldable]
     | some vl =>
-      cases hr : Constants.lookup cs rr with
-      | none => simp [foldable, hl, hr] at h
+      cases hr : Constants.constant cs s rr with
+      | none => simp_all [foldable]
       | some vr =>
         cases vl with
         | i32 a =>
@@ -157,18 +157,18 @@ theorem foldable_inert (cs : List (ValueId × Value)) (i i' : Instr) (s : State)
             simp only [foldable, hl, hr, Option.some.injEq] at h
             cases h
             simp [bodyTrace, runBody, execInstr]
-          | i64 _ => simp [foldable, hl, hr] at h
-          | f32 _ => simp [foldable, hl, hr] at h
-          | f64 _ => simp [foldable, hl, hr] at h
-        | i64 _ => simp [foldable, hl, hr] at h
-        | f32 _ => simp [foldable, hl, hr] at h
-        | f64 _ => simp [foldable, hl, hr] at h
+          | i64 _ => simp_all [foldable]
+          | f32 _ => simp_all [foldable]
+          | f64 _ => simp_all [foldable]
+        | i64 _ => simp_all [foldable]
+        | f32 _ => simp_all [foldable]
+        | f64 _ => simp_all [foldable]
   | binI64 r op l rr =>
-    cases hl : Constants.lookup cs l with
-    | none => simp [foldable, hl] at h
+    cases hl : Constants.constant cs s l with
+    | none => simp_all [foldable]
     | some vl =>
-      cases hr : Constants.lookup cs rr with
-      | none => simp [foldable, hl, hr] at h
+      cases hr : Constants.constant cs s rr with
+      | none => simp_all [foldable]
       | some vr =>
         cases vl with
         | i64 a =>
@@ -177,20 +177,20 @@ theorem foldable_inert (cs : List (ValueId × Value)) (i i' : Instr) (s : State)
             simp only [foldable, hl, hr, Option.some.injEq] at h
             cases h
             simp [bodyTrace, runBody, execInstr]
-          | i32 _ => simp [foldable, hl, hr] at h
-          | f32 _ => simp [foldable, hl, hr] at h
-          | f64 _ => simp [foldable, hl, hr] at h
-        | i32 _ => simp [foldable, hl, hr] at h
-        | f32 _ => simp [foldable, hl, hr] at h
-        | f64 _ => simp [foldable, hl, hr] at h
-  | cmpI32 r op l rr => simp [foldable] at h
-  | load r m a w => simp [foldable] at h
-  | store m a v w => simp [foldable] at h
-  | globalGet r i => simp [foldable] at h
-  | globalSet i v => simp [foldable] at h
-  | call i args results => simp [foldable] at h
-  | callHost n g args results => simp [foldable] at h
-  | drop v => simp [foldable] at h
+          | i32 _ => simp_all [foldable]
+          | f32 _ => simp_all [foldable]
+          | f64 _ => simp_all [foldable]
+        | i32 _ => simp_all [foldable]
+        | f32 _ => simp_all [foldable]
+        | f64 _ => simp_all [foldable]
+  | cmpI32 r op l rr => simp_all [foldable]
+  | load r m a w => simp_all [foldable]
+  | store m a v w => simp_all [foldable]
+  | globalGet r i => simp_all [foldable]
+  | globalSet i v => simp_all [foldable]
+  | call i args results => simp_all [foldable]
+  | callHost n g args results => simp_all [foldable]
+  | drop v => simp_all [foldable]
 
 /- **What a fold step does
  
@@ -199,7 +199,7 @@ unconditionally, and the reason it is only about the trace is not a weakness of 
 proof but a fact about the model.
  
 `foldable` is handed a constant *table*, and it reads that table rather than the
-state. So for `foldable (.binI32 r op l rr) cs = some (.constI32 r v)` to be sound,
+state. So for `foldable s cs (.binI32 r op l rr) = some (.constI32 r v)` to be sound,
 `cs` must say `l` and `rr` hold the values the *state* holds -- otherwise the fold
 replaces an arithmetic step with a constant computed from different operands. In
 this model that failure is real and not hypothetical: on `State.empty`,

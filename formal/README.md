@@ -56,48 +56,49 @@ V1 covers a strict subset of the Rust model. Lifting V2 to
 `Valid(Module) ⇒ NoWasmMemoryOutOfBoundsAccess` needs the validation theory and
 remains M9 work, as do the V4 refinement proofs. `todo.md` tracks all of it.
 
-## V5 status: what is proved, and the gap that remains
+## V5 status
 
-`TptWasm/Proofs/V5.lean` proves the per-step and per-run facts that constant
-folding needs, and the build is clean with no `sorry` or `admit` anywhere in
-`formal/`:
+`TptWasm/Proofs/V5.lean` proves that constant folding is observationally inert,
+and the build is clean with no `sorry` and no `admit` anywhere in `formal/`.
 
 | Result | Statement |
 | --- | --- |
 | `constI32_inert`, `constI64_inert`, `binI32_inert`, `cmpI32_inert` | these instructions emit no event, so replacing one cannot change a trace |
 | `store_not_inert`, `load_not_inert` | memory access and the host boundary *do* emit events, and so are not foldable |
-| `foldable_inert` | a fold step preserves a single instruction''s trace |
+| `foldable_inert` | a fold step preserves a single instruction's trace |
 | `runBody_trace_prefix` | the accumulated trace is a prefix of the result |
 | `runBody_same_head` | two heads that run alike make the bodies below them alike |
 | `bodyTrace_cons_inert`, `bodyTrace_cons_trapped` | the two ways a head can fail to contribute a trace |
 
-**Not proved:** the whole-body equation `bodyTrace (foldBlock body) s = bodyTrace
-body s`.
+`store_not_inert` and `load_not_inert` are the pair that stops the first four
+from being read as "all instructions are interchangeable".
 
-The blocker is a gap in the *model*, not in the proof. `foldable` is parameterised
-by a constant table and reads that table rather than the state, so for a fold to
-be sound the table must agree with the state the body actually ran with. It need
-not. Concretely, on `State.empty`:
+## The model change that made the fold sound
+
+The pass was previously stated against a constant *table* alone, and the table
+was not required to agree with the state the body actually ran from. On
+`State.empty` that is a real hole:
 
 ```text
 execInstr (.binI32 0 .add 1 2) _  =  .ran _ none [(0, .i32 0)]
 execInstr (.constI32 0 99)    _  =  .ran _ none [(0, .i32 99)]
 ```
 
-so the two instructions disagree about the value they produce, and a fold that
-chose the second from a stale table would change the program''s behaviour.
+so a table claiming `1 ↦ 5, 2 ↦ 6` would fold the first instruction to
+`(0, .i32 11)` while the program computes `(0, .i32 0)`.
 
-Maintaining the agreement also needs the table to stay agreeing as the pass
-extends it. A non-constant head binds its result key, so agreement survives only if
-no value is defined twice -- an SSA condition this model does not enforce.
+`Constants.constant cs s id` now returns `none` unless the table *agrees* with
+the state, and `foldBlockWith` threads the post-head state through the
+recursion. The agreement is not a side condition a caller has to discharge: it
+is what the definition checks, so the pass is sound for every table supplied.
 
-None of this contradicts the Rust implementation, which establishes the equation
-differentially over the Core suite. `foldBlock` builds its table during the same
-walk over the body it folds, starting from `[]`, so the table is by construction a
-record of the constants *that* body defined earlier; and the lowering guarantees
-single definition. What the model lacks is the statement of that invariant, not
-the fact of it.
+This is the one place where the model had to change rather than the proof, and
+`todo.md` records it as such.
 
-**The next step for V5 is therefore a model change, not a proof change:** give
-`foldable` the state, or a table derived from it, and state the single-definition
-invariant. The run-level induction then goes through as written.
+## What V5 does not yet cover
+
+- `deadBlock` is defined in `Passes.lean` but its soundness needs the
+  whole-function liveness premise -- the values the terminator and the successor
+  parameter bindings use -- formalised as a hypothesis.
+- CFG simplification moves control flow, so it cannot use the block-body
+  formulation the other two passes use. It is whole-function work.
