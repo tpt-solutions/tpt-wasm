@@ -3,7 +3,12 @@ import TptWasm.Instruction
 import TptWasm.Store
 import TptWasm.Config
 import TptWasm.Transition
+import TptWasm.Observation
+import TptWasm.IR
+import TptWasm.IRExec
+import TptWasm.Passes
 import TptWasm.Invariants
 import TptWasm.Proofs.V1
 import TptWasm.Proofs.V2
 import TptWasm.Proofs.V3
+import TptWasm.Proofs.V5

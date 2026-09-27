@@ -204,7 +204,7 @@ def execInstr : Instr → State → StepResult
         .ran { s with store := s.store.setGlobal index { g with value := s.values value } }
           (some (TptWasm.Event.globalSet index)) []
       | none => .ran s (some (TptWasm.Event.globalSet index)) []
-  | .call index args _, s => .ran s (some (TptWasm.Event.call index)) []
+  | .call index _ _, s => .ran s (some (TptWasm.Event.call index)) []
   | .callHost name granted args _, s =>
       if granted then .ran s (some (TptWasm.Event.hostCall name (args.map s.values))) [] else .ran s none []
   | .drop _, s => .ran s none []
@@ -214,7 +214,7 @@ def runBody : List Instr → State → List Event → Option (State × List Even
   | [], s, trace => some (s, trace)
   | i :: rest, s, trace =>
     match execInstr i s with
-    | .trapped t => none
+    | .trapped _ => none
     | .ran s' event results =>
       let s'' := results.foldl (fun st (r, v) => st.bind r v) s'
       let trace' := match event with

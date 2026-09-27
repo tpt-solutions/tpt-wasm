@@ -35,6 +35,11 @@ goes to `.lake/`, which is gitignored.
 | `TptWasm/Proofs/V1.lean` | V1: the interpreter agrees with the rules, and the rules are deterministic. |
 | `TptWasm/Proofs/V2.lean` | V2: a memory access happens only inside the memory, and out of bounds is a trap. |
 | `TptWasm/Proofs/V3.lean` | V3: a host capability is invoked only if granted, and execution cannot widen authority. |
+| `TptWasm/Observation.lean` | `Event`, `Finish`, `Observation`, and what a refinement is. |
+| `TptWasm/IR.lean` | The TPT-Wasm IR: SSA values, blocks with parameters, terminators. |
+| `TptWasm/IRExec.lean` | IR execution: `execInstr` and the fuel-bounded `runBody`. |
+| `TptWasm/Passes.lean` | The three passes V5 is about: `foldBlock` and `deadBlock`. |
+| `TptWasm/Proofs/V5.lean` | V5: which instructions are observably inert, and which are not. |
 
 `TptWasm.lean` imports all of them, so `lake build` checks the whole model.
 

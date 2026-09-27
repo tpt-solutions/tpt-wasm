@@ -161,7 +161,7 @@ def targets : Terminator → List (BlockId × List ValueId)
 /-- The values this terminator reads. -/
 def reads : Terminator → List ValueId
   | .branch _ args => args
-  | .condBranch c (t₁, a₁) (t₂, a₂) => c :: a₁ ++ a₂
+  | .condBranch c (_, a₁) (_, a₂) => c :: a₁ ++ a₂
   | .ret values => values
   | .trap _ | .unreachable => []
 
