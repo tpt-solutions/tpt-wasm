@@ -10,4 +10,5 @@ repository.workspace = true
 [dependencies]
 tpt-wasm-types.workspace = true
 tpt-wasm-ir.workspace = true
+tpt-wasm-opt.workspace = true
 tpt-wasm-codegen.workspace = true

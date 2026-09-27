@@ -64,6 +64,19 @@ pub enum VerificationError {
     ImmutableGlobal(u32),
     /// A memory instruction in a module that declares no memory.
     NoMemory,
+    /// A memory access claiming its bounds were proven, where the claim does not
+    /// hold against the memory's declared minimum size.
+    ///
+    /// The verifier re-derives the proof rather than trusting the claim, so a
+    /// wrong `Proven` is caught here instead of becoming an unchecked access that
+    /// reads or writes outside the buffer.
+    UnprovenBounds {
+        function: usize,
+        /// The last byte the access needs, exclusive.
+        required: u64,
+        /// The memory's guaranteed size in bytes, from its declared minimum.
+        available: u64,
+    },
     ParameterArity {
         function: usize,
         expected: usize,
@@ -170,6 +183,20 @@ fn verify_function(
     // dominates it, which is what `verify_dominance` has just established. The
     // block's *own* results are deliberately not pre-seeded, so an operand used
     // before the instruction that defines it in the same block is still caught.
+    // Values that are statically known `i32` constants, used to re-derive a
+    // memory access's bounds claim. A local is deliberately excluded: a local is
+    // storage that `local.set` re-assigns, so "the constant this value held at
+    // its definition" is not a property the value still has. A constant is
+    // immutable by construction, so the claim stays true wherever it is read.
+    let mut constants: HashMap<ValueId, i32> = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instrs {
+            if let super::IrInstr::ConstI32 { result, value } = instruction {
+                constants.insert(*result, *value);
+            }
+        }
+    }
+
     for &block_index in &order {
         let block = &function.blocks[block_index];
         // Parameters and locals are entry-block storage: they exist for the whole
@@ -193,7 +220,14 @@ fn verify_function(
             }
         }
         for instruction in &block.instrs {
-            verify_instruction(instruction, function_index, module, &values, &mut defined)?;
+            verify_instruction(
+                instruction,
+                function_index,
+                module,
+                &values,
+                &mut defined,
+                &constants,
+            )?;
         }
         verify_terminator(
             &block.terminator,
@@ -202,6 +236,58 @@ fn verify_function(
             &defined,
             &function.function_type.results.0,
         )?;
+    }
+
+    // Every edge in the function must name values that exist, whether or not the
+    // edge can execute.
+    //
+    // The loop above only walks *reachable* blocks, which is correct for
+    // dominance -- an unreachable block has no dominators to speak of. But a
+    // backend compiles the whole function, unreachable regions included, and the
+    // optimizer is free to delete the block that would have supplied a value.
+    // Checking only reachability therefore lets a pass leave an edge that names a
+    // value nothing defines, which the IR verifier accepts and the backend then
+    // rejects with an unrelated-sounding error.
+    //
+    // This is a real defect class rather than a theoretical one: it is how an
+    // optimizing compiler can produce a module that verifies and then fails to
+    // compile, and the failure appears to be the backend's.
+    verify_all_edges(function, &values, &scope)?;
+    Ok(())
+}
+
+/// Check that every branch edge names declared values.
+///
+/// The operand *types* are already checked by `verify_branch_types` for reachable
+/// blocks; what this adds is that the values exist at all, for every block.
+fn verify_all_edges(
+    function: &super::IrFunction,
+    values: &HashMap<ValueId, ValueType>,
+    scope: &Scope,
+) -> Result<(), VerificationError> {
+    for block in &function.blocks {
+        let edges: Vec<&[ValueId]> = match &block.terminator {
+            super::Terminator::Branch { values, .. } => vec![values],
+            super::Terminator::CondBranch {
+                then_values,
+                else_values,
+                ..
+            } => vec![then_values, else_values],
+            _ => Vec::new(),
+        };
+        for operands in edges {
+            for operand in operands {
+                // The value must be *declared* and defined *somewhere* in the
+                // function. Requiring more than that would be wrong: an edge may
+                // legitimately carry a value defined in a block that does not
+                // dominate the edge's source. Requiring nothing is also wrong: a
+                // pass that deletes the definition leaves a backend error about a
+                // value it cannot find, several passes after the mistake.
+                if !values.contains_key(operand) || !scope.def_block.contains_key(operand) {
+                    return Err(VerificationError::UndefinedValue(*operand));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -289,7 +375,15 @@ fn verify_blocks(
     // Every incoming edge must supply exactly the target's parameter count.
     for (index, block) in function.blocks.iter().enumerate() {
         for predecessor in predecessors_of(&successors, index) {
-            let incoming = incoming_arity(&function.blocks[predecessor].terminator, index);
+            let Some(incoming) = incoming_arity(&function.blocks[predecessor].terminator, block.id)
+            else {
+                // `predecessors_of` only reports blocks that actually target this
+                // one, so a `None` here means the two disagree about the graph --
+                // which is a verifier bug rather than a malformed module, and
+                // reporting it as an arity error would point the reader at the
+                // wrong thing.
+                continue;
+            };
             if incoming != block.params.len() {
                 return Err(VerificationError::BlockParameterArity {
                     function: function_index,
@@ -313,10 +407,31 @@ fn predecessors_of(successors: &[Vec<usize>], target: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The number of values a terminator supplies to the block at `target`.
-fn incoming_arity(terminator: &super::Terminator, target: usize) -> usize {
+/// The number of values a terminator supplies to the block at `target_id`.
+///
+/// `target_id` is a *block id*, not a block position, and the two are not
+/// interchangeable. Comparing a position against a `BlockId` happens to work only
+/// while ids and positions coincide, which is why this bug survived: a function
+/// whose blocks are laid out in id order made the two equal by construction.
+///
+/// Two further cases it got wrong:
+///
+/// * a `CondBranch` whose *then* arm targets a different block fell through to
+///   the else arm's values, so an unrelated target could be checked against the
+///   wrong list;
+/// * a block that is the target of *neither* arm returned `0`, which happened to
+///   be right for the caller only because such a block is not a predecessor --
+///   but the arity check iterates predecessors, so the `0` case was only ever
+///   reached through the same id/position confusion.
+///
+/// The function now answers for one specific id and is only ever called for a
+/// block that is a real predecessor, so both arms are checked independently and a
+/// non-matching target returns `None` rather than a misleading `0`.
+fn incoming_arity(terminator: &super::Terminator, target_id: super::BlockId) -> Option<usize> {
     match terminator {
-        super::Terminator::Branch { target: t, values } if t.0 as usize == target => values.len(),
+        super::Terminator::Branch { target, values } => {
+            (*target == target_id).then_some(values.len())
+        }
         super::Terminator::CondBranch {
             then_target,
             then_values,
@@ -324,15 +439,18 @@ fn incoming_arity(terminator: &super::Terminator, target: usize) -> usize {
             else_values,
             ..
         } => {
-            if then_target.0 as usize == target {
-                then_values.len()
-            } else if else_target.0 as usize == target {
-                else_values.len()
-            } else {
-                0
+            // Both arms are checked: a `CondBranch` may target the same block from
+            // either side, and each supplies its own values. Returning the first
+            // match would silently accept an arm whose arity is wrong.
+            if *then_target == target_id {
+                return Some(then_values.len());
             }
+            if *else_target == target_id {
+                return Some(else_values.len());
+            }
+            None
         }
-        _ => 0,
+        _ => None,
     }
 }
 
@@ -799,7 +917,7 @@ fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
 }
 
 /// Values an instruction defines.
-fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
+pub fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
     use super::IrInstr::*;
     match instruction {
         Call { results, .. } => results.clone(),
@@ -941,6 +1059,7 @@ fn verify_instruction(
     module: &IrModule,
     values: &HashMap<ValueId, ValueType>,
     defined: &mut HashSet<ValueId>,
+    constants: &HashMap<ValueId, i32>,
 ) -> Result<(), VerificationError> {
     match instruction {
         super::IrInstr::ConstI32 { result, .. } => {
@@ -1450,13 +1569,21 @@ fn verify_instruction(
         super::IrInstr::Load {
             result,
             address,
+            offset,
             operation,
-            ..
+            bounds,
         } => {
-            if module.memory.is_none() {
-                return Err(VerificationError::NoMemory);
-            }
+            let memory = module.memory.as_ref().ok_or(VerificationError::NoMemory)?;
             expect_defined_type(*address, ValueType::I32, function_index, values, defined)?;
+            verify_proven_bounds(
+                *bounds,
+                *address,
+                *offset,
+                u64::from(operation.width()),
+                memory,
+                function_index,
+                constants,
+            )?;
             define_value(
                 *result,
                 operation.result_type(),
@@ -1468,12 +1595,11 @@ fn verify_instruction(
         super::IrInstr::Store {
             address,
             value,
+            offset,
             operation,
-            ..
+            bounds,
         } => {
-            if module.memory.is_none() {
-                return Err(VerificationError::NoMemory);
-            }
+            let memory = module.memory.as_ref().ok_or(VerificationError::NoMemory)?;
             expect_defined_type(*address, ValueType::I32, function_index, values, defined)?;
             expect_defined_type(
                 *value,
@@ -1482,7 +1608,15 @@ fn verify_instruction(
                 values,
                 defined,
             )?;
-            Ok(())
+            verify_proven_bounds(
+                *bounds,
+                *address,
+                *offset,
+                u64::from(operation.width()),
+                memory,
+                function_index,
+                constants,
+            )
         }
         super::IrInstr::MemorySize { result } => {
             if module.memory.is_none() {
@@ -1654,3 +1788,65 @@ fn expect_defined_type(
     require_defined(id, values, defined)?;
     expect_type(id, expected, function_index, values)
 }
+
+/// Re-derive a memory access's bounds claim instead of trusting it.
+///
+/// `Checked` is always accepted: it asserts nothing, and the backend will range
+/// check. `Proven` asserts the access lies inside the memory, which is only
+/// checkable when the address itself is a known constant, and that is exactly the
+/// condition the bounds-check-elimination pass establishes. The comparison is in
+/// `u64`, so an address near `u32::MAX` plus a large offset cannot wrap into a
+/// small value and slip through: an overflowing sum is reported, not accepted.
+///
+/// The available size comes from the memory's *declared minimum*, which
+/// instantiation guarantees and `memory.grow` can only increase, so proving an
+/// access fits the minimum proves it fits forever.
+fn verify_proven_bounds(
+    bounds: super::BoundsCheck,
+    address: ValueId,
+    offset: u32,
+    width: u64,
+    memory: &super::IrMemory,
+    function_index: usize,
+    constants: &HashMap<ValueId, i32>,
+) -> Result<(), VerificationError> {
+    let available = memory.min_pages.saturating_mul(PAGE_SIZE);
+    // A `Checked` access asserts nothing, so there is nothing to confirm: the
+    // backend range-checks it at run time. Only a `Proven` claim is a claim.
+    if bounds.needs_check() {
+        return Ok(());
+    }
+    // Only a constant address can be proven. Reasoning about a runtime value is
+    // the optimizer's job; the verifier's job is to confirm what the optimizer
+    // claimed, and an address it cannot read is a claim it cannot confirm.
+    let Some(base) = constants.get(&address).copied() else {
+        return Err(VerificationError::UnprovenBounds {
+            function: function_index,
+            required: u64::from(offset) + width,
+            available,
+        });
+    };
+    // The address is an `i32` and the offset a `u32`, so the sum is computed in
+    // `u64` and every addition is checked: a wrap here would turn an
+    // out-of-bounds access into an apparently tiny one, which is exactly the bug
+    // a bounds check exists to prevent.
+    let end = u64::from(base as u32)
+        .checked_add(u64::from(offset))
+        .and_then(|value| value.checked_add(width));
+    match end {
+        Some(required) if required <= available => Ok(()),
+        Some(required) => Err(VerificationError::UnprovenBounds {
+            function: function_index,
+            required,
+            available,
+        }),
+        None => Err(VerificationError::UnprovenBounds {
+            function: function_index,
+            required: u64::MAX,
+            available,
+        }),
+    }
+}
+
+/// One 64 KiB page, the unit a memory's declared minimum is counted in.
+const PAGE_SIZE: u64 = 65_536;

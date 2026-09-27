@@ -560,6 +560,7 @@ fn execute_ir_function(
                     address,
                     offset,
                     operation,
+                    ..
                 } => {
                     let base = match values.get(address) {
                         Some(Value::I32(value)) => *value as u32 as u64,
@@ -576,6 +577,7 @@ fn execute_ir_function(
                     value,
                     offset,
                     operation,
+                    ..
                 } => {
                     let base = match values.get(address) {
                         Some(Value::I32(value)) => *value as u32 as u64,
@@ -2845,6 +2847,7 @@ fn verifier_rejects_memory_use_in_a_module_without_memory() {
             address: ValueId(0),
             offset: 0,
             operation: super::MemoryLoad::I32,
+            bounds: super::BoundsCheck::Checked,
         },
     ];
     ir.functions[0].values.push(IrValue {

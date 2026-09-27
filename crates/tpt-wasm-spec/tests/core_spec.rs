@@ -447,6 +447,25 @@ fn core_spec_suite_on_baseline() {
     assert_suite_passes(EngineMode::Baseline);
 }
 
+/// The same directives, through the optimizing engine.
+///
+/// This is the strongest single check in the project for the optimization
+/// contract. The Core suite is the reference implementation's own corpus, and
+/// running it through the optimizer means every one of its exact return values,
+/// NaN payloads, signed zeros, trap kinds, and `assert_exhaustion` cases has to
+/// come out of the *optimized* module unchanged. A pass that folded `0.0 / 0.0`
+/// to a host NaN, or deleted a division that happened to trap, or reordered a
+/// store, fails here on the specific directive that covers it rather than in a
+/// fuzz report months later.
+///
+/// The counts are re-asserted exactly as for the other two backends, so a backend
+/// that dropped a directive to make a test pass would fail rather than quietly
+/// reduce its coverage.
+#[test]
+fn core_spec_suite_on_the_optimizing_engine() {
+    assert_suite_passes(EngineMode::Optimizing);
+}
+
 fn assert_suite_passes(mode: EngineMode) {
     let mut failures: Vec<String> = Vec::new();
     let mut miscounted: Vec<String> = Vec::new();

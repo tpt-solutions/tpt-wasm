@@ -1370,6 +1370,10 @@ fn lower_load(
         address,
         offset,
         operation,
+        // The address is an arbitrary `i32` at this point, so nothing is known
+        // about whether the access is in bounds. An optimization pass may
+        // strengthen this once it can prove the access is inside the memory.
+        bounds: super::BoundsCheck::Checked,
     });
     state.push(result, result_type);
     Ok(())
@@ -1390,6 +1394,8 @@ fn lower_store(
         value,
         offset,
         operation,
+        // See `lower_load`: the address is unconstrained here.
+        bounds: super::BoundsCheck::Checked,
     });
     Ok(())
 }

@@ -26,6 +26,8 @@ use tpt_wasm_types::{
 };
 use tpt_wasm_validate::{ValidatedModule, ValidationError, Validator};
 
+mod optimizing;
+
 /// Which execution backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EngineMode {
@@ -465,7 +467,7 @@ impl Linker {
             self,
             context,
             execution,
-            EngineMode::Micro,
+            &Config::default(),
         )
     }
 }
@@ -480,11 +482,11 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: Config) -> Result<Self, RuntimeError> {
-        // The optimizing engine is not implemented. Baseline is a complete
-        // execution backend and is accepted; see `instantiate_validated`.
-        if config.engine_mode == EngineMode::Optimizing {
-            return Err(RuntimeError::UnsupportedFeature("optimizing engine mode"));
-        }
+        // Every mode is now implemented. The optimizing mode differs from the
+        // baseline only in the compilation it runs -- both execute through the
+        // same portable executor -- so the two can be compared directly, and
+        // `docs/compiler/optimization.md` records which clause of the
+        // optimization contract is discharged by which mechanism.
         if !config.features.mvp || config.features.non_mvp_enabled() {
             return Err(RuntimeError::UnsupportedFeature(
                 "requested WebAssembly feature",
@@ -532,7 +534,7 @@ impl Engine {
             &self.linker,
             self.context.clone(),
             execution,
-            self.config.engine_mode,
+            &self.config,
         )
     }
 
@@ -779,21 +781,34 @@ fn same_context(context: &RuntimeContext, export: &ExternalExport) -> Result<(),
     }
 }
 
-/// Compile a module to the portable baseline, when the engine asks for it.
+/// Compile a module for whichever compiled mode the engine asked for.
 ///
 /// Returns `None` in micro mode, so the store-backed path is used unchanged.
-/// A module the baseline cannot represent is reported here rather than failing
-/// later, so a baseline instance is never left half-usable.
+/// A module the compiler cannot represent is reported here rather than failing
+/// later, so a compiled instance is never left half-usable.
+///
+/// The two modes share this function and differ only in whether the optimizer
+/// runs. That is what makes them comparable: the same validation, the same
+/// lowering, the same executor, and the same memory/global/table wiring, with
+/// the pass pipeline as the only variable. A behavioural difference between
+/// `EngineMode::Baseline` and `EngineMode::Optimizing` is therefore a difference
+/// in optimization and nothing else -- which is the property the differential
+/// tests rely on.
 fn compile_baseline(
     module: &Module,
-    engine_mode: EngineMode,
+    config: &Config,
 ) -> Result<Option<tpt_wasm_codegen::BaselineModule>, RuntimeError> {
-    if engine_mode != EngineMode::Baseline {
+    let engine_mode = config.engine_mode;
+    if engine_mode == EngineMode::Micro {
         return Ok(None);
     }
     let validated = Validator::new()
         .validate(module.clone())
         .map_err(RuntimeError::Validation)?;
+
+    // Lower and verify once, then optimize only if this mode asks for it. Doing
+    // the lowering in one place means the two modes cannot drift apart in how
+    // they interpret a module, which is what the differential comparison assumes.
     let verified = tpt_wasm_ir::lower_and_verify(&validated).map_err(|error| {
         // The reason is carried through, not replaced by a stage name: a module
         // refused here is otherwise reported as a bare "baseline lowering", which
@@ -813,8 +828,23 @@ fn compile_baseline(
         // `String` for every caller.
         RuntimeError::UnsupportedFeature(Box::leak(format!("baseline {reason}").into_boxed_str()))
     })?;
-    let compiled = tpt_wasm_codegen::BaselineModule::lower(verified.module())
-        .map_err(|_| RuntimeError::UnsupportedFeature("baseline code generation"))?;
+
+    let ir = match optimizing::compile(&validated, config)? {
+        Some(optimized) => optimized,
+        None => verified.into_module(),
+    };
+    // The codegen error is carried through rather than discarded. A bare
+    // "baseline code generation" says only that *something* was refused, and
+    // naming the variant turns it into the specific cause -- which is the
+    // difference between a two-minute diagnosis and an afternoon. This is where a
+    // module the optimizer produced but the backend cannot represent is caught,
+    // and the message is what tells an embedder which half of the compiler to
+    // look at.
+    let compiled = tpt_wasm_codegen::BaselineModule::lower(&ir).map_err(|error| {
+        RuntimeError::UnsupportedFeature(Box::leak(
+            format!("baseline code generation: {error:?}").into_boxed_str(),
+        ))
+    })?;
     // The host boundary is installed by `instantiate_module`, once the imports
     // have been resolved to callbacks. Until then a `CallHost` traps, so a
     // compiled module cannot reach outside itself by accident.
@@ -911,11 +941,11 @@ fn instantiate_module(
     linker: &Linker,
     context: RuntimeContext,
     execution: ExecutionConfig,
-    engine_mode: EngineMode,
+    config: &Config,
 ) -> Result<Instance, RuntimeError> {
     // Compiled first, while the module is still whole: the instantiation below
     // takes its sections apart, after which it can no longer be borrowed.
-    let baseline = compile_baseline(&module, engine_mode)?;
+    let baseline = compile_baseline(&module, config)?;
     let start = module.start;
     let _call_gate = lock_call_gate(&context.call_gate)?;
     let mut store = lock_store(&context.store)?.clone();
@@ -927,7 +957,10 @@ fn instantiate_module(
     // Maps each import the baseline will call to the same synthesized callback
     // name Micro resolves it to, so both backends reach one implementation.
     let mut baseline_bindings: Vec<(String, String)> = Vec::new();
-    let baseline_mode = engine_mode == EngineMode::Baseline;
+    // Both compiled modes route through the baseline executor; they differ only
+    // in whether the optimizer ran. Treating them the same here is what makes
+    // them comparable.
+    let baseline_mode = config.engine_mode != EngineMode::Micro;
 
     for import in &module.imports {
         let definition = linker
@@ -1587,10 +1620,10 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
+    use super::{optimizing, Config, Engine, EngineMode, HostFunction, RuntimeError, Validator};
     use std::fs;
     use std::sync::Arc;
 
-    use super::{Config, Engine, EngineMode, HostFunction, RuntimeError};
     use tpt_wasm_decode::encode;
     use tpt_wasm_format::{
         ConstExpr, DataMode, DataSegment, Export, ExportDesc, Function, Global, Import, ImportDesc,
@@ -3036,19 +3069,101 @@ mod tests {
         ));
     }
 
+    /// The optimizing engine runs a module and agrees with the other two modes.
+    ///
+    /// This is the integration-level counterpart to the optimizer crate's own
+    /// tests: those drive the passes directly, and this one drives them through
+    /// the public API an embedder uses, so a wiring mistake -- a mode that
+    /// silently falls back, or an instance that executes the *un*optimized module
+    /// -- shows up here even though every pass is individually correct.
     #[test]
-    fn the_optimizing_engine_is_still_refused() {
-        let error = Engine::new(Config {
+    fn the_optimizing_engine_runs_a_module_and_agrees_with_micro() {
+        let module = baseline_module();
+        let mut results = Vec::new();
+        for mode in [
+            EngineMode::Micro,
+            EngineMode::Baseline,
+            EngineMode::Optimizing,
+        ] {
+            let engine = Engine::new(Config {
+                engine_mode: mode,
+                ..Config::default()
+            })
+            .expect("every mode should be accepted");
+            let mut instance = engine
+                .instantiate(module.clone())
+                .expect("the module should compile in every mode");
+            results.push(
+                instance
+                    .call("run", vec![Value::I32(7)])
+                    .expect("the call should succeed"),
+            );
+        }
+        assert_eq!(results[0], results[1], "the baseline must agree with Micro");
+        assert_eq!(
+            results[0], results[2],
+            "the optimizing engine must agree with Micro"
+        );
+    }
+
+    /// The optimizing engine must produce a *different* compiled module.
+    ///
+    /// The companion to the test above. Agreeing with Micro is necessary but not
+    /// sufficient: an engine that accepted the mode and then ignored the
+    /// optimizer would pass that one. This asserts the mode actually optimizes.
+    #[test]
+    fn the_optimizing_engine_actually_optimizes() {
+        let module = baseline_module();
+        let validated = Validator::new()
+            .validate(module)
+            .expect("the fixture must validate");
+        let verified = tpt_wasm_ir::lower_and_verify(&validated).expect("the fixture must lower");
+        let config = Config {
             engine_mode: EngineMode::Optimizing,
             ..Config::default()
-        })
-        .expect_err("the optimizing engine is not implemented");
+        };
+        let optimized = optimizing::compile(&validated, &config)
+            .expect("the optimizer must succeed")
+            .expect("the optimizing mode must produce a module");
+        let (before, _) = tpt_wasm_opt::size_of(verified.module());
+        let (after, _) = tpt_wasm_opt::size_of(&optimized);
         assert!(
-            matches!(
-                error,
-                RuntimeError::UnsupportedFeature("optimizing engine mode")
-            ),
-            "unexpected error: {error:?}"
+            after <= before,
+            "optimizing grew the module: {before} instructions became {after}"
         );
+    }
+
+    /// The optimizing engine must reach the same host call as Micro.
+    ///
+    /// Host effects are one of the eight things the optimization contract
+    /// preserves, and they are among the easiest to get wrong: a pass that
+    /// reordered instructions, or folded across a `CallHost`, would change what
+    /// the embedder observes without necessarily changing the return value.
+    /// Routing the compiled engines through `invoke_host_call` is what makes this
+    /// one implementation rather than three that happen to agree.
+    #[test]
+    fn the_optimizing_engine_reaches_the_same_host_call() {
+        let module = host_calling_module();
+        for mode in [EngineMode::Micro, EngineMode::Optimizing] {
+            let mut engine = Engine::new(Config {
+                engine_mode: mode,
+                ..Config::default()
+            })
+            .expect("every mode should be accepted");
+            engine
+                .linker_mut()
+                .define_function("env", "answer", AnswerHost);
+            let mut instance = engine
+                .instantiate(module.clone())
+                .expect("the host-calling module should instantiate");
+            let called = instance
+                .call("run", Vec::new())
+                .expect("the host call should succeed");
+            assert_eq!(
+                called,
+                vec![Value::I32(42)],
+                "mode {mode:?} disagreed on the host call result"
+            );
+        }
     }
 }

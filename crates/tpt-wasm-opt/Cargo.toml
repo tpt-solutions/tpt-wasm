@@ -1,6 +1,6 @@
 [package]
-name = "tpt-wasm-runtime"
-description = "WebAssembly runtime (Store, Instance, Linker, Engine) for tpt-wasm"
+name = "tpt-wasm-opt"
+description = "Optimizing compiler passes for tpt-wasm"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,11 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tpt-wasm-format.workspace = true
-tpt-wasm-decode.workspace = true
 tpt-wasm-types.workspace = true
+tpt-wasm-ir.workspace = true
+
+[dev-dependencies]
+tpt-wasm-format.workspace = true
 tpt-wasm-validate.workspace = true
 tpt-wasm-micro.workspace = true
-tpt-wasm-ir.workspace = true
 tpt-wasm-codegen.workspace = true
-tpt-wasm-opt.workspace = true
+tpt-wasm-runtime.workspace = true
+tpt-wasm-decode.workspace = true

@@ -326,6 +326,15 @@ pub enum BaselineOp {
         address: u32,
         offset: u32,
         operation: tpt_wasm_ir::MemoryLoad,
+        /// Whether the access still needs a run-time range check.
+        ///
+        /// The baseline executor keeps performing the check either way. It
+        /// interprets a `Proven` claim as "this access is known to be in
+        /// bounds", and the *IR verifier* is what actually re-checks that claim,
+        /// so an unchecked access can only exist if the module verified. That
+        /// keeps this backend a faithful reference for the optimized form
+        /// rather than a second place where a bounds proof has to be trusted.
+        bounds: tpt_wasm_ir::BoundsCheck,
     },
     /// Write the low `width` bytes of `value` at `address + offset`.
     Store {
@@ -333,6 +342,8 @@ pub enum BaselineOp {
         value: u32,
         offset: u32,
         operation: tpt_wasm_ir::MemoryStore,
+        /// See [`BaselineOp::Load::bounds`].
+        bounds: tpt_wasm_ir::BoundsCheck,
     },
     MemorySize {
         result: u32,
@@ -415,8 +426,18 @@ impl SlotState {
             .get(&id)
             .copied()
             .ok_or(CodegenError::UnknownValue(id))?;
-        if self.slots.contains_key(&id) {
-            return Err(CodegenError::DuplicateValue(id));
+        // A value that already has a slot is returned as-is rather than reported
+        // as a duplicate.
+        //
+        // `lower_function` allocates every result up front so that a branch edge
+        // naming a later definition resolves, which means the instruction that
+        // computes a value finds its slot already present. Rejecting that as a
+        // duplicate would make the pre-pass and the per-instruction `define` fight
+        // each other. The genuine duplicate -- one value defined twice by two
+        // different instructions -- is still caught here, because the verifier
+        // rejects it first and the pre-pass would have inserted the id twice.
+        if let Some(&existing) = self.slots.get(&id) {
+            return Ok(existing);
         }
         let slot = u32::try_from(self.types.len()).map_err(|_| CodegenError::UnknownValue(id))?;
         self.slots.insert(id, slot);
@@ -495,6 +516,32 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
             slots.push(state.define(*id)?);
         }
         block_params.push(slots);
+    }
+    // Instruction results are allocated up front for the same reason block
+    // parameters are.
+    //
+    // Without this, lowering depends on the *order* blocks happen to appear in,
+    // because a value defined in a later block has no slot when an earlier
+    // block's branch edge names it. That constraint is invisible -- the IR is
+    // perfectly valid SSA, and nothing in the verifier says an edge may not
+    // reference a later definition -- so it made the backend's acceptance
+    // depend on block order rather than on semantics. An optimizer that merges
+    // and reorders blocks then produces IR the backend rejects, with an
+    // "unknown value" that names the backend rather than the ordering it
+    // happened to require.
+    //
+    // The slot is only a *name*; the value is still written by the instruction
+    // that computes it, so allocating early costs nothing and changes no
+    // semantics.
+    let mut result_slots: HashMap<ValueId, u32> = HashMap::with_capacity(function.values.len());
+    for block in &function.blocks {
+        for instruction in &block.instrs {
+            for result in tpt_wasm_ir::instruction_results(instruction) {
+                if result_slots.insert(result, state.define(result)?).is_some() {
+                    return Err(CodegenError::DuplicateValue(result));
+                }
+            }
+        }
     }
 
     let mut blocks = Vec::with_capacity(function.blocks.len());
@@ -1241,6 +1288,7 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     address,
                     offset,
                     operation,
+                    bounds,
                 } => {
                     let address = state.expect(*address, ValueType::I32)?;
                     let result = state.define(*result)?;
@@ -1249,6 +1297,7 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                         address,
                         offset: *offset,
                         operation: *operation,
+                        bounds: *bounds,
                     });
                 }
                 IrInstr::Store {
@@ -1256,6 +1305,7 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     value,
                     offset,
                     operation,
+                    bounds,
                 } => {
                     let address = state.expect(*address, ValueType::I32)?;
                     let value = state.expect(*value, operation.operand_type())?;
@@ -1264,6 +1314,7 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                         value,
                         offset: *offset,
                         operation: *operation,
+                        bounds: *bounds,
                     });
                 }
                 IrInstr::MemorySize { result } => {
@@ -2450,6 +2501,14 @@ impl BaselineFunction {
                         address,
                         offset,
                         operation,
+                        // The bounds claim is read here but not acted on: this
+                        // backend range-checks every access unconditionally, so
+                        // the optimized and unoptimized forms take the identical
+                        // path. A backend that *does* elide the check is the one
+                        // that has to justify it, and it inherits the proof from
+                        // the IR verifier, which re-derived it from the constant
+                        // address rather than taking the optimizer's word.
+                        bounds: _,
                     } => {
                         let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
                         let effective = effective_address(&slots, *address, *offset)?;
@@ -2461,6 +2520,7 @@ impl BaselineFunction {
                         value,
                         offset,
                         operation,
+                        bounds: _,
                     } => {
                         let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
                         let effective = effective_address(&slots, *address, *offset)?;

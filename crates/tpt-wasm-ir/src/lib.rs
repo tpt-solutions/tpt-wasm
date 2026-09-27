@@ -18,6 +18,15 @@ mod lower;
 mod tests;
 mod verify;
 
+/// Values an instruction defines, exported so a backend can allocate slots for
+/// every result before lowering any block.
+///
+/// A backend needs this in advance because a branch edge may name a value defined
+/// in a later block; without a pre-pass, the backend accepts only the block order
+/// the lowering happened to produce, which is a constraint on layout rather than
+/// on semantics.
+pub use verify::instruction_results;
+
 pub use lower::{const_expr_i32, lower_module, LoweringError};
 pub use verify::{
     lower_and_verify, verify_module, IrVerificationCertificate, LowerAndVerifyError,
@@ -548,6 +557,7 @@ pub enum IrInstr {
         address: ValueId,
         offset: u32,
         operation: MemoryLoad,
+        bounds: BoundsCheck,
     },
     /// Write the low `width` bytes of `value` at `address + offset`.
     Store {
@@ -555,6 +565,7 @@ pub enum IrInstr {
         value: ValueId,
         offset: u32,
         operation: MemoryStore,
+        bounds: BoundsCheck,
     },
     /// Current size of memory 0, in pages.
     MemorySize {
@@ -605,6 +616,38 @@ pub enum IrInstr {
         result: ValueId,
         value: ValueId,
     },
+}
+
+/// Whether a memory access still needs a run-time bounds check.
+///
+/// The lowerer always emits [`BoundsCheck::Checked`], because at that point the
+/// only thing known about an address is that it is an `i32`, and an `i32` can
+/// name any byte in a four-gigabyte space. An optimization pass may replace that
+/// with [`BoundsCheck::Proven`] once it has *proved* the access lies inside the
+/// memory's declared minimum size, which is a lower bound the memory can never
+/// drop below -- `memory.grow` only ever adds pages. A backend is then free to
+/// omit the range check, and a backend that does not understand the proof must
+/// still perform the check rather than trust it.
+///
+/// This is deliberately a *claim to be verified*, not a hint: the IR verifier
+/// re-checks a `Proven` access against the memory's minimum size and rejects a
+/// claim it cannot confirm, so a buggy or hostile optimizer cannot use it to
+/// reach outside the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BoundsCheck {
+    /// The access must be range-checked at run time.
+    #[default]
+    Checked,
+    /// An optimization pass proved the access is within the memory's minimum
+    /// size, so it cannot be out of bounds and needs no check.
+    Proven,
+}
+
+impl BoundsCheck {
+    /// Does this access still need a run-time bounds check?
+    pub fn needs_check(self) -> bool {
+        matches!(self, Self::Checked)
+    }
 }
 
 /// The width, signedness, and result type of one Wasm memory load.
