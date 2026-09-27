@@ -83,8 +83,13 @@ mvp_verified = "partial"
 #   property of the pipeline over a program population rather than of the cases
 #   someone remembered to write. Extending the generator to control flow is what
 #   exposed the branch defects recorded below, and the official spec suite now
-#   runs the same comparison across 10,145 directives on both backends. Not
-#   `true`: the reference-interpreter differential does not execute yet.
+#   runs the same comparison across 16,075 directives on both backends. A second
+#   generator, `crates/tpt-wasm-spec/tests/differential.rs`, adds 2,000 more
+#   seeded modules built through the project's own encoder and run on both
+#   backends, comparing the return value, an exported counter global, and the trap
+#   variant. Still not `true`: that generator does not drive the official
+#   reference interpreter, and the spec suite covers only what upstream wrote a
+#   test for.
 # mvp_compiled  — the portable baseline in tpt-wasm-codegen lowers and executes
 #   every instruction the IR can represent, and EngineMode::Baseline runs it at
 #   instantiation, including through a host boundary for imported functions, and

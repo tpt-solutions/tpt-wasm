@@ -13,3 +13,9 @@ tpt-wasm-validate.workspace = true
 tpt-wasm-runtime.workspace = true
 tpt-wasm-types.workspace = true
 wast = { version = "259", default-features = false, features = ["wasm-module"] }
+
+# The differential harness builds modules structurally rather than parsing text,
+# so it needs the format types the encoder consumes. Not a normal dependency: the
+# harness lives in `tests/`, and nothing in the library uses it.
+[dev-dependencies]
+tpt-wasm-format.workspace = true
