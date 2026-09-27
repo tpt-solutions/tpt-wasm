@@ -40,6 +40,7 @@ goes to `.lake/`, which is gitignored.
 | `TptWasm/IRExec.lean` | IR execution: `execInstr` and the fuel-bounded `runBody`. |
 | `TptWasm/Passes.lean` | The three passes V5 is about: `foldBlock` and `deadBlock`. |
 | `TptWasm/Proofs/V5.lean` | V5: which instructions are observably inert, and which are not. |
+| `TptWasm/Proofs/V6.lean` | V6: the lowering skeleton -- the machine, the lowering, and the obligations. |
 
 `TptWasm.lean` imports all of them, so `lake build` checks the whole model.
 
@@ -95,10 +96,35 @@ is what the definition checks, so the pass is sound for every table supplied.
 This is the one place where the model had to change rather than the proof, and
 `todo.md` records it as such.
 
-## What V5 does not yet cover
+| `deadBlock_keeps_observable` | dead-value elimination never removes an instruction whose execution is observable |
 
-- `deadBlock` is defined in `Passes.lean` but its soundness needs the
-  whole-function liveness premise -- the values the terminator and the successor
-  parameter bindings use -- formalised as a hypothesis.
-- CFG simplification moves control flow, so it cannot use the block-body
-  formulation the other two passes use. It is whole-function work.
+## What the two remaining passes still need
+
+`deadBlock_keeps_observable` is the safety-critical half of dead-value
+elimination, and it is the half that does not need the liveness premise: an
+observable instruction is in the output whenever it was in the input, for every
+liveness set. The other half -- that removing a *pure* instruction whose results
+nobody reads changes nothing -- needs the whole-function liveness premise, the
+values the terminator and the successor parameter bindings use.
+
+Writing that premise is where a dead-value pass fails *silently*. A pass that
+deleted on "no use in this body" alone would produce well-formed IR reading a
+value nothing defines, and every downstream check would pass. The premise is
+worth stating rather than assuming for exactly that reason.
+
+CFG simplification moves control flow, so it cannot use the block-body
+formulation the other two passes use. It is whole-function work.
+
+## V6
+
+`TptWasm/Proofs/V6.lean` is the skeleton `spec.txt` section 29 asks for. It
+states the target machine, the lowering, the refinement relation, and every
+obligation in `LoweringObligations` -- slot injectivity, block shape, entry
+correspondence, effects in both directions, control-flow edges, and the main
+event. Six of the seven are real statements rather than placeholders, and
+`lower_preserves_block_count` is proved.
+
+The obligations are a `structure` and not a list of `theorem`s because this
+package admits no `sorry`: every field is a hypothesis the caller supplies, so
+the file is a checked specification. A `sorry` would compile and prove nothing,
+which is worse than a gap that is visible.

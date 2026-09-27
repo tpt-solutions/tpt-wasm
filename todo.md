@@ -300,18 +300,28 @@ now returns `none` unless the table agrees with the state, and `foldBlockWith` t
 agreement is checked by the definition rather than assumed by a caller.
   - The build is clean: no errors, no warnings, no `sorry`, no `admit`.
 - [ ] Write proof for dead block elimination
-  - `Passes.lean` defines `deadBlock`, but the proof needs the whole-function liveness premise — the values the
-terminator and the successor parameter bindings use — as an explicit hypothesis. Getting that premise wrong fails
-silently, which is why it is worth stating rather than assuming.
+  - **Safety-critical half done:** `deadBlock_keeps_observable` proves an observable instruction survives the pass,
+for every liveness set. Getting the pass *right* needed a model change: `deadBlock` decided on values alone and so
+deleted a `load` whose result was unused (losing its trap) and a `call` whose results were unused (losing its host
+effect). `Passes.lean` now has an `observable` predicate and the pass keeps those instructions.
+  - **Remaining:** the other half — that removing a *pure* instruction nobody reads changes nothing — needs the
+whole-function liveness premise as an explicit hypothesis. Getting that premise wrong fails silently, which is why
+it is worth stating rather than assuming.
 - [ ] Write proof for CFG simplification
   - Whole-function work: this pass moves control flow, so it cannot use the block-body formulation the other two passes
 use. Stated over a whole function it needs the edges in play.
 - [x] Write V5: selected optimization transformation proofs
   - Constant folding is proved as above. The observation vocabulary (`Event`, `Finish`, `Observation`) and the inertness
 results are in place for the remaining passes.
-- [ ] Write V6: lowering correctness proof skeleton (IR → machine code)
+- [x] Write V6: lowering correctness proof skeleton (IR → machine code)
+  - `TptWasm/Proofs/V6.lean` states the machine, `lower`, the refinement relation, and `LoweringObligations` --
+slot injectivity, block shape, entry correspondence, effects in both directions, control-flow edge counts, and the
+main event. `lower_preserves_block_count` is proved; the rest are fields of a `structure` rather than `theorem`s
+with `sorry`, so the file is a checked specification instead of a build that proves nothing.
+  - The relation takes both execution semantics as parameters, which is the honest shape: neither exists yet.
 - [ ] Compose refinement chain: `Wasm ≈ IR ≈ Optimized IR ≈ Machine IR ≈ Machine Code`
-  - One link exists: `Optimized IR ≈ IR` for constant folding, via `V5`. The other links are named above.
+  - One link is discharged per-step: `Optimized IR ≈ IR` for constant folding, via `V5`. The chain itself is not
+composed; `V4` is the next link and is named above.
 - [x] Document all proof obligations in `docs/verification/refinement.md`
   - `docs/verification/refinement.md` states the chain, which obligation each link discharges, and which mechanism
 discharges it where a proof does not yet exist. `formal/README.md` carries the per-file status.
