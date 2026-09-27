@@ -287,13 +287,34 @@
 ## M9 — Formal Compiler Verification
 
 - [ ] Write V4: IR refinement proofs in Lean 4 (Wasm ≈ TPT IR)
-- [ ] Write proof for constant folding (`x + 0 = x`)
+  - `TptWasm/Observation.lean` defines the observable vocabulary both sides are judged against, and `TptWasm/IRExec.lean`
+gives the IR its own fuel-bounded executor. What is missing is the simulation relation relating an `OpStep` derivation to
+the corresponding IR execution.
+- [x] Write proof for constant folding (`x + 0 = x`)
+  - `TptWasm/Proofs/V5.lean` proves `foldable_inert` (a fold step preserves one instruction's trace) together with the
+per-step facts it rests on: the arithmetic instructions emit nothing, memory and the host boundary emit something, and
+a fold cannot change a head's event.
+  - Getting there required a **model** change, not a proof change. `foldable` read a constant table without checking it
+against the state the body ran from, so a stale table replaced the program's own arithmetic. `Constants.constant cs s id`
+now returns `none` unless the table agrees with the state, and `foldBlockWith` threads the post-head state through. The
+agreement is checked by the definition rather than assumed by a caller.
+  - The build is clean: no errors, no warnings, no `sorry`, no `admit`.
 - [ ] Write proof for dead block elimination
+  - `Passes.lean` defines `deadBlock`, but the proof needs the whole-function liveness premise — the values the
+terminator and the successor parameter bindings use — as an explicit hypothesis. Getting that premise wrong fails
+silently, which is why it is worth stating rather than assuming.
 - [ ] Write proof for CFG simplification
-- [ ] Write V5: selected optimization transformation proofs
+  - Whole-function work: this pass moves control flow, so it cannot use the block-body formulation the other two passes
+use. Stated over a whole function it needs the edges in play.
+- [x] Write V5: selected optimization transformation proofs
+  - Constant folding is proved as above. The observation vocabulary (`Event`, `Finish`, `Observation`) and the inertness
+results are in place for the remaining passes.
 - [ ] Write V6: lowering correctness proof skeleton (IR → machine code)
 - [ ] Compose refinement chain: `Wasm ≈ IR ≈ Optimized IR ≈ Machine IR ≈ Machine Code`
-- [ ] Document all proof obligations in `docs/verification/refinement.md`
+  - One link exists: `Optimized IR ≈ IR` for constant folding, via `V5`. The other links are named above.
+- [x] Document all proof obligations in `docs/verification/refinement.md`
+  - `docs/verification/refinement.md` states the chain, which obligation each link discharges, and which mechanism
+discharges it where a proof does not yet exist. `formal/README.md` carries the per-file status.
 
 ---
 
