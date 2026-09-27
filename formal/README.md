@@ -40,6 +40,7 @@ goes to `.lake/`, which is gitignored.
 | `TptWasm/IRExec.lean` | IR execution: `execInstr` and the fuel-bounded `runBody`. |
 | `TptWasm/Passes.lean` | The three passes V5 is about: `foldBlock` and `deadBlock`. |
 | `TptWasm/Proofs/V5.lean` | V5: which instructions are observably inert, and which are not. |
+| `TptWasm/Proofs/V4.lean` | V4: the correspondence between Wasm and IR instructions, and the address agreement. |
 | `TptWasm/Proofs/V6.lean` | V6: the lowering skeleton -- the machine, the lowering, and the obligations. |
 
 `TptWasm.lean` imports all of them, so `lake build` checks the whole model.
@@ -97,6 +98,29 @@ This is the one place where the model had to change rather than the proof, and
 `todo.md` records it as such.
 
 | `deadBlock_keeps_observable` | dead-value elimination never removes an instruction whose execution is observable |
+
+## V4: what is proved, and what the relation has to be
+
+`TptWasm/Proofs/V4.lean` states `Related`, the correspondence between a Wasm
+instruction and an IR one, and proves two things about it.
+
+`ir_address_agrees` says both sides compute an access address the same way: read
+an `i32`, take its magnitude. That is the step that decides *which* byte is
+touched, and a signed-versus-unsigned disagreement between the two would put a
+store in the wrong place.
+
+`liftI32_sound` records which Wasm binary operations have an IR counterpart.
+It is an `Option` rather than a total function, and the reason matters: the IR
+models six binary operations and Wasm has sixteen. Mapping the other ten to
+*something* would make `Related` satisfiable for a lowering that does not exist,
+and the correspondence would stop being evidence. Returning `none` records the
+gap where it is.
+
+**Not proved:** the store correspondence, and the simulation itself. Both the Wasm
+rule and the IR executor reduce a store to the same `writeLE?` call, so the trap
+condition is one decision rather than two -- but the `storedBits` terms are not
+yet in the same form on the two sides, and that is the work. The file says so
+where the lemma would have gone.
 
 ## What the two remaining passes still need
 

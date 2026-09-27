@@ -287,9 +287,12 @@
 ## M9 — Formal Compiler Verification
 
 - [ ] Write V4: IR refinement proofs in Lean 4 (Wasm ≈ TPT IR)
-  - `TptWasm/Observation.lean` defines the observable vocabulary both sides are judged against, and `TptWasm/IRExec.lean`
-gives the IR its own fuel-bounded executor. What is missing is the simulation relation relating an `OpStep` derivation to
-the corresponding IR execution.
+  - `TptWasm/Proofs/V4.lean` states `Related`, the Wasm-to-IR correspondence, and proves the address agreement
+(`ir_address_agrees`) and which binary operations have a counterpart (`liftI32_sound`).
+  - `liftI32` returns an `Option` on purpose: the IR models six binary operations and Wasm has sixteen, and giving the
+other ten a counterpart would make `Related` satisfiable for a lowering that does not exist.
+  - **Remaining:** the store correspondence and the simulation. Both sides reduce a store to the same `writeLE?`, so the
+trap condition is one decision rather than two, but the `storedBits` terms are not yet in the same form on both sides.
 - [x] Write proof for constant folding (`x + 0 = x`)
   - `TptWasm/Proofs/V5.lean` proves `foldable_inert` (a fold step preserves one instruction's trace) together with the
 per-step facts it rests on: the arithmetic instructions emit nothing, memory and the host boundary emit something, and
