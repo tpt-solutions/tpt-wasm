@@ -318,6 +318,56 @@ theorem runBody_same_head (i i' : Instr) (rest : List Instr) (s : State)
   -- expression -- and `runBody` is deterministic in those.
   simp only [runBody, hexec, hexec']
 
+/-- **V5: dead-value elimination never removes an observable instruction.**
+
+This is the safety-critical half of the dead-block pass, and it is the half that
+does not need the liveness premise.
+
+The pass takes the set of values that are live, and an instruction whose results
+are all live is kept while one whose results are all dead is deleted. That
+reasoning is about *values*, and it is silent about everything else an
+instruction does: a `load` can trap and a `call` reaches the host, and neither is
+a value. A pass that deleted on values alone would drop a trap or a host effect
+while every value-level check still passed.
+
+This theorem is what rules that out, by saying directly that an instruction whose
+execution is observable is present in the output whenever it was present in the
+input. The liveness premise then only has to be about the *other* instructions --
+the ones that really are pure.
+
+The statement is membership rather than a whole-run equation because that is the
+precise claim: it holds for every `extra`, so no choice of liveness set can break
+it. -/
+theorem deadBlock_keeps_observable :
+    forall (extra : List ValueId) (body : List Instr) (i : Instr),
+      i ∈ body → observable i → i ∈ deadBlock extra body := by
+  intro extra body
+  induction body generalizing extra with
+  | nil =>
+    intro i himem
+    simp at himem
+  | cons head tail ih =>
+    intro i himem hobs
+    simp only [List.mem_cons] at himem
+    cases himem with
+    | inl heq =>
+      -- `i` is the head. An observable head is kept unconditionally, and a head
+      -- that is deleted must be non-observable -- which `hobs` rules out.
+      subst heq
+      -- `hobs` decides the outer test, so the head is kept and the goal is
+      -- membership in a cons whose head is the element being looked for.
+      simp [deadBlock, hobs]
+    | inr htail =>
+      -- `i` is in the tail. Every branch of the pass recurses on the tail with
+      -- the head's operands added to the live set, so the hypothesis applies
+      -- whichever branch was taken.
+      simp only [deadBlock]
+      split
+      · exact List.mem_cons_of_mem _ (ih (usedBy head ++ extra) i htail hobs)
+      · split
+        · exact List.mem_cons_of_mem _ (ih (usedBy head ++ extra) i htail hobs)
+        · exact ih (usedBy head ++ extra) i htail hobs
+
 /- **What is proved here, and what is not.**
  
 Proved, in order:

@@ -173,27 +173,60 @@ goes. A caller that already has a table may pass it to `foldBlockWith`. -/
 def foldBlock (s : State) (body : List Instr) : List Instr :=
   foldBlockWith s [] body body.length
 
+/-- An instruction that must never be deleted, because running it is observable.
+
+This is the same lesson `foldable` taught, in a different place. Dead-value
+elimination is only sound on instructions whose *absence* cannot be noticed, and
+two of the modeled instructions do not qualify:
+
+* a `load` can trap (`Trap.memoryOutOfBounds`), so deleting a load whose result
+  nobody reads deletes a trap with it -- which `load_not_inert` in
+  `TptWasm.Proofs.V5` proves is observable;
+* a `call` or `callHost` emits an event, so deleting a call whose results nobody
+  reads deletes a host or module effect with it -- which `store_not_inert` proves
+  is observable, and which the host boundary makes visible to the embedder.
+
+`definedBy` is `[]` for a `store`, so the old formulation happened to keep stores
+by accident. It did *not* keep calls or loads: a call with unused results and a
+load with an unused result were both deleted, and both deletions lose something
+an embedder can see.
+
+The predicate is named for what it is -- not a claim about values, but about the
+instruction as a whole -- and it is deliberately the conservative answer. A future
+proof that some load is in bounds can narrow it; nothing here depends on that. -/
+def observable : Instr -> Bool
+  | .load _ _ _ _ => true
+  | .call _ _ _ => true
+  | .callHost _ _ _ _ => true
+  | _ => false
+
 /-- Dead-value elimination: remove an instruction whose result nothing uses.
 
-Stated over a block body, so it removes an instruction whose result is used by
-nothing *later in the same body*. That is sound only because the pass is given the
-values the block's own terminator and its successors' parameter bindings use; the
-whole-function version of this pass needs exactly that set, and
-`TptWasm.Proofs.V5` states the theorem with it as a premise.
+Stated over a block body, so it removes an instruction whose results are used by
+nothing *later in the same body*. That is sound only because the pass is given
+the values the block's own terminator and its successors' parameter bindings use;
+the whole-function version needs exactly that set, and `TptWasm.Proofs.V5` states
+the theorem with it as a premise.
 
 Getting that premise wrong is the failure this pass is most prone to, and it fails
 *silently*: a pass that deleted on "no use in this body" alone would produce
 well-formed IR reading a value nothing defines, and every downstream check would
 pass.
--/
-def deadBlock (extra : List ValueId) : List Instr → List Instr
+
+An observable instruction is kept whatever the liveness says, for the reasons in
+`observable`. That is the one place the pass is conservative, and it is
+conservative in the direction that cannot change behaviour. -/
+def deadBlock (extra : List ValueId) : List Instr -> List Instr
   | [] => []
   | i :: rest =>
-    let used' := IR.usedBy i ++ extra
-    if IR.definedBy i |>.all (fun r => r ∈ used') then
-      i :: deadBlock used' rest
+    if observable i then
+      i :: deadBlock (usedBy i ++ extra) rest
     else
-      deadBlock used' rest
+      let used' := usedBy i ++ extra
+      if definedBy i |>.all (fun r => r ∈ used') then
+        i :: deadBlock used' rest
+      else
+        deadBlock used' rest
 
 end IR
 end TptWasm
