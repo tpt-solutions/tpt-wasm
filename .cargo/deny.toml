@@ -2,7 +2,9 @@
 targets = []
 
 [advisories]
-unmaintained = "all"
+# `unmaintained` is intentionally omitted: its accepted values differ between
+# cargo-deny releases (allow/warn/deny in older ones, all/workspace/transitive/none
+# in 0.18+), and the CI action's binary rejects either form the other expects.
 yanked = "deny"
 
 [licenses]

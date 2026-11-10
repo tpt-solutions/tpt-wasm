@@ -27,10 +27,12 @@ use tpt_wasm_types::{
 use tpt_wasm_validate::{ValidatedModule, ValidationError, Validator};
 
 mod cache;
+mod debug;
 mod optimizing;
 mod provenance;
 
 pub use cache::{CacheStats, CompilationCache, CompilationKey};
+pub use debug::{DebugSession, FrameInfo, StopReason};
 pub use provenance::{
     hash_bytes, Configuration, ExecutionArtifact, ExecutionMetadata, Hash, Outcome, Reproduction,
 };
@@ -145,6 +147,10 @@ impl Default for Config {
 /// Errors raised while building or calling a runtime instance.
 #[derive(Debug)]
 pub enum RuntimeError {
+    /// A debug session is open on this engine, so the store is not available.
+    DebugSessionActive,
+    /// A debug session has returned or trapped, so it takes no further steps.
+    DebugSessionFinished,
     UnsupportedFeature(&'static str),
     Validation(ValidationError),
     Decode(DecodeError),
@@ -210,6 +216,13 @@ impl fmt::Display for RuntimeError {
             Self::UnknownExport(name) => write!(f, "unknown export: {name}"),
             Self::Store(error) => write!(f, "store error: {error}"),
             Self::Trap(trap) => write!(f, "wasm trap: {trap}"),
+            Self::DebugSessionActive => {
+                write!(
+                    f,
+                    "a debug session is open on this engine; the store is held by it"
+                )
+            }
+            Self::DebugSessionFinished => write!(f, "the debug session has already finished"),
             Self::HostCall(call) => write!(f, "host call required: {}", call.func_name),
             Self::HostFunction { name, message } => {
                 write!(f, "host function {name} failed: {message}")
@@ -250,6 +263,9 @@ impl fmt::Debug for HostFunctionDefinition {
 struct RuntimeContext {
     store: Arc<Mutex<Store>>,
     call_gate: Arc<Mutex<()>>,
+    /// Set while a debug session owns the store. Every call and instantiation on the
+    /// engine checks it under the call gate and refuses while it is set.
+    debug_active: Arc<std::sync::atomic::AtomicBool>,
     host_functions: Arc<Mutex<HashMap<String, Arc<dyn HostFunction>>>>,
     /// The limits the store was built with, kept here so a caller that cannot
     /// reach the store can still be told what the instance is bounded by.
@@ -279,6 +295,7 @@ impl RuntimeContext {
         Self {
             store: Arc::new(Mutex::new(Store::new(limits))),
             call_gate: Arc::new(Mutex::new(())),
+            debug_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host_functions: Arc::new(Mutex::new(HashMap::new())),
             limits,
             baseline_memories: Arc::new(Mutex::new(HashMap::new())),
@@ -1028,6 +1045,12 @@ fn instantiate_module(
     };
     let start = module.start;
     let _call_gate = lock_call_gate(&context.call_gate)?;
+    if context
+        .debug_active
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(RuntimeError::DebugSessionActive);
+    }
     let mut store = lock_store(&context.store)?.clone();
     let mut func_addrs = Vec::new();
     let mut table_addrs = Vec::new();
@@ -1555,6 +1578,13 @@ impl Instance {
     }
 
     fn call_baseline(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
+        if self
+            .context
+            .debug_active
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RuntimeError::DebugSessionActive);
+        }
         let index = self.baseline_index(name)?;
         let module = self
             .baseline
@@ -1656,6 +1686,13 @@ impl Instance {
         address: u32,
         args: Vec<Value>,
     ) -> Result<Vec<Value>, RuntimeError> {
+        if self
+            .context
+            .debug_active
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RuntimeError::DebugSessionActive);
+        }
         let function = {
             let store = lock_store(&self.context.store)?;
             store.function(address)?.clone()
