@@ -320,53 +320,247 @@ theorem runBody_same_head (i i' : Instr) (rest : List Instr) (s : State)
 
 /-- **V5: dead-value elimination never removes an observable instruction.**
 
-This is the safety-critical half of the dead-block pass, and it is the half that
-does not need the liveness premise.
-
-The pass takes the set of values that are live, and an instruction whose results
-are all live is kept while one whose results are all dead is deleted. That
-reasoning is about *values*, and it is silent about everything else an
-instruction does: a `load` can trap and a `call` reaches the host, and neither is
-a value. A pass that deleted on values alone would drop a trap or a host effect
-while every value-level check still passed.
-
-This theorem is what rules that out, by saying directly that an instruction whose
-execution is observable is present in the output whenever it was present in the
-input. The liveness premise then only has to be about the *other* instructions --
-the ones that really are pure.
-
-The statement is membership rather than a whole-run equation because that is the
-precise claim: it holds for every `extra`, so no choice of liveness set can break
-it. -/
+An observable instruction is present in the output whenever it was present in the
+input, for every `extra`. That is the claim that stops a value-only pass from
+dropping a trap or a host effect while every value-level check still passes. It is
+kept as its own theorem because it needs no liveness reasoning at all; the
+semantic statement `deadBlock_sound` below subsumes it. -/
 theorem deadBlock_keeps_observable :
     forall (extra : List ValueId) (body : List Instr) (i : Instr),
       i ∈ body → observable i → i ∈ deadBlock extra body := by
   intro extra body
-  induction body generalizing extra with
+  induction body with
   | nil =>
     intro i himem
     simp at himem
   | cons head tail ih =>
     intro i himem hobs
     simp only [List.mem_cons] at himem
-    cases himem with
-    | inl heq =>
-      -- `i` is the head. An observable head is kept unconditionally, and a head
-      -- that is deleted must be non-observable -- which `hobs` rules out.
-      subst heq
-      -- `hobs` decides the outer test, so the head is kept and the goal is
-      -- membership in a cons whose head is the element being looked for.
-      simp [deadBlock, hobs]
-    | inr htail =>
-      -- `i` is in the tail. Every branch of the pass recurses on the tail with
-      -- the head's operands added to the live set, so the hypothesis applies
-      -- whichever branch was taken.
-      simp only [deadBlock]
+    rcases himem with rfl | htail
+    · simp [deadBlock, hobs]
+    · simp only [deadBlock]
       split
-      · exact List.mem_cons_of_mem _ (ih (usedBy head ++ extra) i htail hobs)
-      · split
-        · exact List.mem_cons_of_mem _ (ih (usedBy head ++ extra) i htail hobs)
-        · exact ih (usedBy head ++ extra) i htail hobs
+      · exact List.mem_cons_of_mem _ (ih i htail hobs)
+      · exact ih i htail hobs
+
+/-! ### The liveness half of dead-block elimination
+
+`deadBlock_keeps_observable` says what the pass must not delete. The theorems below
+say what it may delete, and that deleting it changes nothing a caller can see. The
+premise is the live-out set `extra`, stated explicitly: the caller promises that
+`extra` covers every value read after the body (the terminator and the successors'
+parameter bindings). Getting that premise wrong is the failure this pass is most
+prone to, which is why it is a hypothesis and not an assumption. -/
+
+/-- Two states agree on a set of values when they hold the same store and give the
+same value to every member of `L`. -/
+def Agree (L : List ValueId) (s t : State) : Prop :=
+  s.store = t.store ∧ ∀ v ∈ L, s.values v = t.values v
+
+theorem Agree.mono {a b : List ValueId} (hab : ∀ v ∈ a, v ∈ b) {s t : State}
+    (h : Agree b s t) : Agree a s t :=
+  ⟨h.1, fun v hv => h.2 v (hab v hv)⟩
+
+/-- How one instruction's result, run from `sB`, relates to the result of the same
+instruction run from `sD`.
+
+The `ran` case says the events and the defined values are equal, the stores are
+equal afterwards, and each side's values are its own input values: a non-store
+instruction returns the state it was given, and a store changes only the store. -/
+def SimFrom (sB sD : State) : StepResult -> StepResult -> Prop
+  | .ran s1 e1 r1, .ran s2 e2 r2 =>
+      e1 = e2 ∧ r1 = r2 ∧ s1.store = s2.store ∧ s1.values = sB.values ∧ s2.values = sD.values
+  | .trapped t1, .trapped t2 => t1 = t2
+  | _, _ => False
+
+/-- An instruction behaves the same on two states that agree on what it reads. -/
+theorem execInstr_sim (i : Instr) (sB sD : State) (h : Agree (usedBy i) sB sD) :
+    SimFrom sB sD (execInstr i sB) (execInstr i sD) := by
+  obtain ⟨hstore, hval⟩ := h
+  cases i with
+  | constI32 r v => simp [execInstr, SimFrom, hstore]
+  | constI64 r v => simp [execInstr, SimFrom, hstore]
+  | binI32 r op l rr =>
+    have hl := hval l (by simp [usedBy])
+    have hr := hval rr (by simp [usedBy])
+    simp [execInstr, SimFrom, hl, hr, hstore]
+  | binI64 r op l rr =>
+    have hl := hval l (by simp [usedBy])
+    have hr := hval rr (by simp [usedBy])
+    simp [execInstr, SimFrom, hl, hr, hstore]
+  | cmpI32 r op l rr =>
+    have hl := hval l (by simp [usedBy])
+    have hr := hval rr (by simp [usedBy])
+    simp [execInstr, SimFrom, hl, hr, hstore]
+  | load r memory address width =>
+    have ha := hval address (by simp [usedBy])
+    simp only [execInstr, hstore, ha]
+    repeat' split
+    all_goals simp [SimFrom, hstore]
+  | store memory address value width =>
+    have ha := hval address (by simp [usedBy])
+    have hv := hval value (by simp [usedBy])
+    simp only [execInstr, hstore, ha, hv]
+    repeat' split
+    all_goals simp [SimFrom]
+  | globalGet r index =>
+    simp only [execInstr, hstore]
+    repeat' split
+    all_goals simp [SimFrom, hstore]
+  | globalSet index value =>
+    have hv := hval value (by simp [usedBy])
+    simp only [execInstr, hstore, hv]
+    repeat' split
+    all_goals simp [SimFrom, hstore]
+  | call index args results => simp [execInstr, SimFrom, hstore]
+  | callHost name granted args results =>
+    have hargs : args.map sB.values = args.map sD.values := by
+      apply List.map_congr_left
+      intro a ha
+      exact hval a (by simpa [usedBy] using ha)
+    cases granted <;> simp [execInstr, SimFrom, hargs, hstore]
+  | drop value => simp [execInstr, SimFrom, hstore]
+
+/-- Binding the same results into two agreeing states keeps them agreeing. -/
+theorem fold_bind_agree (L : List ValueId) (results : List (ValueId × Value)) :
+    ∀ (s t : State), s.store = t.store -> (∀ v ∈ L, s.values v = t.values v) ->
+      Agree L (results.foldl (fun st (r, v) => st.bind r v) s)
+        (results.foldl (fun st (r, v) => st.bind r v) t) := by
+  induction results with
+  | nil =>
+    intro s t hs hv
+    exact ⟨hs, hv⟩
+  | cons head rest ih =>
+    intro s t hs hv
+    obtain ⟨r, v⟩ := head
+    apply ih
+    · simp [State.bind, hs]
+    · intro w hw
+      simp only [State.bind]
+      split
+      · rfl
+      · exact hv w hw
+
+/-- A removable instruction runs without effect and defines exactly one value. -/
+theorem removable_shape (i : Instr) (s : State) (h : removable i = true) :
+    ∃ r v, definedBy i = [r] ∧ execInstr i s = .ran s none [(r, v)] := by
+  cases i with
+  | constI32 r val => exact ⟨r, .i32 val, rfl, rfl⟩
+  | constI64 r val => exact ⟨r, .i64 val, rfl, rfl⟩
+  | binI32 r op l rr =>
+    exact ⟨r, .i32 (binI32Eval op (intPayload (s.values l)) (intPayload (s.values rr))), rfl, rfl⟩
+  | binI64 r op l rr =>
+    exact ⟨r, .i64 (binI64Eval op (intPayload (s.values l)) (intPayload (s.values rr))), rfl, rfl⟩
+  | cmpI32 r op l rr =>
+    exact ⟨r, cmpI32Eval op (intPayload (s.values l)) (intPayload (s.values rr)), rfl, rfl⟩
+  | load _ _ _ _ => simp [removable] at h
+  | store _ _ _ _ => simp [removable] at h
+  | globalGet _ _ => simp [removable] at h
+  | globalSet _ _ => simp [removable] at h
+  | call _ _ _ => simp [removable] at h
+  | callHost _ _ _ _ => simp [removable] at h
+  | drop _ => simp [removable] at h
+
+/-- **V5: dead-value elimination preserves the block's behaviour.**
+
+Let `D` be `deadBlock extra body`, and let `sB`, `sD` be two states that agree on
+the values `D` reads and on the store. Then running `body` from `sB` and `D` from
+`sD` either both trap, or both succeed with the same trace and with final states
+that agree on `extra`.
+
+This is the whole-body statement the earlier note on the constant-folding pass
+said was missing. It holds for three reasons, each proved above or in the
+induction: an instruction the pass keeps reads only values in the live set, so it
+runs the same in both states (`execInstr_sim`); an instruction the pass deletes is
+pure, so running it changes only the one value it defines (`removable_shape`); and
+that value is not read by anything that survives after it, so the later steps
+cannot see the difference. -/
+theorem deadBlock_sound (extra : List ValueId) :
+    forall (body : List Instr) (sB sD : State) (tr : List Event),
+      Agree (liveOf extra (deadBlock extra body)) sB sD ->
+      (runBody body sB tr = none ∧ runBody (deadBlock extra body) sD tr = none) ∨
+      ∃ sB' sD' trE, runBody body sB tr = some (sB', trE) ∧
+        runBody (deadBlock extra body) sD tr = some (sD', trE) ∧ Agree extra sB' sD' := by
+  intro body
+  induction body with
+  | nil =>
+    intro sB sD tr hag
+    right
+    refine ⟨sB, sD, tr, ?_, ?_, ?_⟩
+    · simp [runBody]
+    · simp [deadBlock, runBody]
+    · simpa [deadBlock, liveOf] using hag
+  | cons i rest ih =>
+    intro sB sD tr hag
+    by_cases hk : (observable i || !removable i ||
+        (definedBy i).any (fun r => decide (r ∈ liveOf extra (deadBlock extra rest)))) = true
+    · -- The pass keeps `i`.
+      have hD : deadBlock extra (i :: rest) = i :: deadBlock extra rest := by
+        simp [deadBlock, hk]
+      have hsub : ∀ v ∈ usedBy i, v ∈ liveOf extra (deadBlock extra (i :: rest)) := by
+        intro v hv
+        rw [hD]
+        simp only [liveOf, List.flatMap_cons, List.mem_append]
+        exact Or.inr (Or.inl hv)
+      have hrest : ∀ v ∈ liveOf extra (deadBlock extra rest),
+          v ∈ liveOf extra (deadBlock extra (i :: rest)) := by
+        intro v hv
+        rw [hD]
+        simp only [liveOf, List.flatMap_cons, List.mem_append] at hv ⊢
+        rcases hv with hv | hv
+        · exact Or.inl hv
+        · exact Or.inr (Or.inr hv)
+      have hagI : Agree (usedBy i) sB sD := hag.mono hsub
+      have hagR : Agree (liveOf extra (deadBlock extra rest)) sB sD := hag.mono hrest
+      have hsim := execInstr_sim i sB sD hagI
+      rw [hD]
+      cases hB : execInstr i sB with
+      | trapped t =>
+        cases hDi : execInstr i sD with
+        | trapped t2 =>
+          rw [hB, hDi] at hsim
+          simp only [SimFrom] at hsim
+          subst hsim
+          left
+          simp [runBody, hB, hDi]
+        | ran s2 e2 r2 =>
+          rw [hB, hDi] at hsim
+          simp only [SimFrom] at hsim
+      | ran s1 e1 r1 =>
+        cases hDi : execInstr i sD with
+        | trapped t2 =>
+          rw [hB, hDi] at hsim
+          simp only [SimFrom] at hsim
+        | ran s2 e2 r2 =>
+          rw [hB, hDi] at hsim
+          simp only [SimFrom] at hsim
+          obtain ⟨he, hr, hstore, hv1, hv2⟩ := hsim
+          subst he
+          subst hr
+          have hfold := fold_bind_agree (liveOf extra (deadBlock extra rest)) r1 s1 s2 hstore
+            (fun v hv => by rw [hv1, hv2]; exact hagR.2 v hv)
+          simp only [runBody, hB, hDi]
+          exact ih _ _ _ hfold
+    · -- The pass deletes `i`: it is pure, and its value is read by nothing that survives.
+      have hD : deadBlock extra (i :: rest) = deadBlock extra rest := by
+        simp [deadBlock, hk]
+      have hpure : removable i = true := by
+        by_cases hne : removable i = true
+        · exact hne
+        · exfalso
+          apply hk
+          simp [hne]
+      obtain ⟨r, v, hdef, hrun⟩ := removable_shape i sB hpure
+      have hnotlive : r ∉ liveOf extra (deadBlock extra rest) := by
+        intro hmem
+        apply hk
+        simp [hdef, hmem]
+      rw [hD] at hag ⊢
+      simp only [runBody, hrun]
+      apply ih
+      refine ⟨hag.1, fun w hw => ?_⟩
+      have hwr : w ≠ r := fun h => hnotlive (by rw [← h]; exact hw)
+      simp [State.bind, hwr, hag.2 w hw]
 
 /- **What is proved here, and what is not.**
  

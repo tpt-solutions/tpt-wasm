@@ -177,56 +177,71 @@ def foldBlock (s : State) (body : List Instr) : List Instr :=
 
 This is the same lesson `foldable` taught, in a different place. Dead-value
 elimination is only sound on instructions whose *absence* cannot be noticed, and
-two of the modeled instructions do not qualify:
+the modeled instructions that are not:
 
 * a `load` can trap (`Trap.memoryOutOfBounds`), so deleting a load whose result
   nobody reads deletes a trap with it -- which `load_not_inert` in
   `TptWasm.Proofs.V5` proves is observable;
 * a `call` or `callHost` emits an event, so deleting a call whose results nobody
   reads deletes a host or module effect with it -- which `store_not_inert` proves
-  is observable, and which the host boundary makes visible to the embedder.
-
-`definedBy` is `[]` for a `store`, so the old formulation happened to keep stores
-by accident. It did *not* keep calls or loads: a call with unused results and a
-load with an unused result were both deleted, and both deletions lose something
-an embedder can see.
+  is observable, and which the host boundary makes visible to the embedder;
+* a `globalGet` emits a `globalGet` event whatever its result is, so deleting one
+  whose value nobody reads still changes the trace. It was missing from this
+  predicate until the liveness proof in `TptWasm.Proofs.V5` found it.
 
 The predicate is named for what it is -- not a claim about values, but about the
-instruction as a whole -- and it is deliberately the conservative answer. A future
-proof that some load is in bounds can narrow it; nothing here depends on that. -/
+instruction as a whole -- and it is deliberately the conservative answer. -/
 def observable : Instr -> Bool
   | .load _ _ _ _ => true
   | .call _ _ _ => true
   | .callHost _ _ _ _ => true
+  | .globalGet _ _ => true
   | _ => false
 
-/-- Dead-value elimination: remove an instruction whose result nothing uses.
+/-- The instructions the pass is allowed to delete.
 
-Stated over a block body, so it removes an instruction whose results are used by
-nothing *later in the same body*. That is sound only because the pass is given
-the values the block's own terminator and its successors' parameter bindings use;
-the whole-function version needs exactly that set, and `TptWasm.Proofs.V5` states
-the theorem with it as a premise.
+These are the five that compute one value and do nothing else: they emit no event,
+they cannot trap, and they do not touch the store. Everything else is kept
+unconditionally. A store, a `global.set`, and a `drop` define no value, so a
+liveness test on them would be vacuously true; keeping them by name rather than by
+that accident is what makes the pass's guarantee readable from the definition. -/
+def removable : Instr -> Bool
+  | .constI32 _ _ | .constI64 _ _ | .binI32 _ _ _ _ | .binI64 _ _ _ _
+  | .cmpI32 _ _ _ _ => true
+  | _ => false
 
-Getting that premise wrong is the failure this pass is most prone to, and it fails
-*silently*: a pass that deleted on "no use in this body" alone would produce
-well-formed IR reading a value nothing defines, and every downstream check would
-pass.
+/-- The values live after a body, given the values live after the whole block.
 
-An observable instruction is kept whatever the liveness says, for the reasons in
-`observable`. That is the one place the pass is conservative, and it is
-conservative in the direction that cannot change behaviour. -/
+`extra` is the caller's premise: the values the block's terminator and its
+successors read. It is supplied rather than computed, because the block-body pass
+cannot see the edges. Every value a body reads is in `liveOf`, so the set is the
+uses of the body's own instructions together with `extra`. -/
+def liveOf (extra : List ValueId) (body : List Instr) : List ValueId :=
+  extra ++ body.flatMap usedBy
+
+/-- Dead-value elimination on a block body, with `extra` the values live out of it.
+
+The sweep runs backwards, matching `tpt-wasm-opt::dce::eliminate`. An instruction is
+kept when it is observable, when it is not removable, or when one of the values it
+defines is read by something that survives after it. The liveness it tests is
+therefore the uses of the *kept* later instructions together with `extra`, and
+that is computed from the already-processed suffix `deadBlock extra rest`.
+
+An earlier version of this pass tested the uses of the instructions *before* the
+one being considered, so it never looked at a later reader. It deleted a constant
+that a later `binI32` read, and then deleted the `binI32` as well, leaving the
+kept `store` to read two values nothing defined. That is the failure this
+definition replaces, and `TptWasm.Proofs.V5.deadBlock_sound` is what shows the
+current version cannot make it. -/
 def deadBlock (extra : List ValueId) : List Instr -> List Instr
   | [] => []
   | i :: rest =>
-    if observable i then
-      i :: deadBlock (usedBy i ++ extra) rest
+    let rest' := deadBlock extra rest
+    if observable i || !removable i ||
+        (definedBy i).any (fun r => decide (r ∈ liveOf extra rest')) then
+      i :: rest'
     else
-      let used' := usedBy i ++ extra
-      if definedBy i |>.all (fun r => r ∈ used') then
-        i :: deadBlock used' rest
-      else
-        deadBlock used' rest
+      rest'
 
 end IR
 end TptWasm

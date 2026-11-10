@@ -107,9 +107,14 @@ store; the two memory theorems are what rule that out.
   inert instruction) is not yet connected to `foldBlock` by an induction, so
   `foldBlock`'s output is not shown to observe the same as its input. The
   remaining step is mechanical; it was not completed here.
-* **Dead-value elimination.** `TptWasm.Passes.deadBlock` is defined with the
-  `extra` argument the liveness analysis must supply, but no correctness theorem
-  over it is written.
+* **Dead-value elimination** is proved over a block body by
+  `TptWasm.Proofs.V5.deadBlock_sound`: running the pruned body from a state that
+  agrees on the live values gives the same trace and a trap at the same point, and
+  final states that agree on `extra`. `extra` is the liveness premise the caller
+  supplies (the values the terminator and successors read). Writing that proof
+  exposed a bug in the model: `deadBlock` had been tested against the uses of the
+  instructions *before* each one, not after, and so deleted values that later
+  instructions read. The model now runs backwards, as `tpt-wasm-opt::dce` does.
 * **CFG simplification.** Not started. This is the one pass of the three that
   moves control flow, so it needs the whole function rather than a block body, and
   the reachability argument the Rust `graph` pass had to get right (see the

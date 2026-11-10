@@ -98,6 +98,7 @@ This is the one place where the model had to change rather than the proof, and
 `todo.md` records it as such.
 
 | `deadBlock_keeps_observable` | dead-value elimination never removes an instruction whose execution is observable |
+| `deadBlock_sound` | dead-value elimination preserves the trace, the trap point, and the live values, given the liveness premise `extra` |
 
 ## V4: what is proved, and what the relation has to be
 
@@ -122,22 +123,27 @@ condition is one decision rather than two -- but the `storedBits` terms are not
 yet in the same form on the two sides, and that is the work. The file says so
 where the lemma would have gone.
 
-## What the two remaining passes still need
+## Dead-value elimination: what is proved, and the premise
 
-`deadBlock_keeps_observable` is the safety-critical half of dead-value
-elimination, and it is the half that does not need the liveness premise: an
-observable instruction is in the output whenever it was in the input, for every
-liveness set. The other half -- that removing a *pure* instruction whose results
-nobody reads changes nothing -- needs the whole-function liveness premise, the
-values the terminator and the successor parameter bindings use.
+`deadBlock_keeps_observable` says an observable instruction is never removed. The
+liveness half is `deadBlock_sound`: for a block body, running the pruned body from a
+state that agrees on the live values gives the same trace and traps at the same
+point, and the final states agree on `extra`.
 
-Writing that premise is where a dead-value pass fails *silently*. A pass that
-deleted on "no use in this body" alone would produce well-formed IR reading a
-value nothing defines, and every downstream check would pass. The premise is
-worth stating rather than assuming for exactly that reason.
+`extra` is the premise, and it is an explicit argument rather than something the
+proof computes: the caller promises it covers every value read after the body (the
+terminator and the successors' parameter bindings). Getting that premise wrong is
+where a dead-value pass fails *silently*, so it is a hypothesis.
+
+Stating the theorem found a model bug. `deadBlock` had tested each instruction
+against the uses of the instructions *before* it, so it never looked at a later
+reader and deleted a constant that a later `binI32` read. It also omitted
+`globalGet`, which emits an event and so cannot be deleted. The model now sweeps
+backwards, as `tpt-wasm-opt::dce` does, and `globalGet` is observable.
 
 CFG simplification moves control flow, so it cannot use the block-body
-formulation the other two passes use. It is whole-function work.
+formulation the other two passes use. It is whole-function work, and is the one
+pass still open.
 
 ## V6
 
