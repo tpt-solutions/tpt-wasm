@@ -23,7 +23,9 @@ Before any public release, complete all items:
 - [ ] Fuzz corpus clean
 - [ ] Security issues reviewed (see SECURITY.md)
 - [ ] SBOM generated (`cargo cyclonedx` or equivalent)
+  - `scripts/sbom.py` writes a CycloneDX 1.5 SBOM from the locked graph; CI uploads it as an artifact on every run. Not yet attached to a release.
 - [ ] Reproducible build verified
+  - `scripts/repro-check.sh` passes locally on Windows (byte-identical CLI builds). The Linux CI job has not run yet.
 - [ ] Release source archive verifiable
 
 ## Artifacts

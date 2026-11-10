@@ -343,3 +343,131 @@ component_model = "pending"
 
 [semantics]
 version = "0.1"
+
+# Per-proposal evidence. Each proposal above has a row here recording what is
+# actually checked, separately from whether it is implemented. A value is `true`
+# only when a test in this repository exercises the whole proposal, `"partial"`
+# when it exercises some of it, and `false` otherwise. Every non-false value names
+# the test or document it rests on in `notes`, so the claim can be checked.
+#
+#   tested        covered by unit, integration, or spec-suite tests in CI
+#   fuzzed        covered by a fuzz target or a seeded generator
+#   differential  compared against Micro (the golden result) on generated input
+#   verified      covered by a Lean proof or a checked invariant in formal/
+
+[evidence.mvp]
+tested = "partial"
+fuzzed = "partial"
+differential = "partial"
+verified = "partial"
+notes = "Core suite: 45 files vendored and run on both backends; binary-format suite run; the rest is blocked on post-MVP proposals (docs in todo.md, M2). Decoder fuzz target in fuzz/ (not run in CI). Seeded differential generators in tpt-wasm-spec and tpt-wasm-opt. Lean V0-V3, V5 (partial), V6 skeleton."
+
+[evidence.reference_types]
+tested = "partial"
+fuzzed = false
+differential = "partial"
+verified = false
+notes = "ref.null, ref.func, ref.is_null, funcref/externref in signatures and locals; exercised by the Core files that do not need table.get/set. Not tested: table.get/set, externref tables, passive and declarative element segments. The opt generator emits reference instructions; the spec differential does not."
+
+[evidence.sign_extension_ops]
+tested = true
+fuzzed = false
+differential = "partial"
+verified = false
+notes = "i32.wast and i64.wast run in CI through the spec harness. The spec differential generator draws from the 0x45-0xc4 numeric range, which includes 0xc0-0xc4, but it does not target them specifically."
+
+[evidence.bulk_memory]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.non_trapping_float_to_int]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.simd]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.multi_value]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.threads]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.extended_const]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.exception_handling]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.memory64]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.multi_memory]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.tail_call]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.relaxed_simd]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.gc]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.typed_function_references]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.memory_control]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.branch_hinting]
+tested = false
+fuzzed = false
+differential = false
+verified = false
+
+[evidence.flexible_vectors]
+tested = false
+fuzzed = false
+differential = false
+verified = false
