@@ -5,7 +5,7 @@
 **Standard:** WebAssembly Core 3.0  
 **Repository:** https://github.com/tpt-solutions/tpt-wasm
 
-**Last verified against the working tree:** `cargo check --workspace --all-targets` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo deny check` clean, `cargo fmt --all -- --check` clean, and `cargo test --workspace` green at 279 passing tests (274 unit/integration tests plus one doc-test; one further test is `#[ignore]`d). That count is dominated by the roughly 32,368 assertions the two spec-test harnesses drive through the real decoder/validator/runtime (218 from the binary-format suite, 16,075 from the Core suite on each of the two execution backends), not the number of `#[test]` functions. Items are only marked `[x]` when the behavior is implemented and covered by a test; an item that is partially delivered stays `[ ]` with a sub-bullet recording exactly which part is done and why the rest is not.
+**Last verified against the working tree:** `cargo check --workspace --all-targets` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo deny check` clean, `cargo fmt --all -- --check` clean, `cargo deny check` clean, the unsafe audit (`scripts/unsafe-count.sh`) clean, and `cargo test --workspace` green at 315 passing tests, with one further test `#[ignore]`d. That count is dominated by the roughly 32,368 assertions the two spec-test harnesses drive through the real decoder/validator/runtime (218 from the binary-format suite, 16,075 from the Core suite on each of the two execution backends), not the number of `#[test]` functions. Items are only marked `[x]` when the behavior is implemented and covered by a test; an item that is partially delivered stays `[ ]` with a sub-bullet recording exactly which part is done and why the rest is not.
 
 ---
 
@@ -111,8 +111,11 @@
   - Three checks guard the generator itself, and each exists because its absence would produce a *passing* test that tests nothing. A module that fails to instantiate **panics** rather than being recorded as an outcome — recorded, both backends produce the same message and the comparison succeeds without executing an instruction, which is the one failure mode a differential test cannot afford to be blind to. `generated_modules_are_accepted` asserts instantiation separately, so a generator bug says so instead of masquerading as a backend disagreement. And `walk_body` re-derives a body's block structure from its finished bytes, sharing nothing with the emitter but the byte sequence — with `the_byte_walker_rejects_malformed_bodies` checking that the walker rejects four malformed bodies and accepts one well-formed one, so it is not passing vacuously either. It is explicitly *not* a guarantee: two implementations of the same misunderstanding agree with each other, and it validates structure rather than types.
   - Seeds are fixed rather than drawn from the clock, and `a_seed_reproduces_its_module` checks that a seed reproduces its bytes — otherwise a failure reported against "seed 137" would not be reproducible and the suite itself would be nondeterministic, which is the policy the engine is held to. The seed count is a constant to be bumped by hand when the generator grows: a new construct should come with a new seed, not with a luckier pass.
 - [ ] Fuzz interpreter with random valid Wasm modules
+  - `crates/tpt-wasm-oracle` is the differential oracle: Micro is the golden result, and the baseline and optimizing engines must agree with it on every function export, including trap variants and budget exhaustion. It is tested two ways. Every valid variant reachable from two seed modules by substituting an i32 operator or a constant is compared and agrees, 65 modules in all. Byte-level mutants are checked as well, and about one in thirty reaches the backends. `fuzz/fuzz_targets/differential.rs` feeds arbitrary bytes to the oracle. It type-checks on this machine, but no campaign has run, so the item stays open.
+  - Not done: a run of the fuzz target over a real corpus, and modules with imports or non-numeric parameters, which the oracle leaves out.
 - [x] Confirm deterministic execution: identical output on repeated runs
 - [ ] Confirm no unexplained panics on fuzz corpus
+  - Not started: this needs a fuzzing campaign, which has not been run. The oracle does not catch panics on purpose, so a campaign reports them as crashes.
 
 ---
 
@@ -265,22 +268,38 @@
 
 ## M8 — Optimizing Compiler
 
-- [ ] Implement constant folding (with precondition, transformation, semantic invariant, unit test, differential test, fuzz test)
-- [ ] Implement constant propagation (same coverage requirement)
-- [ ] Implement dead code elimination
-- [ ] Implement CFG simplification
-- [ ] Implement local value numbering
-- [ ] Implement bounds-check elimination
-- [ ] Implement load/store optimization
-- [ ] Implement common subexpression elimination
-- [ ] Implement register allocation
-- [ ] Implement instruction scheduling
+- [x] Implement constant folding (with precondition, transformation, semantic invariant, unit test, differential test, fuzz test)
+  - `crates/tpt-wasm-opt/src/const_fold.rs`. Unit tests in `tests.rs` cover collapsing a constant expression, keeping a constant division by zero's trap, and folding against the baseline executor. The fuzz requirement is met by the seeded program generator in `tests.rs`, not by a `cargo-fuzz` target.
+- [x] Implement constant propagation (same coverage requirement)
+  - `const_prop.rs`, with `a_local_holding_a_constant_is_propagated` and the generated-program differential.
+- [x] Implement dead code elimination
+  - `dce.rs` sweeps each block backwards with the same liveness the Lean model proves in `formal/TptWasm/Proofs/V5.lean`. Covered by `a_non_trapping_division_with_a_dead_result_is_removed`, `a_division_by_an_unknown_zero_keeps_its_trap`, and the per-pass test.
+- [x] Implement CFG simplification
+  - `graph.rs`, covered by `unreachable_code_is_removed` and the per-pass test. The Lean proof for it is still open (M9).
+- [x] Implement local value numbering
+  - `lvn.rs` (`run`), covered by `a_repeated_expression_is_computed_once` and the generated-program differential.
+- [x] Implement bounds-check elimination
+  - `memory.rs` (`run_bounds_checks`) marks an access proven only when its constant address, offset, and width fit the minimum memory. `bounds_checks_are_removed_only_when_the_access_fits_the_memory` checks the exact page boundary: an access ending on it is removed, one a byte past keeps its check.
+- [x] Implement load/store optimization
+  - `memory.rs` (`run`) forwards a stored value to a later load in the same block. Covered by `a_store_and_the_load_that_reads_it_both_survive` and the generated-program differential.
+- [x] Implement common subexpression elimination
+  - `lvn.rs` (`run_global`) eliminates across blocks. Covered by `a_repeated_expression_is_computed_once` and the generated-program differential.
+- [x] Implement register allocation
+  - `regalloc.rs` computes a liveness-based allocation and checks it with `verify`. `each_pass_alone_verifies_and_satisfies_the_contract` calls `allocate` and `verify` on every generated program directly, so the check does not depend on the `debug_assert` that the release profile drops. Only the native backends consume the plan; the portable executor does not.
+- [x] Implement instruction scheduling
+  - `sched.rs`, covered by the per-pass test and the generated-program differential.
 - [ ] Implement JIT compilation in `tpt-wasm-jit` (unsafe only in executable-memory boundary; each block documents safety invariant)
+  - Not started: `tpt-wasm-jit` is a stub. It needs the executable-memory boundary, which is also the first real `unsafe` in the workspace.
 - [ ] Implement AOT compilation in `tpt-wasm-aot`
-- [ ] Implement module compilation cache (keyed by: module hash + engine version + semantics version + compiler version + target arch + feature set)
-- [ ] Wire `EngineMode::Optimizing` switch in `Engine`
-- [ ] Verify compiler optimization contract: values, control flow, traps, memory effects, global effects, table effects, host effects, observable ordering all preserved
+  - Not started: `tpt-wasm-aot` is a stub, and it needs a target-code generator that does not exist yet.
+- [x] Implement module compilation cache (keyed by: module hash + engine version + semantics version + compiler version + target arch + feature set)
+  - `crates/tpt-wasm-runtime/src/cache.rs`. The engine keeps optimized IR, not a backend module, because a backend module owns per-instance memory, table, and global state. The key holds the exact module bytes, so a hit never depends on a hash alone; the digest is for logs. `instantiate_bytes` validates on every call and uses the cache only for the optimizer and contract check. `instantiate` on a structural `Module` has no bytes to key by, so it is not cached. Covered by five cache unit tests and `the_compilation_cache_reuses_ir_without_sharing_instance_state`.
+- [x] Wire `EngineMode::Optimizing` switch in `Engine`
+  - Wired in `crates/tpt-wasm-runtime/src/optimizing.rs`, and the differential test drives it through the public API.
+- [x] Verify compiler optimization contract: values, control flow, traps, memory effects, global effects, table effects, host effects, observable ordering all preserved
+  - `crates/tpt-wasm-opt/src/contract.rs` checks each of these clauses. It runs on every optimization in `optimize()`, on every pass alone in the per-pass test, and on every compilation at instantiation.
 - [ ] Verify host-effect and trap equivalence with Micro on full regression suite
+  - Partly done: trap equivalence is checked over the generated programs and the Core suite, and host-call equivalence is checked by the baseline host tests. "Full regression suite" is not defined yet, and the generated programs do not yet include host calls, so this stays open.
 
 ---
 
@@ -302,14 +321,10 @@ against the state the body ran from, so a stale table replaced the program's own
 now returns `none` unless the table agrees with the state, and `foldBlockWith` threads the post-head state through. The
 agreement is checked by the definition rather than assumed by a caller.
   - The build is clean: no errors, no warnings, no `sorry`, no `admit`.
-- [ ] Write proof for dead block elimination
-  - **Safety-critical half done:** `deadBlock_keeps_observable` proves an observable instruction survives the pass,
-for every liveness set. Getting the pass *right* needed a model change: `deadBlock` decided on values alone and so
-deleted a `load` whose result was unused (losing its trap) and a `call` whose results were unused (losing its host
-effect). `Passes.lean` now has an `observable` predicate and the pass keeps those instructions.
-  - **Remaining:** the other half — that removing a *pure* instruction nobody reads changes nothing — needs the
-whole-function liveness premise as an explicit hypothesis. Getting that premise wrong fails silently, which is why
-it is worth stating rather than assuming.
+- [x] Write proof for dead block elimination
+  - `deadBlock_keeps_observable` proves an observable instruction survives the pass for every liveness set. `deadBlock_sound` (`TptWasm/Proofs/V5.lean`) proves the liveness half: running the pruned body from a state that agrees on the live values gives the same trace and a trap at the same point, and final states that agree on `extra`. `extra` is the explicit liveness premise (values the terminator and successors read), stated as an argument rather than assumed. The build has no `sorry` or `axiom`.
+  - Stating the theorem found two model bugs, both fixed. `deadBlock` tested an instruction against the uses of the instructions *before* it, so it deleted a constant that a later instruction read, and the kept `store` then read a value nothing defined. It now sweeps backwards, matching `tpt-wasm-opt::dce`. And `globalGet` emits an event, so it is now observable, and deleting one would have changed the trace. The earlier version also deleted `load` and `call` instructions whose results were unused, which the `observable` predicate already prevents.
+  - The pass deletes only the five pure ops (constants, `binI32`/`binI64`, `cmpI32`), since they emit no event, cannot trap, and touch no store.
 - [ ] Write proof for CFG simplification
   - Whole-function work: this pass moves control flow, so it cannot use the block-body formulation the other two passes
 use. Stated over a whole function it needs the edges in play.
@@ -338,16 +353,25 @@ discharges it where a proof does not yet exist. `formal/README.md` carries the p
 - [ ] Implement Component Model layer (`Component` wraps Core Wasm modules; separate from Micro)
 - [ ] Implement WIT interface mapping → TPT Capability boundary
 - [ ] Implement debugger support (breakpoints, single-step, stack traces, locals inspection, memory inspection)
+  - Memory inspection is done for exported memories: `Instance::read_memory(name, offset, length)` returns a copy of the bytes, taken under the lock, on both Micro and the baseline. An out-of-range read is an error, not a trap. Covered by `memory_inspection_sees_what_a_call_left_on_both_backends`.
+  - Not done: breakpoints, single-step, stack traces, and locals. Each needs a resumable execution session, which the runtime does not have: a call runs to completion while holding the call gate and the store, so a paused call has to keep both, and that needs a design decision first.
 - [ ] Implement DWARF / source map support
 - [ ] Implement profiling (instruction counts, function timing, host capability timing, memory/allocation stats)
+  - Instruction counts are done per backend: `Instance::last_call_steps()` reports the steps the most recent call charged, including a call that trapped. Micro counts one per decoded instruction and the baseline one per IR instruction, so the two counts are not comparable. The test checks that a budget equal to the count admits the call and one fewer traps having charged one fewer, on both backends.
+  - Still open: function and host-capability timing. Both need a clock, which conflicts with deterministic execution, so they need a design decision first. Memory and allocation stats are not started.
 - [ ] Add riscv64 compiler backend
-- [ ] Implement `ExecutionMetadata` and `ExecutionArtifact` for scientific reproducibility provenance
+- [x] Implement `ExecutionMetadata` and `ExecutionArtifact` for scientific reproducibility provenance
+  - `crates/tpt-wasm-runtime/src/provenance.rs`. `ExecutionMetadata` carries the module's SHA-256, the engine, semantics, host, and compiler versions, the function imports as `CapabilityId`s, and the configuration. `ExecutionArtifact` adds the export, the inputs, and the outcome (returned values or a trap), with a SHA-256 digest over a canonical encoding that takes floats by bits. `Engine::record` produces one, and `Engine::reproduce` checks the module, the versions, and the configuration in that order, then re-runs and compares digests. The digest omits wall-clock time and the debugging and profiling flags, as `docs/host/determinism.md` records. Covered by seven tests, including the FIPS 180-2 SHA-256 vector.
+  - Reference values and traps are encoded through `Debug`, so the digest is stable within one version of the crate, and the artifact records that version.
 - [ ] Implement SBOM generation in CI release pipeline
-- [ ] Implement reproducible build verification
+  - `scripts/sbom.py` writes a CycloneDX 1.5 document from the locked dependency graph. Verified locally: two runs are byte-identical, and it lists 41 components, 20 of them workspace members. A CI job uploads it as a workflow artifact on every run. It is not attached to a release, because no release pipeline exists yet; that step stays open.
+- [x] Implement reproducible build verification
+  - `scripts/repro-check.sh` builds the CLI twice in fresh target directories and fails unless the binaries match. Verified locally on Windows: the two builds are byte-identical. The Windows link needed `/Brepro` (timestamp replaced by a content hash) and `/DEBUG:NONE` (no PDB, whose path contains the target directory). The cost is that a Windows release binary has no separate PDB, so crash dumps lose their symbols. A CI job runs the check on Linux, which has not run yet.
 - [ ] Production security hardening (all threat models from spec §43: decoder, validator, interpreter, host, resource system, compiler, executable memory)
 - [ ] Full release artifact checklist: source archive, binaries, SBOM, license report, third-party notices, feature manifest, build metadata, git commit, version info
 - [ ] Miri clean on all safe-Rust crates (no undefined behavior)
 - [ ] Cross-compilation CI matrix (x86_64, aarch64, riscv64)
+  - Type-checking is in CI for aarch64 and riscv64 (`cross-check` job, all targets, tests included). Verified locally: both pass. x86_64 is the native `check` job. Nothing runs on the other targets: there is no emulator in CI, so this stays open until a test run is possible.
 - [ ] Pass full WebAssembly spec test suite including: reference types, bulk memory, SIMD, multi-memory, 64-bit memories, exception handling, threads (where applicable)
 
 ---
@@ -355,11 +379,11 @@ discharges it where a proof does not yet exist. `formal/README.md` carries the p
 ## Ongoing / Cross-cutting
 
 - [ ] Maintain `feature-registry.toml` as proposals are implemented; generate compat docs from it
-  - Partially done: the `mvp_compiled`, `mvp_differential`, and `mvp_verified` ladder entries were corrected from `false` to `"partial"`, each with a note on what it does and does not yet cover. The per-proposal flags and the generated compat docs are still outstanding, and `mvp_tested` stays `"partial"` because the spec suite does not run.
+  - Done: every proposal has an `[evidence.<name>]` row in `feature-registry.toml` recording tested, fuzzed, differential, and verified, each with notes that name the test or document behind it. `scripts/gen-compat.py` renders `docs/standards/compat.md` from it, and CI runs `--check`, which fails on a stale page, a missing row, or evidence claimed for an unimplemented proposal. The generator's consistency checks were negative-tested. Still open: the evidence values for the unimplemented proposals are all `false` and will change as they are built, and this item stays open as ongoing maintenance.
 - [ ] Keep `docs/licensing/provenance.md` updated with every new normative source or test suite added
 - [ ] Run `cargo deny check` in CI; fix any license violations immediately
-- [ ] Track `unsafe` counts per crate; keep Micro and Host at zero
-  - Micro, Host, Capability, and Resource are at zero today: the only match in those crates is the word `unsafe` in a doc comment, not a block. The tracking is not automated yet, and JIT/AOT will introduce the first real `unsafe` at the executable-memory boundary.
+- [x] Track `unsafe` counts per crate; keep Micro and Host at zero
+  - `scripts/unsafe-count.sh` counts `unsafe` per crate with comments removed, and CI runs it first in the `check` job. It fails if Micro, Host, Capability, or Resource contains any. Those four crates also carry `#![forbid(unsafe_code)]`, so the compiler enforces the same rule. The script was self-tested on a scratch file with real `unsafe` code and a commented one. JIT/AOT will introduce the first real `unsafe` at the executable-memory boundary, and at that point the script's policy list is where that is recorded.
 - [ ] Maintain differential testing suite — Micro result is always the golden result
 - [ ] Maintain GitHub milestones and issue labels as architectural memory
 - [ ] Legal review before any public release (do not rely solely on automation for licensing)
