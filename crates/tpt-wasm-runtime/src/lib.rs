@@ -26,10 +26,18 @@ use tpt_wasm_types::{
 };
 use tpt_wasm_validate::{ValidatedModule, ValidationError, Validator};
 
+mod cache;
 mod optimizing;
+mod provenance;
+
+pub use cache::{CacheStats, CompilationCache, CompilationKey};
+pub use provenance::{
+    hash_bytes, Configuration, ExecutionArtifact, ExecutionMetadata, Hash, Outcome, Reproduction,
+};
+use tpt_wasm_ir::IrModule;
 
 /// Which execution backend to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum EngineMode {
     #[default]
     Micro,
@@ -38,7 +46,7 @@ pub enum EngineMode {
 }
 
 /// WebAssembly feature switches for the MVP runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Features {
     pub mvp: bool,
     pub reference_types: bool,
@@ -468,6 +476,7 @@ impl Linker {
             context,
             execution,
             &Config::default(),
+            None,
         )
     }
 }
@@ -478,6 +487,7 @@ pub struct Engine {
     config: Config,
     linker: Linker,
     context: RuntimeContext,
+    cache: CompilationCache,
 }
 
 impl Engine {
@@ -496,13 +506,73 @@ impl Engine {
             context: RuntimeContext::new(config.limits),
             config,
             linker: Linker::new(),
+            cache: CompilationCache::new(cache::DEFAULT_CAPACITY),
         })
     }
 
     /// Decode, validate, and instantiate a binary module.
+    ///
+    /// The optimized IR for these bytes is kept in the engine's compilation cache,
+    /// so instantiating the same bytes again skips the optimizer and the contract
+    /// check. Validation runs on every call: it is cheap, and it means a hit never
+    /// depends on a previous call having validated anything.
     pub fn instantiate_bytes(&self, bytes: &[u8]) -> Result<Instance, RuntimeError> {
         let module = decode(bytes).map_err(RuntimeError::Decode)?;
-        self.instantiate(module)
+        let validated = Validator::new()
+            .validate(module)
+            .map_err(RuntimeError::Validation)?;
+        let ir = self.cached_ir(bytes, &validated)?;
+        self.instantiate_prepared(validated, ir)
+    }
+
+    /// Hit, miss, and entry counts for the compilation cache.
+    pub fn compilation_cache_stats(&self) -> CacheStats {
+        self.cache.stats()
+    }
+
+    /// The optimized IR for `bytes`, from the cache when it is there.
+    ///
+    /// `None` in micro mode, which compiles nothing. The key is built from the bytes
+    /// and this engine's mode and features; the versions and target are part of the
+    /// key itself (see `cache`).
+    fn cached_ir(
+        &self,
+        bytes: &[u8],
+        validated: &ValidatedModule,
+    ) -> Result<Option<Arc<IrModule>>, RuntimeError> {
+        if self.config.engine_mode == EngineMode::Micro {
+            return Ok(None);
+        }
+        let key = CompilationKey::new(bytes, self.config.engine_mode, self.config.features);
+        if let Some(ir) = self.cache.get(&key) {
+            return Ok(Some(ir));
+        }
+        let Some(ir) = compile_ir(validated, &self.config)? else {
+            return Ok(None);
+        };
+        let ir = Arc::new(ir);
+        self.cache.insert(key, Arc::clone(&ir));
+        Ok(Some(ir))
+    }
+
+    fn instantiate_prepared(
+        &self,
+        validated: ValidatedModule,
+        ir: Option<Arc<IrModule>>,
+    ) -> Result<Instance, RuntimeError> {
+        let execution = if self.config.deterministic {
+            ExecutionConfig::deterministic(0)
+        } else {
+            ExecutionConfig::host_dependent()
+        };
+        instantiate_module(
+            validated.module,
+            &self.linker,
+            self.context.clone(),
+            execution,
+            &self.config,
+            ir.as_deref(),
+        )
     }
 
     /// Read, decode, validate, and instantiate a `.wasm` file.
@@ -524,22 +594,19 @@ impl Engine {
         &self,
         validated: ValidatedModule,
     ) -> Result<Instance, RuntimeError> {
-        let execution = if self.config.deterministic {
-            ExecutionConfig::deterministic(0)
-        } else {
-            ExecutionConfig::host_dependent()
-        };
-        instantiate_module(
-            validated.module,
-            &self.linker,
-            self.context.clone(),
-            execution,
-            &self.config,
-        )
+        // No bytes to key a cache entry by, so a structural module is compiled
+        // every time. `instantiate_bytes` is the cached path.
+        let ir = compile_ir(&validated, &self.config)?.map(Arc::new);
+        self.instantiate_prepared(validated, ir)
     }
 
     pub fn linker_mut(&mut self) -> &mut Linker {
         &mut self.linker
+    }
+
+    /// The configuration this engine was built with.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 }
 
@@ -603,6 +670,8 @@ pub struct Instance {
     /// observes and mutates the same state the previous call left behind.
     baseline: Option<tpt_wasm_codegen::BaselineModule>,
     context: RuntimeContext,
+    /// Steps the most recent call charged on this instance's backend.
+    last_call_steps: u64,
 }
 
 impl fmt::Debug for Instance {
@@ -794,22 +863,18 @@ fn same_context(context: &RuntimeContext, export: &ExternalExport) -> Result<(),
 /// `EngineMode::Baseline` and `EngineMode::Optimizing` is therefore a difference
 /// in optimization and nothing else -- which is the property the differential
 /// tests rely on.
-fn compile_baseline(
-    module: &Module,
+fn compile_ir(
+    validated: &ValidatedModule,
     config: &Config,
-) -> Result<Option<tpt_wasm_codegen::BaselineModule>, RuntimeError> {
-    let engine_mode = config.engine_mode;
-    if engine_mode == EngineMode::Micro {
+) -> Result<Option<IrModule>, RuntimeError> {
+    if config.engine_mode == EngineMode::Micro {
         return Ok(None);
     }
-    let validated = Validator::new()
-        .validate(module.clone())
-        .map_err(RuntimeError::Validation)?;
 
     // Lower and verify once, then optimize only if this mode asks for it. Doing
     // the lowering in one place means the two modes cannot drift apart in how
     // they interpret a module, which is what the differential comparison assumes.
-    let verified = tpt_wasm_ir::lower_and_verify(&validated).map_err(|error| {
+    let verified = tpt_wasm_ir::lower_and_verify(validated).map_err(|error| {
         // The reason is carried through, not replaced by a stage name: a module
         // refused here is otherwise reported as a bare "baseline lowering", which
         // says nothing about *what* is unsupported and makes every such refusal a
@@ -829,7 +894,7 @@ fn compile_baseline(
         RuntimeError::UnsupportedFeature(Box::leak(format!("baseline {reason}").into_boxed_str()))
     })?;
 
-    let ir = match optimizing::compile(&validated, config)? {
+    let ir = match optimizing::compile(validated, config)? {
         Some(optimized) => optimized,
         None => verified.into_module(),
     };
@@ -840,7 +905,16 @@ fn compile_baseline(
     // module the optimizer produced but the backend cannot represent is caught,
     // and the message is what tells an embedder which half of the compiler to
     // look at.
-    let compiled = tpt_wasm_codegen::BaselineModule::lower(&ir).map_err(|error| {
+    Ok(Some(ir))
+}
+
+/// Lower optimized IR to the portable backend.
+///
+/// Kept apart from `compile_ir` so the optimized IR can be cached: a cache hit
+/// skips the optimizer and still builds a fresh backend module, because the
+/// backend owns each instance's memory, table, and global handles.
+fn lower_baseline(ir: &IrModule) -> Result<tpt_wasm_codegen::BaselineModule, RuntimeError> {
+    let compiled = tpt_wasm_codegen::BaselineModule::lower(ir).map_err(|error| {
         RuntimeError::UnsupportedFeature(Box::leak(
             format!("baseline code generation: {error:?}").into_boxed_str(),
         ))
@@ -848,7 +922,7 @@ fn compile_baseline(
     // The host boundary is installed by `instantiate_module`, once the imports
     // have been resolved to callbacks. Until then a `CallHost` traps, so a
     // compiled module cannot reach outside itself by accident.
-    Ok(Some(compiled))
+    Ok(compiled)
 }
 
 /// Routes a compiled module's host calls through the same capability-mediated
@@ -906,6 +980,7 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
             execution: ExecutionConfig::default(),
             baseline: None,
             context,
+            last_call_steps: 0,
         };
         let result = instance.invoke_host_call(&tpt_wasm_micro::machine::HostCall {
             func_name: callback.clone(),
@@ -942,10 +1017,15 @@ fn instantiate_module(
     context: RuntimeContext,
     execution: ExecutionConfig,
     config: &Config,
+    ir: Option<&IrModule>,
 ) -> Result<Instance, RuntimeError> {
-    // Compiled first, while the module is still whole: the instantiation below
-    // takes its sections apart, after which it can no longer be borrowed.
-    let baseline = compile_baseline(&module, config)?;
+    // Lowered first, while the module is still whole: the instantiation below
+    // takes its sections apart, after which it can no longer be borrowed. The IR
+    // is built by the caller, so a cached compilation reaches here unchanged.
+    let baseline = match ir {
+        Some(ir) => Some(lower_baseline(ir)?),
+        None => None,
+    };
     let start = module.start;
     let _call_gate = lock_call_gate(&context.call_gate)?;
     let mut store = lock_store(&context.store)?.clone();
@@ -1239,6 +1319,7 @@ fn instantiate_module(
         execution,
         baseline,
         context: context.clone(),
+        last_call_steps: 0,
     };
     // The baseline's host boundary needs the resolved callbacks, which only exist
     // once the import loop has run. It is installed here, before the start
@@ -1479,7 +1560,70 @@ impl Instance {
             .baseline
             .as_mut()
             .expect("checked by the caller that dispatched here");
-        module.call(index, args).map_err(baseline_error)
+        let (result, steps) = module.call_counted(index, args);
+        self.last_call_steps = steps;
+        result.map_err(baseline_error)
+    }
+
+    /// The steps the most recent call charged, including a call that trapped.
+    ///
+    /// Each backend counts its own steps and the counts are not comparable: Micro
+    /// charges one per decoded instruction, the baseline one per IR instruction. The
+    /// count is for the budget, which both enforce, and for reporting how much work a
+    /// call did on the backend it ran on.
+    pub fn last_call_steps(&self) -> u64 {
+        self.last_call_steps
+    }
+
+    /// Read `length` bytes at `offset` from the memory exported as `name`.
+    ///
+    /// For inspection, so a debugger or a test can see what a call left behind. The
+    /// bytes are a copy taken under the lock, so the caller sees the memory between
+    /// calls and never a call half-finished. A read outside the memory is an error,
+    /// not a trap, since no Wasm code asked for it.
+    pub fn read_memory(
+        &self,
+        name: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        let index = match self.exports.get(name) {
+            Some(ExportDesc::Memory(index)) => *index,
+            Some(_) => {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: "memory export".into(),
+                    actual: "non-memory export".into(),
+                })
+            }
+            None => return Err(RuntimeError::UnknownExport(name.to_owned())),
+        };
+        if let Some(module) = self.baseline.as_ref() {
+            // The compiled backend owns its memory, and MVP modules have only index 0.
+            if index != 0 {
+                return Err(RuntimeError::UnsupportedFeature(
+                    "memory index other than 0",
+                ));
+            }
+            let handle = module
+                .memory_handle()
+                .ok_or(RuntimeError::UnsupportedFeature("module has no memory"))?;
+            let memory = handle.lock().map_err(|_| RuntimeError::StorePoisoned)?;
+            return memory
+                .bytes_at(offset, length)
+                .ok_or(RuntimeError::Store(StoreError::MemoryOutOfBounds));
+        }
+        let store = lock_store(&self.context.store)?;
+        let address = *store
+            .instance(self.index)
+            .map_err(RuntimeError::Store)?
+            .memory_addrs
+            .get(index as usize)
+            .ok_or(RuntimeError::Store(StoreError::UnknownMemory(index)))?;
+        let memory = store.memory(address).map_err(RuntimeError::Store)?;
+        memory
+            .read(offset, length)
+            .map(<[u8]>::to_vec)
+            .map_err(RuntimeError::Store)
     }
 
     pub fn store(&self) -> Result<MutexGuard<'_, Store>, RuntimeError> {
@@ -1553,7 +1697,9 @@ impl Instance {
             Machine::with_execution(lock_store(&self.context.store)?.clone(), self.execution);
         machine.push_frame(frame).map_err(RuntimeError::Trap)?;
         loop {
-            match machine.run() {
+            let outcome = machine.run();
+            self.last_call_steps = machine.steps;
+            match outcome {
                 Step::Return(values) => {
                     self.commit_store(machine.store)?;
                     return Ok(values);
@@ -3104,6 +3250,212 @@ mod tests {
             results[0], results[2],
             "the optimizing engine must agree with Micro"
         );
+    }
+
+    /// Instantiating the same bytes twice must reuse the optimized IR, and the
+    /// reused IR must behave exactly like a fresh compilation.
+    ///
+    /// The first instantiation misses and fills the cache; the second hits. Both
+    /// instances then run, and both must agree with a micro engine. This test does
+    /// not check that the instances' state is separate; that is covered by the
+    /// design, since the cache stores IR and each instantiation lowers its own
+    /// backend module, and the cached value has no instance state to share.
+    #[test]
+    fn the_compilation_cache_reuses_ir_without_sharing_instance_state() {
+        let bytes = encode(&baseline_module()).expect("the fixture must encode");
+        let optimizing = Engine::new(Config {
+            engine_mode: EngineMode::Optimizing,
+            ..Config::default()
+        })
+        .expect("the optimizing mode should be accepted");
+        assert_eq!(optimizing.compilation_cache_stats().entries, 0);
+
+        let mut first = optimizing
+            .instantiate_bytes(&bytes)
+            .expect("the first instantiation should compile");
+        let after_first = optimizing.compilation_cache_stats();
+        assert_eq!(
+            (after_first.hits, after_first.misses, after_first.entries),
+            (0, 1, 1)
+        );
+
+        let mut second = optimizing
+            .instantiate_bytes(&bytes)
+            .expect("the cached compilation should instantiate");
+        let after_second = optimizing.compilation_cache_stats();
+        assert_eq!(
+            (after_second.hits, after_second.misses, after_second.entries),
+            (1, 1, 1)
+        );
+
+        let micro = Engine::new(Config::default()).expect("micro should be accepted");
+        let mut reference = micro
+            .instantiate_bytes(&bytes)
+            .expect("micro should instantiate the fixture");
+        let expected = reference
+            .call("run", vec![Value::I32(7)])
+            .expect("micro should run the fixture");
+        assert_eq!(
+            first
+                .call("run", vec![Value::I32(7)])
+                .expect("the first instance runs"),
+            expected
+        );
+        assert_eq!(
+            second
+                .call("run", vec![Value::I32(7)])
+                .expect("the cached instance runs"),
+            expected
+        );
+    }
+
+    /// A call reports the steps it charged, and the budget edge falls on that count.
+    ///
+    /// Run on both backends. A repeated call must charge the same count, since each
+    /// call gets a fresh budget. A budget of exactly that many steps must admit the
+    /// call, and one fewer must trap having charged one fewer, which is the accounting
+    /// the budget tests rely on, now read back through the public API.
+    #[test]
+    fn a_call_reports_the_steps_it_charged_and_the_budget_edge_is_that_count() {
+        let bytes = encode(&baseline_module()).expect("the fixture must encode");
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let mut instance = Engine::new(Config {
+                engine_mode: mode,
+                ..Config::default()
+            })
+            .expect("accepted")
+            .instantiate_bytes(&bytes)
+            .expect("instantiates");
+            instance
+                .call("run", vec![Value::I32(7)])
+                .expect("runs without a budget");
+            let used = instance.last_call_steps();
+            assert!(used > 0, "{mode:?}: a call that ran reported no steps");
+            instance
+                .call("run", vec![Value::I32(7)])
+                .expect("runs again");
+            assert_eq!(
+                instance.last_call_steps(),
+                used,
+                "{mode:?}: a repeated call charged a different count"
+            );
+
+            let with_budget = |steps: u64| Config {
+                engine_mode: mode,
+                limits: tpt_wasm_types::ResourceLimits {
+                    max_execution_steps: Some(steps),
+                    ..tpt_wasm_types::ResourceLimits::default()
+                },
+                ..Config::default()
+            };
+            let mut exact = Engine::new(with_budget(used))
+                .expect("accepted")
+                .instantiate_bytes(&bytes)
+                .expect("instantiates");
+            exact
+                .call("run", vec![Value::I32(7)])
+                .expect("a budget of exactly the count admits the call");
+
+            let mut short = Engine::new(with_budget(used - 1))
+                .expect("accepted")
+                .instantiate_bytes(&bytes)
+                .expect("instantiates");
+            let error = short
+                .call("run", vec![Value::I32(7)])
+                .expect_err("one step short must trap");
+            assert!(
+                matches!(
+                    error,
+                    RuntimeError::Trap(tpt_wasm_types::Trap::StepsExhausted)
+                ),
+                "{mode:?}: expected StepsExhausted, got {error:?}"
+            );
+            assert_eq!(
+                short.last_call_steps(),
+                used - 1,
+                "{mode:?}: a trapped call must report the steps it actually charged"
+            );
+        }
+    }
+
+    /// A module with one page of memory, exported as `mem`, and a function `set` that
+    /// stores 42 at address 0.
+    fn writing_module() -> Module {
+        Module {
+            types: vec![tpt_wasm_types::FunctionType {
+                params: tpt_wasm_types::ResultType(Vec::new()),
+                results: tpt_wasm_types::ResultType(Vec::new()),
+            }],
+            functions: vec![tpt_wasm_format::Function {
+                type_index: 0,
+                locals: Vec::new(),
+                // i32.const 0; i32.const 42; i32.store align=2 offset=0; end
+                body: vec![0x41, 0x00, 0x41, 0x2a, 0x36, 0x02, 0x00, 0x0b],
+            }],
+            memories: vec![tpt_wasm_format::Memory {
+                memory_type: tpt_wasm_types::MemoryType {
+                    limits: tpt_wasm_types::Limits { min: 1, max: None },
+                    memory64: false,
+                },
+            }],
+            exports: vec![
+                tpt_wasm_format::Export {
+                    name: "set".into(),
+                    desc: tpt_wasm_format::ExportDesc::Function(0),
+                },
+                tpt_wasm_format::Export {
+                    name: "mem".into(),
+                    desc: tpt_wasm_format::ExportDesc::Memory(0),
+                },
+            ],
+            ..Module::default()
+        }
+    }
+
+    /// Memory inspection reports what the last call left, on both backends.
+    ///
+    /// A fresh memory is zero, a store made by a call is visible afterwards, and an
+    /// out-of-range read and a read through a non-memory export are both refused.
+    #[test]
+    fn memory_inspection_sees_what_a_call_left_on_both_backends() {
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let mut instance = Engine::new(Config {
+                engine_mode: mode,
+                ..Config::default()
+            })
+            .expect("accepted")
+            .instantiate(writing_module())
+            .expect("instantiates");
+            assert_eq!(
+                instance.read_memory("mem", 0, 4).expect("reads"),
+                vec![0, 0, 0, 0],
+                "{mode:?}: a fresh memory is zero"
+            );
+            instance.call("set", Vec::new()).expect("set runs");
+            assert_eq!(
+                instance.read_memory("mem", 0, 4).expect("reads"),
+                vec![42, 0, 0, 0],
+                "{mode:?}: the call's store is visible afterwards"
+            );
+            assert!(
+                instance.read_memory("mem", 65_536, 1).is_err(),
+                "{mode:?}: a read past the page is refused"
+            );
+            assert!(
+                matches!(
+                    instance.read_memory("set", 0, 1),
+                    Err(RuntimeError::TypeMismatch { .. })
+                ),
+                "{mode:?}: a function export is not memory"
+            );
+            assert!(
+                matches!(
+                    instance.read_memory("nope", 0, 1),
+                    Err(RuntimeError::UnknownExport(_))
+                ),
+                "{mode:?}: an unknown export is reported"
+            );
+        }
     }
 
     /// The optimizing engine must produce a *different* compiled module.

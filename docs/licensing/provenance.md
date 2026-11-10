@@ -50,7 +50,8 @@ Dependencies are tracked by: crate name, version, license, copyright, source, re
 
 | Crate | Version | License | Reason |
 |---|---|---|---|
-| *(populated by cargo deny / cargo metadata)* | | | |
+| `sha2` | 0.11.1 | MIT OR Apache-2.0 | SHA-256 for the module hash and the execution-artifact digest in `tpt-wasm-runtime` (`provenance.rs`). Chosen over a hand-written hash, so the digest rests on a widely reviewed implementation. Transitive: `digest`, `crypto-common`, `block-buffer`, `cpufeatures`, `const-oid`, `hybrid-array`, `typenum`; all MIT or Apache-2.0 per `cargo deny list`. |
+| `tpt-wasm-capability` | workspace | MIT OR Apache-2.0 | Internal. The runtime uses its `CapabilityId` to list a module's function imports in `ExecutionMetadata`. |
 
 ---
 

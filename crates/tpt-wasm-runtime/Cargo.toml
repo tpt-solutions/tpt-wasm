@@ -16,3 +16,5 @@ tpt-wasm-micro.workspace = true
 tpt-wasm-ir.workspace = true
 tpt-wasm-codegen.workspace = true
 tpt-wasm-opt.workspace = true
+tpt-wasm-capability.workspace = true
+sha2 = "0.11"
