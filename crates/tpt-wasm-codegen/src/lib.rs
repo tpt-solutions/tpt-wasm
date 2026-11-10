@@ -1503,6 +1503,15 @@ impl BaselineMemory {
     }
 
     /// The declared maximum page count, or `None` when the module set none.
+    /// The `length` bytes at `offset`, copied out, or `None` when the range is not
+    /// wholly inside the memory. For inspection between calls, not for Wasm access,
+    /// which goes through the checked loads and stores.
+    pub fn bytes_at(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(length)?;
+        self.data.get(start..end).map(<[u8]>::to_vec)
+    }
+
     pub fn max_pages(&self) -> Option<u64> {
         self.max_pages
     }
@@ -2070,6 +2079,34 @@ impl BaselineModule {
 
     /// Call one function by index.
     pub fn call(&mut self, index: usize, args: Vec<Value>) -> Result<Vec<Value>, BaselineError> {
+        self.call_counted(index, args).0
+    }
+
+    /// Call one function by index, and report the steps the call charged.
+    ///
+    /// The count is returned even when the call traps: a trap after a long run is
+    /// the case the count is most useful for. It counts this backend's steps, one per
+    /// IR instruction, so it is not comparable with Micro's, which counts one per
+    /// decoded instruction.
+    pub fn call_counted(
+        &mut self,
+        index: usize,
+        args: Vec<Value>,
+    ) -> (Result<Vec<Value>, BaselineError>, u64) {
+        let mut budget = StepBudget {
+            limit: self.max_execution_steps,
+            retired: 0,
+        };
+        let result = self.call_with_budget(index, args, &mut budget);
+        (result, budget.retired)
+    }
+
+    fn call_with_budget(
+        &mut self,
+        index: usize,
+        args: Vec<Value>,
+        budget: &mut StepBudget,
+    ) -> Result<Vec<Value>, BaselineError> {
         if index >= self.functions.len() {
             return Err(BaselineError::Trap(Trap::HostFailure(
                 "baseline call target is not in the module".into(),
@@ -2107,10 +2144,7 @@ impl BaselineModule {
             // same call rather than differing by one.
             depth: 1,
             max_call_depth: self.max_call_depth,
-            steps: &mut StepBudget {
-                limit: self.max_execution_steps,
-                retired: 0,
-            },
+            steps: budget,
         };
         functions[index].run(&mut state, args)
     }
