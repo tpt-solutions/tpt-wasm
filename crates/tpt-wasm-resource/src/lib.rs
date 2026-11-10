@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 TPT Solutions
 
+#![forbid(unsafe_code)]
 //! Host resource table and opaque resource handles.
 //!
 //! Resources are accessed through opaque u64 handles.

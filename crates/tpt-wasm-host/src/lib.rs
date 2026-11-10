@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 TPT Solutions
 
+#![forbid(unsafe_code)]
 //! TPT capability-oriented host.
 //!
 //! Core principle: No ambient authority.

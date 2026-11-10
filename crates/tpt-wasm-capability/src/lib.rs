@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 TPT Solutions
 
+#![forbid(unsafe_code)]
 //! Capability types and trait.
 //!
 //! The host has no ambient authority. All host interactions go through
