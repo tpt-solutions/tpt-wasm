@@ -21,6 +21,7 @@ members = [
     "crates/tpt-wasm-aot",
     "crates/tpt-wasm",
     "crates/tpt-wasm-cli",
+    "crates/tpt-wasm-oracle",
 ]
 
 [workspace.package]
