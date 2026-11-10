@@ -33,6 +33,10 @@ use std::fmt;
 
 use tpt_wasm_ir::{verify_module, IrModule, VerificationError};
 
+/// The version of the optimizer. A compiled artifact records it, so a cached
+/// result from another version of the passes is never reused.
+pub const COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod analysis;
 pub mod const_fold;
 pub mod const_prop;

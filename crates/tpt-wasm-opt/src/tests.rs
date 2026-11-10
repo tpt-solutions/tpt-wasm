@@ -913,3 +913,97 @@ fn optimization_is_deterministic() {
         }
     }
 }
+
+/// Every pass, run on its own, must leave verified IR that satisfies the contract.
+///
+/// The pipeline tests run all the passes together, so a pass that broke the
+/// contract only in the company of another would be masked by its neighbours, and
+/// a pass that was never run on its own could not be blamed. Running each alone
+/// over the generated programs assigns any violation to the pass that made it.
+/// This is also the only test that exercises the scheduler and the register
+/// allocator directly, since neither has a fixture of its own.
+#[test]
+fn each_pass_alone_verifies_and_satisfies_the_contract() {
+    use crate::{const_fold, const_prop, dce, graph, lvn, memory, regalloc, sched};
+    use tpt_wasm_ir::verify_module;
+
+    type PassFn = fn(&mut tpt_wasm_ir::IrModule) -> crate::PassOutcome;
+    let passes: [(&str, PassFn); 10] = [
+        ("constant-folding", const_fold::run),
+        ("constant-propagation", const_prop::run),
+        ("cfg-simplification", graph::run),
+        ("dead-code-elimination", dce::run),
+        ("lvn", lvn::run),
+        ("cse", lvn::run_global),
+        ("load-store-optimization", memory::run),
+        ("bounds-check-elimination", memory::run_bounds_checks),
+        ("instruction-scheduling", sched::run),
+        ("register-allocation", regalloc::run),
+    ];
+    for seed in 0..300u64 {
+        let fixture = generated_program(seed);
+        let validated = tpt_wasm_validate::validate(fixture).expect("must validate");
+        let original = lower_and_verify(&validated)
+            .expect("must lower")
+            .module()
+            .clone();
+        for (name, pass) in passes {
+            let mut working = original.clone();
+            pass(&mut working);
+            // The pipeline prunes the declarations a pass orphans before it verifies,
+            // so a pass is judged with the same cleanup. Without this step, a pass
+            // that removes a definition reports an undefined value that the
+            // pipeline never sees, and the failure is the test's, not the pass's.
+            for function in &mut working.functions {
+                crate::analysis::prune_garbage(function);
+            }
+            verify_module(&working).unwrap_or_else(|error| {
+                panic!("seed {seed}: {name} alone left IR that does not verify: {error:?}")
+            });
+            crate::contract::verify_contract(&original, &working).unwrap_or_else(|violation| {
+                panic!("seed {seed}: {name} alone broke the contract: {violation}")
+            });
+        }
+        // The register-allocation pass checks its plan with a `debug_assert`, which a
+        // release build drops. Checking the plan here does not depend on the profile.
+        for function in &original.functions {
+            let allocation = regalloc::allocate(function);
+            regalloc::verify(function, &allocation).unwrap_or_else(|error| {
+                panic!("seed {seed}: the register allocation does not verify: {error}")
+            });
+        }
+    }
+}
+
+/// Bounds-check elimination proves an access in range and leaves one out alone.
+///
+/// One page of memory. An `i32.load` at 65532 reads bytes 65532 to 65535, exactly
+/// the page, so its check is provable and must be removed. At 65533 it reads up to
+/// 65536 and runs one byte past the page, so its check must stay. Both are compared
+/// with Micro, and the second traps there, so a proof that wrongly covered it would
+/// show up as a result where Micro traps.
+#[test]
+fn bounds_checks_are_removed_only_when_the_access_fits_the_memory() {
+    use crate::memory;
+    use tpt_wasm_ir::verify_module;
+
+    for (address, expected_removals) in [(65_532, 1), (65_533, 0)] {
+        let mut body = const_i32(address);
+        // i32.load, alignment 2, offset 0, then end.
+        body.extend([0x28, 0x02, 0x00, 0x0b]);
+        let fixture = with_memory(module(body));
+        let validated = tpt_wasm_validate::validate(fixture.clone()).expect("must validate");
+        let mut ir = lower_and_verify(&validated)
+            .expect("must lower")
+            .module()
+            .clone();
+        let outcome = memory::run_bounds_checks(&mut ir);
+        assert_eq!(
+            outcome.rewrites, expected_removals,
+            "address {address}: the bounds check was removed {} time(s), expected {expected_removals}",
+            outcome.rewrites
+        );
+        verify_module(&ir).expect("the rewritten IR must still verify");
+        assert_optimized_matches_micro(&fixture, 0, Vec::new(), OptimizationLevel::Full);
+    }
+}
