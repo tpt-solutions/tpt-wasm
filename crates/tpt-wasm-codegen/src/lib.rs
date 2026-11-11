@@ -12,12 +12,12 @@
 //! set and structured control flow represented by the IR; native backends
 //! pending.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tpt_wasm_ir::{BlockId, IrFunction, IrInstr, Terminator, ValueId};
-use tpt_wasm_types::{FunctionType, ResourceLimits, Trap, Value, ValueType};
+use tpt_wasm_types::{FunctionType, GuestMemory, ResourceLimits, Trap, Value, ValueType};
 
 /// Target architecture for code generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1483,6 +1483,32 @@ const PAGE_SIZE: usize = 65_536;
 /// The architecture limit on page count, and so on address space.
 const MAX_PAGES: u64 = 65_536;
 
+impl GuestMemory for BaselineMemory {
+    fn size(&self) -> u64 {
+        self.data.len() as u64
+    }
+
+    fn read(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
+        self.bytes_at(offset, usize::try_from(length).ok()?)
+    }
+
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> bool {
+        let Ok(start) = usize::try_from(offset) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(bytes.len()) else {
+            return false;
+        };
+        match self.data.get_mut(start..end) {
+            Some(target) => {
+                target.copy_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 impl BaselineMemory {
     /// Build a memory of `min_pages` zeroed pages, capped by `max_pages`.
     pub fn new(min_pages: u64, max_pages: Option<u64>) -> Result<Self, CodegenError> {
@@ -1781,10 +1807,15 @@ impl From<HostCallFailure> for BaselineError {
 /// interpreter uses, so both backends produce the same effects and failures.
 pub trait HostBoundary {
     /// Invoke the host function an import names, or fail.
+    ///
+    /// `memory` is the calling module's memory, lent for this call when the module has
+    /// one. It is `None` when no Wasm code is calling, as when an export is itself an
+    /// import.
     fn call(
         &mut self,
         module: &str,
         name: &str,
+        memory: Option<&mut dyn GuestMemory>,
         args: Vec<Value>,
     ) -> Result<Vec<Value>, HostCallFailure>;
 }
@@ -1972,7 +2003,7 @@ impl BaselineModule {
                 message: "no host boundary was installed".into(),
             })
         })?;
-        let returned = host.call(&declaration.module, &declaration.name, args)?;
+        let returned = host.call(&declaration.module, &declaration.name, None, args)?;
         // The host is outside the verified module, so its return is not trusted:
         // the arity it declared is what this accepts, and anything else is a
         // host failure rather than a value the module would then compute on.
@@ -2093,12 +2124,31 @@ impl BaselineModule {
         index: usize,
         args: Vec<Value>,
     ) -> (Result<Vec<Value>, BaselineError>, u64) {
+        let (result, steps, _) = self.call_profiled(index, args, false);
+        (result, steps)
+    }
+
+    /// Call one function, and report its steps and, when `profile` is set, the steps
+    /// charged to each function.
+    ///
+    /// The profile is keyed by instance function index: an imported function takes
+    /// the indices before the defined ones, as it does in Micro, so the two backends
+    /// name a function the same way. Each charged step is attributed once, to the
+    /// function whose code it belongs to, so the values sum to the step count.
+    pub fn call_profiled(
+        &mut self,
+        index: usize,
+        args: Vec<Value>,
+        profile: bool,
+    ) -> (Result<Vec<Value>, BaselineError>, u64, BTreeMap<u32, u64>) {
         let mut budget = StepBudget {
             limit: self.max_execution_steps,
             retired: 0,
+            profile: profile.then(BTreeMap::new),
+            current: 0,
         };
         let result = self.call_with_budget(index, args, &mut budget);
-        (result, budget.retired)
+        (result, budget.retired, budget.profile.unwrap_or_default())
     }
 
     fn call_with_budget(
@@ -2116,6 +2166,7 @@ impl BaselineModule {
         // `self`, which lets the recursive call take `&mut state` as well.
         let functions: &[BaselineFunction] = &self.functions;
         let imports: &[tpt_wasm_ir::IrImport] = &self.imports;
+        budget.current = function_key(imports, index);
         // The memory is locked for the whole execution, not per access, so the
         // module sees its own stores and no observer can see a half-applied one.
         let mut memory = match self.memory.as_ref() {
@@ -2181,6 +2232,15 @@ struct ExecState<'a> {
 struct StepBudget {
     limit: Option<u64>,
     retired: u64,
+    /// Steps charged to each function, when profiling. `None` costs nothing.
+    profile: Option<BTreeMap<u32, u64>>,
+    /// The instance function index of the code that is running now.
+    current: u32,
+}
+
+/// The instance function index of a defined function: imports come first.
+fn function_key(imports: &[tpt_wasm_ir::IrImport], defined: usize) -> u32 {
+    u32::try_from(imports.len() + defined).unwrap_or(u32::MAX)
 }
 
 impl StepBudget {
@@ -2197,6 +2257,9 @@ impl StepBudget {
             }
         }
         self.retired = self.retired.saturating_add(1);
+        if let Some(profile) = self.profile.as_mut() {
+            *profile.entry(self.current).or_insert(0) += 1;
+        }
         Ok(())
     }
 }
@@ -2211,6 +2274,7 @@ impl ExecState<'_> {
     /// correct it.
     fn call(
         &mut self,
+        callee_key: u32,
         callee: &BaselineFunction,
         args: Vec<Value>,
     ) -> Result<Vec<Value>, BaselineError> {
@@ -2218,7 +2282,11 @@ impl ExecState<'_> {
             return Err(BaselineError::Trap(Trap::CallDepthExceeded));
         }
         self.depth += 1;
+        // The profile follows the running code, so the callee's steps are its own and
+        // the caller resumes attributing to itself. Restored on a trap as well.
+        let caller = std::mem::replace(&mut self.steps.current, callee_key);
         let returned = callee.run(self, args);
+        self.steps.current = caller;
         self.depth -= 1;
         returned
     }
@@ -2257,6 +2325,8 @@ impl BaselineFunction {
             steps: &mut StepBudget {
                 limit: ResourceLimits::default().max_execution_steps,
                 retired: 0,
+                profile: None,
+                current: 0,
             },
         };
         self.run(&mut state, args)
@@ -2295,509 +2365,40 @@ impl BaselineFunction {
                 // each op so no variant can be added that skips it.
                 state.steps.charge()?;
                 match op {
-                    BaselineOp::ConstI32 { slot, value } => {
-                        slots[*slot as usize] = Some(Value::I32(*value));
-                    }
-                    BaselineOp::I32Binary {
-                        result,
-                        left,
-                        right,
-                        operation,
-                    } => {
-                        let left = i32_slot(&slots, *left)?;
-                        let right = i32_slot(&slots, *right)?;
-                        let value = eval_i32_binary(*operation, left, right)?;
-                        slots[*result as usize] = Some(Value::I32(value));
-                    }
-                    BaselineOp::I32Eqz { result, value } => {
-                        let value = i32_slot(&slots, *value)?;
-                        slots[*result as usize] = Some(Value::I32((value == 0) as i32));
-                    }
-                    BaselineOp::I32Compare {
-                        result,
-                        left,
-                        right,
-                        comparison,
-                    } => {
-                        let left = i32_slot(&slots, *left)?;
-                        let right = i32_slot(&slots, *right)?;
-                        slots[*result as usize] =
-                            Some(Value::I32(compare_i32(left, right, *comparison)));
-                    }
-                    BaselineOp::ConstI64 { slot, value } => {
-                        slots[*slot as usize] = Some(Value::I64(*value));
-                    }
-                    BaselineOp::I64Binary {
-                        result,
-                        left,
-                        right,
-                        operation,
-                    } => {
-                        let left = i64_slot(&slots, *left)?;
-                        let right = i64_slot(&slots, *right)?;
-                        let value = eval_i64_binary(*operation, left, right)?;
-                        slots[*result as usize] = Some(Value::I64(value));
-                    }
-                    BaselineOp::I64Eqz { result, value } => {
-                        let value = i64_slot(&slots, *value)?;
-                        slots[*result as usize] = Some(Value::I32((value == 0) as i32));
-                    }
-                    BaselineOp::I64Compare {
-                        result,
-                        left,
-                        right,
-                        comparison,
-                    } => {
-                        let left = i64_slot(&slots, *left)?;
-                        let right = i64_slot(&slots, *right)?;
-                        slots[*result as usize] =
-                            Some(Value::I32(compare_i64(left, right, *comparison)));
-                    }
-                    BaselineOp::ConstF32 { slot, value } => {
-                        slots[*slot as usize] = Some(Value::F32(*value));
-                    }
-                    BaselineOp::F32Binary {
-                        result,
-                        left,
-                        right,
-                        operation,
-                    } => {
-                        let left = f32_slot(&slots, *left)?;
-                        let right = f32_slot(&slots, *right)?;
-                        slots[*result as usize] =
-                            Some(Value::F32(eval_f32_binary(*operation, left, right)));
-                    }
-                    BaselineOp::F32Unary {
-                        result,
-                        value,
-                        operation,
-                    } => {
-                        let value = f32_slot(&slots, *value)?;
-                        slots[*result as usize] =
-                            Some(Value::F32(eval_f32_unary(*operation, value)));
-                    }
-                    BaselineOp::F32Compare {
-                        result,
-                        left,
-                        right,
-                        comparison,
-                    } => {
-                        let left = f32_slot(&slots, *left)?;
-                        let right = f32_slot(&slots, *right)?;
-                        slots[*result as usize] =
-                            Some(Value::I32(compare_f32(left, right, *comparison) as i32));
-                    }
-                    BaselineOp::ConstF64 { slot, value } => {
-                        slots[*slot as usize] = Some(Value::F64(*value));
-                    }
-                    BaselineOp::F64Binary {
-                        result,
-                        left,
-                        right,
-                        operation,
-                    } => {
-                        let left = f64_slot(&slots, *left)?;
-                        let right = f64_slot(&slots, *right)?;
-                        slots[*result as usize] =
-                            Some(Value::F64(eval_f64_binary(*operation, left, right)));
-                    }
-                    BaselineOp::F64Unary {
-                        result,
-                        value,
-                        operation,
-                    } => {
-                        let value = f64_slot(&slots, *value)?;
-                        slots[*result as usize] =
-                            Some(Value::F64(eval_f64_unary(*operation, value)));
-                    }
-                    BaselineOp::F64Compare {
-                        result,
-                        left,
-                        right,
-                        comparison,
-                    } => {
-                        let left = f64_slot(&slots, *left)?;
-                        let right = f64_slot(&slots, *right)?;
-                        slots[*result as usize] =
-                            Some(Value::I32(compare_f64(left, right, *comparison) as i32));
-                    }
-                    BaselineOp::Drop { value } => {
-                        // The operand was already evaluated; a straight-line `drop`
-                        // only ends its live range, so the slot is left untouched.
-                        let _ = read_slot(&slots, *value)?;
-                    }
-                    BaselineOp::Select {
-                        result,
-                        condition,
-                        left,
-                        right,
-                    } => {
-                        let condition = i32_slot(&slots, *condition)?;
-                        let selected = if condition != 0 {
-                            read_slot(&slots, *left)?
-                        } else {
-                            read_slot(&slots, *right)?
-                        };
-                        slots[*result as usize] = Some(selected);
-                    }
-                    BaselineOp::LocalGet { result, local } => {
-                        slots[*result as usize] = Some(read_slot(&slots, *local)?);
-                    }
-                    BaselineOp::LocalSet { local, value } => {
-                        slots[*local as usize] = Some(read_slot(&slots, *value)?);
-                    }
-                    BaselineOp::LocalTee {
-                        result,
-                        local,
-                        value,
-                    } => {
-                        let value = read_slot(&slots, *value)?;
-                        slots[*local as usize] = Some(value.clone());
-                        slots[*result as usize] = Some(value);
-                    }
-                    BaselineOp::I32Unary {
-                        result,
-                        value,
-                        operation,
-                    } => {
-                        let value = i32_slot(&slots, *value)?;
-                        slots[*result as usize] =
-                            Some(Value::I32(eval_i32_unary(*operation, value)));
-                    }
-                    BaselineOp::I64Unary {
-                        result,
-                        value,
-                        operation,
-                    } => {
-                        let value = i64_slot(&slots, *value)?;
-                        slots[*result as usize] =
-                            Some(Value::I64(eval_i64_unary(*operation, value)));
-                    }
-                    BaselineOp::IntConvert {
-                        result,
-                        value,
-                        operation,
-                    } => {
-                        slots[*result as usize] =
-                            Some(eval_int_convert(&slots, *operation, *value)?);
-                    }
-                    BaselineOp::Reinterpret {
-                        result,
-                        value,
-                        operation,
-                    } => {
-                        slots[*result as usize] =
-                            Some(eval_reinterpret(&slots, *operation, *value)?);
-                    }
-                    BaselineOp::SignExtend {
-                        result,
-                        value,
-                        operation,
-                    } => {
-                        slots[*result as usize] =
-                            Some(eval_sign_extend(&slots, *operation, *value)?);
-                    }
-                    BaselineOp::FloatConvert {
-                        result,
-                        value,
-                        operation,
-                    } => {
-                        slots[*result as usize] =
-                            Some(eval_float_convert(&slots, *operation, *value)?);
-                    }
-                    BaselineOp::FloatTrunc {
-                        result,
-                        value,
-                        operation,
-                    } => {
-                        slots[*result as usize] =
-                            Some(eval_float_trunc(&slots, *operation, *value)?);
-                    }
-                    BaselineOp::Return(results) => {
-                        return results
-                            .iter()
-                            .map(|slot| {
-                                slots
-                                    .get(*slot as usize)
-                                    .and_then(Clone::clone)
-                                    .ok_or_else(|| {
-                                        BaselineError::Trap(Trap::HostFailure(
-                                            "baseline return slot is empty".into(),
-                                        ))
-                                    })
-                            })
-                            .collect();
-                    }
-                    BaselineOp::Trap(trap) => return Err(BaselineError::Trap(trap.clone())),
-                    BaselineOp::Unreachable => return Err(BaselineError::Trap(Trap::Unreachable)),
-                    BaselineOp::Load {
-                        result,
-                        address,
-                        offset,
-                        operation,
-                        // The bounds claim is read here but not acted on: this
-                        // backend range-checks every access unconditionally, so
-                        // the optimized and unoptimized forms take the identical
-                        // path. A backend that *does* elide the check is the one
-                        // that has to justify it, and it inherits the proof from
-                        // the IR verifier, which re-derived it from the constant
-                        // address rather than taking the optimizer's word.
-                        bounds: _,
-                    } => {
-                        let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
-                        let effective = effective_address(&slots, *address, *offset)?;
-                        let bits = memory.read(effective, u64::from(operation.width()))?;
-                        slots[*result as usize] = Some(decode_load(*operation, bits));
-                    }
-                    BaselineOp::Store {
-                        address,
-                        value,
-                        offset,
-                        operation,
-                        bounds: _,
-                    } => {
-                        let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
-                        let effective = effective_address(&slots, *address, *offset)?;
-                        let bits = value_bits(&slots, *value)?;
-                        memory.write(effective, u64::from(operation.width()), bits)?;
-                    }
-                    BaselineOp::MemorySize { result } => {
-                        let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
-                        slots[*result as usize] = Some(Value::I32(memory.pages() as i32));
-                    }
-                    BaselineOp::MemoryGrow { result, delta } => {
-                        let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
-                        let delta = i32_slot(&slots, *delta)? as u32 as u64;
-                        slots[*result as usize] = Some(Value::I32(memory.grow(delta)));
-                    }
-                    BaselineOp::GlobalGet { result, global } => {
-                        // An imported global whose handle has not arrived is
-                        // refused rather than read: the embedder has to install
-                        // every import before the first call, and a global with no
-                        // value is not a global holding zero.
-                        let handle = state
-                            .globals
-                            .get(*global as usize)
-                            .and_then(|slot| slot.as_ref())
-                            .ok_or_else(|| {
-                                Trap::HostFailure("baseline global index is out of range".into())
-                            })?;
-                        let value = handle
-                            .lock()
-                            .map_err(|_| Trap::HostFailure("a shared global is locked".into()))?
-                            .clone();
-                        slots[*result as usize] = Some(value);
-                    }
-                    BaselineOp::GlobalSet { global, value } => {
-                        let stored = read_slot(&slots, *value)?;
-                        let handle = state
-                            .globals
-                            .get(*global as usize)
-                            .and_then(|slot| slot.as_ref())
-                            .ok_or_else(|| {
-                                Trap::HostFailure("baseline global index is out of range".into())
-                            })?;
-                        *handle
-                            .lock()
-                            .map_err(|_| Trap::HostFailure("a shared global is locked".into()))? =
-                            stored;
-                    }
-                    BaselineOp::RefNull {
-                        slot,
-                        reference_type,
-                    } => {
-                        slots[*slot as usize] =
-                            Some(Value::Ref(tpt_wasm_types::RefValue::Null(*reference_type)));
-                    }
-                    BaselineOp::RefFunc { slot, function } => {
-                        // The index addresses this module's function table, the
-                        // same space a direct `Call` dispatches through. A `Call`
-                        // resolves its target at run time and reports an index
-                        // outside the module as a host failure, so a reference to
-                        // a function this module does not carry is refused the
-                        // same way rather than producing a dangling reference.
-                        if usize::try_from(*function)
-                            .ok()
-                            .and_then(|index| state.functions.get(index))
-                            .is_none()
-                        {
-                            return Err(BaselineError::Trap(Trap::HostFailure(
-                                "baseline ref.func target is not in the module".into(),
-                            )));
-                        }
-                        slots[*slot as usize] =
-                            Some(Value::Ref(tpt_wasm_types::RefValue::FuncRef(*function)));
-                    }
-                    BaselineOp::RefIsNull { result, value } => {
-                        let reference = read_slot(&slots, *value)?;
-                        let is_null = match reference {
-                            Value::Ref(tpt_wasm_types::RefValue::Null(_)) => true,
-                            Value::Ref(tpt_wasm_types::RefValue::FuncRef(_))
-                            | Value::Ref(tpt_wasm_types::RefValue::ExternRef(_)) => false,
-                            other => {
-                                return Err(BaselineError::Trap(Trap::HostFailure(format!(
-                                    "baseline ref.is_null operand is not a reference: {other:?}"
-                                ))))
-                            }
-                        };
-                        slots[*result as usize] = Some(Value::I32(is_null as i32));
-                    }
-                    BaselineOp::Branch { target, values } => {
-                        next = Some((*target, values.clone()));
-                        break;
-                    }
-                    BaselineOp::CondBranch {
-                        condition,
-                        then_target,
-                        then_values,
-                        else_target,
-                        else_values,
-                    } => {
-                        let condition = i32_slot(&slots, *condition)?;
-                        next = Some(if condition != 0 {
-                            (*then_target, then_values.clone())
-                        } else {
-                            (*else_target, else_values.clone())
-                        });
-                        break;
-                    }
                     BaselineOp::Call {
                         function,
                         arguments,
                         results,
-                    } => {
-                        // An index outside the table means the function table does
-                        // not match the one this function was lowered against.
-                        let callee = state.functions.get(*function as usize).ok_or_else(|| {
-                            Trap::HostFailure("baseline call target is not in the module".into())
-                        })?;
-                        if callee.params.len() != arguments.len() {
-                            return Err(BaselineError::Trap(Trap::HostFailure(
-                                "baseline call argument arity mismatch".into(),
-                            )));
-                        }
-                        let mut call_args = Vec::with_capacity(arguments.len());
-                        for slot in arguments {
-                            call_args.push(read_slot(&slots, *slot)?);
-                        }
-                        let returned = state.call(callee, call_args)?;
-                        if returned.len() != results.len() {
-                            return Err(BaselineError::Trap(Trap::HostFailure(
-                                "baseline call result arity mismatch".into(),
-                            )));
-                        }
-                        for (slot, value) in results.iter().copied().zip(returned) {
-                            check_value_type(&value, self.value_types[slot as usize])?;
-                            slots[slot as usize] = Some(value);
-                        }
-                    }
-                    BaselineOp::CallHost {
-                        import,
+                    } => exec_call(
+                        state,
+                        &mut slots,
+                        &self.value_types,
+                        *function,
                         arguments,
                         results,
-                    } => {
-                        let declaration = state.imports.get(*import as usize).ok_or_else(|| {
-                            Trap::HostFailure("baseline host import is out of range".into())
-                        })?;
-                        let qualified = format!("{}::{}", declaration.module, declaration.name);
-                        // No boundary means the embedder granted no host
-                        // capability, so the call is refused rather than
-                        // resolved by guesswork. That is a host refusal rather
-                        // than the module trapping, so it is reported as one.
-                        let host = state.host.as_deref_mut().ok_or_else(|| {
-                            BaselineError::Host(HostCallFailure {
-                                name: qualified.clone(),
-                                message: "no host boundary was installed".into(),
-                            })
-                        })?;
-                        let mut call_args = Vec::with_capacity(arguments.len());
-                        for slot in arguments {
-                            call_args.push(read_slot(&slots, *slot)?);
-                        }
-                        let returned =
-                            host.call(&declaration.module, &declaration.name, call_args)?;
-                        // The import's declared result arity and types are
-                        // re-checked here: the host is outside the verified
-                        // module, so its return is not trusted. A host that
-                        // breaks its declared signature is reported as a host
-                        // failure, matching how the interpreter reports one.
-                        if returned.len() != results.len() {
-                            return Err(BaselineError::Host(HostCallFailure {
-                                name: qualified.clone(),
-                                message: format!(
-                                    "host returned {} results, the import declares {}",
-                                    returned.len(),
-                                    results.len()
-                                ),
-                            }));
-                        }
-                        for (position, expected) in
-                            declaration.function_type.results.0.iter().enumerate()
-                        {
-                            check_value_type(&returned[position], *expected).map_err(|trap| {
-                                BaselineError::Host(HostCallFailure {
-                                    name: qualified.clone(),
-                                    message: Trap::HostFailure(format!(
-                                        "host returned the wrong type for a result: {trap}"
-                                    ))
-                                    .to_string(),
-                                })
-                            })?;
-                        }
-                        for (slot, value) in results.iter().copied().zip(returned) {
-                            slots[slot as usize] = Some(value);
-                        }
-                    }
+                    )?,
                     BaselineOp::CallIndirect {
                         type_index,
                         operand,
                         arguments,
                         results,
-                    } => {
-                        // Re-borrowed rather than moved: the recursive call takes
-                        // `&mut state` again, and the table handle has to stay
-                        // available for the next instruction.
-                        let table = state.table.as_deref_mut().ok_or_else(|| {
-                            Trap::HostFailure("baseline indirect call needs a table".into())
-                        })?;
-                        let index = i32_slot(&slots, *operand)? as u32;
-                        // Out of range and null are distinct traps, matching the
-                        // order in which the reference is resolved.
-                        let target = table
-                            .elements
-                            .get(index as usize)
-                            .copied()
-                            .ok_or(Trap::TableOutOfBounds)?
-                            .ok_or(Trap::NullReference)?;
-                        let callee = state.functions.get(target as usize).ok_or_else(|| {
-                            Trap::HostFailure(
-                                "baseline indirect target is not in the module".into(),
-                            )
-                        })?;
-                        // The signature is checked against the entry the table
-                        // holds, not against the type index the call names, since
-                        // a mismatch is exactly the trap we are modelling.
-                        let expected = state.types.get(*type_index as usize).ok_or_else(|| {
-                            Trap::HostFailure("baseline indirect call type is unknown".into())
-                        })?;
-                        if &callee.function_type != expected {
-                            return Err(BaselineError::Trap(Trap::IndirectCallTypeMismatch));
+                    } => exec_call_indirect(
+                        state,
+                        &mut slots,
+                        &self.value_types,
+                        *type_index,
+                        *operand,
+                        arguments,
+                        results,
+                    )?,
+                    _ => match exec_op(state, &mut slots, &self.value_types, op)? {
+                        OpFlow::Continue => {}
+                        OpFlow::Jump(target, values) => {
+                            next = Some((target, values));
+                            break;
                         }
-                        let mut call_args = Vec::with_capacity(arguments.len());
-                        for slot in arguments {
-                            call_args.push(read_slot(&slots, *slot)?);
-                        }
-                        let returned = state.call(callee, call_args)?;
-                        if returned.len() != results.len() {
-                            return Err(BaselineError::Trap(Trap::HostFailure(
-                                "baseline indirect call result arity mismatch".into(),
-                            )));
-                        }
-                        for (slot, value) in results.iter().copied().zip(returned) {
-                            check_value_type(&value, self.value_types[slot as usize])?;
-                            slots[slot as usize] = Some(value);
-                        }
-                    }
+                        OpFlow::Return(values) => return Ok(values),
+                    },
                 }
             }
             // Bind the incoming values to the target block's parameter slots,
@@ -2825,6 +2426,560 @@ impl BaselineFunction {
             current = target;
         }
     }
+}
+
+/// What an op leaves for the block walker: fall through, jump to a block, or return.
+enum OpFlow {
+    Continue,
+    Jump(u32, Vec<u32>),
+    Return(Vec<Value>),
+}
+
+/// Execute one op that is not a call, and say where control goes next.
+///
+/// Kept apart from `run` on purpose: `run` is on the host stack for every Wasm call,
+/// so its frame has to stay small. Everything that does not recurse lives here, and
+/// its frame is gone before the next op runs.
+#[inline(never)]
+fn exec_op(
+    state: &mut ExecState<'_>,
+    slots: &mut [Option<Value>],
+    value_types: &[ValueType],
+    op: &BaselineOp,
+) -> Result<OpFlow, BaselineError> {
+    match op {
+        BaselineOp::ConstI32 { slot, value } => {
+            slots[*slot as usize] = Some(Value::I32(*value));
+        }
+        BaselineOp::I32Binary {
+            result,
+            left,
+            right,
+            operation,
+        } => {
+            let left = i32_slot(slots, *left)?;
+            let right = i32_slot(slots, *right)?;
+            let value = eval_i32_binary(*operation, left, right)?;
+            slots[*result as usize] = Some(Value::I32(value));
+        }
+        BaselineOp::I32Eqz { result, value } => {
+            let value = i32_slot(slots, *value)?;
+            slots[*result as usize] = Some(Value::I32((value == 0) as i32));
+        }
+        BaselineOp::I32Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => {
+            let left = i32_slot(slots, *left)?;
+            let right = i32_slot(slots, *right)?;
+            slots[*result as usize] = Some(Value::I32(compare_i32(left, right, *comparison)));
+        }
+        BaselineOp::ConstI64 { slot, value } => {
+            slots[*slot as usize] = Some(Value::I64(*value));
+        }
+        BaselineOp::I64Binary {
+            result,
+            left,
+            right,
+            operation,
+        } => {
+            let left = i64_slot(slots, *left)?;
+            let right = i64_slot(slots, *right)?;
+            let value = eval_i64_binary(*operation, left, right)?;
+            slots[*result as usize] = Some(Value::I64(value));
+        }
+        BaselineOp::I64Eqz { result, value } => {
+            let value = i64_slot(slots, *value)?;
+            slots[*result as usize] = Some(Value::I32((value == 0) as i32));
+        }
+        BaselineOp::I64Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => {
+            let left = i64_slot(slots, *left)?;
+            let right = i64_slot(slots, *right)?;
+            slots[*result as usize] = Some(Value::I32(compare_i64(left, right, *comparison)));
+        }
+        BaselineOp::ConstF32 { slot, value } => {
+            slots[*slot as usize] = Some(Value::F32(*value));
+        }
+        BaselineOp::F32Binary {
+            result,
+            left,
+            right,
+            operation,
+        } => {
+            let left = f32_slot(slots, *left)?;
+            let right = f32_slot(slots, *right)?;
+            slots[*result as usize] = Some(Value::F32(eval_f32_binary(*operation, left, right)));
+        }
+        BaselineOp::F32Unary {
+            result,
+            value,
+            operation,
+        } => {
+            let value = f32_slot(slots, *value)?;
+            slots[*result as usize] = Some(Value::F32(eval_f32_unary(*operation, value)));
+        }
+        BaselineOp::F32Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => {
+            let left = f32_slot(slots, *left)?;
+            let right = f32_slot(slots, *right)?;
+            slots[*result as usize] =
+                Some(Value::I32(compare_f32(left, right, *comparison) as i32));
+        }
+        BaselineOp::ConstF64 { slot, value } => {
+            slots[*slot as usize] = Some(Value::F64(*value));
+        }
+        BaselineOp::F64Binary {
+            result,
+            left,
+            right,
+            operation,
+        } => {
+            let left = f64_slot(slots, *left)?;
+            let right = f64_slot(slots, *right)?;
+            slots[*result as usize] = Some(Value::F64(eval_f64_binary(*operation, left, right)));
+        }
+        BaselineOp::F64Unary {
+            result,
+            value,
+            operation,
+        } => {
+            let value = f64_slot(slots, *value)?;
+            slots[*result as usize] = Some(Value::F64(eval_f64_unary(*operation, value)));
+        }
+        BaselineOp::F64Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => {
+            let left = f64_slot(slots, *left)?;
+            let right = f64_slot(slots, *right)?;
+            slots[*result as usize] =
+                Some(Value::I32(compare_f64(left, right, *comparison) as i32));
+        }
+        BaselineOp::Drop { value } => {
+            // The operand was already evaluated; a straight-line `drop`
+            // only ends its live range, so the slot is left untouched.
+            let _ = read_slot(slots, *value)?;
+        }
+        BaselineOp::Select {
+            result,
+            condition,
+            left,
+            right,
+        } => {
+            let condition = i32_slot(slots, *condition)?;
+            let selected = if condition != 0 {
+                read_slot(slots, *left)?
+            } else {
+                read_slot(slots, *right)?
+            };
+            slots[*result as usize] = Some(selected);
+        }
+        BaselineOp::LocalGet { result, local } => {
+            slots[*result as usize] = Some(read_slot(slots, *local)?);
+        }
+        BaselineOp::LocalSet { local, value } => {
+            slots[*local as usize] = Some(read_slot(slots, *value)?);
+        }
+        BaselineOp::LocalTee {
+            result,
+            local,
+            value,
+        } => {
+            let value = read_slot(slots, *value)?;
+            slots[*local as usize] = Some(value.clone());
+            slots[*result as usize] = Some(value);
+        }
+        BaselineOp::I32Unary {
+            result,
+            value,
+            operation,
+        } => {
+            let value = i32_slot(slots, *value)?;
+            slots[*result as usize] = Some(Value::I32(eval_i32_unary(*operation, value)));
+        }
+        BaselineOp::I64Unary {
+            result,
+            value,
+            operation,
+        } => {
+            let value = i64_slot(slots, *value)?;
+            slots[*result as usize] = Some(Value::I64(eval_i64_unary(*operation, value)));
+        }
+        BaselineOp::IntConvert {
+            result,
+            value,
+            operation,
+        } => {
+            slots[*result as usize] = Some(eval_int_convert(slots, *operation, *value)?);
+        }
+        BaselineOp::Reinterpret {
+            result,
+            value,
+            operation,
+        } => {
+            slots[*result as usize] = Some(eval_reinterpret(slots, *operation, *value)?);
+        }
+        BaselineOp::SignExtend {
+            result,
+            value,
+            operation,
+        } => {
+            slots[*result as usize] = Some(eval_sign_extend(slots, *operation, *value)?);
+        }
+        BaselineOp::FloatConvert {
+            result,
+            value,
+            operation,
+        } => {
+            slots[*result as usize] = Some(eval_float_convert(slots, *operation, *value)?);
+        }
+        BaselineOp::FloatTrunc {
+            result,
+            value,
+            operation,
+        } => {
+            slots[*result as usize] = Some(eval_float_trunc(slots, *operation, *value)?);
+        }
+        BaselineOp::Return(results) => {
+            return results
+                .iter()
+                .map(|slot| {
+                    slots
+                        .get(*slot as usize)
+                        .and_then(Clone::clone)
+                        .ok_or_else(|| {
+                            BaselineError::Trap(Trap::HostFailure(
+                                "baseline return slot is empty".into(),
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<Value>, BaselineError>>()
+                .map(OpFlow::Return);
+        }
+        BaselineOp::Trap(trap) => return Err(BaselineError::Trap(trap.clone())),
+        BaselineOp::Unreachable => return Err(BaselineError::Trap(Trap::Unreachable)),
+        BaselineOp::Load {
+            result,
+            address,
+            offset,
+            operation,
+            // The bounds claim is read here but not acted on: this
+            // backend range-checks every access unconditionally, so
+            // the optimized and unoptimized forms take the identical
+            // path. A backend that *does* elide the check is the one
+            // that has to justify it, and it inherits the proof from
+            // the IR verifier, which re-derived it from the constant
+            // address rather than taking the optimizer's word.
+            bounds: _,
+        } => {
+            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let effective = effective_address(slots, *address, *offset)?;
+            let bits = memory.read(effective, u64::from(operation.width()))?;
+            slots[*result as usize] = Some(decode_load(*operation, bits));
+        }
+        BaselineOp::Store {
+            address,
+            value,
+            offset,
+            operation,
+            bounds: _,
+        } => {
+            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let effective = effective_address(slots, *address, *offset)?;
+            let bits = value_bits(slots, *value)?;
+            memory.write(effective, u64::from(operation.width()), bits)?;
+        }
+        BaselineOp::MemorySize { result } => {
+            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            slots[*result as usize] = Some(Value::I32(memory.pages() as i32));
+        }
+        BaselineOp::MemoryGrow { result, delta } => {
+            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let delta = i32_slot(slots, *delta)? as u32 as u64;
+            slots[*result as usize] = Some(Value::I32(memory.grow(delta)));
+        }
+        BaselineOp::GlobalGet { result, global } => {
+            // An imported global whose handle has not arrived is
+            // refused rather than read: the embedder has to install
+            // every import before the first call, and a global with no
+            // value is not a global holding zero.
+            let handle = state
+                .globals
+                .get(*global as usize)
+                .and_then(|slot| slot.as_ref())
+                .ok_or_else(|| Trap::HostFailure("baseline global index is out of range".into()))?;
+            let value = handle
+                .lock()
+                .map_err(|_| Trap::HostFailure("a shared global is locked".into()))?
+                .clone();
+            slots[*result as usize] = Some(value);
+        }
+        BaselineOp::GlobalSet { global, value } => {
+            let stored = read_slot(slots, *value)?;
+            let handle = state
+                .globals
+                .get(*global as usize)
+                .and_then(|slot| slot.as_ref())
+                .ok_or_else(|| Trap::HostFailure("baseline global index is out of range".into()))?;
+            *handle
+                .lock()
+                .map_err(|_| Trap::HostFailure("a shared global is locked".into()))? = stored;
+        }
+        BaselineOp::RefNull {
+            slot,
+            reference_type,
+        } => {
+            slots[*slot as usize] =
+                Some(Value::Ref(tpt_wasm_types::RefValue::Null(*reference_type)));
+        }
+        BaselineOp::RefFunc { slot, function } => {
+            // The index addresses this module's function table, the
+            // same space a direct `Call` dispatches through. A `Call`
+            // resolves its target at run time and reports an index
+            // outside the module as a host failure, so a reference to
+            // a function this module does not carry is refused the
+            // same way rather than producing a dangling reference.
+            if usize::try_from(*function)
+                .ok()
+                .and_then(|index| state.functions.get(index))
+                .is_none()
+            {
+                return Err(BaselineError::Trap(Trap::HostFailure(
+                    "baseline ref.func target is not in the module".into(),
+                )));
+            }
+            slots[*slot as usize] = Some(Value::Ref(tpt_wasm_types::RefValue::FuncRef(*function)));
+        }
+        BaselineOp::RefIsNull { result, value } => {
+            let reference = read_slot(slots, *value)?;
+            let is_null = match reference {
+                Value::Ref(tpt_wasm_types::RefValue::Null(_)) => true,
+                Value::Ref(tpt_wasm_types::RefValue::FuncRef(_))
+                | Value::Ref(tpt_wasm_types::RefValue::ExternRef(_)) => false,
+                other => {
+                    return Err(BaselineError::Trap(Trap::HostFailure(format!(
+                        "baseline ref.is_null operand is not a reference: {other:?}"
+                    ))))
+                }
+            };
+            slots[*result as usize] = Some(Value::I32(is_null as i32));
+        }
+        BaselineOp::Branch { target, values } => {
+            return Ok(OpFlow::Jump(*target, values.clone()));
+        }
+        BaselineOp::CondBranch {
+            condition,
+            then_target,
+            then_values,
+            else_target,
+            else_values,
+        } => {
+            let condition = i32_slot(slots, *condition)?;
+            let (target, values) = if condition != 0 {
+                (*then_target, then_values.clone())
+            } else {
+                (*else_target, else_values.clone())
+            };
+            return Ok(OpFlow::Jump(target, values));
+        }
+        BaselineOp::CallHost {
+            import,
+            arguments,
+            results,
+        } => {
+            let declaration = state
+                .imports
+                .get(*import as usize)
+                .ok_or_else(|| Trap::HostFailure("baseline host import is out of range".into()))?;
+            let qualified = format!("{}::{}", declaration.module, declaration.name);
+            // No boundary means the embedder granted no host
+            // capability, so the call is refused rather than
+            // resolved by guesswork. That is a host refusal rather
+            // than the module trapping, so it is reported as one.
+            let memory = state
+                .memory
+                .as_deref_mut()
+                .map(|memory| memory as &mut dyn GuestMemory);
+            let host = state.host.as_deref_mut().ok_or_else(|| {
+                BaselineError::Host(HostCallFailure {
+                    name: qualified.clone(),
+                    message: "no host boundary was installed".into(),
+                })
+            })?;
+            let mut call_args = Vec::with_capacity(arguments.len());
+            for slot in arguments {
+                call_args.push(read_slot(slots, *slot)?);
+            }
+            let returned = host.call(&declaration.module, &declaration.name, memory, call_args)?;
+            // The import's declared result arity and types are
+            // re-checked here: the host is outside the verified
+            // module, so its return is not trusted. A host that
+            // breaks its declared signature is reported as a host
+            // failure, matching how the interpreter reports one.
+            if returned.len() != results.len() {
+                return Err(BaselineError::Host(HostCallFailure {
+                    name: qualified.clone(),
+                    message: format!(
+                        "host returned {} results, the import declares {}",
+                        returned.len(),
+                        results.len()
+                    ),
+                }));
+            }
+            for (position, expected) in declaration.function_type.results.0.iter().enumerate() {
+                check_value_type(&returned[position], *expected).map_err(|trap| {
+                    BaselineError::Host(HostCallFailure {
+                        name: qualified.clone(),
+                        message: Trap::HostFailure(format!(
+                            "host returned the wrong type for a result: {trap}"
+                        ))
+                        .to_string(),
+                    })
+                })?;
+            }
+            for (slot, value) in results.iter().copied().zip(returned) {
+                slots[slot as usize] = Some(value);
+            }
+        }
+        BaselineOp::Call {
+            function,
+            arguments,
+            results,
+        } => exec_call(state, slots, value_types, *function, arguments, results)?,
+        BaselineOp::CallIndirect {
+            type_index,
+            operand,
+            arguments,
+            results,
+        } => exec_call_indirect(
+            state,
+            slots,
+            value_types,
+            *type_index,
+            *operand,
+            arguments,
+            results,
+        )?,
+    }
+    Ok(OpFlow::Continue)
+}
+
+/// A direct call to a defined function. One of the two ops that recurse, so it is
+/// kept small: its frame is on the host stack for every level of the call.
+#[inline(never)]
+fn exec_call(
+    state: &mut ExecState<'_>,
+    slots: &mut [Option<Value>],
+    value_types: &[ValueType],
+    function: u32,
+    arguments: &[u32],
+    results: &[u32],
+) -> Result<(), BaselineError> {
+    // An index outside the table means the function table does
+    // not match the one this function was lowered against.
+    let callee = state
+        .functions
+        .get(function as usize)
+        .ok_or_else(|| Trap::HostFailure("baseline call target is not in the module".into()))?;
+    if callee.params.len() != arguments.len() {
+        return Err(BaselineError::Trap(Trap::HostFailure(
+            "baseline call argument arity mismatch".into(),
+        )));
+    }
+    let mut call_args = Vec::with_capacity(arguments.len());
+    for slot in arguments {
+        call_args.push(read_slot(slots, *slot)?);
+    }
+    let returned = state.call(
+        function_key(state.imports, function as usize),
+        callee,
+        call_args,
+    )?;
+    if returned.len() != results.len() {
+        return Err(BaselineError::Trap(Trap::HostFailure(
+            "baseline call result arity mismatch".into(),
+        )));
+    }
+    for (slot, value) in results.iter().copied().zip(returned) {
+        check_value_type(&value, value_types[slot as usize])?;
+        slots[slot as usize] = Some(value);
+    }
+    Ok(())
+}
+
+/// An indirect call through the table. The other op that recurses.
+#[inline(never)]
+fn exec_call_indirect(
+    state: &mut ExecState<'_>,
+    slots: &mut [Option<Value>],
+    value_types: &[ValueType],
+    type_index: u32,
+    operand: u32,
+    arguments: &[u32],
+    results: &[u32],
+) -> Result<(), BaselineError> {
+    // Re-borrowed rather than moved: the recursive call takes
+    // `&mut state` again, and the table handle has to stay
+    // available for the next instruction.
+    let table = state
+        .table
+        .as_deref_mut()
+        .ok_or_else(|| Trap::HostFailure("baseline indirect call needs a table".into()))?;
+    let index = i32_slot(slots, operand)? as u32;
+    // Out of range and null are distinct traps, matching the
+    // order in which the reference is resolved.
+    let target = table
+        .elements
+        .get(index as usize)
+        .copied()
+        .ok_or(Trap::TableOutOfBounds)?
+        .ok_or(Trap::NullReference)?;
+    let callee = state
+        .functions
+        .get(target as usize)
+        .ok_or_else(|| Trap::HostFailure("baseline indirect target is not in the module".into()))?;
+    // The signature is checked against the entry the table
+    // holds, not against the type index the call names, since
+    // a mismatch is exactly the trap we are modelling.
+    let expected = state
+        .types
+        .get(type_index as usize)
+        .ok_or_else(|| Trap::HostFailure("baseline indirect call type is unknown".into()))?;
+    if &callee.function_type != expected {
+        return Err(BaselineError::Trap(Trap::IndirectCallTypeMismatch));
+    }
+    let mut call_args = Vec::with_capacity(arguments.len());
+    for slot in arguments {
+        call_args.push(read_slot(slots, *slot)?);
+    }
+    let returned = state.call(
+        function_key(state.imports, target as usize),
+        callee,
+        call_args,
+    )?;
+    if returned.len() != results.len() {
+        return Err(BaselineError::Trap(Trap::HostFailure(
+            "baseline indirect call result arity mismatch".into(),
+        )));
+    }
+    for (slot, value) in results.iter().copied().zip(returned) {
+        check_value_type(&value, value_types[slot as usize])?;
+        slots[slot as usize] = Some(value);
+    }
+    Ok(())
 }
 
 fn eval_i32_binary(operation: I32BinaryOp, left: i32, right: i32) -> Result<i32, Trap> {
@@ -5068,8 +5223,9 @@ mod tests {
                     let field_name = parts.next().unwrap_or_default();
                     // A refused capability is reported as a trap in this
                     // harness, matching what the runtime surfaces to a caller.
+                    // This harness lends no memory to the boundary.
                     let results = boundary
-                        .call(module_name, field_name, call.args)
+                        .call(module_name, field_name, None, call.args)
                         .map_err(|failure| Trap::HostFailure(failure.message))?;
                     machine.resume_host_call(results)?;
                 }
@@ -5806,6 +5962,7 @@ mod tests {
             &mut self,
             module: &str,
             name: &str,
+            _memory: Option<&mut dyn tpt_wasm_types::GuestMemory>,
             args: Vec<Value>,
         ) -> Result<Vec<Value>, super::HostCallFailure> {
             let qualified = format!("{module}::{name}");
@@ -5912,9 +6069,10 @@ mod tests {
             &mut self,
             module: &str,
             name: &str,
+            memory: Option<&mut dyn tpt_wasm_types::GuestMemory>,
             args: Vec<Value>,
         ) -> Result<Vec<Value>, super::HostCallFailure> {
-            self.0.call(module, name, args)
+            self.0.call(module, name, memory, args)
         }
     }
 

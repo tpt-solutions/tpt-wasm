@@ -322,6 +322,34 @@ pub struct MemoryInstance {
     pub declared_max_pages: Option<u64>,
 }
 
+impl tpt_wasm_types::GuestMemory for MemoryInstance {
+    fn size(&self) -> u64 {
+        self.data.len() as u64
+    }
+
+    fn read(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(usize::try_from(length).ok()?)?;
+        self.data.get(start..end).map(<[u8]>::to_vec)
+    }
+
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> bool {
+        let Ok(start) = usize::try_from(offset) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(bytes.len()) else {
+            return false;
+        };
+        match self.data.get_mut(start..end) {
+            Some(target) => {
+                target.copy_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 impl MemoryInstance {
     pub fn new(
         min_pages: u64,

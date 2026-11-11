@@ -4,6 +4,7 @@
 use crate::execution::{DeterministicRng, ExecutionConfig};
 use crate::instr::decode_body;
 use crate::store::Store;
+use std::collections::BTreeMap;
 use tpt_wasm_types::{RefValue, Trap, Value, ValueType};
 
 /// The complete state of the abstract machine.
@@ -14,6 +15,13 @@ pub struct Machine {
     pub frames: Vec<Frame>,
     pub control_stack: Vec<ControlFrame>,
     pub steps: u64,
+    /// Steps charged to each function, keyed by the frame's function index, when
+    /// profiling is enabled. `None` means the machine is not profiling.
+    ///
+    /// Every charged step lands in exactly one entry, so the values sum to `steps`.
+    /// A step counts as time here on purpose: wall-clock time would make a profile
+    /// depend on the host, which deterministic execution forbids.
+    pub profile: Option<BTreeMap<u32, u64>>,
     pub pending_host_results: Option<usize>,
     pub execution: ExecutionConfig,
     rng: DeterministicRng,
@@ -153,10 +161,14 @@ pub fn step(machine: &mut Machine) -> Step {
     let Some(frame) = machine.frames.last_mut() else {
         return Step::Trap(Trap::HostFailure("no active frame".into()));
     };
+    let func_idx = frame.func_idx;
     let Some(instruction) = frame.instrs.get(frame.pc).cloned() else {
         return Step::Trap(Trap::HostFailure("program counter out of bounds".into()));
     };
     machine.steps = machine.steps.saturating_add(1);
+    if let Some(profile) = machine.profile.as_mut() {
+        *profile.entry(func_idx).or_insert(0) += 1;
+    }
     machine.frames.last_mut().expect("frame remains present").pc += 1;
     execute_instruction(machine, instruction)
 }
@@ -1793,10 +1805,17 @@ impl Machine {
             frames: Vec::new(),
             control_stack: Vec::new(),
             steps: 0,
+            profile: None,
             pending_host_results: None,
             rng: DeterministicRng::new(execution.seed),
             execution,
         }
+    }
+
+    /// Start attributing charged steps to functions. Steps charged before this call
+    /// are not attributed, so enable it before the first step of the run.
+    pub fn enable_profiling(&mut self) {
+        self.profile = Some(BTreeMap::new());
     }
 
     /// Draw the next value from the machine's reproducible effect stream.

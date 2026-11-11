@@ -163,6 +163,23 @@ impl ValueType {
     }
 }
 
+/// A guest's linear memory, lent to a host function for the length of one call.
+///
+/// A host function reads the arguments that point into memory and writes results
+/// back through it. Every access is bounds-checked and reports failure instead of
+/// panicking, so the host can turn an out-of-range pointer into an error code.
+pub trait GuestMemory {
+    /// The memory's size in bytes.
+    fn size(&self) -> u64;
+
+    /// The `length` bytes at `offset`, or `None` if the range is not wholly inside.
+    fn read(&self, offset: u64, length: u64) -> Option<Vec<u8>>;
+
+    /// Write `bytes` at `offset`, or return `false` and write nothing if the range is
+    /// not wholly inside.
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RefValue, ReferenceType, Value, ValueType};

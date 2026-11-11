@@ -6,7 +6,7 @@
 //! This crate provides the MVP execution boundary. It accepts a validated
 //! module, builds explicit store state, and drives the Micro interpreter.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -21,8 +21,8 @@ use tpt_wasm_micro::instr::{decode_body, Instr};
 use tpt_wasm_micro::machine::{Frame, Machine, Step};
 pub use tpt_wasm_micro::store::{Instance as StoreInstance, Store, StoreError};
 use tpt_wasm_types::{
-    FunctionType, GlobalType, Limits, MemoryType, RefValue, ResourceLimits, TableType, Trap, Value,
-    ValueType,
+    FunctionType, GlobalType, GuestMemory, Limits, MemoryType, RefValue, ResourceLimits, TableType,
+    Trap, Value, ValueType,
 };
 use tpt_wasm_validate::{ValidatedModule, ValidationError, Validator};
 
@@ -243,6 +243,21 @@ impl From<StoreError> for RuntimeError {
 pub trait HostFunction: Send + Sync {
     fn function_type(&self) -> FunctionType;
     fn call(&self, args: &[Value]) -> Result<Vec<Value>, String>;
+
+    /// As [`call`](Self::call), with the calling module's memory lent for this call.
+    ///
+    /// `memory` is `None` when no Wasm code is calling. The default ignores the memory,
+    /// so an implementation that does not touch memory does not have to override this.
+    /// One that does reads its pointer arguments and writes results through the
+    /// [`GuestMemory`] it is given.
+    fn call_with_memory(
+        &self,
+        memory: Option<&mut dyn GuestMemory>,
+        args: &[Value],
+    ) -> Result<Vec<Value>, String> {
+        let _ = memory;
+        self.call(args)
+    }
 }
 
 #[derive(Clone)]
@@ -316,6 +331,36 @@ impl fmt::Debug for RuntimeContext {
                     .unwrap_or_default(),
             )
             .finish_non_exhaustive()
+    }
+}
+
+/// The store address of memory 0 of the instance that made the host call.
+///
+/// A host call does not push a frame, so the frame on top is the caller's: its
+/// instance's first memory is the one the host function may read and write.
+fn caller_memory_address(machine: &Machine) -> Option<u32> {
+    let caller = machine.frames.last()?.instance_idx;
+    let instance = machine.store.instance(caller).ok()?;
+    instance.memory_addrs.first().copied()
+}
+
+/// The import's own `module::name` for a host callback's store name.
+///
+/// The store names each host callback `tpt-host:<slot>:<module>::<name>`, where the slot
+/// makes the name unique within the store. Callers counting by capability want the
+/// import's name, so the slot is dropped. A name without the prefix is returned as is.
+fn capability_name(callback: &str) -> &str {
+    callback
+        .strip_prefix("tpt-host:")
+        .and_then(|rest| rest.split_once(':'))
+        .map_or(callback, |(_, name)| name)
+}
+
+/// The growth between two memory sizes, zero when either was unavailable.
+fn pages_added(before: Option<u64>, after: Option<u64>) -> u64 {
+    match (before, after) {
+        (Some(before), Some(after)) => after.saturating_sub(before),
+        _ => 0,
     }
 }
 
@@ -689,6 +734,17 @@ pub struct Instance {
     context: RuntimeContext,
     /// Steps the most recent call charged on this instance's backend.
     last_call_steps: u64,
+    /// Pages the most recent call added to memory 0, or zero if it added none.
+    last_call_memory_pages_added: u64,
+    /// Whether calls on this instance record a per-function step profile.
+    profiling: bool,
+    /// Steps the most recent call charged to each function, keyed by function index.
+    last_call_profile: BTreeMap<u32, u64>,
+    /// Host calls the most recent call made, keyed by the import's `module::name`.
+    last_call_host_calls: BTreeMap<String, u64>,
+    /// Shared with the baseline's host boundary, which counts its calls here, since
+    /// the boundary is owned by the compiled module rather than by this instance.
+    baseline_host_counts: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 impl fmt::Debug for Instance {
@@ -958,6 +1014,8 @@ struct BaselineHost {
     /// One entry per import the baseline may call, mapping `module::name` to the
     /// synthesized callback name Micro resolves it to.
     bindings: Vec<(String, String)>,
+    /// Calls made through this boundary, keyed by `module::name`, for the instance.
+    counts: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 impl tpt_wasm_codegen::HostBoundary for BaselineHost {
@@ -965,6 +1023,7 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
         &mut self,
         module: &str,
         name: &str,
+        memory: Option<&mut dyn GuestMemory>,
         args: Vec<Value>,
     ) -> Result<Vec<Value>, tpt_wasm_codegen::HostCallFailure> {
         let context = self
@@ -975,6 +1034,9 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
                 message: "baseline host call has no runtime context".into(),
             })?;
         let wanted = format!("{module}::{name}");
+        if let Ok(mut counts) = self.counts.lock() {
+            *counts.entry(wanted.clone()).or_insert(0) += 1;
+        }
         let callback = self
             .bindings
             .iter()
@@ -998,12 +1060,20 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
             baseline: None,
             context,
             last_call_steps: 0,
+            last_call_memory_pages_added: 0,
+            profiling: false,
+            last_call_profile: BTreeMap::new(),
+            last_call_host_calls: BTreeMap::new(),
+            baseline_host_counts: Arc::new(Mutex::new(BTreeMap::new())),
         };
-        let result = instance.invoke_host_call(&tpt_wasm_micro::machine::HostCall {
-            func_name: callback.clone(),
-            args,
-            expected_results: 0,
-        });
+        let result = instance.invoke_host_call(
+            &tpt_wasm_micro::machine::HostCall {
+                func_name: callback.clone(),
+                args,
+                expected_results: 0,
+            },
+            memory,
+        );
         drop(instance);
         // The interpreter's host failure is taken apart rather than stringified,
         // so both backends report the same name and message instead of the same
@@ -1343,15 +1413,22 @@ fn instantiate_module(
         baseline,
         context: context.clone(),
         last_call_steps: 0,
+        last_call_memory_pages_added: 0,
+        profiling: config.profiling,
+        last_call_profile: BTreeMap::new(),
+        last_call_host_calls: BTreeMap::new(),
+        baseline_host_counts: Arc::new(Mutex::new(BTreeMap::new())),
     };
     // The baseline's host boundary needs the resolved callbacks, which only exist
     // once the import loop has run. It is installed here, before the start
     // function, so a start function that calls a host function resolves too.
+    let host_counts = Arc::clone(&instance.baseline_host_counts);
     if let Some(module) = instance.baseline.as_mut() {
         if !baseline_bindings.is_empty() {
             module.set_host(BaselineHost {
                 context: Some(context.clone()),
                 bindings: baseline_bindings,
+                counts: host_counts,
             });
         }
         // The baseline recurses to make a call, so it needs the same call-depth
@@ -1551,8 +1628,60 @@ impl Instance {
         if self.baseline.is_some() {
             return self.call_baseline(name, args);
         }
-        let address = self.get_function(name)?;
-        self.call_address(address, args)
+        let before = self.memory_pages();
+        let result = self
+            .get_function(name)
+            .and_then(|address| self.call_address(address, args));
+        self.last_call_memory_pages_added = pages_added(before, self.memory_pages());
+        result
+    }
+
+    /// The size of memory 0 in pages, or `None` when the instance has no memory.
+    ///
+    /// Read between calls, so it never sees a call half-finished. Only memory 0 is
+    /// reported: MVP modules have at most one memory, and the baseline owns only that
+    /// one.
+    pub fn memory_pages(&self) -> Option<u64> {
+        if let Some(module) = self.baseline.as_ref() {
+            let handle = module.memory_handle()?;
+            let memory = handle.lock().ok()?;
+            return Some(u64::from(memory.pages()));
+        }
+        let store = lock_store(&self.context.store).ok()?;
+        let address = *store.instance(self.index).ok()?.memory_addrs.first()?;
+        Some(store.memory(address).ok()?.pages())
+    }
+
+    /// The steps the most recent call charged to each function, keyed by function index.
+    ///
+    /// Empty unless `Config::profiling` was set. Both backends key a function by its
+    /// instance function index, imports first, so the same function has the same key on
+    /// either. The values sum to `last_call_steps()`, because each charged step is
+    /// attributed once. The baseline counts its own IR instructions, so its values are
+    /// not comparable with Micro's, only its attribution is.
+    pub fn last_call_profile(&self) -> &BTreeMap<u32, u64> {
+        &self.last_call_profile
+    }
+
+    /// The host calls the most recent call made, keyed by the import's `module::name`.
+    ///
+    /// Counts calls to each host function, including a call that trapped. On Micro a
+    /// call made by exporting an import directly is counted too. The baseline cannot
+    /// export an import, so it counts only calls made from Wasm code. These are counts,
+    /// not times: a host call has no step cost of its own, and a wall-clock time per
+    /// capability would conflict with deterministic execution.
+    pub fn last_call_host_calls(&self) -> &BTreeMap<String, u64> {
+        &self.last_call_host_calls
+    }
+
+    /// The pages the most recent call added to memory 0, or zero if it added none.
+    ///
+    /// A `memory.grow` that succeeds adds its delta, and one that fails adds nothing.
+    /// Memories never shrink in MVP, so the difference between the size before and
+    /// after the call is exactly the growth the call made. A call that trapped still
+    /// reports the growth it made before the trap, because its memory is kept.
+    pub fn last_call_memory_pages_added(&self) -> u64 {
+        self.last_call_memory_pages_added
     }
 
     /// Resolve a Wasm export by name.
@@ -1594,12 +1723,25 @@ impl Instance {
             return Err(RuntimeError::DebugSessionActive);
         }
         let index = self.baseline_index(name)?;
+        self.last_call_profile.clear();
+        self.last_call_host_calls.clear();
+        if let Ok(mut counts) = self.baseline_host_counts.lock() {
+            counts.clear();
+        }
+        let before = self.memory_pages();
         let module = self
             .baseline
             .as_mut()
             .expect("checked by the caller that dispatched here");
-        let (result, steps) = module.call_counted(index, args);
+        let (result, steps, profile) = module.call_profiled(index, args, self.profiling);
         self.last_call_steps = steps;
+        self.last_call_profile = profile;
+        self.last_call_host_calls = self
+            .baseline_host_counts
+            .lock()
+            .map(|counts| counts.clone())
+            .unwrap_or_default();
+        self.last_call_memory_pages_added = pages_added(before, self.memory_pages());
         result.map_err(baseline_error)
     }
 
@@ -1701,6 +1843,8 @@ impl Instance {
         {
             return Err(RuntimeError::DebugSessionActive);
         }
+        self.last_call_profile.clear();
+        self.last_call_host_calls.clear();
         let function = {
             let store = lock_store(&self.context.store)?;
             store.function(address)?.clone()
@@ -1719,7 +1863,11 @@ impl Instance {
                     args,
                     expected_results: function.func_type.results.0.len(),
                 };
-                return self.invoke_host_call(&call);
+                *self
+                    .last_call_host_calls
+                    .entry(capability_name(&call.func_name).to_owned())
+                    .or_insert(0) += 1;
+                return self.invoke_host_call(&call, None);
             }
         };
         check_arguments(&func_type, &args)?;
@@ -1740,10 +1888,16 @@ impl Instance {
         );
         let mut machine =
             Machine::with_execution(lock_store(&self.context.store)?.clone(), self.execution);
+        if self.profiling {
+            machine.enable_profiling();
+        }
         machine.push_frame(frame).map_err(RuntimeError::Trap)?;
         loop {
             let outcome = machine.run();
             self.last_call_steps = machine.steps;
+            if let Some(profile) = machine.profile.as_ref() {
+                self.last_call_profile.clone_from(profile);
+            }
             match outcome {
                 Step::Return(values) => {
                     self.commit_store(machine.store)?;
@@ -1754,7 +1908,20 @@ impl Instance {
                     return Err(RuntimeError::Trap(trap));
                 }
                 Step::HostCall(call) => {
-                    let results = match self.invoke_host_call(&call) {
+                    *self
+                        .last_call_host_calls
+                        .entry(capability_name(&call.func_name).to_owned())
+                        .or_insert(0) += 1;
+                    let outcome = match caller_memory_address(&machine)
+                        .and_then(|address| machine.store.memory_mut(address).ok())
+                    {
+                        Some(memory) => {
+                            let memory: &mut dyn GuestMemory = memory;
+                            self.invoke_host_call(&call, Some(memory))
+                        }
+                        None => self.invoke_host_call(&call, None),
+                    };
+                    let results = match outcome {
                         Ok(results) => results,
                         Err(error) => {
                             self.commit_store(machine.store)?;
@@ -1784,6 +1951,7 @@ impl Instance {
     fn invoke_host_call(
         &self,
         call: &tpt_wasm_micro::machine::HostCall,
+        memory: Option<&mut dyn GuestMemory>,
     ) -> Result<Vec<Value>, RuntimeError> {
         let implementation = {
             let callbacks = lock_host_functions(&self.context.host_functions)?;
@@ -1797,13 +1965,12 @@ impl Instance {
         };
         let function_type = implementation.function_type();
         check_values("argument", &function_type.params.0, &call.args)?;
-        let results =
-            implementation
-                .call(&call.args)
-                .map_err(|message| RuntimeError::HostFunction {
-                    name: call.func_name.clone(),
-                    message,
-                })?;
+        let results = implementation
+            .call_with_memory(memory, &call.args)
+            .map_err(|message| RuntimeError::HostFunction {
+                name: call.func_name.clone(),
+                message,
+            })?;
         check_values("result", &function_type.results.0, &results)?;
         Ok(results)
     }
@@ -3499,6 +3666,438 @@ mod tests {
                     Err(RuntimeError::UnknownExport(_))
                 ),
                 "{mode:?}: an unknown export is reported"
+            );
+        }
+    }
+
+    /// A module whose `grow` export is `memory.grow` on its argument.
+    fn growing_module() -> Module {
+        Module {
+            types: vec![tpt_wasm_types::FunctionType {
+                params: tpt_wasm_types::ResultType(vec![tpt_wasm_types::ValueType::I32]),
+                results: tpt_wasm_types::ResultType(vec![tpt_wasm_types::ValueType::I32]),
+            }],
+            functions: vec![tpt_wasm_format::Function {
+                type_index: 0,
+                locals: Vec::new(),
+                // local.get 0; memory.grow 0; end
+                body: vec![0x20, 0x00, 0x40, 0x00, 0x0b],
+            }],
+            memories: vec![tpt_wasm_format::Memory {
+                memory_type: tpt_wasm_types::MemoryType {
+                    limits: tpt_wasm_types::Limits { min: 1, max: None },
+                    memory64: false,
+                },
+            }],
+            exports: vec![
+                tpt_wasm_format::Export {
+                    name: "grow".into(),
+                    desc: tpt_wasm_format::ExportDesc::Function(0),
+                },
+                tpt_wasm_format::Export {
+                    name: "mem".into(),
+                    desc: tpt_wasm_format::ExportDesc::Memory(0),
+                },
+            ],
+            ..Module::default()
+        }
+    }
+
+    /// Memory size and per-call growth are reported the same on both backends.
+    ///
+    /// A successful grow adds its delta, a zero-delta grow adds nothing, and a grow past
+    /// the module's maximum fails and adds nothing. The size is read between calls.
+    #[test]
+    fn memory_growth_per_call_agrees_on_both_backends() {
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let mut instance = Engine::new(Config {
+                engine_mode: mode,
+                ..Config::default()
+            })
+            .expect("accepted")
+            .instantiate(growing_module())
+            .expect("instantiates");
+            assert_eq!(
+                instance.memory_pages(),
+                Some(1),
+                "{mode:?}: starts at one page"
+            );
+            assert_eq!(
+                instance.last_call_memory_pages_added(),
+                0,
+                "{mode:?}: no call yet"
+            );
+
+            let previous = instance
+                .call("grow", vec![Value::I32(2)])
+                .expect("grow runs");
+            assert_eq!(
+                previous,
+                vec![Value::I32(1)],
+                "{mode:?}: grow returns the old size"
+            );
+            assert_eq!(
+                instance.memory_pages(),
+                Some(3),
+                "{mode:?}: grew by two pages"
+            );
+            assert_eq!(
+                instance.last_call_memory_pages_added(),
+                2,
+                "{mode:?}: call added two"
+            );
+
+            instance
+                .call("grow", vec![Value::I32(0)])
+                .expect("grow runs");
+            assert_eq!(
+                instance.memory_pages(),
+                Some(3),
+                "{mode:?}: zero delta changes nothing"
+            );
+            assert_eq!(
+                instance.last_call_memory_pages_added(),
+                0,
+                "{mode:?}: zero delta adds none"
+            );
+
+            let failed = instance
+                .call("grow", vec![Value::I32(i32::MAX)])
+                .expect("a failed grow is a value, not a trap");
+            assert_eq!(
+                failed,
+                vec![Value::I32(-1)],
+                "{mode:?}: a refused grow returns -1"
+            );
+            assert_eq!(
+                instance.memory_pages(),
+                Some(3),
+                "{mode:?}: a refused grow adds nothing"
+            );
+            assert_eq!(
+                instance.last_call_memory_pages_added(),
+                0,
+                "{mode:?}: refused adds none"
+            );
+        }
+    }
+
+    /// A module whose `run` calls `helper` once, so a profile sees two functions.
+    fn two_function_module() -> Module {
+        let result_i32 = tpt_wasm_types::FunctionType {
+            params: tpt_wasm_types::ResultType(Vec::new()),
+            results: tpt_wasm_types::ResultType(vec![tpt_wasm_types::ValueType::I32]),
+        };
+        Module {
+            types: vec![result_i32],
+            functions: vec![
+                tpt_wasm_format::Function {
+                    type_index: 0,
+                    locals: Vec::new(),
+                    // helper: i32.const 7; end
+                    body: vec![0x41, 0x07, 0x0b],
+                },
+                tpt_wasm_format::Function {
+                    type_index: 0,
+                    locals: Vec::new(),
+                    // run: call 0; i32.const 1; i32.add; end
+                    body: vec![0x10, 0x00, 0x41, 0x01, 0x6a, 0x0b],
+                },
+            ],
+            exports: vec![tpt_wasm_format::Export {
+                name: "run".into(),
+                desc: tpt_wasm_format::ExportDesc::Function(1),
+            }],
+            ..Module::default()
+        }
+    }
+
+    /// A profile attributes every charged step to a function, and only when asked.
+    ///
+    /// On Micro with profiling on, the entries sum to the call's step count and both
+    /// functions appear. With profiling off the profile is empty. The baseline never
+    /// records one, so its profile is empty even when profiling is on.
+    #[test]
+    fn profile_attributes_every_step_to_a_function() {
+        let run = |mode, profiling| {
+            let mut instance = Engine::new(Config {
+                engine_mode: mode,
+                profiling,
+                ..Config::default()
+            })
+            .expect("accepted")
+            .instantiate(two_function_module())
+            .expect("instantiates");
+            let result = instance.call("run", Vec::new()).expect("run returns");
+            assert_eq!(result, vec![Value::I32(8)], "{mode:?}: helper's 7 plus 1");
+            instance
+        };
+
+        let micro = run(EngineMode::Micro, true);
+        let profile = micro.last_call_profile();
+        assert!(
+            profile.contains_key(&0),
+            "helper is in the profile: {profile:?}"
+        );
+        assert!(
+            profile.contains_key(&1),
+            "run is in the profile: {profile:?}"
+        );
+        assert_eq!(
+            profile.values().sum::<u64>(),
+            micro.last_call_steps(),
+            "every charged step is attributed exactly once"
+        );
+
+        let quiet = run(EngineMode::Micro, false);
+        assert!(
+            quiet.last_call_profile().is_empty(),
+            "profiling is off unless the config asks for it"
+        );
+
+        let compiled = run(EngineMode::Baseline, true);
+        let compiled_profile = compiled.last_call_profile();
+        assert_eq!(
+            compiled_profile.keys().collect::<Vec<_>>(),
+            profile.keys().collect::<Vec<_>>(),
+            "both backends name the same functions by the same keys"
+        );
+        assert_eq!(
+            compiled_profile.values().sum::<u64>(),
+            compiled.last_call_steps(),
+            "the baseline attributes each of its steps once too"
+        );
+
+        // With an import, the defined functions come after it, on both backends.
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let mut engine = Engine::new(Config {
+                engine_mode: mode,
+                profiling: true,
+                ..Config::default()
+            })
+            .expect("accepted");
+            engine.linker_mut().define_function("env", "seven", Seven);
+            let mut instance = engine
+                .instantiate(importing_module())
+                .expect("instantiates");
+            instance.call("run", Vec::new()).expect("run returns");
+            let profile = instance.last_call_profile();
+            assert!(
+                profile.contains_key(&1) && !profile.contains_key(&0),
+                "{mode:?}: run is function 1 after one import, got {profile:?}"
+            );
+        }
+    }
+
+    /// A host function that returns 7 and is counted by the runtime, not by itself.
+    struct Seven;
+
+    impl HostFunction for Seven {
+        fn function_type(&self) -> tpt_wasm_types::FunctionType {
+            tpt_wasm_types::FunctionType {
+                params: tpt_wasm_types::ResultType(Vec::new()),
+                results: tpt_wasm_types::ResultType(vec![tpt_wasm_types::ValueType::I32]),
+            }
+        }
+
+        fn call(&self, _args: &[Value]) -> Result<Vec<Value>, String> {
+            Ok(vec![Value::I32(7)])
+        }
+    }
+
+    /// A module that imports `env.seven` as function 0 and calls it from `run`.
+    ///
+    /// `run` is `call 0; i32.const 1; i32.add`, so it returns 8, and `seven` is also
+    /// exported as the import itself so a direct export call can be counted too.
+    fn importing_module() -> Module {
+        let result_i32 = tpt_wasm_types::FunctionType {
+            params: tpt_wasm_types::ResultType(Vec::new()),
+            results: tpt_wasm_types::ResultType(vec![tpt_wasm_types::ValueType::I32]),
+        };
+        Module {
+            types: vec![result_i32],
+            imports: vec![tpt_wasm_format::Import {
+                module: "env".into(),
+                name: "seven".into(),
+                desc: tpt_wasm_format::ImportDesc::Function(0),
+            }],
+            functions: vec![tpt_wasm_format::Function {
+                type_index: 0,
+                locals: Vec::new(),
+                body: vec![0x10, 0x00, 0x41, 0x01, 0x6a, 0x0b],
+            }],
+            exports: vec![
+                tpt_wasm_format::Export {
+                    name: "run".into(),
+                    desc: tpt_wasm_format::ExportDesc::Function(1),
+                },
+                tpt_wasm_format::Export {
+                    name: "seven".into(),
+                    desc: tpt_wasm_format::ExportDesc::Function(0),
+                },
+            ],
+            ..Module::default()
+        }
+    }
+
+    /// Host calls are counted per capability for the most recent call, on both backends.
+    ///
+    /// `run` makes one host call, so its count is one, and a second `run` starts from
+    /// zero again rather than accumulating. Exporting the import and calling it counts
+    /// as a host call too on Micro. The baseline counts the calls its code makes.
+    #[test]
+    fn host_calls_are_counted_per_capability_for_the_last_call() {
+        let build = |mode| {
+            let mut engine = Engine::new(Config {
+                engine_mode: mode,
+                ..Config::default()
+            })
+            .expect("accepted");
+            engine.linker_mut().define_function("env", "seven", Seven);
+            engine
+                .instantiate(importing_module())
+                .expect("instantiates")
+        };
+
+        let mut micro = build(EngineMode::Micro);
+        assert_eq!(
+            micro.call("run", Vec::new()).expect("run returns"),
+            vec![Value::I32(8)]
+        );
+        assert_eq!(micro.last_call_host_calls().get("env::seven"), Some(&1));
+        micro.call("run", Vec::new()).expect("run returns");
+        assert_eq!(
+            micro.last_call_host_calls().get("env::seven"),
+            Some(&1),
+            "the count is for the last call, not accumulated"
+        );
+        micro.call("seven", Vec::new()).expect("export runs");
+        assert_eq!(
+            micro.last_call_host_calls().get("env::seven"),
+            Some(&1),
+            "exporting the import counts as one host call"
+        );
+
+        let mut compiled = build(EngineMode::Baseline);
+        compiled.call("run", Vec::new()).expect("run returns");
+        assert_eq!(
+            compiled.last_call_host_calls().get("env::seven"),
+            Some(&1),
+            "the baseline counts the calls its code makes"
+        );
+        compiled.call("run", Vec::new()).expect("run returns");
+        assert_eq!(
+            compiled.last_call_host_calls().get("env::seven"),
+            Some(&1),
+            "the baseline's count is for the last call too"
+        );
+    }
+
+    /// A host function that writes one byte through the caller's memory.
+    struct PokeMemory;
+
+    impl HostFunction for PokeMemory {
+        fn function_type(&self) -> tpt_wasm_types::FunctionType {
+            tpt_wasm_types::FunctionType {
+                params: tpt_wasm_types::ResultType(vec![tpt_wasm_types::ValueType::I32]),
+                results: tpt_wasm_types::ResultType(Vec::new()),
+            }
+        }
+
+        fn call(&self, _args: &[Value]) -> Result<Vec<Value>, String> {
+            Err("this host function needs the caller's memory".into())
+        }
+
+        fn call_with_memory(
+            &self,
+            memory: Option<&mut dyn tpt_wasm_types::GuestMemory>,
+            args: &[Value],
+        ) -> Result<Vec<Value>, String> {
+            let Some(memory) = memory else {
+                return Err("no caller memory was lent".into());
+            };
+            let Some(Value::I32(pointer)) = args.first() else {
+                return Err("expected an i32 pointer".into());
+            };
+            if memory.write(u64::from(*pointer as u32), &[42]) {
+                Ok(Vec::new())
+            } else {
+                Err(format!("pointer {pointer} is outside the memory"))
+            }
+        }
+    }
+
+    /// A module whose `run(p)` calls the imported `env.poke(p)`, with one memory.
+    fn poking_module() -> Module {
+        Module {
+            types: vec![tpt_wasm_types::FunctionType {
+                params: tpt_wasm_types::ResultType(vec![tpt_wasm_types::ValueType::I32]),
+                results: tpt_wasm_types::ResultType(Vec::new()),
+            }],
+            imports: vec![tpt_wasm_format::Import {
+                module: "env".into(),
+                name: "poke".into(),
+                desc: tpt_wasm_format::ImportDesc::Function(0),
+            }],
+            functions: vec![tpt_wasm_format::Function {
+                type_index: 0,
+                locals: Vec::new(),
+                // local.get 0; call 0; end
+                body: vec![0x20, 0x00, 0x10, 0x00, 0x0b],
+            }],
+            memories: vec![tpt_wasm_format::Memory {
+                memory_type: tpt_wasm_types::MemoryType {
+                    limits: tpt_wasm_types::Limits { min: 1, max: None },
+                    memory64: false,
+                },
+            }],
+            exports: vec![
+                tpt_wasm_format::Export {
+                    name: "run".into(),
+                    desc: tpt_wasm_format::ExportDesc::Function(1),
+                },
+                tpt_wasm_format::Export {
+                    name: "mem".into(),
+                    desc: tpt_wasm_format::ExportDesc::Memory(0),
+                },
+            ],
+            ..Module::default()
+        }
+    }
+
+    /// A host function reaches the calling module's memory on both backends.
+    ///
+    /// The write lands in the memory the module exports, so the caller sees what the
+    /// host wrote. A pointer outside the memory is a host failure on both backends.
+    #[test]
+    fn host_function_reaches_the_callers_memory_on_both_backends() {
+        for mode in [EngineMode::Micro, EngineMode::Baseline] {
+            let mut engine = Engine::new(Config {
+                engine_mode: mode,
+                ..Config::default()
+            })
+            .expect("accepted");
+            engine
+                .linker_mut()
+                .define_function("env", "poke", PokeMemory);
+            let mut instance = engine.instantiate(poking_module()).expect("instantiates");
+
+            instance
+                .call("run", vec![Value::I32(16)])
+                .expect("the in-bounds write succeeds");
+            assert_eq!(
+                instance.read_memory("mem", 16, 1).expect("reads"),
+                vec![42],
+                "{mode:?}: the host wrote into the caller's memory"
+            );
+
+            let failure = instance
+                .call("run", vec![Value::I32(70_000)])
+                .expect_err("an out-of-bounds write is a host failure");
+            assert!(
+                matches!(&failure, RuntimeError::HostFunction { message, .. }
+                    if message.contains("outside the memory")),
+                "{mode:?}: reported as a host failure, got {failure:?}"
             );
         }
     }

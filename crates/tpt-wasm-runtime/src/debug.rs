@@ -253,7 +253,16 @@ impl DebugSession<'_> {
                     return Ok(Some(StopReason::Trapped(trap)));
                 }
                 Step::HostCall(call) => {
-                    let results = match self.instance.invoke_host_call(&call) {
+                    let memory = super::caller_memory_address(&self.machine)
+                        .and_then(|address| self.machine.store.memory_mut(address).ok());
+                    let invoked = match memory {
+                        Some(memory) => {
+                            let memory: &mut dyn tpt_wasm_types::GuestMemory = memory;
+                            self.instance.invoke_host_call(&call, Some(memory))
+                        }
+                        None => self.instance.invoke_host_call(&call, None),
+                    };
+                    let results = match invoked {
                         Ok(results) => results,
                         Err(error) => {
                             self.close()?;
