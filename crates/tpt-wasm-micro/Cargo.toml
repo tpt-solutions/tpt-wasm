@@ -6,6 +6,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/tpt-wasm-micro"
+keywords = ["webassembly", "wasm", "interpreter", "semantics", "reference"]
+categories = ["wasm", "emulators"]
 
 [dependencies]
 tpt-wasm-types.workspace = true

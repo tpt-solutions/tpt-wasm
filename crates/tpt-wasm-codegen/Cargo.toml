@@ -6,6 +6,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/tpt-wasm-codegen"
+keywords = ["webassembly", "wasm", "codegen", "compiler", "baseline"]
+categories = ["wasm", "compilers"]
 
 [dependencies]
 tpt-wasm-types.workspace = true

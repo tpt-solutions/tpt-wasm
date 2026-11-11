@@ -6,6 +6,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/tpt-wasm-oracle"
+keywords = ["webassembly", "wasm", "differential-testing", "fuzzing", "testing"]
+categories = ["wasm", "development-tools::testing"]
 publish = false
 
 [dependencies]

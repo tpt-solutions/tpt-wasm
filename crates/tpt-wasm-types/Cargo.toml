@@ -6,5 +6,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/tpt-wasm-types"
+keywords = ["webassembly", "wasm", "types", "values", "semantics"]
+categories = ["wasm"]
 
 [dependencies]

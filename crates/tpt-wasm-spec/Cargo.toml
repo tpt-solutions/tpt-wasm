@@ -6,6 +6,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/tpt-wasm-spec"
+keywords = ["webassembly", "wasm", "spec-tests", "conformance", "testing"]
+categories = ["wasm", "development-tools::testing"]
 
 [dependencies]
 tpt-wasm-decode.workspace = true

@@ -6,6 +6,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/tpt-wasm-runtime"
+keywords = ["webassembly", "wasm", "runtime", "engine", "interpreter"]
+categories = ["wasm", "virtualization"]
 
 [dependencies]
 tpt-wasm-format.workspace = true
