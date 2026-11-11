@@ -312,8 +312,8 @@
 (`ir_address_agrees`) and which binary operations have a counterpart (`liftI32_sound`).
   - `liftI32` returns an `Option` on purpose: the IR models six binary operations and Wasm has sixteen, and giving the
 other ten a counterpart would make `Related` satisfiable for a lowering that does not exist.
-  - **Remaining:** the store correspondence and the simulation. Both sides reduce a store to the same `writeLE?`, so the
-trap condition is one decision rather than two, but the `storedBits` terms are not yet in the same form on both sides.
+  - Store correspondence: done. `store_write_agrees` proves that, given the same address and operand, the Wasm store and the IR store compute the same `writeLE?` call, so the trap condition is one decision on both sides; `store_trap_agrees` and `store_updated_agrees` are the two corollaries the simulation needs. The package builds with no `sorry` or `axiom`.
+  - **Remaining:** the simulation itself, that a related Wasm configuration and IR state step together over a whole function. It needs the control stack and the block structure related, which `Related` does not cover yet (it relates single instructions only).
 - [x] Write proof for constant folding (`x + 0 = x`)
   - `TptWasm/Proofs/V5.lean` proves `foldable_inert` (a fold step preserves one instruction's trace) together with the
 per-step facts it rests on: the arithmetic instructions emit nothing, memory and the host boundary emit something, and

@@ -119,18 +119,38 @@ theorem ir_address_agrees (s : IR.State) (a : IR.ValueId) (address : Int)
     (IR.intPayload (s.values a)).natAbs = address.natAbs := by
   simp [h, IR.intPayload]
 
-/- The store correspondence is stated and not yet proved.
+/- **V4: a store writes the same bytes, at the same address, on both sides.**
 
-Both the Wasm rule and the IR executor reduce a store to the *same* call,
-`memory.writeLE? address.natAbs width (storedBits value)`, so the trap
-condition is one decision rather than two. That is the trap-position clause
-of the `spec.txt` section 67 contract in its most concrete form: an
-out-of-bounds store is a trap, and a lowering that disagreed about which
-would either swallow a trap or invent one.
+Both the Wasm rule (`TptWasm.Transition`, the `store` step) and the IR executor
+(`TptWasm.IRExec`, the `.store` case) reduce a store to
+`memory.writeLE? address.natAbs width (storedBits value)`, with the same width
+(`op.width`, carried by the IR instruction) and the same bit pattern. Given that
+the two states hold the same address and the same operand, the two calls are
+equal, so the success result and the trap condition are one decision on both
+sides, not two that could drift apart. -/
+theorem store_write_agrees (memory : MemoryState) (width : Nat) (s : IR.State)
+    (a v : IR.ValueId) (address : Int) (operand : Value)
+    (ha : s.values a = .i32 address) (hv : s.values v = operand) :
+    memory.writeLE? (IR.intPayload (s.values a)).natAbs width (storedBits (s.values v))
+      = memory.writeLE? address.natAbs width (storedBits operand) := by
+  simp [ha, hv, IR.intPayload]
 
-The statement is not here yet. The reduction is visible in both definitions
-(`TptWasm.Transition` and `TptWasm.IRExec`), and the address half of it is
-`ir_address_agrees` above, but the `storedBits` terms are not yet in the
-same form on the two sides and closing that is the work. -/
+/-- The trap half of the same fact: an out-of-bounds store is a trap on both sides,
+and an in-bounds one is not, because the two results are equal. -/
+theorem store_trap_agrees (memory : MemoryState) (width : Nat) (s : IR.State)
+    (a v : IR.ValueId) (address : Int) (operand : Value)
+    (ha : s.values a = .i32 address) (hv : s.values v = operand) :
+    (memory.writeLE? (IR.intPayload (s.values a)).natAbs width (storedBits (s.values v))).isNone
+      = (memory.writeLE? address.natAbs width (storedBits operand)).isNone := by
+  rw [store_write_agrees memory width s a v address operand ha hv]
+
+/-- The IR store and the Wasm store produce the same updated memory when they succeed. -/
+theorem store_updated_agrees (memory updated : MemoryState) (width : Nat) (s : IR.State)
+    (a v : IR.ValueId) (address : Int) (operand : Value)
+    (ha : s.values a = .i32 address) (hv : s.values v = operand)
+    (write : memory.writeLE? address.natAbs width (storedBits operand) = some updated) :
+    memory.writeLE? (IR.intPayload (s.values a)).natAbs width (storedBits (s.values v))
+      = some updated := by
+  rw [store_write_agrees memory width s a v address operand ha hv, write]
 
 end TptWasm
