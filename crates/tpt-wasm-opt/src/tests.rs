@@ -1007,3 +1007,139 @@ fn bounds_checks_are_removed_only_when_the_access_fits_the_memory() {
         assert_optimized_matches_micro(&fixture, 0, Vec::new(), OptimizationLevel::Full);
     }
 }
+
+/// A stateful host function for the host-effect differential.
+///
+/// Each call returns its argument mixed with the number of calls made before it, so
+/// the count and the order of host calls are part of every result. Each engine gets
+/// its own instance and so starts from zero, which is what lets three backends be
+/// compared on the same sequence of calls.
+struct EffectHost {
+    calls: std::sync::atomic::AtomicI32,
+}
+
+impl tpt_wasm_runtime::HostFunction for EffectHost {
+    fn function_type(&self) -> FunctionType {
+        function_type(vec![ValueType::I32], vec![ValueType::I32])
+    }
+
+    fn call(&self, args: &[Value]) -> Result<Vec<Value>, String> {
+        let before = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match args.first() {
+            Some(Value::I32(argument)) => Ok(vec![Value::I32(
+                argument.wrapping_mul(31).wrapping_add(before),
+            )]),
+            _ => Err("effect takes one i32".into()),
+        }
+    }
+}
+
+/// A program that calls the host effect in a fixed pattern, with some of the calls'
+/// results dropped. The seed chooses the arguments.
+///
+/// A dropped call looks dead, but the host effect is observable, so an optimizer that
+/// removed it would change the count the later calls see. That is the property under
+/// test. The stack is balanced after each step: one value is accumulated per step.
+fn generated_host_program(seed: u64) -> Module {
+    let mut state = seed
+        .wrapping_mul(0x2545_f491_4f6c_dd1d)
+        .wrapping_add(0x0bad_5eed_cafe_f00d);
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    let mut body = Vec::new();
+    for step in 0..5u32 {
+        let argument = (next() % 64) as i32 - 32;
+        body.extend(const_i32(argument));
+        body.extend([0x10, 0x00]); // call 0: the imported host effect
+        if step > 0 {
+            body.push(0x6a); // i32.add, folding this result into the running total
+        }
+        if next() % 2 == 0 {
+            body.extend(const_i32(argument ^ 5));
+            body.extend([0x10, 0x00]); // call 0 again ...
+            body.push(0x1a); // ... and drop its result
+        }
+    }
+    body.push(0x0b); // end
+
+    let mut fixture = module_with(&function_type(Vec::new(), vec![ValueType::I32]), body);
+    // Type 1 is the import's signature; type 0 stays the signature of `run`.
+    fixture
+        .types
+        .push(function_type(vec![ValueType::I32], vec![ValueType::I32]));
+    fixture.imports = vec![tpt_wasm_format::Import {
+        module: "env".into(),
+        name: "effect".into(),
+        desc: tpt_wasm_format::ImportDesc::Function(1),
+    }];
+    // With one import, the first defined function is function 1 in the index space.
+    fixture.exports[0].desc = tpt_wasm_format::ExportDesc::Function(1);
+    fixture
+}
+
+/// Run a host-calling module through the public engine on one backend, with a fresh
+/// stateful host, comparing the returned value or the trap.
+fn run_with_effect(
+    module: &Module,
+    mode: tpt_wasm_runtime::EngineMode,
+) -> Result<Vec<Value>, Trap> {
+    let mut engine = tpt_wasm_runtime::Engine::new(tpt_wasm_runtime::Config {
+        engine_mode: mode,
+        ..tpt_wasm_runtime::Config::default()
+    })
+    .expect("the engine must be constructible");
+    engine.linker_mut().define_function(
+        "env",
+        "effect",
+        EffectHost {
+            calls: std::sync::atomic::AtomicI32::new(0),
+        },
+    );
+    let mut instance = engine
+        .instantiate(module.clone())
+        .unwrap_or_else(|error| panic!("the host program must instantiate in {mode:?}: {error:?}"));
+    instance.call("run", Vec::new()).map_err(trap_of)
+}
+
+/// Host effects are preserved by every backend, including the optimizer.
+///
+/// Micro is the golden machine. The baseline and the optimizing engine run the same
+/// programs, and must make the same host calls in the same order, so they return the
+/// same value. This is the host-effect half of the regression claim: the generated
+/// programs elsewhere in this file do not call the host at all.
+#[test]
+fn host_effects_are_preserved_by_every_backend_over_generated_programs() {
+    use tpt_wasm_runtime::EngineMode;
+
+    let mut distinct: Vec<Result<Vec<Value>, Trap>> = Vec::new();
+    for seed in 0..500u64 {
+        let fixture = generated_host_program(seed);
+        let expected = run_with_effect(&fixture, EngineMode::Micro);
+        assert!(
+            expected.is_ok(),
+            "seed {seed}: Micro should not trap: {expected:?}"
+        );
+        for mode in [EngineMode::Baseline, EngineMode::Optimizing] {
+            let actual = run_with_effect(&fixture, mode);
+            assert_eq!(
+                expected, actual,
+                "seed {seed}: {mode:?} disagrees with Micro about the host effects"
+            );
+        }
+        if !distinct.contains(&expected) {
+            distinct.push(expected);
+        }
+    }
+    // Guard against a vacuous pass: if the host's answers did not reach the result,
+    // every seed would return the same value and the comparison would prove nothing.
+    assert!(
+        distinct.len() > 100,
+        "the programs must produce varied results, got {} distinct",
+        distinct.len()
+    );
+}
