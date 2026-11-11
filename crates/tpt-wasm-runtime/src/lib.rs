@@ -1508,22 +1508,7 @@ impl Instance {
     /// `GlobalInstance` is only the one Micro executes against, so this reads
     /// whichever backend actually owns the global.
     pub fn global(&self, name: &str) -> Result<Value, RuntimeError> {
-        let ExportDesc::Global(index) = self
-            .exports
-            .get(name)
-            .ok_or_else(|| RuntimeError::UnknownExport(name.to_owned()))?
-        else {
-            return Err(RuntimeError::TypeMismatch {
-                expected: "global export".into(),
-                actual: "non-global export".into(),
-            });
-        };
-        let address = lock_store(&self.context.store)?
-            .instance(self.index)?
-            .global_addrs
-            .get(*index as usize)
-            .copied()
-            .ok_or(RuntimeError::UnknownExport(name.to_owned()))?;
+        let address = self.global_address(name)?;
         let shared = lock_baseline_globals(&self.context.baseline_globals)?
             .get(&address)
             .cloned();
@@ -1535,6 +1520,29 @@ impl Instance {
             .global(address)?
             .value
             .clone())
+    }
+
+    /// The store address of the global behind the export `name`.
+    ///
+    /// Shared by [`Instance::global`] and debug sessions, which read the same global
+    /// from different copies of the store.
+    pub(crate) fn global_address(&self, name: &str) -> Result<u32, RuntimeError> {
+        let ExportDesc::Global(index) = self
+            .exports
+            .get(name)
+            .ok_or_else(|| RuntimeError::UnknownExport(name.to_owned()))?
+        else {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "global export".into(),
+                actual: "non-global export".into(),
+            });
+        };
+        lock_store(&self.context.store)?
+            .instance(self.index)?
+            .global_addrs
+            .get(*index as usize)
+            .copied()
+            .ok_or(RuntimeError::UnknownExport(name.to_owned()))
     }
 
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {

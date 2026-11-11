@@ -190,6 +190,16 @@ impl DebugSession<'_> {
         &self.machine.operand_stack
     }
 
+    /// The current value of the exported global `name`, as this call has left it.
+    ///
+    /// It reads the session's private store, so a `global.set` that has run in this
+    /// call is visible here before the call returns, and the instance's own
+    /// [`Instance::global`] does not show it until the session commits.
+    pub fn global(&self, name: &str) -> Result<Value, RuntimeError> {
+        let address = self.instance.global_address(name)?;
+        Ok(self.machine.store.global(address)?.value.clone())
+    }
+
     /// Run exactly one instruction, ignoring breakpoints.
     pub fn step(&mut self) -> Result<StopReason, RuntimeError> {
         self.check_live()?;
@@ -333,6 +343,67 @@ mod tests {
         .expect("micro is accepted")
         .instantiate_bytes(bytes)
         .expect("the fixture instantiates")
+    }
+
+    /// `bump() -> ()` does `counter = counter + 1`, where `counter` is an exported
+    /// mutable i32 global that starts at 0. Its body is `global.get 0; i32.const 1;
+    /// i32.add; global.set 0; end`, so the store happens at position 3.
+    const COUNTER: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, //
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, //
+        0x03, 0x02, 0x01, 0x00, //
+        0x06, 0x06, 0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b, //
+        0x07, 0x12, 0x02, 0x04, 0x62, 0x75, 0x6d, 0x70, 0x00, 0x00, //
+        0x07, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x65, 0x72, 0x03, 0x00, //
+        0x0a, 0x0b, 0x01, 0x09, 0x00, 0x23, 0x00, 0x41, 0x01, 0x6a, 0x24, 0x00, 0x0b,
+    ];
+
+    #[test]
+    fn a_session_reads_a_global_as_the_call_has_changed_it_so_far() {
+        let mut instance = micro(COUNTER);
+        {
+            let mut session = instance.debug("bump", Vec::new()).expect("starts");
+            assert_eq!(session.global("counter").expect("reads"), Value::I32(0));
+            for _ in 0..3 {
+                session.step().expect("steps");
+            }
+            assert_eq!(
+                session.global("counter").expect("reads"),
+                Value::I32(0),
+                "the store has not run yet, so the global still holds its old value"
+            );
+            session.step().expect("the global.set runs");
+            assert_eq!(
+                session.global("counter").expect("reads"),
+                Value::I32(1),
+                "the session sees the write before the call returns"
+            );
+        }
+        assert_eq!(
+            instance.global("counter").expect("reads"),
+            Value::I32(0),
+            "a session dropped mid-call rolls its global back"
+        );
+        let mut session = instance.debug("bump", Vec::new()).expect("starts again");
+        while !session.is_finished() {
+            session.step().expect("steps");
+        }
+        drop(session);
+        assert_eq!(instance.global("counter").expect("reads"), Value::I32(1));
+    }
+
+    #[test]
+    fn a_session_refuses_to_read_a_name_that_is_not_a_global() {
+        let mut instance = micro(COUNTER);
+        let session = instance.debug("bump", Vec::new()).expect("starts");
+        assert!(matches!(
+            session.global("bump"),
+            Err(RuntimeError::TypeMismatch { .. })
+        ));
+        assert!(matches!(
+            session.global("missing"),
+            Err(RuntimeError::UnknownExport(_))
+        ));
     }
 
     #[test]
