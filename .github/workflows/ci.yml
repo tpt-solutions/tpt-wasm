@@ -111,7 +111,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v1
+        uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
           arguments: --all-features
@@ -140,10 +140,25 @@ jobs:
       - name: Fail on any `sorry` or `axiom`
         working-directory: formal
         run: |
-          if grep -rn --include='*.lean' -E '\bsorry\b|^ *axiom ' TptWasm TptWasm.lean; then
-            echo "::error::the formal model must not use sorry or axiom"
-            exit 1
-          fi
+          # Comments and docstrings are blanked first, so prose that mentions
+          # `sorry` (the proof files explain the rule) is not flagged.
+          python3 - <<'PY'
+          import pathlib, re, sys
+          pat = re.compile(r'\bsorry\b|^\s*axiom\s')
+          files = list(pathlib.Path('TptWasm').rglob('*.lean')) + [pathlib.Path('TptWasm.lean')]
+          bad = []
+          for p in files:
+              text = p.read_text(encoding='utf-8')
+              text = re.sub(r'/-.*?-/', lambda m: '\n' * m.group(0).count('\n'), text, flags=re.S)
+              text = re.sub(r'--[^\n]*', '', text)
+              for n, line in enumerate(text.splitlines(), 1):
+                  if pat.search(line):
+                      bad.append(f'{p}:{n}: {line.strip()}')
+          if bad:
+              print('\n'.join(bad))
+              print('::error::the formal model must not use sorry or axiom')
+              sys.exit(1)
+          PY
 
   spec-tests:
     name: WebAssembly spec tests
