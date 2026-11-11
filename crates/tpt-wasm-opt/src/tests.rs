@@ -1016,6 +1016,9 @@ fn bounds_checks_are_removed_only_when_the_access_fits_the_memory() {
 /// compared on the same sequence of calls.
 struct EffectHost {
     calls: std::sync::atomic::AtomicI32,
+    /// The zero-based call that fails, if any. The failure message names the call, so
+    /// two backends agree on the trap only if they stopped at the same host call.
+    fail_at: Option<i32>,
 }
 
 impl tpt_wasm_runtime::HostFunction for EffectHost {
@@ -1025,6 +1028,9 @@ impl tpt_wasm_runtime::HostFunction for EffectHost {
 
     fn call(&self, args: &[Value]) -> Result<Vec<Value>, String> {
         let before = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_at == Some(before) {
+            return Err(format!("refused host call {before}"));
+        }
         match args.first() {
             Some(Value::I32(argument)) => Ok(vec![Value::I32(
                 argument.wrapping_mul(31).wrapping_add(before),
@@ -1088,6 +1094,15 @@ fn run_with_effect(
     module: &Module,
     mode: tpt_wasm_runtime::EngineMode,
 ) -> Result<Vec<Value>, Trap> {
+    run_with_failing_effect(module, mode, None)
+}
+
+/// As `run_with_effect`, but the host refuses its `fail_at`th call (zero-based).
+fn run_with_failing_effect(
+    module: &Module,
+    mode: tpt_wasm_runtime::EngineMode,
+    fail_at: Option<i32>,
+) -> Result<Vec<Value>, Trap> {
     let mut engine = tpt_wasm_runtime::Engine::new(tpt_wasm_runtime::Config {
         engine_mode: mode,
         ..tpt_wasm_runtime::Config::default()
@@ -1098,6 +1113,7 @@ fn run_with_effect(
         "effect",
         EffectHost {
             calls: std::sync::atomic::AtomicI32::new(0),
+            fail_at,
         },
     );
     let mut instance = engine
@@ -1141,5 +1157,43 @@ fn host_effects_are_preserved_by_every_backend_over_generated_programs() {
         distinct.len() > 100,
         "the programs must produce varied results, got {} distinct",
         distinct.len()
+    );
+}
+
+/// A host that refuses a call traps at the same host call on every backend.
+///
+/// The generated program makes between five and ten host calls. For each seed the host
+/// refuses one of the first five calls, chosen by the seed, so every program reaches
+/// it. The refused call is sometimes one whose result is dropped. Dropping does not
+/// make a host call dead, so the optimizer must keep it and the trap must land on the
+/// same call everywhere. The failure message names the call, so agreement means the
+/// same call, not merely some trap.
+#[test]
+fn host_traps_are_preserved_by_every_backend_over_generated_programs() {
+    use tpt_wasm_runtime::EngineMode;
+
+    let mut distinct_refusals = std::collections::BTreeSet::new();
+    for seed in 0..200u64 {
+        let fixture = generated_host_program(seed);
+        let fail_at = (seed % 5) as i32;
+        let expected = run_with_failing_effect(&fixture, EngineMode::Micro, Some(fail_at));
+        assert!(
+            matches!(expected, Err(Trap::HostFailure(ref message))
+                if message.contains(&format!("refused host call {fail_at}"))),
+            "seed {seed}: Micro should trap at refused call {fail_at}: {expected:?}"
+        );
+        for mode in [EngineMode::Baseline, EngineMode::Optimizing] {
+            let actual = run_with_failing_effect(&fixture, mode, Some(fail_at));
+            assert_eq!(
+                expected, actual,
+                "seed {seed}: {mode:?} disagrees with Micro about a refused host call"
+            );
+        }
+        distinct_refusals.insert(fail_at);
+    }
+    assert_eq!(
+        distinct_refusals.len(),
+        5,
+        "the seeds must exercise every refused call index"
     );
 }
