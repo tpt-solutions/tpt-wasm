@@ -7,6 +7,8 @@
 //! facade. It does not provide a complete WASI ABI, POSIX access, or implicit
 //! filesystem, clock, random, process, or network authority.
 
+pub mod preview1;
+
 use std::sync::{Arc, Mutex};
 
 use tpt_wasm_capability::{CapabilityId, Operation};
@@ -14,6 +16,8 @@ use tpt_wasm_host::Host;
 pub use tpt_wasm_host::{WasiAdapterError, WasiBinding, WASI_SNAPSHOT_PREVIEW1_MODULE};
 use tpt_wasm_runtime::Linker;
 use tpt_wasm_types::FunctionType;
+
+pub use preview1::{Preview1, Preview1Config};
 
 /// The module name used by Preview 1-style imports.
 pub const PREVIEW1_MODULE: &str = WASI_SNAPSHOT_PREVIEW1_MODULE;

@@ -23,6 +23,25 @@ and operation behind every import, and supplies the function signature.
   - `bindings` and `binding` report what has been bound.
 - `WasiBinding`, `WasiAdapterError` — the bindings and the reasons a binding is refused.
 
+## Preview 1 core
+
+`Preview1` implements the part of Preview 1 that needs no filesystem, against explicit grants
+in `Preview1Config`:
+
+- `args_sizes_get`, `args_get`, `environ_sizes_get`, `environ_get` — the arguments and
+  environment the embedder supplied, laid out as the ABI specifies;
+- `clock_time_get` — a virtual clock the embedder starts and steps, so runs are reproducible;
+- `random_get` — bytes from a seed the embedder chose;
+- `fd_write`, `fd_read`, `fd_close` — descriptors 0–2 only, and only the streams granted;
+- `proc_exit` — records the exit code, which `Preview1::exit_code` returns after the run.
+
+Pointers are checked against the caller's memory, so a bad pointer is an errno (`EFAULT`),
+not a trap. Install with `Preview1::define`. It is not installed by default, and it replaces
+a capability-backed binding for the same names, so use one or the other for each name.
+
+Not provided: `path_*`, file-backed `fd_*`, sockets, polling, and the other clock and
+random variants.
+
 ## Example
 
 ```rust
