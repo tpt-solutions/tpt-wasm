@@ -32,6 +32,13 @@ use tpt_wasm_types::{ResourceLimits, Trap, Value, ValueType};
 /// backends charge the budget at the same instruction, so the trap is compared too.
 pub const STEP_BUDGET: u64 = 50_000;
 
+/// Largest memory, in 64 KiB pages, an input may declare. The engine's own default
+/// is 4 GiB, and each input is instantiated on all three backends, so an uncapped
+/// declaration of a few hundred megabytes exhausted a fuzzer's memory. A module over
+/// the cap is refused by every backend in the same way, which the comparison already
+/// treats as out of scope, so nothing is lost but the allocation.
+pub const MEMORY_PAGES: u64 = 64;
+
 /// How one call ended, in a form two backends can be compared on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallOutcome {
@@ -70,6 +77,7 @@ fn config(mode: EngineMode) -> Config {
         engine_mode: mode,
         limits: ResourceLimits {
             max_execution_steps: Some(STEP_BUDGET),
+            max_memory_pages: MEMORY_PAGES,
             ..ResourceLimits::default()
         },
         ..Config::default()
@@ -412,5 +420,34 @@ bytes: {mutant:02x?}"
             &CallOutcome::Returned(vec![Value::F32(0x7fc0_0000)]),
             &CallOutcome::Returned(vec![Value::F32(0x7fc0_0001)])
         ));
+    }
+
+    /// A memory declaring a minimum of 12,538 pages (about 782 MiB), which the fuzzer
+    /// found by running out of memory: all three backends instantiated it. It must now
+    /// be refused by every backend, and so be out of scope rather than allocated.
+    #[test]
+    fn an_oversized_memory_is_refused_everywhere_and_not_allocated() {
+        const OVERSIZED: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            0x05, 0x04, 0x01, 0x00, 0xfa, 0x61, // one memory, no maximum, min 12,538 pages
+        ];
+        assert_eq!(check(OVERSIZED), Ok(Verdict::OutOfScope));
+        let module = tpt_wasm_decode::decode(OVERSIZED).expect("the input decodes");
+        assert_eq!(
+            module.memories.len(),
+            1,
+            "the input is a real memory declaration"
+        );
+        for mode in [
+            EngineMode::Micro,
+            EngineMode::Baseline,
+            EngineMode::Optimizing,
+        ] {
+            let engine = Engine::new(config(mode)).expect("the engine starts");
+            assert!(
+                engine.instantiate_bytes(OVERSIZED).is_err(),
+                "{mode:?} must refuse the oversized memory at instantiation"
+            );
+        }
     }
 }
