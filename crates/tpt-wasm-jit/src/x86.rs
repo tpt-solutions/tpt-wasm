@@ -123,10 +123,12 @@ struct Frame {
     abi: Abi,
     /// Bytes reserved below the slots for a callee's shadow space. Set when the function calls.
     shadow: i32,
+    /// Whether the host has SSE4.1, which the rounding functions need.
+    sse41: bool,
 }
 
 impl Frame {
-    fn new(function: &IrFunction, abi: Abi, env: &CallEnv) -> Self {
+    fn new(function: &IrFunction, abi: Abi, env: &CallEnv, sse41: bool) -> Self {
         Self {
             slots: HashMap::new(),
             types: function
@@ -139,6 +141,7 @@ impl Frame {
             env: env.clone(),
             abi,
             shadow: 0,
+            sse41,
         }
     }
 
@@ -392,7 +395,12 @@ impl Emitter {
 }
 
 /// Compile `function` to machine code for `abi`.
-pub(crate) fn encode(function: &IrFunction, abi: Abi, env: &CallEnv) -> Result<Vec<u8>, JitError> {
+pub(crate) fn encode(
+    function: &IrFunction,
+    abi: Abi,
+    env: &CallEnv,
+    sse41: bool,
+) -> Result<Vec<u8>, JitError> {
     check_supported(function)?;
     let blocks: HashMap<BlockId, &BasicBlock> = function
         .blocks
@@ -400,7 +408,7 @@ pub(crate) fn encode(function: &IrFunction, abi: Abi, env: &CallEnv) -> Result<V
         .map(|block| (block.id, block))
         .collect();
 
-    let mut frame = Frame::new(function, abi, env);
+    let mut frame = Frame::new(function, abi, env, sse41);
     let mut emitter = Emitter::new();
 
     // The two pointers arrive in argument registers. They are kept in slots, because the code
@@ -737,6 +745,34 @@ fn float_unary(
 ) -> Result<(), JitError> {
     let value = frame.slot(value);
     let destination = frame.slot(result);
+    if matches!(
+        operation,
+        FloatUnary::Ceil | FloatUnary::Floor | FloatUnary::Trunc | FloatUnary::Nearest
+    ) {
+        if !frame.sse41 {
+            return Err(JitError::Unsupported(
+                "a rounding function, which needs SSE4.1 on this host".into(),
+            ));
+        }
+        // roundss/roundsd xmm0, xmm0, imm8. The low two bits of the immediate pick the mode: 0 for
+        // nearest-even, 1 down (floor), 2 up (ceil), 3 toward zero (trunc). Bit 3 suppresses the
+        // precision exception, which Wasm does not expose.
+        let mode: u8 = match operation {
+            FloatUnary::Nearest => 0x8,
+            FloatUnary::Floor => 0x9,
+            FloatUnary::Ceil => 0xA,
+            _ => 0xB,
+        };
+        let opcode = if wide { 0x0B } else { 0x0A };
+        emitter.scalar_load_xmm0(if wide { 0xF2 } else { 0xF3 }, value);
+        emitter
+            .bytes
+            .extend_from_slice(&[0x66, 0x0F, 0x3A, opcode, 0xC0, mode]);
+        canonicalize_nan_xmm0(wide, emitter);
+        emitter.move_xmm0_to_rax(wide);
+        emitter.store64(EAX, destination);
+        return Ok(());
+    }
     if operation == FloatUnary::Sqrt {
         // sqrtss/sqrtsd xmm0, xmm0. A negative operand gives the hardware's NaN, which is replaced.
         let prefix = if wide { 0xF2 } else { 0xF3 };
@@ -1802,6 +1838,33 @@ mod tests {
     /// The bytes for `return 7`, worked out by hand. The frame holds the two saved pointers and
     /// one value: three 8-byte slots, so 24 bytes rounded to 32.
     #[test]
+    fn a_rounding_function_needs_sse41_and_is_refused_without_it() {
+        // f64.ceil of a constant, returning the rounded value (an f64, which the test function's
+        // declared i32 result does not check: only the encoder runs here).
+        let value = |id: u32, value_type: ValueType| IrValue {
+            id: ValueId(id),
+            value_type,
+        };
+        let function = one_block(
+            vec![IrInstr::F64Unary {
+                result: ValueId(1),
+                value: ValueId(0),
+                operation: FloatUnary::Ceil,
+            }],
+            ValueId(1),
+            vec![value(0, ValueType::F64), value(1, ValueType::F64)],
+        );
+        assert!(
+            matches!(
+                encode(&function, Abi::SysV, &CallEnv::default(), false),
+                Err(JitError::Unsupported(_))
+            ),
+            "without SSE4.1 the rounding function is refused, not approximated"
+        );
+        assert!(encode(&function, Abi::SysV, &CallEnv::default(), true).is_ok());
+    }
+
+    #[test]
     fn a_constant_return_has_the_expected_encoding() {
         let function = one_block(
             vec![IrInstr::ConstI32 {
@@ -1811,7 +1874,7 @@ mod tests {
             ValueId(0),
             vec![i32_value(0)],
         );
-        let code = encode(&function, Abi::SysV, &CallEnv::default()).expect("compiles");
+        let code = encode(&function, Abi::SysV, &CallEnv::default(), false).expect("compiles");
         assert_eq!(
             code,
             vec![
@@ -1878,7 +1941,7 @@ mod tests {
                 },
             ],
         };
-        let code = encode(&function, Abi::SysV, &CallEnv::default()).expect("compiles");
+        let code = encode(&function, Abi::SysV, &CallEnv::default(), false).expect("compiles");
         let tail = &code[code.len() - 5..];
         assert_eq!(tail[0], 0xE9);
         let displacement = i32::from_le_bytes(tail[1..5].try_into().unwrap());

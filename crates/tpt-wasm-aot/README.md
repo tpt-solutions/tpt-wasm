@@ -26,6 +26,9 @@ authenticate the artifact, and a forged artifact can carry a valid checksum. Aut
 signature is not implemented.
 
 Artifacts are target-specific: the target names are `x86_64-windows`, `x86_64-unix`,
-`aarch64-unix`, and `riscv64-unix`. `load` refuses an artifact generated for another target.
+`aarch64-unix`, and `riscv64-unix`, and on x86-64 a host with SSE4.1 names its target with a
+`+sse4.1` suffix, such as `x86_64-unix+sse4.1`. The suffix is recorded because the rounding
+functions need that instruction set. `load` refuses an artifact generated for another target,
+so an artifact from an SSE4.1 host does not load on an older one, even when it uses no rounding.
 
 The format is documented in the crate's module documentation.

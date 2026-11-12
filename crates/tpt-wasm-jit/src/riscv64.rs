@@ -1354,6 +1354,70 @@ fn float_compare_into(
     emitter.push(store(3, T0, SP, destination as i32));
 }
 
+/// `fcvt.l.d` (`wide`) or `fcvt.l.s`: a float to a 64-bit integer, in the rounding mode `rm`
+/// (0 nearest-even, 1 toward zero, 2 down, 3 up).
+fn float_to_int64(wide: bool, rm: u32, rd: u32, fs: u32) -> u32 {
+    r_type(if wide { 0x61 } else { 0x60 }, 2, fs, rm, rd, 0x53)
+}
+
+/// `fcvt.d.l` (`wide`) or `fcvt.s.l`: a 64-bit integer to a float. Exact for the integers that
+/// reach it, which are below 2^52 for `f64` and 2^23 for `f32`.
+fn int64_to_float(wide: bool, fd: u32, rs: u32) -> u32 {
+    r_type(if wide { 0x69 } else { 0x68 }, 2, rs, 0, fd, 0x53)
+}
+
+/// `fsgnj`: `fd` gets the magnitude of `fs1` with the sign of `fs2`.
+fn float_copy_sign(wide: bool, fd: u32, fs1: u32, fs2: u32) -> u32 {
+    r_type(0x10 | u32::from(wide), fs2, fs1, 0, fd, 0x53)
+}
+
+/// The rounding functions, which RISC-V has no instruction for. A value of magnitude at least 2^52
+/// (2^23 for `f32`), and a NaN, is already integral or is a NaN, and passes through. Any other is
+/// converted to a 64-bit integer with the mode, and back, which is exact below the threshold. The
+/// sign of the operand is then copied on, so a zero result is `-0` for a negative operand.
+fn float_round_into(
+    wide: bool,
+    operation: FloatUnary,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let rounding = match operation {
+        FloatUnary::Nearest => 0,
+        FloatUnary::Trunc => 1,
+        FloatUnary::Floor => 2,
+        _ => 3, // Ceil
+    };
+    let threshold = if wide {
+        0x4330_0000_0000_0000i64 // 2^52
+    } else {
+        0x4b00_0000i64 // 2^23
+    };
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    let keep = emitter.new_label();
+    emitter.push(load(3, T0, SP, source as i32));
+    emitter.push(fmv_to_float(wide, 0, T0)); // f0 = x
+                                             // A NaN fails `feq x, x`: keep it, and the canonical NaN step sets it.
+    emitter.push(float_compare_bit(wide, 2, T2, 0, 0));
+    emitter.branch(branch(0, T2, ZERO), Target::Label(keep), Fixup::Branch13);
+    // |x| at or above the threshold: already an integer. `fsgnjx` gives the magnitude.
+    emitter.push(float_sign(wide, true, 1, 0));
+    load_constant64(T2, threshold, emitter);
+    emitter.push(fmv_to_float(wide, 2, T2));
+    emitter.push(float_compare_bit(wide, 0, T2, 2, 1)); // fle t2, threshold, |x|
+    emitter.branch(branch(1, T2, ZERO), Target::Label(keep), Fixup::Branch13);
+    // Convert with the mode and back. Both are exact below the threshold.
+    emitter.push(float_to_int64(wide, rounding, T2, 0));
+    emitter.push(int64_to_float(wide, 1, T2));
+    emitter.push(float_copy_sign(wide, 0, 1, 0)); // f0 = |f1| with the sign of x
+    emitter.bind(keep);
+    canonicalize_nan(wide, emitter);
+    emitter.push(fmv_from_float(wide, T0, 0));
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
 /// `fsqrt.s` or, when `wide`, `fsqrt.d`, rounding to nearest even, on `f<fs1>` into `f<fd>`.
 fn float_sqrt_op(wide: bool, fd: u32, fs1: u32) -> u32 {
     r_type(0x2C | u32::from(wide), 0, fs1, 0, fd, 0x53)
@@ -1454,6 +1518,13 @@ fn float_unary_arm(
     frame: &mut Frame,
     emitter: &mut Emitter,
 ) -> Result<(), JitError> {
+    if matches!(
+        operation,
+        FloatUnary::Ceil | FloatUnary::Floor | FloatUnary::Trunc | FloatUnary::Nearest
+    ) {
+        float_round_into(wide, operation, result, value, frame, emitter);
+        return Ok(());
+    }
     if operation == FloatUnary::Sqrt {
         let source = frame.slot(value);
         let destination = frame.slot(result);

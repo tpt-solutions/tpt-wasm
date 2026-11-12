@@ -1278,6 +1278,20 @@ fn float_binary(
     emitter.push(str_x(R9, SP, destination));
 }
 
+/// The rounding instruction for `operation` on a single or double register: `frintn` (to nearest,
+/// ties to even), `frintm` (down, floor), `frintp` (up, ceil), or `frintz` (toward zero, trunc).
+/// Each keeps the sign of its operand, so a zero result is signed as Micro's is.
+fn float_round(wide: bool, operation: FloatUnary, vd: u32, vn: u32) -> u32 {
+    let base = match operation {
+        FloatUnary::Nearest => 0x1E24_4000,
+        FloatUnary::Floor => 0x1E25_4000,
+        FloatUnary::Ceil => 0x1E24_C000,
+        _ => 0x1E25_C000, // Trunc
+    };
+    let base = if wide { base + 0x0040_0000 } else { base };
+    base | (vn << 5) | vd
+}
+
 /// `fsqrt <vd>, <vn>`, on a single or double register.
 fn float_sqrt(wide: bool, vd: u32, vn: u32) -> u32 {
     let base = if wide { 0x1E61_C000 } else { 0x1E21_C000 };
@@ -1461,6 +1475,16 @@ fn float_unary_arm(
     match operation {
         FloatUnary::Neg => float_unary_into(wide, false, result, value, frame, emitter),
         FloatUnary::Abs => float_unary_into(wide, true, result, value, frame, emitter),
+        FloatUnary::Nearest | FloatUnary::Floor | FloatUnary::Ceil | FloatUnary::Trunc => {
+            let source = frame.slot(value);
+            let destination = frame.slot(result);
+            emitter.push(ldr_x(R9, SP, source));
+            emitter.push(fmov_to_float(wide, 0, R9));
+            emitter.push(float_round(wide, operation, 0, 0));
+            canonicalize_nan(wide, emitter);
+            emitter.push(fmov_from_float(wide, R9, 0));
+            emitter.push(str_x(R9, SP, destination));
+        }
         FloatUnary::Sqrt => {
             let source = frame.slot(value);
             let destination = frame.slot(result);
@@ -1470,11 +1494,6 @@ fn float_unary_arm(
             canonicalize_nan(wide, emitter);
             emitter.push(fmov_from_float(wide, R9, 0));
             emitter.push(str_x(R9, SP, destination));
-        }
-        other => {
-            return Err(JitError::Unsupported(format!(
-                "the {other:?} float operation"
-            )))
         }
     }
     Ok(())

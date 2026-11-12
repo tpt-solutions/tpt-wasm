@@ -367,6 +367,141 @@ fn compiled_float_sqrt_min_max_and_copysign_agree_with_micro() {
     assert_eq!(traps, 0, "float operations do not trap");
 }
 
+/// Whether this host can run the rounding functions. On x86-64 they need SSE4.1, and the compiler
+/// refuses them without it, so the test is skipped there, not failed.
+fn rounding_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("sse4.1")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
+    }
+}
+
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        unix,
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    )
+))]
+#[test]
+fn compiled_float_rounding_agrees_with_micro() {
+    if !rounding_available() {
+        return;
+    }
+    let mut rng = Lcg(0x8080_8080);
+    let mut cases = Vec::new();
+    for (op, name) in [
+        (0x8D, "f32.ceil"),
+        (0x8E, "f32.floor"),
+        (0x8F, "f32.trunc"),
+        (0x90, "f32.nearest"),
+    ] {
+        cases.push(Case {
+            params: vec![ValueType::F32],
+            result: ValueType::F32,
+            body: vec![0x20, 0x00, op, 0x0B],
+            memory: false,
+            name: name.into(),
+        });
+    }
+    for (op, name) in [
+        (0x9B, "f64.ceil"),
+        (0x9C, "f64.floor"),
+        (0x9D, "f64.trunc"),
+        (0x9E, "f64.nearest"),
+    ] {
+        cases.push(Case {
+            params: vec![ValueType::F64],
+            result: ValueType::F64,
+            body: vec![0x20, 0x00, op, 0x0B],
+            memory: false,
+            name: name.into(),
+        });
+    }
+    let (values, traps, _) = check(&cases, &mut rng, 300);
+    assert_eq!(values, cases.len() * 300);
+    assert_eq!(traps, 0);
+
+    // The values where the modes differ: halves (ties to even against away from zero), both zeros,
+    // the thresholds at which every value is already an integer, and the non-finite ones.
+    let f64_values = [
+        0.5f64,
+        -0.5,
+        1.5,
+        2.5,
+        -2.5,
+        0.3,
+        -0.3,
+        -0.0,
+        0.0,
+        4_503_599_627_370_495.5,
+        4_503_599_627_370_496.0,
+        4_503_599_627_370_496.5,
+        9_007_199_254_740_992.0,
+        1e300,
+        -1e300,
+        1e-310,
+        -1e-310,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let f32_values = [
+        0.5f32,
+        -0.5,
+        1.5,
+        2.5,
+        -2.5,
+        0.3,
+        -0.3,
+        -0.0,
+        0.0,
+        8_388_607.5,
+        8_388_608.0,
+        16_777_216.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        1e-40,
+    ];
+    for case in cases.iter().take(4) {
+        let module = module(case.params.clone(), case.result, case.body.clone(), false);
+        let code = compiled(&module);
+        for value in f32_values {
+            let args = [i64::from(value.to_bits())];
+            let (expected, _) = micro(&module, case, &args);
+            let actual = jit(&code, case.result, &args, None);
+            assert!(
+                agree(&expected, &actual),
+                "{} of {value}: {expected:?} vs {actual:?}",
+                case.name
+            );
+        }
+    }
+    for case in cases.iter().skip(4) {
+        let module = module(case.params.clone(), case.result, case.body.clone(), false);
+        let code = compiled(&module);
+        for value in f64_values {
+            let args = [value.to_bits() as i64];
+            let (expected, _) = micro(&module, case, &args);
+            let actual = jit(&code, case.result, &args, None);
+            assert!(
+                agree(&expected, &actual),
+                "{} of {value}: {expected:?} vs {actual:?}",
+                case.name
+            );
+        }
+    }
+}
+
 fn binary_cases(width: ValueType, table: &[(u8, &str)], result: ValueType) -> Vec<Case> {
     table
         .iter()

@@ -17,7 +17,8 @@
 //!   width conversions (`wrap`, `extend`), and the sign extensions `extend8_s`, `extend16_s`,
 //!   and `extend32_s`;
 //! - the float operations `add`, `sub`, `mul`, `div`, `min`, `max`, `copysign`, `sqrt`, the
-//!   comparisons, `neg`, and `abs`;
+//!   rounding functions `ceil`, `floor`, `trunc`, and `nearest` (on x86-64 these need SSE4.1, and
+//!   the target name records it), the comparisons, `neg`, and `abs`;
 //! - linear memory: loads and stores of all the integer widths and of both float widths, each
 //!   checked against the memory's length;
 //! - direct calls to other functions of the same module, when they are compiled with
@@ -27,7 +28,7 @@
 //!
 //! Each value lives in a stack slot, so each IR instruction is a load, at most one operation,
 //! and a store. Anything else is refused with [`JitError::Unsupported`] rather than compiled
-//! approximately: the other float operations, rotations, bit counting, conversions between
+//! approximately: the conversions between integers and floats, rotations, bit counting, conversions between
 //! integers and floats, calls through imported or exported tables, memory growth and size, and a frame larger than the
 //! encoder's limit are left to the interpreter or the baseline. A call to a function that is not
 //! compiled refuses the caller too, so [`compile_module`] leaves that caller out as well.
@@ -340,13 +341,40 @@ impl fmt::Debug for CompiledFunction {
     }
 }
 
+/// Whether this host has SSE4.1, which the x86-64 rounding functions need (`roundss` and
+/// `roundsd`). Always false off x86-64.
+fn host_has_sse41() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("sse4.1")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// The name of the target that generated code runs on, or `"unsupported"` where there is no code
 /// generator. An artifact records this, and loading it on another target is refused.
+///
+/// On x86-64 the name carries `+sse4.1` when the host has SSE4.1. Code generated there may use
+/// `roundss` and `roundsd`, which an older x86-64 CPU does not have, so an artifact from such a host
+/// is refused on a host without it. The rule is conservative: an artifact that uses no rounding
+/// still records the feature.
 pub fn target_id() -> &'static str {
+    let sse41 = host_has_sse41();
     if cfg!(all(target_arch = "x86_64", windows)) {
-        "x86_64-windows"
+        if sse41 {
+            "x86_64-windows+sse4.1"
+        } else {
+            "x86_64-windows"
+        }
     } else if cfg!(all(target_arch = "x86_64", unix)) {
-        "x86_64-unix"
+        if sse41 {
+            "x86_64-unix+sse4.1"
+        } else {
+            "x86_64-unix"
+        }
     } else if cfg!(all(target_arch = "aarch64", unix)) {
         "aarch64-unix"
     } else if cfg!(all(target_arch = "riscv64", unix)) {
@@ -377,7 +405,7 @@ fn encode_for_host(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, JitE
     } else if cfg!(target_arch = "riscv64") {
         riscv64::encode(function, env)
     } else {
-        x86::encode(function, x86::Abi::host(), env)
+        x86::encode(function, x86::Abi::host(), env, host_has_sse41())
     }
 }
 
