@@ -39,5 +39,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "jit_module"
+path = "fuzz_targets/jit_module.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
