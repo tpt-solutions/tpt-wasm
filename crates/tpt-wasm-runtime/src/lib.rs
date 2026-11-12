@@ -4102,6 +4102,57 @@ mod tests {
         }
     }
 
+    /// A function whose body nests `depth` empty blocks.
+    fn nested_blocks_module(depth: usize) -> Module {
+        let mut body = Vec::with_capacity(2 * depth + 1);
+        body.extend(std::iter::repeat_n([0x02u8, 0x40], depth).flatten());
+        body.extend(std::iter::repeat_n(0x0bu8, depth));
+        body.push(0x0b);
+        Module {
+            types: vec![tpt_wasm_types::FunctionType {
+                params: tpt_wasm_types::ResultType(Vec::new()),
+                results: tpt_wasm_types::ResultType(Vec::new()),
+            }],
+            functions: vec![tpt_wasm_format::Function {
+                type_index: 0,
+                locals: Vec::new(),
+                body,
+            }],
+            exports: vec![tpt_wasm_format::Export {
+                name: "run".into(),
+                desc: tpt_wasm_format::ExportDesc::Function(0),
+            }],
+            ..Module::default()
+        }
+    }
+
+    /// Deep block nesting neither exhausts the host stack nor takes super-linear time.
+    ///
+    /// Every engine must run a function nesting 100,000 empty blocks and return. Before
+    /// the fixes this test was written against, the optimizing engine overflowed the
+    /// host stack at 4,000 levels, and the baseline and verifier took quadratic time, so
+    /// 100,000 levels did not finish in minutes. A host stack overflow aborts the
+    /// process, so the test passing at all is part of the claim.
+    #[test]
+    fn deeply_nested_blocks_do_not_exhaust_the_host_stack() {
+        for mode in [
+            EngineMode::Micro,
+            EngineMode::Baseline,
+            EngineMode::Optimizing,
+        ] {
+            let mut instance = Engine::new(Config {
+                engine_mode: mode,
+                ..Config::default()
+            })
+            .expect("accepted")
+            .instantiate(nested_blocks_module(100_000))
+            .unwrap_or_else(|error| panic!("{mode:?}: the nesting must instantiate: {error:?}"));
+            instance
+                .call("run", Vec::new())
+                .unwrap_or_else(|error| panic!("{mode:?}: the empty blocks must run: {error:?}"));
+        }
+    }
+
     /// The optimizing engine must produce a *different* compiled module.
     ///
     /// The companion to the test above. Agreeing with Micro is necessary but not
