@@ -373,8 +373,9 @@ fn verify_blocks(
     // checks below.
 
     // Every incoming edge must supply exactly the target's parameter count.
+    let predecessors = predecessor_lists(&successors);
     for (index, block) in function.blocks.iter().enumerate() {
-        for predecessor in predecessors_of(&successors, index) {
+        for &predecessor in &predecessors[index] {
             let Some(incoming) = incoming_arity(&function.blocks[predecessor].terminator, block.id)
             else {
                 // `predecessors_of` only reports blocks that actually target this
@@ -398,13 +399,21 @@ fn verify_blocks(
 }
 
 /// Predecessor block indices of `target`, in block order.
-fn predecessors_of(successors: &[Vec<usize>], target: usize) -> Vec<usize> {
-    successors
-        .iter()
-        .enumerate()
-        .filter(|(_, edges)| edges.contains(&target))
-        .map(|(index, _)| index)
-        .collect()
+/// The distinct predecessors of every block, in ascending order.
+///
+/// Built once per function. A scan of all blocks per query made the dominator fixpoint
+/// quadratic in the block count, so the lists are computed up front and indexed.
+fn predecessor_lists(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut lists: Vec<Vec<usize>> = vec![Vec::new(); successors.len()];
+    for (index, edges) in successors.iter().enumerate() {
+        for &target in edges {
+            // Indices ascend, so a repeated edge from the same block is the last entry.
+            if lists[target].last() != Some(&index) {
+                lists[target].push(index);
+            }
+        }
+    }
+    lists
 }
 
 /// The number of values a terminator supplies to the block at `target_id`.
@@ -493,7 +502,7 @@ fn compute_dominators(
     function: &super::IrFunction,
     entry: usize,
     order: &[usize],
-    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
 ) -> Dominators {
     let count = function.blocks.len();
     let mut position = vec![usize::MAX; count];
@@ -511,7 +520,7 @@ fn compute_dominators(
                 continue;
             }
             let mut candidate = usize::MAX;
-            for predecessor in predecessors_of(successors, block) {
+            for &predecessor in &predecessors[block] {
                 if idom[predecessor] == usize::MAX {
                     continue;
                 }
@@ -590,7 +599,7 @@ fn verify_dominance(
         .position(|block| block.id == function.entry)
         .ok_or(VerificationError::MissingBlock(function.entry))?;
     let successors = resolve_successors(function)?;
-    let dominators = compute_dominators(function, entry, order, &successors);
+    let dominators = compute_dominators(function, entry, order, &predecessor_lists(&successors));
 
     // Record the defining block of every value. Parameters and locals are
     // entry-block values; block parameters and instruction results are defined
@@ -699,6 +708,13 @@ fn verify_branch_types(
     function_index: usize,
     values: &HashMap<ValueId, ValueType>,
 ) -> Result<(), VerificationError> {
+    // Found by id once, rather than by a scan of every block per branch edge, which made
+    // this check quadratic in the block count.
+    let by_id: HashMap<super::BlockId, &super::BasicBlock> = function
+        .blocks
+        .iter()
+        .map(|block| (block.id, block))
+        .collect();
     for block in &function.blocks {
         let edges: Vec<(super::BlockId, &[ValueId])> = match &block.terminator {
             super::Terminator::Branch { target, values } => vec![(*target, values)],
@@ -712,10 +728,9 @@ fn verify_branch_types(
             _ => Vec::new(),
         };
         for (target, args) in edges {
-            let target_block = function
-                .blocks
-                .iter()
-                .find(|candidate| candidate.id == target)
+            let target_block = by_id
+                .get(&target)
+                .copied()
                 .ok_or(VerificationError::MissingBlock(target))?;
             for (argument, parameter) in args.iter().zip(&target_block.params) {
                 expect_type(
