@@ -272,6 +272,7 @@ dependencies = [
  "tpt-wasm-decode",
  "tpt-wasm-format",
  "tpt-wasm-ir",
+ "tpt-wasm-jit",
  "tpt-wasm-micro",
  "tpt-wasm-opt",
  "tpt-wasm-types",

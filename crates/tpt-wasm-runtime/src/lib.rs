@@ -28,6 +28,7 @@ use tpt_wasm_validate::{ValidatedModule, ValidationError, Validator};
 
 mod cache;
 mod debug;
+mod jit_tier;
 mod optimizing;
 mod provenance;
 
@@ -45,6 +46,12 @@ pub enum EngineMode {
     Micro,
     Baseline,
     Optimizing,
+    /// The baseline, with each function the JIT accepts running as machine code.
+    ///
+    /// Needs the `jit` feature. A function the compiler refuses runs on the baseline, and
+    /// the native tier is off for an instance with a step limit, profiling or debugging,
+    /// since native code charges no steps. Results match the baseline's.
+    Jit,
 }
 
 /// WebAssembly feature switches for the MVP runtime.
@@ -564,6 +571,12 @@ impl Engine {
                 "requested WebAssembly feature",
             ));
         }
+        #[cfg(not(feature = "jit"))]
+        if config.engine_mode == EngineMode::Jit {
+            return Err(RuntimeError::UnsupportedFeature(
+                "the jit engine mode needs the `jit` feature",
+            ));
+        }
         Ok(Self {
             context: RuntimeContext::new(config.limits),
             config,
@@ -740,6 +753,9 @@ pub struct Instance {
     profiling: bool,
     /// Steps the most recent call charged to each function, keyed by function index.
     last_call_profile: BTreeMap<u32, u64>,
+    /// Functions of this instance that run as machine code, empty unless the engine is in
+    /// `EngineMode::Jit` and the instance asks for nothing the native tier cannot report.
+    jit: jit_tier::JitTier,
     /// Host calls the most recent call made, keyed by the import's `module::name`.
     last_call_host_calls: BTreeMap<String, u64>,
     /// Shared with the baseline's host boundary, which counts its calls here, since
@@ -1058,6 +1074,7 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
             exports: HashMap::new(),
             execution: ExecutionConfig::default(),
             baseline: None,
+            jit: jit_tier::JitTier::default(),
             context,
             last_call_steps: 0,
             last_call_memory_pages_added: 0,
@@ -1406,11 +1423,22 @@ fn instantiate_module(
             callbacks.insert(name, implementation);
         }
     }
+    // The native tier charges no steps and keeps no profile, and it does not stop for the
+    // debugger, so it is used only when none of those is asked for.
+    let native_allowed = config.engine_mode == EngineMode::Jit
+        && !config.profiling
+        && !config.debugging
+        && config.limits.max_execution_steps.is_none();
+    let jit = match ir {
+        Some(ir) if native_allowed => jit_tier::JitTier::compile(ir),
+        _ => jit_tier::JitTier::default(),
+    };
     let mut instance = Instance {
         index: allocated_index,
         exports,
         execution,
         baseline,
+        jit,
         context: context.clone(),
         last_call_steps: 0,
         last_call_memory_pages_added: 0,
@@ -1626,6 +1654,9 @@ impl Instance {
         // In baseline mode the module is executed by its own compiled form
         // rather than by Micro, so the store lookup is not used at all.
         if self.baseline.is_some() {
+            if let Some(result) = self.call_native(name, &args) {
+                return result;
+            }
             return self.call_baseline(name, args);
         }
         let before = self.memory_pages();
@@ -1634,6 +1665,50 @@ impl Instance {
             .and_then(|address| self.call_address(address, args));
         self.last_call_memory_pages_added = pages_added(before, self.memory_pages());
         result
+    }
+
+    /// Whether the export `name` runs as machine code rather than on the baseline or Micro.
+    ///
+    /// False for an unknown name and for any instance outside `EngineMode::Jit`.
+    pub fn runs_natively(&self, name: &str) -> bool {
+        self.baseline_index(name)
+            .map(|index| self.jit.contains(index))
+            .unwrap_or(false)
+    }
+
+    /// Run `name` as machine code when it has native code.
+    ///
+    /// `None` means the function runs on the baseline, which is also where an unknown name
+    /// is reported, so the error is the one the baseline has always given.
+    fn call_native(
+        &mut self,
+        name: &str,
+        args: &[Value],
+    ) -> Option<Result<Vec<Value>, RuntimeError>> {
+        let index = self.baseline_index(name).ok()?;
+        if !self.jit.contains(index) {
+            return None;
+        }
+        // The memory lock is what makes the two tiers one memory: the baseline cannot run
+        // while the native function holds it, and the native function sees every store the
+        // baseline made before the call.
+        let handle = self.baseline.as_ref()?.memory_handle();
+        let result = match handle {
+            Some(handle) => match handle.lock() {
+                Ok(mut memory) => self.jit.run(index, args, Some(memory.bytes_mut())),
+                Err(_) => Err(RuntimeError::UnsupportedFeature(
+                    "a memory whose lock was poisoned",
+                )),
+            },
+            None => self.jit.run(index, args, None),
+        };
+        // Native code charges no steps, keeps no profile, makes no host calls, and cannot
+        // grow memory, so the counters a call reports are all zero.
+        self.last_call_steps = 0;
+        self.last_call_profile.clear();
+        self.last_call_host_calls.clear();
+        self.last_call_memory_pages_added = 0;
+        Some(result)
     }
 
     /// The size of memory 0 in pages, or `None` when the instance has no memory.
