@@ -31,3 +31,7 @@ tpt-wasm-aot = { workspace = true, optional = true }
 [features]
 default = []
 jit = ["dep:tpt-wasm-jit", "dep:tpt-wasm-aot"]
+
+[[example]]
+name = "native_bench"
+required-features = ["jit"]
