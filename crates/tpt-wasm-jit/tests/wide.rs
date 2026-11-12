@@ -349,8 +349,9 @@ fn compiled_i64_memory_agrees_with_micro_at_every_width() {
 }
 
 #[test]
-fn an_f32_value_is_refused_on_every_target() {
-    // f32.const 1.0; i32.reinterpret_f32: floats are not compiled.
+fn an_f32_reinterpretation_is_compiled_and_not_refused() {
+    // f32.const 1.0; i32.reinterpret_f32: a bit copy, which the native tier compiles. The
+    // differential tests in float.rs check its values; this checks that it is not refused.
     let body = vec![0x43, 0x00, 0x00, 0x80, 0x3F, 0xBC, 0x0B];
     let validated = tpt_wasm_validate::validate(Module {
         types: vec![FunctionType {
@@ -370,8 +371,11 @@ fn an_f32_value_is_refused_on_every_target() {
     })
     .expect("validates");
     let verified = tpt_wasm_ir::lower_and_verify(&validated).expect("lowers");
-    assert!(matches!(
-        compile(&verified.module().functions[0]),
-        Err(JitError::Unsupported(_))
-    ));
+    assert!(
+        !matches!(
+            compile(&verified.module().functions[0]),
+            Err(JitError::Unsupported(_))
+        ),
+        "a bit reinterpretation is in the subset"
+    );
 }

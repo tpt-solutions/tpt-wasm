@@ -19,6 +19,9 @@
 //! - the float operations `add`, `sub`, `mul`, `div`, `min`, `max`, `copysign`, `sqrt`, the
 //!   rounding functions `ceil`, `floor`, `trunc`, and `nearest` (on x86-64 these need SSE4.1, and
 //!   the target name records it), the comparisons, `neg`, and `abs`;
+//! - the conversions between integers and floats, between the two float widths, and the bit
+//!   reinterpretations; the float-to-integer truncations, which trap on a NaN, an infinity, or an
+//!   out-of-range value;
 //! - linear memory: loads and stores of all the integer widths and of both float widths, each
 //!   checked against the memory's length;
 //! - direct calls to other functions of the same module, when they are compiled with
@@ -28,8 +31,7 @@
 //!
 //! Each value lives in a stack slot, so each IR instruction is a load, at most one operation,
 //! and a store. Anything else is refused with [`JitError::Unsupported`] rather than compiled
-//! approximately: the conversions between integers and floats, rotations, bit counting, conversions between
-//! integers and floats, calls through imported or exported tables, memory growth and size, and a frame larger than the
+//! approximately: rotations, bit counting, calls through imported or exported tables, memory growth and size, and a frame larger than the
 //! encoder's limit are left to the interpreter or the baseline. A call to a function that is not
 //! compiled refuses the caller too, so [`compile_module`] leaves that caller out as well.
 //!
@@ -78,6 +80,8 @@ pub(crate) const STATUS_TABLE_OUT_OF_BOUNDS: u32 = 5;
 pub(crate) const STATUS_NULL_REFERENCE: u32 = 6;
 /// The status for an indirect call whose slot holds a function of another signature.
 pub(crate) const STATUS_INDIRECT_TYPE_MISMATCH: u32 = 7;
+/// The status for a float-to-integer truncation of a NaN, an infinity, or a value out of range.
+pub(crate) const STATUS_INVALID_CONVERSION: u32 = 8;
 
 /// What a compiled function reads and writes besides its arguments.
 ///
@@ -150,6 +154,7 @@ fn finish(bits: u64, status: u64) -> Result<u64, JitError> {
         STATUS_TABLE_OUT_OF_BOUNDS => Err(JitError::Trap(Trap::TableOutOfBounds)),
         STATUS_NULL_REFERENCE => Err(JitError::Trap(Trap::NullReference)),
         STATUS_INDIRECT_TYPE_MISMATCH => Err(JitError::Trap(Trap::IndirectCallTypeMismatch)),
+        STATUS_INVALID_CONVERSION => Err(JitError::Trap(Trap::InvalidConversion)),
         other => Err(JitError::Unsupported(format!("an unknown status {other}"))),
     }
 }

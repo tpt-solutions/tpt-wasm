@@ -20,14 +20,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
-    BasicBlock, BlockId, FloatComparison, FloatUnary, IntComparison, IntConversion, IrFunction,
-    IrInstr, MemoryLoad, MemoryStore, SignExtend, Terminator, ValueId,
+    BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
+    IntConversion, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
+    Terminator, ValueId,
 };
 use tpt_wasm_types::ValueType;
 
 use crate::{
     CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_INDIRECT_TYPE_MISMATCH,
-    STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
+    STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
 };
 
 /// The calling convention whose argument registers the code reads.
@@ -942,6 +943,255 @@ fn float_copysign(
     emitter.store64(EAX, destination);
 }
 
+/// A float to an integer, truncating toward zero, which traps as Micro does: a NaN, an infinity, or
+/// a truncated value outside the target's range is an invalid conversion.
+///
+/// The value is truncated first with `roundsd`, which needs SSE4.1, and then checked against
+/// bounds that are exact powers of two in both widths: `t >= lo` and `hi > t`, each written so that a
+/// NaN fails it. The conversion is then exact. An unsigned 64-bit target above 2^63 is reduced by
+/// 2^63, converted, and given the top bit back.
+fn float_trunc_into(
+    operation: FloatTrunc,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    if !frame.sse41 {
+        return Err(JitError::Unsupported(
+            "a truncation, which needs SSE4.1 on this host".into(),
+        ));
+    }
+    let (wide, signed, to_64) = match operation {
+        FloatTrunc::I32FromF32S => (false, true, false),
+        FloatTrunc::I32FromF32U => (false, false, false),
+        FloatTrunc::I32FromF64S => (true, true, false),
+        FloatTrunc::I32FromF64U => (true, false, false),
+        FloatTrunc::I64FromF32S => (false, true, true),
+        FloatTrunc::I64FromF32U => (false, false, true),
+        FloatTrunc::I64FromF64S => (true, true, true),
+        FloatTrunc::I64FromF64U => (true, false, true),
+    };
+    // The target's range, as the truncated values it accepts: [lo, hi).
+    let (lo, hi) = match (signed, to_64) {
+        (true, false) => (-2147483648.0f64, 2147483648.0f64),
+        (false, false) => (0.0, 4294967296.0),
+        (true, true) => (-9223372036854775808.0, 9223372036854775808.0),
+        (false, true) => (0.0, 18446744073709551616.0),
+    };
+    let bits = |value: f64| -> i64 {
+        if wide {
+            value.to_bits() as i64
+        } else {
+            i64::from((value as f32).to_bits())
+        }
+    };
+    let (lo_bits, hi_bits) = (bits(lo), bits(hi));
+    let prefix = if wide { 0xF2 } else { 0xF3 };
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+
+    // xmm0 = trunc(x), by roundss/roundsd with the truncating mode.
+    emitter.scalar_load_xmm0(prefix, source);
+    emitter.bytes.extend_from_slice(&[
+        0x66,
+        0x0F,
+        0x3A,
+        if wide { 0x0B } else { 0x0A },
+        0xC0,
+        0x0B,
+    ]);
+    // Trap unless t >= lo: `ucomis xmm0, xmm1` sets CF for t < lo, and for a NaN.
+    emitter.movabs(ECX, lo_bits);
+    move_rcx_to_xmm(wide, 1, emitter);
+    ucomis_xmm(wide, 0, 1, emitter);
+    guard_trap(frame, 0x73, STATUS_INVALID_CONVERSION, emitter)?; // jae: CF clear
+                                                                  // Trap unless hi > t: `ucomis xmm2, xmm0` is "above" only when hi > t and neither is a NaN.
+    emitter.movabs(ECX, hi_bits);
+    move_rcx_to_xmm(wide, 2, emitter);
+    ucomis_xmm(wide, 2, 0, emitter);
+    guard_trap(frame, 0x77, STATUS_INVALID_CONVERSION, emitter)?; // ja: above
+
+    let cvtt = |emitter: &mut Emitter, long: bool| {
+        emitter.bytes.push(prefix);
+        if long {
+            emitter.bytes.push(0x48);
+        }
+        emitter.bytes.extend_from_slice(&[0x0F, 0x2C, 0xC0]); // cvtt{s,d}2si rax|eax, xmm0
+    };
+    match (signed, to_64) {
+        (true, false) => cvtt(emitter, false),
+        (false, false) | (true, true) => cvtt(emitter, true),
+        (false, true) => {
+            // xmm1 = 2^63; at or above it, reduce by 2^63, convert, and set the top bit again.
+            let small = emitter.new_label();
+            let done = emitter.new_label();
+            emitter.movabs(ECX, two_to_the_63_bits(wide));
+            move_rcx_to_xmm(wide, 1, emitter);
+            ucomis_xmm(wide, 0, 1, emitter);
+            emitter.jump(&[0x0F, 0x82], Target::Label(small)); // jb: below 2^63
+            emitter.bytes.extend_from_slice(&[prefix, 0x0F, 0x5C, 0xC1]); // sub xmm0, xmm1
+            cvtt(emitter, true);
+            emitter.movabs(ECX, i64::MIN);
+            emitter.bytes.extend_from_slice(&[0x48, 0x31, 0xC8]); // xor rax, rcx
+            emitter.jump(&[0xE9], Target::Label(done));
+            emitter.bind(small);
+            cvtt(emitter, true);
+            emitter.bind(done);
+        }
+    }
+    emitter.store64(EAX, destination);
+    Ok(())
+}
+
+/// The bits of 2^63 at the source width.
+fn two_to_the_63_bits(wide: bool) -> i64 {
+    if wide {
+        (9223372036854775808.0f64).to_bits() as i64
+    } else {
+        i64::from((9223372036854775808.0f32).to_bits())
+    }
+}
+
+/// `ucomisd xmm<a>, xmm<b>` (`wide`) or `ucomiss`: compares, setting CF for "below", ZF for "equal"
+/// and PF for "unordered".
+fn ucomis_xmm(wide: bool, a: u8, b: u8, emitter: &mut Emitter) {
+    if wide {
+        emitter.bytes.push(0x66);
+    }
+    emitter
+        .bytes
+        .extend_from_slice(&[0x0F, 0x2E, 0xC0 | (a << 3) | b]);
+}
+
+/// `movq xmm<n>, rcx` (`wide`) or `movd xmm<n>, ecx`: a constant's bits into `xmm<n>`.
+fn move_rcx_to_xmm(wide: bool, register: u8, emitter: &mut Emitter) {
+    let modrm = 0xC0 | (register << 3) | 1; // reg = xmm<n>, rm = rcx
+    if wide {
+        emitter
+            .bytes
+            .extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, modrm]);
+    } else {
+        emitter.bytes.extend_from_slice(&[0x66, 0x0F, 0x6E, modrm]);
+    }
+}
+
+/// `movq xmm0, rax` (`wide`) or `movd xmm0, eax`: a value's bits into `xmm0`.
+fn move_rax_to_xmm0(wide: bool, emitter: &mut Emitter) {
+    if wide {
+        emitter
+            .bytes
+            .extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
+    } else {
+        emitter.bytes.extend_from_slice(&[0x66, 0x0F, 0x6E, 0xC0]);
+    }
+}
+
+/// A conversion between widths, or from an integer to a float. Each is the hardware conversion,
+/// which rounds to nearest-even as Micro's `as` does. An unsigned 64-bit source is converted by
+/// halving it, keeping the lowest bit as a sticky bit so the rounding stays correct, and doubling
+/// the result. Float to integer conversions trap, and are not compiled here.
+fn float_convert_into(
+    operation: FloatConversion,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    let to_f64 = matches!(
+        operation,
+        FloatConversion::F64FromI32S
+            | FloatConversion::F64FromI32U
+            | FloatConversion::F64FromI64S
+            | FloatConversion::F64FromI64U
+            | FloatConversion::F64FromF32
+    );
+    let prefix = if to_f64 { 0xF2 } else { 0xF3 };
+    match operation {
+        FloatConversion::F32FromI32S | FloatConversion::F64FromI32S => {
+            // The 32-bit form reads the sign of the low half.
+            emitter.load32(EAX, source);
+            emitter.bytes.extend_from_slice(&[prefix, 0x0F, 0x2A, 0xC0]); // cvtsi2ss/sd xmm0, eax
+        }
+        FloatConversion::F32FromI32U | FloatConversion::F64FromI32U => {
+            // The zero-extended value is non-negative, so the 64-bit signed form is exact.
+            emitter.load32(EAX, source);
+            emitter
+                .bytes
+                .extend_from_slice(&[prefix, 0x48, 0x0F, 0x2A, 0xC0]); // cvtsi2ss/sd xmm0, rax
+        }
+        FloatConversion::F32FromI64S | FloatConversion::F64FromI64S => {
+            emitter.load64(EAX, source);
+            emitter
+                .bytes
+                .extend_from_slice(&[prefix, 0x48, 0x0F, 0x2A, 0xC0]);
+        }
+        FloatConversion::F32FromI64U | FloatConversion::F64FromI64U => {
+            let signed = emitter.new_label();
+            let done = emitter.new_label();
+            emitter.load64(EAX, source);
+            emitter.bytes.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+            emitter.jump(&[0x0F, 0x89], Target::Label(signed)); // jns: below 2^63
+                                                                // rcx = (rax >> 1) | (rax & 1), converted and doubled.
+            emitter.bytes.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+            emitter.bytes.extend_from_slice(&[0x48, 0xD1, 0xE9]); // shr rcx, 1
+            emitter.bytes.extend_from_slice(&[0x83, 0xE0, 0x01]); // and eax, 1
+            emitter.bytes.extend_from_slice(&[0x48, 0x09, 0xC1]); // or rcx, rax
+            emitter
+                .bytes
+                .extend_from_slice(&[prefix, 0x48, 0x0F, 0x2A, 0xC1]); // cvtsi2 xmm0, rcx
+            emitter.bytes.extend_from_slice(&[prefix, 0x0F, 0x58, 0xC0]); // add xmm0, xmm0
+            emitter.jump(&[0xE9], Target::Label(done));
+            emitter.bind(signed);
+            emitter
+                .bytes
+                .extend_from_slice(&[prefix, 0x48, 0x0F, 0x2A, 0xC0]); // cvtsi2 xmm0, rax
+            emitter.bind(done);
+        }
+        FloatConversion::F32FromF64 => {
+            // cvtsd2ss: a NaN result is replaced by the canonical one, as Micro does.
+            emitter.load64(EAX, source);
+            move_rax_to_xmm0(true, emitter);
+            emitter.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5A, 0xC0]);
+            canonicalize_nan_xmm0(false, emitter);
+            emitter.move_xmm0_to_rax(false);
+            emitter.store64(EAX, destination);
+            return Ok(());
+        }
+        FloatConversion::F64FromF32 => {
+            emitter.load32(EAX, source);
+            move_rax_to_xmm0(false, emitter);
+            emitter.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5A, 0xC0]); // cvtss2sd
+            canonicalize_nan_xmm0(true, emitter);
+            emitter.move_xmm0_to_rax(true);
+            emitter.store64(EAX, destination);
+            return Ok(());
+        }
+    }
+    emitter.move_xmm0_to_rax(to_f64);
+    emitter.store64(EAX, destination);
+    Ok(())
+}
+
+/// A reinterpretation copies the bits: the same value, in the other type's slot.
+fn reinterpret_into(
+    operation: Reinterpret,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    match operation {
+        Reinterpret::I32FromF32 | Reinterpret::F32FromI32 => emitter.load32(EAX, source),
+        Reinterpret::I64FromF64 | Reinterpret::F64FromI64 => emitter.load64(EAX, source),
+    }
+    emitter.store64(EAX, destination);
+}
+
 /// A direct call to another function of the module, through the call table in the context.
 ///
 /// The arguments are copied to a block of slots in this frame, and the block's address is the
@@ -1170,6 +1420,21 @@ fn emit_instruction(
             left,
             right,
         } => float_copysign(true, *result, *left, *right, frame, emitter),
+        IrInstr::FloatConvert {
+            result,
+            value,
+            operation,
+        } => float_convert_into(*operation, *result, *value, frame, emitter)?,
+        IrInstr::Reinterpret {
+            result,
+            value,
+            operation,
+        } => reinterpret_into(*operation, *result, *value, frame, emitter),
+        IrInstr::FloatTrunc {
+            result,
+            value,
+            operation,
+        } => float_trunc_into(*operation, *result, *value, frame, emitter)?,
         IrInstr::Drop { .. } => {}
         IrInstr::Call {
             function,

@@ -23,14 +23,17 @@ A function whose parameters and result are `i32`, `i64`, `f32`, or `f64`, and wh
 - direct calls to other functions of the same module, when they are compiled together with
   `compile_module`; a call is made through a table of entry points in the call context, and
   a call past the call-depth limit traps as it does on Micro;
+- the conversions between integers and floats (signed and unsigned, including the 64-bit
+  unsigned sources), between `f32` and `f64`, and the bit reinterpretations. The float-to-integer
+  truncations trap as Micro does, on a NaN, an infinity, or a value out of range; on x86-64 they
+  need SSE4.1, as the rounding functions do;
 - indirect calls through the module's table, when that table is defined in the module and not
   exported (so no other instance can write it). The index and the slot's signature are checked
   in the order Micro checks them, and each slot must hold a function compiled in the same module;
 - unconditional and conditional branches, including loops, and a return.
 
-Everything else is refused with `JitError::Unsupported`. That includes the conversions between
-integers and floats, calls through an imported or exported table, globals, memory growth, and
-frames larger than one page. A function that calls one of those is refused too. A single function compiled with
+Everything else is refused with `JitError::Unsupported`. That includes calls through an imported
+or exported table, globals, memory growth, and frames larger than one page. A function that calls one of those is refused too. A single function compiled with
 `compile` on its own cannot call anything, since a call needs the module it belongs to.
 
 Division and remainder, signed and unsigned, are compiled with Wasm's traps. A zero divisor

@@ -20,14 +20,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
-    BasicBlock, BlockId, FloatComparison, FloatUnary, IntComparison, IntConversion, IrFunction,
-    IrInstr, MemoryLoad, MemoryStore, SignExtend, Terminator, ValueId,
+    BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
+    IntConversion, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
+    Terminator, ValueId,
 };
 
 use crate::x86::{check_supported, instruction_name, terminator_name};
 use crate::{
     CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_INDIRECT_TYPE_MISMATCH,
-    STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
+    STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
 };
 
 /// Register numbers.
@@ -849,6 +850,21 @@ fn emit_instruction(
             left,
             right,
         } => float_copysign(true, *result, *left, *right, frame, emitter),
+        IrInstr::FloatConvert {
+            result,
+            value,
+            operation,
+        } => float_convert_into(*operation, *result, *value, frame, emitter),
+        IrInstr::Reinterpret {
+            result,
+            value,
+            operation,
+        } => reinterpret_into(*operation, *result, *value, frame, emitter),
+        IrInstr::FloatTrunc {
+            result,
+            value,
+            operation,
+        } => float_trunc_into(*operation, *result, *value, frame, emitter),
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
         IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),
@@ -1354,6 +1370,73 @@ fn float_compare_into(
     emitter.push(store(3, T0, SP, destination as i32));
 }
 
+/// A conversion between widths, or from an integer to a float, with the rounding mode to nearest-even.
+/// The integer forms select the source by the `rs2` field: 0 for a signed 32-bit, 1 unsigned 32-bit,
+/// 2 signed 64-bit, 3 unsigned 64-bit. A NaN from a width change is replaced by the canonical NaN.
+fn float_convert_into(
+    operation: FloatConversion,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    emitter.push(load(3, T0, SP, source as i32));
+    match operation {
+        FloatConversion::F32FromF64 => {
+            emitter.push(fmv_to_float(true, 0, T0));
+            emitter.push(r_type(0x20, 1, 0, 0, 0, 0x53)); // fcvt.s.d f0, f0
+            canonicalize_nan(false, emitter);
+            emitter.push(fmv_from_float(false, T0, 0));
+        }
+        FloatConversion::F64FromF32 => {
+            emitter.push(fmv_to_float(false, 0, T0));
+            emitter.push(r_type(0x21, 0, 0, 0, 0, 0x53)); // fcvt.d.s f0, f0
+            canonicalize_nan(true, emitter);
+            emitter.push(fmv_from_float(true, T0, 0));
+        }
+        integer => {
+            let (to_double, signed, from_64) = match integer {
+                FloatConversion::F32FromI32S => (false, true, false),
+                FloatConversion::F32FromI32U => (false, false, false),
+                FloatConversion::F32FromI64S => (false, true, true),
+                FloatConversion::F32FromI64U => (false, false, true),
+                FloatConversion::F64FromI32S => (true, true, false),
+                FloatConversion::F64FromI32U => (true, false, false),
+                FloatConversion::F64FromI64S => (true, true, true),
+                _ => (true, false, true), // F64FromI64U
+            };
+            let rs2 = (if from_64 { 2 } else { 0 }) + u32::from(!signed);
+            let funct7 = if to_double { 0x69 } else { 0x68 };
+            emitter.push(r_type(funct7, rs2, T0, 0, 0, 0x53)); // fcvt.{s,d}.{w,wu,l,lu} f0, t0
+            emitter.push(fmv_from_float(to_double, T0, 0));
+        }
+    }
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
+/// A reinterpretation copies the bits. A 32-bit value is loaded zero-extended (`lwu`).
+fn reinterpret_into(
+    operation: Reinterpret,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    match operation {
+        Reinterpret::I32FromF32 | Reinterpret::F32FromI32 => {
+            emitter.push(load(6, T0, SP, source as i32)); // lwu
+        }
+        Reinterpret::I64FromF64 | Reinterpret::F64FromI64 => {
+            emitter.push(load(3, T0, SP, source as i32));
+        }
+    }
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
 /// `fcvt.l.d` (`wide`) or `fcvt.l.s`: a float to a 64-bit integer, in the rounding mode `rm`
 /// (0 nearest-even, 1 toward zero, 2 down, 3 up).
 fn float_to_int64(wide: bool, rm: u32, rd: u32, fs: u32) -> u32 {
@@ -1389,17 +1472,27 @@ fn float_round_into(
         FloatUnary::Floor => 2,
         _ => 3, // Ceil
     };
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    emitter.push(load(3, T0, SP, source as i32));
+    emitter.push(fmv_to_float(wide, 0, T0)); // f0 = x
+    round_f0(wide, rounding, emitter);
+    canonicalize_nan(wide, emitter);
+    emitter.push(fmv_from_float(wide, T0, 0));
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
+/// Round `f0` in place to an integer value, in the mode `rounding` (see `float_to_int64`). A NaN
+/// and a value of magnitude at or above the threshold pass through unchanged. Uses `f1`, `f2`
+/// and `t2`.
+fn round_f0(wide: bool, rounding: u32, emitter: &mut Emitter) {
     let threshold = if wide {
         0x4330_0000_0000_0000i64 // 2^52
     } else {
         0x4b00_0000i64 // 2^23
     };
-    let source = frame.slot(value);
-    let destination = frame.slot(result);
     let keep = emitter.new_label();
-    emitter.push(load(3, T0, SP, source as i32));
-    emitter.push(fmv_to_float(wide, 0, T0)); // f0 = x
-                                             // A NaN fails `feq x, x`: keep it, and the canonical NaN step sets it.
+    // A NaN fails `feq x, x`: keep it, and the canonical NaN step sets it.
     emitter.push(float_compare_bit(wide, 2, T2, 0, 0));
     emitter.branch(branch(0, T2, ZERO), Target::Label(keep), Fixup::Branch13);
     // |x| at or above the threshold: already an integer. `fsgnjx` gives the magnitude.
@@ -1413,8 +1506,61 @@ fn float_round_into(
     emitter.push(int64_to_float(wide, 1, T2));
     emitter.push(float_copy_sign(wide, 0, 1, 0)); // f0 = |f1| with the sign of x
     emitter.bind(keep);
-    canonicalize_nan(wide, emitter);
-    emitter.push(fmv_from_float(wide, T0, 0));
+}
+
+/// A float to an integer, truncating, which traps as Micro does on a NaN, an infinity, or a
+/// truncated value outside the target's range. The truncation is `round_f0`, and the bounds are
+/// checked with comparisons that a NaN fails, so a NaN traps without a separate test. The conversion
+/// with the truncating mode is then exact, and it covers the whole range of the target.
+fn float_trunc_into(
+    operation: FloatTrunc,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let (wide, signed, to_64) = match operation {
+        FloatTrunc::I32FromF32S => (false, true, false),
+        FloatTrunc::I32FromF32U => (false, false, false),
+        FloatTrunc::I32FromF64S => (true, true, false),
+        FloatTrunc::I32FromF64U => (true, false, false),
+        FloatTrunc::I64FromF32S => (false, true, true),
+        FloatTrunc::I64FromF32U => (false, false, true),
+        FloatTrunc::I64FromF64S => (true, true, true),
+        FloatTrunc::I64FromF64U => (true, false, true),
+    };
+    let (lo, hi) = match (signed, to_64) {
+        (true, false) => (-2147483648.0f64, 2147483648.0f64),
+        (false, false) => (0.0, 4294967296.0),
+        (true, true) => (-9223372036854775808.0, 9223372036854775808.0),
+        (false, true) => (0.0, 18446744073709551616.0),
+    };
+    let bits = |value: f64| -> i64 {
+        if wide {
+            value.to_bits() as i64
+        } else {
+            i64::from((value as f32).to_bits())
+        }
+    };
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    emitter.push(load(3, T0, SP, source as i32));
+    emitter.push(fmv_to_float(wide, 0, T0)); // f0 = x
+    round_f0(wide, 1, emitter); // truncate toward zero
+                                // Trap unless lo <= t: `fle lo, t` is false for a NaN, and the branch skips the trap when true.
+    load_constant64(T1, bits(lo), emitter);
+    emitter.push(fmv_to_float(wide, 1, T1));
+    emitter.push(float_compare_bit(wide, 0, T2, 1, 0));
+    guard_trap(frame, 1, T2, ZERO, STATUS_INVALID_CONVERSION, emitter);
+    // Trap unless t < hi: `flt t, hi` is false for a NaN.
+    load_constant64(T1, bits(hi), emitter);
+    emitter.push(fmv_to_float(wide, 2, T1));
+    emitter.push(float_compare_bit(wide, 1, T2, 0, 2));
+    guard_trap(frame, 1, T2, ZERO, STATUS_INVALID_CONVERSION, emitter);
+    // Convert with the truncating mode: the width of the target selects the form (rs2).
+    let rs2 = (if to_64 { 2 } else { 0 }) + u32::from(!signed);
+    let funct7 = if wide { 0x61 } else { 0x60 };
+    emitter.push(r_type(funct7, rs2, 0, 1, T0, 0x53)); // fcvt.{w,wu,l,lu}.{s,d} t0, f0, rtz
     emitter.push(store(3, T0, SP, destination as i32));
 }
 

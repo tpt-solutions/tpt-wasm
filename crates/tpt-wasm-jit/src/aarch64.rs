@@ -17,15 +17,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
-    BasicBlock, BlockId, FloatComparison, FloatUnary, IntComparison, IntConversion, IrFunction,
-    IrInstr, MemoryLoad, MemoryStore, SignExtend, Terminator, ValueId,
+    BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
+    IntConversion, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
+    Terminator, ValueId,
 };
 use tpt_wasm_types::ValueType;
 
 use crate::x86::{check_supported, instruction_name, terminator_name};
 use crate::{
     CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_INDIRECT_TYPE_MISMATCH,
-    STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
+    STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
 };
 
 /// Scratch registers. `9` holds the first operand, `10` the second, `11` a temporary, and `12`
@@ -908,6 +909,21 @@ fn emit_instruction(
             left,
             right,
         } => float_copysign(true, *result, *left, *right, frame, emitter),
+        IrInstr::FloatConvert {
+            result,
+            value,
+            operation,
+        } => float_convert_into(*operation, *result, *value, frame, emitter)?,
+        IrInstr::Reinterpret {
+            result,
+            value,
+            operation,
+        } => reinterpret_into(*operation, *result, *value, frame, emitter),
+        IrInstr::FloatTrunc {
+            result,
+            value,
+            operation,
+        } => float_trunc_into(*operation, *result, *value, frame, emitter),
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
         IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),
@@ -1275,6 +1291,166 @@ fn float_binary(
     emitter.push(float_arithmetic(wide, opcode, 0, 0, 1));
     canonicalize_nan(wide, emitter);
     emitter.push(fmov_from_float(wide, R9, 0));
+    emitter.push(str_x(R9, SP, destination));
+}
+
+/// A conversion from an integer register to a float register: `scvtf` for signed, `ucvtf` for
+/// unsigned, from a 32-bit (`w`) or 64-bit (`x`) source, to a single or double. Both round to
+/// nearest-even, as Micro's `as` does.
+fn int_to_float(to_double: bool, signed: bool, from_64: bool, vd: u32, rn: u32) -> u32 {
+    let base = match (to_double, signed, from_64) {
+        (false, true, false) => 0x1E22_0000,
+        (false, true, true) => 0x9E22_0000,
+        (false, false, false) => 0x1E23_0000,
+        (false, false, true) => 0x9E23_0000,
+        (true, true, false) => 0x1E62_0000,
+        (true, true, true) => 0x9E62_0000,
+        (true, false, false) => 0x1E63_0000,
+        (true, false, true) => 0x9E63_0000,
+    };
+    base | (rn << 5) | vd
+}
+
+/// `fcvt` between widths: to a double from a single when `to_double`, else to a single.
+fn float_widen_or_narrow(to_double: bool, vd: u32, vn: u32) -> u32 {
+    let base = if to_double { 0x1E22_C000 } else { 0x1E62_4000 };
+    base | (vn << 5) | vd
+}
+
+/// `fcvtzs` or `fcvtzu` (`signed`), from a single or double (`wide_source`) to a 32-bit or 64-bit
+/// integer register, rounding toward zero. The 32-bit result is zero-extended.
+fn float_to_int(wide_source: bool, signed: bool, to_64: bool, rd: u32, vn: u32) -> u32 {
+    let base = match (wide_source, signed, to_64) {
+        (false, true, false) => 0x1E38_0000,
+        (false, true, true) => 0x9E38_0000,
+        (false, false, false) => 0x1E39_0000,
+        (false, false, true) => 0x9E39_0000,
+        (true, true, false) => 0x1E78_0000,
+        (true, true, true) => 0x9E78_0000,
+        (true, false, false) => 0x1E79_0000,
+        (true, false, true) => 0x9E79_0000,
+    };
+    base | (vn << 5) | rd
+}
+
+/// A float to an integer, truncating, which traps as Micro does on a NaN, an infinity, or a
+/// truncated value outside the target's range. The value is truncated with `frintz`, then the
+/// bounds are checked with comparisons that a NaN fails, and `fcvtz*` converts exactly.
+fn float_trunc_into(
+    operation: FloatTrunc,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let (wide, signed, to_64) = match operation {
+        FloatTrunc::I32FromF32S => (false, true, false),
+        FloatTrunc::I32FromF32U => (false, false, false),
+        FloatTrunc::I32FromF64S => (true, true, false),
+        FloatTrunc::I32FromF64U => (true, false, false),
+        FloatTrunc::I64FromF32S => (false, true, true),
+        FloatTrunc::I64FromF32U => (false, false, true),
+        FloatTrunc::I64FromF64S => (true, true, true),
+        FloatTrunc::I64FromF64U => (true, false, true),
+    };
+    let (lo, hi) = match (signed, to_64) {
+        (true, false) => (-2147483648.0f64, 2147483648.0f64),
+        (false, false) => (0.0, 4294967296.0),
+        (true, true) => (-9223372036854775808.0, 9223372036854775808.0),
+        (false, true) => (0.0, 18446744073709551616.0),
+    };
+    let bits = |value: f64| -> u64 {
+        if wide {
+            value.to_bits()
+        } else {
+            u64::from((value as f32).to_bits())
+        }
+    };
+    /// The `ge` and `gt` conditions: signed greater-or-equal and greater, which an unordered
+    /// comparison fails, since it sets V and clears N.
+    const GE: u32 = 10;
+    const GT: u32 = 12;
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    emitter.push(ldr_x(R9, SP, source));
+    emitter.push(fmov_to_float(wide, 0, R9));
+    emitter.push(float_round(wide, FloatUnary::Trunc, 0, 0));
+    // Trap unless t >= lo.
+    emit_constant(bits(lo), R10, emitter);
+    emitter.push(fmov_to_float(wide, 1, R10));
+    emitter.push(float_compare(wide, 0, 1));
+    guard_trap(frame, GE, STATUS_INVALID_CONVERSION, emitter);
+    // Trap unless hi > t.
+    emit_constant(bits(hi), R10, emitter);
+    emitter.push(fmov_to_float(wide, 2, R10));
+    emitter.push(float_compare(wide, 2, 0));
+    guard_trap(frame, GT, STATUS_INVALID_CONVERSION, emitter);
+    emitter.push(float_to_int(wide, signed, to_64, R9, 0));
+    emitter.push(str_x(R9, SP, destination));
+}
+
+/// A conversion between widths, or from an integer to a float, with the result in `x9`'s slot.
+/// A NaN from a width change is replaced by the canonical NaN, as Micro does.
+///
+/// A conversion from an unsigned 64-bit integer is `ucvtf`, which is correct on its own, unlike the
+/// x86-64 form, so no halving is needed here.
+fn float_convert_into(
+    operation: FloatConversion,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    emitter.push(ldr_x(R9, SP, source));
+    let (to_double, signed, from_64) = match operation {
+        FloatConversion::F32FromI32S => (false, true, false),
+        FloatConversion::F32FromI32U => (false, false, false),
+        FloatConversion::F32FromI64S => (false, true, true),
+        FloatConversion::F32FromI64U => (false, false, true),
+        FloatConversion::F64FromI32S => (true, true, false),
+        FloatConversion::F64FromI32U => (true, false, false),
+        FloatConversion::F64FromI64S => (true, true, true),
+        FloatConversion::F64FromI64U => (true, false, true),
+        FloatConversion::F32FromF64 => {
+            emitter.push(fmov_to_float(true, 0, R9));
+            emitter.push(float_widen_or_narrow(false, 0, 0));
+            canonicalize_nan(false, emitter);
+            emitter.push(fmov_from_float(false, R9, 0));
+            emitter.push(str_x(R9, SP, destination));
+            return Ok(());
+        }
+        FloatConversion::F64FromF32 => {
+            emitter.push(fmov_to_float(false, 0, R9));
+            emitter.push(float_widen_or_narrow(true, 0, 0));
+            canonicalize_nan(true, emitter);
+            emitter.push(fmov_from_float(true, R9, 0));
+            emitter.push(str_x(R9, SP, destination));
+            return Ok(());
+        }
+    };
+    emitter.push(int_to_float(to_double, signed, from_64, 0, R9));
+    emitter.push(fmov_from_float(to_double, R9, 0));
+    emitter.push(str_x(R9, SP, destination));
+    Ok(())
+}
+
+/// A reinterpretation copies the bits: the same value, in the other type's slot. A 32-bit value is
+/// loaded at 32 bits, which zero-extends it.
+fn reinterpret_into(
+    operation: Reinterpret,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    match operation {
+        Reinterpret::I32FromF32 | Reinterpret::F32FromI32 => emitter.push(ldr_w(R9, SP, source)),
+        Reinterpret::I64FromF64 | Reinterpret::F64FromI64 => emitter.push(ldr_x(R9, SP, source)),
+    }
     emitter.push(str_x(R9, SP, destination));
 }
 

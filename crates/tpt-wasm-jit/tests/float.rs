@@ -91,6 +91,28 @@ impl Lcg {
     }
 
     /// An address: inside the page or near its end or past it.
+    /// An `i64` operand: an edge value around each power of two that matters for conversions, or
+    /// arbitrary bits. The unsigned path of the conversions starts at 2^63.
+    fn i64_bits(&mut self) -> i64 {
+        const EDGES: [i64; 10] = [
+            0,
+            1,
+            -1,
+            (1 << 53) + 1,
+            (1 << 24) + 1,
+            i64::MAX,
+            i64::MIN,
+            i64::MIN + 1,
+            -1024, // 2^64 - 1024 unsigned: the unsigned path, just below the top
+            0x7fff_ffff_ffff_fc00,
+        ];
+        match self.below(3) {
+            0 => self.next() as i64,
+            1 => EDGES[self.below(EDGES.len() as u64) as usize],
+            _ => self.next() as i64 ^ i64::MIN,
+        }
+    }
+
     fn address(&mut self) -> i32 {
         match self.below(3) {
             0 => PAGE as i32 - 1 - self.below(16) as i32,
@@ -157,7 +179,16 @@ fn arguments(rng: &mut Lcg, params: &[ValueType]) -> Vec<i64> {
         .map(|parameter| match parameter {
             ValueType::F32 => i64::from(rng.f32_bits()),
             ValueType::F64 => rng.f64_bits() as i64,
-            ValueType::I32 => i64::from(rng.address()),
+            // Half the operands are addresses, for the memory cases; half span the whole i32
+            // range, negatives included, for the conversions.
+            ValueType::I32 => {
+                if rng.below(2) == 0 {
+                    i64::from(rng.address())
+                } else {
+                    i64::from(rng.next() as i32)
+                }
+            }
+            ValueType::I64 => rng.i64_bits(),
             other => panic!("the cases use no {other:?} parameter"),
         })
         .collect()
@@ -166,6 +197,7 @@ fn arguments(rng: &mut Lcg, params: &[ValueType]) -> Vec<i64> {
 fn to_value(value_type: ValueType, bits: i64) -> Value {
     match value_type {
         ValueType::I32 => Value::I32(bits as i32),
+        ValueType::I64 => Value::I64(bits),
         ValueType::F32 => Value::F32(bits as u32),
         ValueType::F64 => Value::F64(bits as u64),
         other => panic!("the cases use no {other:?} value"),
@@ -219,6 +251,7 @@ fn jit(
     match code.call_raw(args, memory) {
         Ok(raw) => Ok(match result {
             ValueType::I32 => Value::I32(raw as u32 as i32),
+            ValueType::I64 => Value::I64(raw as i64),
             ValueType::F32 => Value::F32(raw as u32),
             ValueType::F64 => Value::F64(raw),
             other => panic!("the cases use no {other:?} result"),
@@ -496,6 +529,151 @@ fn compiled_float_rounding_agrees_with_micro() {
             assert!(
                 agree(&expected, &actual),
                 "{} of {value}: {expected:?} vs {actual:?}",
+                case.name
+            );
+        }
+    }
+}
+
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        unix,
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    )
+))]
+#[test]
+fn compiled_float_conversions_and_reinterpretations_agree_with_micro() {
+    let mut rng = Lcg(0x9090_9090);
+    let unary = |params: ValueType, result: ValueType, op: u8, name: &str| Case {
+        params: vec![params],
+        result,
+        body: vec![0x20, 0x00, op, 0x0B],
+        memory: false,
+        name: name.into(),
+    };
+    let cases = vec![
+        // Integer to float, signed and unsigned, rounding to nearest-even, including the unsigned
+        // 64-bit path with its halving.
+        unary(ValueType::I32, ValueType::F32, 0xB2, "f32.convert_i32_s"),
+        unary(ValueType::I32, ValueType::F32, 0xB3, "f32.convert_i32_u"),
+        unary(ValueType::I64, ValueType::F32, 0xB4, "f32.convert_i64_s"),
+        unary(ValueType::I64, ValueType::F32, 0xB5, "f32.convert_i64_u"),
+        unary(ValueType::I32, ValueType::F64, 0xB7, "f64.convert_i32_s"),
+        unary(ValueType::I32, ValueType::F64, 0xB8, "f64.convert_i32_u"),
+        unary(ValueType::I64, ValueType::F64, 0xB9, "f64.convert_i64_s"),
+        unary(ValueType::I64, ValueType::F64, 0xBA, "f64.convert_i64_u"),
+        // Width changes, which canonicalize a NaN result.
+        unary(ValueType::F64, ValueType::F32, 0xB6, "f32.demote_f64"),
+        unary(ValueType::F32, ValueType::F64, 0xBB, "f64.promote_f32"),
+        // Reinterpretations, which copy the bits.
+        unary(ValueType::F32, ValueType::I32, 0xBC, "i32.reinterpret_f32"),
+        unary(ValueType::F64, ValueType::I64, 0xBD, "i64.reinterpret_f64"),
+        unary(ValueType::I32, ValueType::F32, 0xBE, "f32.reinterpret_i32"),
+        unary(ValueType::I64, ValueType::F64, 0xBF, "f64.reinterpret_i64"),
+    ];
+    let (values, traps, _) = check(&cases, &mut rng, 300);
+    assert_eq!(values, cases.len() * 300);
+    assert_eq!(traps, 0, "these conversions do not trap");
+}
+
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        unix,
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    )
+))]
+#[test]
+fn compiled_float_truncations_agree_with_micro() {
+    if !rounding_available() {
+        return;
+    }
+    let mut rng = Lcg(0xA0A0_A0A0);
+    let truncation = |param: ValueType, result: ValueType, op: u8, name: &str| Case {
+        params: vec![param],
+        result,
+        body: vec![0x20, 0x00, op, 0x0B],
+        memory: false,
+        name: name.into(),
+    };
+    let cases = vec![
+        truncation(ValueType::F32, ValueType::I32, 0xA8, "i32.trunc_f32_s"),
+        truncation(ValueType::F32, ValueType::I32, 0xA9, "i32.trunc_f32_u"),
+        truncation(ValueType::F64, ValueType::I32, 0xAA, "i32.trunc_f64_s"),
+        truncation(ValueType::F64, ValueType::I32, 0xAB, "i32.trunc_f64_u"),
+        truncation(ValueType::F32, ValueType::I64, 0xAE, "i64.trunc_f32_s"),
+        truncation(ValueType::F32, ValueType::I64, 0xAF, "i64.trunc_f32_u"),
+        truncation(ValueType::F64, ValueType::I64, 0xB0, "i64.trunc_f64_s"),
+        truncation(ValueType::F64, ValueType::I64, 0xB1, "i64.trunc_f64_u"),
+    ];
+    let (values, traps, _) = check(&cases, &mut rng, 300);
+    assert!(values > 500, "values: {values}");
+    assert!(traps > 500, "traps: {traps}");
+
+    // The boundaries: the largest values inside each range, the first outside it, and the values
+    // that truncate to zero from below.
+    let f32_boundary = [
+        -0.5f32,
+        -0.9,
+        -1.0,
+        -2147483648.0,
+        -2147483904.0,
+        2147483520.0,
+        2147483648.0,
+        4294967040.0,
+        4294967296.0,
+        9223371487098961920.0,
+        9223372036854775808.0,
+        18446742974197923840.0,
+        18446744073709551616.0,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    let f64_boundary = [
+        -0.5f64,
+        -0.9,
+        -1.0,
+        -2147483648.0,
+        -2147483649.0,
+        2147483647.9,
+        2147483648.0,
+        4294967295.9,
+        4294967296.0,
+        9223372036854774784.0,
+        9223372036854775808.0,
+        18446744073709549568.0,
+        18446744073709551616.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for case in &cases {
+        let module = module(case.params.clone(), case.result, case.body.clone(), false);
+        let code = compiled(&module);
+        let values: Vec<i64> = match case.params[0] {
+            ValueType::F32 => f32_boundary
+                .iter()
+                .map(|v| i64::from(v.to_bits()))
+                .collect(),
+            _ => f64_boundary.iter().map(|v| v.to_bits() as i64).collect(),
+        };
+        for bits in values {
+            let args = [bits];
+            let (expected, _) = micro(&module, case, &args);
+            let actual = jit(&code, case.result, &args, None);
+            assert!(
+                agree(&expected, &actual),
+                "{} of {bits:#x}: {expected:?} vs {actual:?}",
                 case.name
             );
         }
