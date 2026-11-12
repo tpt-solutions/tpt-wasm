@@ -344,102 +344,112 @@ fn trace(function: &tpt_wasm_ir::IrFunction) -> Vec<Effect> {
     effects
 }
 
+/// Record the effects reachable from `start`, in depth-first order along edges.
+///
+/// This used to recurse once per block, so its host-stack depth was the length of the
+/// longest chain of nested blocks. A module that nests a few thousand blocks overflowed
+/// the stack here (see `deeply_nested_blocks_do_not_exhaust_the_host_stack`), so the walk
+/// keeps its own stack. Successors are pushed in reverse, and a block is marked visited
+/// when it is popped, which visits blocks in the same order the recursive walk did.
 #[allow(clippy::too_many_arguments)]
 fn walk_block(
     function: &tpt_wasm_ir::IrFunction,
-    _cfg: &Cfg,
+    cfg: &Cfg,
     dominators: &Dominators,
-    block_index: usize,
+    start: usize,
     constants: &HashMap<ValueId, i64>,
     visited: &mut [bool],
     effects: &mut Vec<Effect>,
 ) {
-    if visited[block_index] {
-        return;
-    }
-    visited[block_index] = true;
-    let block = &function.blocks[block_index];
-    for instruction in &block.instrs {
-        if let Some(effect) = effect_of(instruction, constants) {
-            effects.push(effect);
+    let mut pending = vec![start];
+    while let Some(block_index) = pending.pop() {
+        if visited[block_index] {
             continue;
         }
-        if let Some(trap) = proven_trap(instruction, constants) {
-            // An operation that provably traps is recorded as the trap it is,
-            // even though it has no effect of its own. Without this the trace
-            // would not see it at all, and the folder's rewriting of it into a
-            // terminator would look like a trap appearing from nowhere.
-            effects.push(Effect::Trap(trap));
-            // The trap ends the block: nothing after it in this block runs, and
-            // no successor is reached. Modelling that is what lets the folder
-            // truncate the dead tail without the checker reading the truncation
-            // as lost work.
-            return;
+        visited[block_index] = true;
+        let block = &function.blocks[block_index];
+        let mut ends_in_trap = false;
+        for instruction in &block.instrs {
+            if let Some(effect) = effect_of(instruction, constants) {
+                effects.push(effect);
+                continue;
+            }
+            if let Some(trap) = proven_trap(instruction, constants) {
+                // An operation that provably traps is recorded as the trap it is,
+                // even though it has no effect of its own. Without this the trace
+                // would not see it at all, and the folder's rewriting of it into a
+                // terminator would look like a trap appearing from nowhere.
+                effects.push(Effect::Trap(trap));
+                // The trap ends the block: nothing after it in this block runs, and
+                // no successor is reached. Modelling that is what lets the folder
+                // truncate the dead tail without the checker reading the truncation
+                // as lost work.
+                ends_in_trap = true;
+                break;
+            }
         }
-    }
-    match &block.terminator {
-        // `Return` and `Unreachable` are not recorded. Both are structural: the
-        // exit-kind check above establishes that a function which could return
-        // still can, and counting returns would make block merging -- a
-        // legitimate rewrite -- look like lost work.
-        Terminator::Return(_) => {}
-        Terminator::Trap(trap) => {
-            effects.push(Effect::Trap(format!("{trap:?}")));
-            return;
+        if ends_in_trap {
+            continue;
         }
-        Terminator::Unreachable => return,
-        Terminator::Branch { .. } | Terminator::CondBranch { .. } => {}
-    }
-    // Which successors can actually be taken.
-    //
-    // A `CondBranch` on a *known constant* condition has only one live edge: the
-    // other arm is unreachable, and an effect in it -- a call, a store -- does
-    // not happen. The optimizer is expected to delete that arm, so walking both
-    // would report the deletion as lost work when it is the opposite.
-    //
-    // This is the same reasoning as the exit-kind check, applied to edges: the
-    // contract compares what the program *does*, and a branch that is never
-    // taken is not something it does.
-    let successors: Vec<usize> = match &block.terminator {
-        Terminator::CondBranch {
-            condition,
-            then_target,
-            else_target,
-            ..
-        } => {
-            match constants.get(condition) {
+        match &block.terminator {
+            // `Return` and `Unreachable` are not recorded. Both are structural: the
+            // exit-kind check above establishes that a function which could return
+            // still can, and counting returns would make block merging -- a
+            // legitimate rewrite -- look like lost work.
+            Terminator::Return(_) => {}
+            Terminator::Trap(trap) => {
+                effects.push(Effect::Trap(format!("{trap:?}")));
+                continue;
+            }
+            Terminator::Unreachable => continue,
+            Terminator::Branch { .. } | Terminator::CondBranch { .. } => {}
+        }
+        // Which successors can actually be taken.
+        //
+        // A `CondBranch` on a *known constant* condition has only one live edge: the
+        // other arm is unreachable, and an effect in it -- a call, a store -- does
+        // not happen. The optimizer is expected to delete that arm, so walking both
+        // would report the deletion as lost work when it is the opposite.
+        //
+        // This is the same reasoning as the exit-kind check, applied to edges: the
+        // contract compares what the program *does*, and a branch that is never
+        // taken is not something it does.
+        let mut successors: Vec<usize> = match &block.terminator {
+            Terminator::CondBranch {
+                condition,
+                then_target,
+                else_target,
+                ..
+            } => match constants.get(condition) {
                 Some(&value) => {
                     let taken = if value != 0 {
                         *then_target
                     } else {
                         *else_target
                     };
-                    _cfg.successors[block_index]
+                    cfg.successors[block_index]
                         .iter()
                         .copied()
-                        .filter(|target| *target == _cfg.index_of[&taken])
+                        .filter(|target| *target == cfg.index_of[&taken])
                         .collect()
                 }
                 // An unknown condition means both arms are live, so both are
                 // walked and both arms' effects are required to survive.
-                None => _cfg.successors[block_index].clone(),
-            }
-        }
-        _ => _cfg.successors[block_index].clone(),
-    };
-    // Sorted deterministically, so two runs over equal modules produce equal
-    // traces regardless of how the successor list was built.
-    let mut successors = successors;
-    successors.sort_by_key(|target| {
-        dominators
-            .immediate(*target)
-            .map(|parent| usize::MAX - parent)
-            .unwrap_or(usize::MAX)
-    });
-    for target in successors {
-        walk_block(
-            function, _cfg, dominators, target, constants, visited, effects,
-        );
+                None => cfg.successors[block_index].clone(),
+            },
+            _ => cfg.successors[block_index].clone(),
+        };
+        // Sorted deterministically, so two runs over equal modules produce equal
+        // traces regardless of how the successor list was built.
+        successors.sort_by_key(|target| {
+            dominators
+                .immediate(*target)
+                .map(|parent| usize::MAX - parent)
+                .unwrap_or(usize::MAX)
+        });
+        // Reversed, so the first successor is the next block popped, as in the
+        // recursive walk.
+        pending.extend(successors.into_iter().rev());
     }
 }
 

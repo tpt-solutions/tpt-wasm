@@ -34,7 +34,7 @@
 //! are bound per incoming edge, so a block with two predecessors has no single
 //! set of values to substitute.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tpt_wasm_ir::{BlockId, IrFunction, IrInstr, IrModule, Terminator, ValueId};
 
@@ -249,14 +249,37 @@ fn remove_unreachable(function: &mut IrFunction) -> usize {
 fn thread_empty_blocks(function: &mut IrFunction) -> usize {
     let mut changes = 0;
     for _ in 0..=function.blocks.len() {
-        let mut step = 0;
-        let by_id: HashMap<BlockId, tpt_wasm_ir::BasicBlock> = function
+        // What threading reads about each block, taken once per round as the round's
+        // snapshot. Only the terminator, emptiness and parameter count are needed, so
+        // the instructions are not copied: copying every block per round made this
+        // pass quadratic in the nesting depth.
+        let by_id: HashMap<BlockId, Shape> = function
             .blocks
             .iter()
-            .map(|block| (block.id, block.clone()))
+            .map(|block| {
+                (
+                    block.id,
+                    Shape {
+                        empty: block.instrs.is_empty(),
+                        params: block.params.len(),
+                        terminator: block.terminator.clone(),
+                    },
+                )
+            })
             .collect();
+        // Which blocks branch to each block, in the same round snapshot. A block that
+        // is already a branch target is checked against this, so the check is a lookup
+        // rather than a scan of every block.
+        let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for block in &function.blocks {
+            for successor in block.terminator.successors() {
+                predecessors.entry(successor).or_default().push(block.id);
+            }
+        }
+        let mut memo: HashMap<BlockId, Option<BlockId>> = HashMap::new();
+        let mut step = 0;
         for block in &mut function.blocks {
-            let Some((target, values)) = thread_target(&block.terminator, &by_id) else {
+            let Some((target, values)) = thread_target(&block.terminator, &by_id, &mut memo) else {
                 continue;
             };
             if target == block.id {
@@ -268,15 +291,16 @@ fn thread_empty_blocks(function: &mut IrFunction) -> usize {
             let Some(destination) = by_id.get(&target) else {
                 continue;
             };
-            if destination.params.len() != values.len() {
+            if destination.params != values.len() {
                 continue;
             }
             // A block that is *already* a branch target must keep being one: a
             // second edge into it would bind its parameters a second time, from a
             // possibly different set of values.
-            if by_id.values().any(|other| {
-                other.id != block.id && other.terminator.successors().contains(&block.id)
-            }) {
+            let entered_from_elsewhere = predecessors
+                .get(&block.id)
+                .is_some_and(|sources| sources.iter().any(|source| *source != block.id));
+            if entered_from_elsewhere {
                 continue;
             }
             block.terminator = Terminator::Branch { target, values };
@@ -290,59 +314,99 @@ fn thread_empty_blocks(function: &mut IrFunction) -> usize {
     changes
 }
 
+/// The parts of a block that threading reads, as they stood at the start of a round.
+struct Shape {
+    empty: bool,
+    params: usize,
+    terminator: Terminator,
+}
+
 /// The branch an empty-block chain resolves to, if the whole chain is empty.
+///
+/// The chain's end depends only on the chain itself, not on the edge being threaded, so
+/// the ends are memoized per round in `memo`. Each block is walked once per round rather
+/// than once per block that reaches it, which is what made a long chain quadratic.
 fn thread_target(
     terminator: &Terminator,
-    by_id: &HashMap<BlockId, tpt_wasm_ir::BasicBlock>,
+    by_id: &HashMap<BlockId, Shape>,
+    memo: &mut HashMap<BlockId, Option<BlockId>>,
 ) -> Option<(BlockId, Vec<ValueId>)> {
     let Terminator::Branch { target, values } = terminator else {
         return None;
     };
-    let mut current = by_id.get(target)?;
-    let mut carried = values.clone();
-    let mut seen: Vec<BlockId> = vec![current.id];
-    loop {
-        if !current.instrs.is_empty() {
-            return Some((current.id, carried));
+    let end = chain_end(*target, by_id, memo)?;
+    Some((end, values.clone()))
+}
+
+/// The first non-empty block reached from `start` along a chain of empty blocks, or
+/// `None` when the chain cannot be skipped.
+///
+/// A block with parameters cannot be skipped: the edge arriving at it is what binds
+/// those parameters, and redirecting past the block would leave them unbound. This is
+/// the case an `if`/`else` produces when one arm is empty -- both arms carry a value into
+/// the merge block, and threading the empty arm would turn that one value into zero.
+///
+/// A link is only followed when the block's branch supplies exactly the next block's
+/// parameter count, and a cycle makes the chain unskippable: a block already on the path
+/// is a failure for every block on it.
+fn chain_end(
+    start: BlockId,
+    by_id: &HashMap<BlockId, Shape>,
+    memo: &mut HashMap<BlockId, Option<BlockId>>,
+) -> Option<BlockId> {
+    let mut path: Vec<BlockId> = Vec::new();
+    let mut on_path: HashSet<BlockId> = HashSet::new();
+    let mut current = start;
+    let outcome = loop {
+        if let Some(&known) = memo.get(&current) {
+            break known;
         }
-        // A block with parameters cannot be skipped: the edge arriving at it is
-        // what binds those parameters, and redirecting past the block would leave
-        // them unbound. This is the case an `if`/`else` produces when one arm is
-        // empty -- both arms carry a value into the merge block, and threading the
-        // empty arm would turn that one value into zero.
-        if !current.params.is_empty() {
-            return None;
+        if !on_path.insert(current) {
+            break None;
         }
-        // Nor can a block be skipped when its branch supplies values for a
-        // successor that declares parameters. Threading the edge past it would
-        // deliver the *original* edge's values to a target that expects the
-        // skipped block's, which is the same class of bug as dropping the values
-        // entirely -- the target is entered with the wrong ones.
+        path.push(current);
+        let Some(shape) = by_id.get(&current) else {
+            break None;
+        };
+        if !shape.empty {
+            break Some(current);
+        }
+        if shape.params != 0 {
+            break None;
+        }
+        // Nor can a block be skipped when its branch supplies values for a successor
+        // that declares parameters: the target would be entered with the wrong values.
         let Terminator::Branch {
             target: next_target,
             values: next_values,
-        } = &current.terminator
+        } = &shape.terminator
         else {
-            return None;
+            break None;
         };
-        let next = by_id.get(next_target)?;
-        if next.params.len() != next_values.len() {
-            return None;
+        let Some(next) = by_id.get(next_target) else {
+            break None;
+        };
+        if next.params != next_values.len() {
+            break None;
         }
-        if seen.contains(&next.id) {
-            return None;
-        }
-        seen.push(next.id);
-        carried = values.clone();
-        current = next;
+        current = *next_target;
+    };
+    for block in path {
+        memo.insert(block, outcome);
     }
+    outcome
 }
 
 /// Append a block to its single predecessor when that is unambiguous.
 fn merge_blocks(function: &mut IrFunction) -> usize {
-    let mut merged = 0;
-    // One merge per round, recomputing the graph each time: a merge changes
-    // predecessor counts, so a batch computed from one snapshot would be wrong.
+    // The graph is built once and kept up to date, rather than rebuilt for every merge.
+    // A merge changes predecessor sets in one place: the target's successors now have
+    // the predecessor as their source instead of the target. So the sets are updated
+    // as each merge is made, and a merge costs the update plus the splice of the
+    // target's body. Rebuilding the whole graph per merge made this pass quadratic in
+    // the function's size.
+    //
+    // Removal is deferred to the end, so block indices stay valid while the pass runs.
     //
     // The substitution map is *carried* across merges in this call, and that is
     // the point. Merging is a chain: merging block 4 into 5 renames `v1` to `v2`,
@@ -354,19 +418,99 @@ fn merge_blocks(function: &mut IrFunction) -> usize {
     // parameters and to the incoming body -- never to unrelated blocks. A value id
     // is reused across a function, so rewriting an operand the rename does not
     // govern would silently change which value it denotes.
+    let mut merged = 0;
+    let cfg = Cfg::new(function);
+    let index_of: HashMap<BlockId, usize> = function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.id, index))
+        .collect();
+    // Distinct predecessors of each block, by index, as the graph stood before the pass.
+    let mut predecessors: Vec<Vec<usize>> = cfg.predecessors.clone();
+    let mut removed = vec![false; function.blocks.len()];
     let mut substitution: HashMap<ValueId, ValueId> = HashMap::new();
-    loop {
-        let cfg = Cfg::new(function);
-        let Some((from, to)) = find_merge(function, &cfg) else {
-            break;
-        };
-        apply_merge(function, from, to, &mut substitution);
-        merged += 1;
-        if merged > function.blocks.len() + 1 {
-            break;
+    let limit = function.blocks.len() + 1;
+
+    let mut progressed = true;
+    while progressed && merged <= limit {
+        progressed = false;
+        for index in 0..function.blocks.len() {
+            // A block can absorb several successors in a row, so keep going from it
+            // until it cannot.
+            while !removed[index] && merged <= limit {
+                let Some(target) =
+                    mergeable_target(function, &cfg, &index_of, &predecessors, &removed, index)
+                else {
+                    break;
+                };
+                // The target's successors now have this block as their predecessor.
+                let successors: Vec<usize> = function.blocks[target]
+                    .terminator
+                    .successors()
+                    .iter()
+                    .filter_map(|id| index_of.get(id).copied())
+                    .collect();
+                apply_merge(function, index, target, &mut substitution);
+                removed[target] = true;
+                for successor in successors {
+                    let sources = &mut predecessors[successor];
+                    sources.retain(|source| *source != target);
+                    if !sources.contains(&index) {
+                        sources.push(index);
+                    }
+                }
+                predecessors[target].clear();
+                merged += 1;
+                progressed = true;
+            }
         }
     }
+
+    if merged > 0 {
+        let mut position = 0;
+        function.blocks.retain(|_| {
+            let keep = !removed[position];
+            position += 1;
+            keep
+        });
+    }
     merged
+}
+
+/// The index of the block `from` may be merged with now, if there is one.
+///
+/// Mirrors the conditions of `find_merge`, evaluated against the graph as the pass has
+/// left it: the branch is unconditional, its target is neither the entry nor `from`
+/// and has not been merged away, the target has exactly one predecessor (this block),
+/// the branch supplies exactly the target's parameter count, and this block was
+/// reachable before the pass. A merge only moves a block's body into its predecessor,
+/// so reachability is not changed by it.
+fn mergeable_target(
+    function: &IrFunction,
+    cfg: &Cfg,
+    index_of: &HashMap<BlockId, usize>,
+    predecessors: &[Vec<usize>],
+    removed: &[bool],
+    from: usize,
+) -> Option<usize> {
+    let Terminator::Branch { target, values } = &function.blocks[from].terminator else {
+        return None;
+    };
+    let to = *index_of.get(target)?;
+    if removed[to] || to == cfg.entry || to == from {
+        return None;
+    }
+    if !cfg.is_reachable(from) {
+        return None;
+    }
+    if predecessors[to] != [from] {
+        return None;
+    }
+    if values.len() != function.blocks[to].params.len() {
+        return None;
+    }
+    Some(to)
 }
 
 /// Perform one merge: append the target's body to its predecessor.
@@ -388,42 +532,21 @@ fn apply_merge(
     // Compose this merge's own parameter substitution into the cumulative one,
     // resolving through what is already there so a chain collapses.
     //
-    // The pairs are collected before any insertion because the resolver borrows
-    // the map immutably and the inserts need it mutably; resolving everything
-    // first and inserting after is also what makes the composition order
-    // independent, so two parameters that resolve to the same value cannot see
-    // each other's partial update.
+    // The pairs are collected before any insertion, and every value is resolved
+    // against the map as it stood before this merge; inserting after resolving is what
+    // makes the composition order independent, so two parameters that resolve to the
+    // same value cannot see each other's partial update.
     let pairs: Vec<(ValueId, ValueId)> =
         params.iter().copied().zip(values.iter().copied()).collect();
     let resolved: Vec<(ValueId, ValueId)> = pairs
         .iter()
-        .map(|(param, value)| {
-            let mut current = *value;
-            for _ in 0..=substitution.len() + 1 {
-                match substitution.get(&current) {
-                    Some(&next) if next != current => current = next,
-                    _ => break,
-                }
-            }
-            (*param, current)
-        })
+        .map(|(param, value)| (*param, resolve(substitution, *value)))
         .collect();
     for (param, value) in resolved {
         substitution.insert(param, value);
     }
-    // The lookup is a plain closure over a *snapshot*: the map is no longer
-    // mutated after this point, so the borrow is unambiguous and the resolver
-    // cannot observe a half-applied merge.
-    let snapshot = substitution.clone();
-    let lookup = move |mut value: ValueId| -> ValueId {
-        for _ in 0..=snapshot.len() + 1 {
-            match snapshot.get(&value) {
-                Some(&next) if next != value => value = next,
-                _ => return value,
-            }
-        }
-        value
-    };
+    // The map is not mutated after this point, so the lookup can borrow it directly.
+    let lookup = |value: ValueId| -> ValueId { resolve(substitution, value) };
 
     // The target's parameters are substituted only inside the body and terminator
     // that are about to be spliced into the predecessor.
@@ -465,73 +588,23 @@ fn apply_merge(
 
     function.blocks[from_index].instrs.extend(body);
     function.blocks[from_index].terminator = terminator;
-    function.blocks.retain(|block| block.id != target_id);
+    // The target is not removed here: `merge_blocks` removes every merged block at the
+    // end, so indices stay valid while the pass runs.
+    let _ = target_id;
 }
 
-/// The `(predecessor, target)` pair to merge, if any.
+/// Follow the cumulative substitution from `value` to the value it stands for.
 ///
-/// The conditions are deliberately narrow, because each one rules out a specific
-/// way a merge could change the program's meaning:
-///
-/// * the predecessor must end in an *unconditional* branch, so there is one edge
-///   and one set of values to inline;
-/// * the target must have exactly one predecessor, so its block parameters are
-///   bound by exactly one set of values -- a block with two predecessors is a
-///   real merge point, and substituting one predecessor's values would break the
-///   other;
-/// * the target must not be the entry, whose parameters are the function's own;
-/// * the branch must supply *exactly* the target's parameter count. This is
-///   checked rather than assumed: a mismatch here would leave the target bound
-///   with the wrong number of values, and the IR verifier would reject the
-///   result with an arity error attributed to a pass that did nothing wrong
-///   locally. Verifying it here means the merge is only attempted when it is
-///   actually well-formed.
-fn find_merge(function: &IrFunction, cfg: &Cfg) -> Option<(usize, usize)> {
-    for (index, block) in function.blocks.iter().enumerate() {
-        let Terminator::Branch { target, values } = &block.terminator else {
-            continue;
-        };
-        let target_index = *cfg.index_of.get(target)?;
-        // Never merge *into* the entry: it is where execution starts, and moving
-        // a predecessor's body into it would place instructions before the
-        // function's parameters are bound.
-        if target_index == cfg.entry || target_index == index {
-            continue;
+/// Bounded by the map's size, which is how a cycle would be cut if one ever arose. A
+/// chain of merges is as long as the nesting, so this walk is the one place a long
+/// chain costs time, and it is taken once per operand of each merged body.
+fn resolve(substitution: &HashMap<ValueId, ValueId>, value: ValueId) -> ValueId {
+    let mut current = value;
+    for _ in 0..=substitution.len() + 1 {
+        match substitution.get(&current) {
+            Some(&next) if next != current => current = next,
+            _ => break,
         }
-        // Never merge from an unreachable block.
-        //
-        // Merging substitutes the target's parameters away in *every* block, on
-        // the grounds that a rename is safe anywhere. That holds for a block that
-        // executes, whose operands are supplied afresh on each entry -- and it
-        // fails for one that cannot, whose operand was already gone before the
-        // rename and is not restored by it. A renamed edge into a block the
-        // optimizer has since emptied then supplies a value nothing defines, and
-        // the backend reports it as unknown even though the path is dead.
-        //
-        // Leaving unreachable blocks alone is not a missed optimization: nothing
-        // about them is observable, and `remove_unreachable` drops them once
-        // nothing names them.
-        if !cfg.is_reachable(index) {
-            continue;
-        }
-        // The branch must supply *exactly* the target's parameter count, and the
-        // target must have exactly one predecessor.
-        //
-        // Together these are the whole correctness condition, and they are checked
-        // rather than assumed. A single predecessor means the target's parameters
-        // are bound by exactly one set of values -- the ones this branch supplies --
-        // and the arity check then guarantees the substitution covers them all.
-        // Getting this wrong does not produce a malformed module: the substituted
-        // value simply no longer exists, and the resulting IR reads a slot nothing
-        // wrote.
-        let predecessors = &cfg.predecessors[target_index];
-        if predecessors.len() != 1 || predecessors[0] != index {
-            continue;
-        }
-        if values.len() != function.blocks[target_index].params.len() {
-            continue;
-        }
-        return Some((index, target_index));
     }
-    None
+    current
 }
