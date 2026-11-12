@@ -214,9 +214,12 @@ name = "tpt-wasm-jit"
 version = "0.1.0"
 dependencies = [
  "tpt-wasm-codegen",
+ "tpt-wasm-format",
  "tpt-wasm-ir",
  "tpt-wasm-opt",
+ "tpt-wasm-runtime",
  "tpt-wasm-types",
+ "tpt-wasm-validate",
 ]
 
 [[package]]

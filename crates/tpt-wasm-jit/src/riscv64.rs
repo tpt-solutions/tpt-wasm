@@ -1,0 +1,1153 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 TPT Solutions
+
+//! The RISC-V (RV64GC, LP64) encoder for the compiled subset. Safe code, tested on every target.
+//!
+//! Every value lives in an 8-byte slot at a fixed offset from `sp`, and each slot holds a 64-bit
+//! value. An `i32` is kept sign-extended, which is what the `W` forms of the arithmetic produce
+//! and what `lw` loads, so the 64-bit comparisons order `i32` values correctly. Each instruction
+//! loads its operands into scratch registers, performs one operation, and stores the result.
+//!
+//! The calling convention is the LP64 one: the arguments pointer arrives in `a0` and the context
+//! pointer in `a1`. The result is returned in `a0`. Traps are stored in the context. Scratch
+//! registers are `t0` to `t4`. `s0` is the frame pointer, callee-saved, so the prologue saves it
+//! and the epilogue restores it, and every epilogue recomputes `sp` from `s0`.
+//!
+//! Limits: the loads and stores take 12-bit signed offsets, so a frame is at most 2 KiB and a
+//! memory offset is below 2 GiB minus 4 KiB. A conditional branch reaches 4 KiB and a jump 1 MiB,
+//! and a function beyond these is refused with `Unsupported`.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use tpt_wasm_ir::{
+    BasicBlock, BlockId, IntComparison, IntConversion, IrFunction, IrInstr, MemoryLoad,
+    MemoryStore, SignExtend, Terminator, ValueId,
+};
+
+use crate::x86::{check_supported, instruction_name, terminator_name};
+use crate::{Context, JitError};
+
+/// Register numbers.
+const ZERO: u32 = 0;
+const SP: u32 = 2;
+const S0: u32 = 8;
+const T0: u32 = 5;
+const T1: u32 = 6;
+const T2: u32 = 7;
+const T3: u32 = 28;
+const T4: u32 = 29;
+const A0: u32 = 10;
+const A1: u32 = 11;
+
+/// The largest frame: a 12-bit signed offset reaches the highest slot.
+const MAX_FRAME: u32 = 2048;
+/// The largest memory offset, leaving room for the access width below it.
+const MAX_OFFSET: u32 = (1 << 31) - 4096;
+
+/// The byte offsets of the context fields the generated code uses.
+const MEMORY_BASE_OFFSET: i32 = std::mem::offset_of!(Context, memory) as i32;
+const MEMORY_LENGTH_OFFSET: i32 = std::mem::offset_of!(Context, memory_len) as i32;
+const STATUS_OFFSET: i32 = std::mem::offset_of!(Context, status) as i32;
+
+/// A place a jump can go: a block of the function, or a label inside the emitted code.
+#[derive(Clone, Copy, Debug)]
+enum Target {
+    Block(BlockId),
+    Label(usize),
+}
+
+/// The branch encodings whose offsets are patched.
+#[derive(Clone, Copy, Debug)]
+enum Fixup {
+    /// A conditional branch: 13-bit signed byte offset.
+    Branch13,
+    /// `jal`: 21-bit signed byte offset.
+    Jump21,
+}
+
+/// The stack slots of a function, as offsets from `sp`.
+struct Frame {
+    slots: HashMap<ValueId, u32>,
+    used: u32,
+    context: u32,
+}
+
+impl Frame {
+    fn new() -> Self {
+        Self {
+            slots: HashMap::new(),
+            used: 0,
+            context: 0,
+        }
+    }
+
+    fn slot(&mut self, value: ValueId) -> u32 {
+        if let Some(&offset) = self.slots.get(&value) {
+            return offset;
+        }
+        let offset = self.used;
+        self.used += 8;
+        self.slots.insert(value, offset);
+        offset
+    }
+
+    fn temporary(&mut self) -> u32 {
+        let offset = self.used;
+        self.used += 8;
+        offset
+    }
+
+    /// The frame size: the slots, rounded up to 16 as the ABI requires.
+    fn size(&self) -> u32 {
+        self.used.div_ceil(16) * 16
+    }
+}
+
+/// The instruction words, with the labels and fixups that patch their branches.
+struct Emitter {
+    words: Vec<u32>,
+    labels: Vec<Option<usize>>,
+    fixups: Vec<(usize, Target, Fixup)>,
+}
+
+impl Emitter {
+    fn new() -> Self {
+        Self {
+            words: Vec::new(),
+            labels: Vec::new(),
+            fixups: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, word: u32) {
+        self.words.push(word);
+    }
+
+    fn new_label(&mut self) -> usize {
+        self.labels.push(None);
+        self.labels.len() - 1
+    }
+
+    fn bind(&mut self, label: usize) {
+        self.labels[label] = Some(self.words.len());
+    }
+
+    /// A branch or jump whose offset is patched later. `word` is the instruction with a zero
+    /// offset.
+    fn branch(&mut self, word: u32, target: Target, fixup: Fixup) {
+        self.fixups.push((self.words.len(), target, fixup));
+        self.push(word);
+    }
+
+    /// Patch every branch now that the word offset of each block is known. Offsets are in bytes,
+    /// and each instruction is four bytes.
+    fn resolve(&mut self, blocks: &HashMap<BlockId, usize>) -> Result<(), JitError> {
+        for (position, target, fixup) in std::mem::take(&mut self.fixups) {
+            let destination = match target {
+                Target::Block(block) => *blocks.get(&block).ok_or_else(|| {
+                    JitError::Unsupported("a branch to a block that was not emitted".into())
+                })?,
+                Target::Label(label) => self.labels[label]
+                    .ok_or_else(|| JitError::Unsupported("a branch to an unbound label".into()))?,
+            };
+            let offset = (destination as i64 - position as i64) * 4;
+            match fixup {
+                Fixup::Branch13 => {
+                    if !(-4096..4096).contains(&offset) {
+                        return Err(JitError::Unsupported(
+                            "a conditional branch beyond 4 KiB".into(),
+                        ));
+                    }
+                    self.words[position] |= b_immediate(offset as u32);
+                }
+                Fixup::Jump21 => {
+                    if !(-(1 << 20)..(1 << 20)).contains(&offset) {
+                        return Err(JitError::Unsupported("a jump beyond 1 MiB".into()));
+                    }
+                    self.words[position] |= j_immediate(offset as u32);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---- instruction encodings. Each returns one 32-bit word.
+
+/// The I-type form: a 12-bit immediate, `rs1`, `funct3`, `rd`, and the opcode.
+fn i_type(imm: i32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
+    (((imm as u32) & 0xFFF) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+}
+
+/// The S-type form: a 12-bit immediate split across the store, `rs2` and `rs1`.
+fn s_type(imm: i32, rs2: u32, rs1: u32, funct3: u32, opcode: u32) -> u32 {
+    let imm = (imm as u32) & 0xFFF;
+    ((imm >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | ((imm & 0x1F) << 7) | opcode
+}
+
+/// The R-type form.
+fn r_type(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
+    (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+}
+
+/// The offset bits of a B-type word, for a byte offset in -4 KiB..4 KiB.
+fn b_immediate(offset: u32) -> u32 {
+    let imm = offset & 0x1FFE;
+    (((imm >> 12) & 1) << 31)
+        | (((imm >> 5) & 0x3F) << 25)
+        | (((imm >> 1) & 0xF) << 8)
+        | (((imm >> 11) & 1) << 7)
+}
+
+/// The offset bits of a J-type word, for a byte offset in -1 MiB..1 MiB.
+fn j_immediate(offset: u32) -> u32 {
+    let imm = offset & 0x1F_FFFE;
+    (((imm >> 20) & 1) << 31)
+        | (((imm >> 1) & 0x3FF) << 21)
+        | (((imm >> 11) & 1) << 20)
+        | (((imm >> 12) & 0xFF) << 12)
+}
+
+/// `addi rd, rs1, imm`.
+fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_type(imm, rs1, 0, rd, 0x13)
+}
+
+/// `addiw rd, rs1, imm`: a 32-bit add, sign-extended to 64 bits.
+fn addiw(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_type(imm, rs1, 0, rd, 0x1B)
+}
+
+/// `ori rd, rs1, imm`.
+fn ori(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_type(imm, rs1, 6, rd, 0x13)
+}
+
+/// `xori rd, rs1, imm`.
+fn xori(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_type(imm, rs1, 4, rd, 0x13)
+}
+
+/// `sltiu rd, rs1, imm`.
+fn sltiu(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_type(imm, rs1, 3, rd, 0x13)
+}
+
+/// `lui rd, imm20`: the upper 20 bits, sign-extended from bit 31.
+fn lui(rd: u32, imm20: u32) -> u32 {
+    ((imm20 & 0xF_FFFF) << 12) | (rd << 7) | 0x37
+}
+
+/// `slli rd, rs1, shamt`: a 64-bit logical left shift.
+fn slli(rd: u32, rs1: u32, shamt: u32) -> u32 {
+    i_type(shamt as i32, rs1, 1, rd, 0x13)
+}
+
+/// `srli rd, rs1, shamt`: a 64-bit logical right shift.
+fn srli(rd: u32, rs1: u32, shamt: u32) -> u32 {
+    i_type(shamt as i32, rs1, 5, rd, 0x13)
+}
+
+/// `srai rd, rs1, shamt`: a 64-bit arithmetic right shift.
+fn srai(rd: u32, rs1: u32, shamt: u32) -> u32 {
+    i_type((0x400 | shamt) as i32, rs1, 5, rd, 0x13)
+}
+
+/// A load, by `funct3`: `lb` (0), `lh` (1), `lw` (2), `ld` (3), `lbu` (4), `lhu` (5), `lwu` (6).
+fn load(funct3: u32, rd: u32, rs1: u32, offset: i32) -> u32 {
+    i_type(offset, rs1, funct3, rd, 0x03)
+}
+
+/// A store, by `funct3`: `sb` (0), `sh` (1), `sw` (2), `sd` (3).
+fn store(funct3: u32, rs2: u32, rs1: u32, offset: i32) -> u32 {
+    s_type(offset, rs2, rs1, funct3, 0x23)
+}
+
+/// A 32-bit register-register operation (`OP-32`).
+fn op_w(funct7: u32, funct3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+    r_type(funct7, rs2, rs1, funct3, rd, 0x3B)
+}
+
+/// A 64-bit register-register operation (`OP`).
+fn op(funct7: u32, funct3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+    r_type(funct7, rs2, rs1, funct3, rd, 0x33)
+}
+
+/// `beq` (funct3 0), `bne` (1), `bgeu` (7), with a zero offset to be patched.
+fn branch(funct3: u32, rs1: u32, rs2: u32) -> u32 {
+    r_type(0, rs2, rs1, funct3, 0, 0x63)
+}
+
+/// `jal x0`, a plain jump, with a zero offset to be patched.
+const JAL_ZERO: u32 = 0x6F;
+
+/// `jalr x0, 0(ra)`: return.
+const RET: u32 = 0x0000_8067;
+
+/// The 32-bit constant `value`, sign-extended to 64 bits, in `rd`.
+fn load_constant32(rd: u32, value: i32, emitter: &mut Emitter) {
+    if (-2048..2048).contains(&value) {
+        emitter.push(addi(rd, ZERO, value));
+        return;
+    }
+    // hi is the upper 20 bits, rounded so that the signed low 12 bits fit.
+    let hi = value.wrapping_add(0x800) >> 12;
+    let lo = value.wrapping_sub(hi << 12);
+    emitter.push(lui(rd, hi as u32));
+    emitter.push(addiw(rd, rd, lo));
+}
+
+/// The 64-bit constant `value` in `rd`, built from 11-bit pieces so that every immediate is
+/// positive and fits.
+fn load_constant64(rd: u32, value: i64, emitter: &mut Emitter) {
+    if let Ok(small) = i32::try_from(value) {
+        load_constant32(rd, small, emitter);
+        return;
+    }
+    let bits = value as u64;
+    let pieces = [
+        ((bits >> 53) & 0x7FF, 11),
+        ((bits >> 42) & 0x7FF, 11),
+        ((bits >> 31) & 0x7FF, 11),
+        ((bits >> 20) & 0x7FF, 11),
+        ((bits >> 9) & 0x7FF, 11),
+        (bits & 0x1FF, 9),
+    ];
+    emitter.push(addi(rd, ZERO, pieces[0].0 as i32));
+    for (piece, width) in &pieces[1..] {
+        emitter.push(slli(rd, rd, *width));
+        if *piece != 0 {
+            emitter.push(ori(rd, rd, *piece as i32));
+        }
+    }
+}
+
+/// Compile `function` to RISC-V machine code.
+pub(crate) fn encode(function: &IrFunction) -> Result<Vec<u8>, JitError> {
+    check_supported(function)?;
+    let blocks: HashMap<BlockId, &BasicBlock> = function
+        .blocks
+        .iter()
+        .map(|block| (block.id, block))
+        .collect();
+
+    let mut frame = Frame::new();
+    let mut emitter = Emitter::new();
+
+    // The two pointers arrive in a0 and a1 and are kept in slots, because the code below uses the
+    // scratch registers freely. Each argument is an 8-byte slot in the arguments array.
+    let args = frame.temporary();
+    frame.context = frame.temporary();
+    emitter.push(store(3, A0, SP, args as i32));
+    emitter.push(store(3, A1, SP, frame.context as i32));
+    for (index, parameter) in function.params.iter().enumerate() {
+        emitter.push(load(3, T0, SP, args as i32));
+        emitter.push(load(3, T0, T0, 8 * index as i32));
+        let slot = frame.slot(*parameter);
+        emitter.push(store(3, T0, SP, slot as i32));
+    }
+    let parameters: HashSet<ValueId> = function.params.iter().copied().collect();
+    for local in &function.locals {
+        if !parameters.contains(local) {
+            let slot = frame.slot(*local);
+            emitter.push(store(3, ZERO, SP, slot as i32));
+        }
+    }
+
+    let mut offsets: HashMap<BlockId, usize> = HashMap::new();
+    let mut queue: VecDeque<BlockId> = VecDeque::from([function.entry]);
+    let mut scheduled: HashSet<BlockId> = HashSet::from([function.entry]);
+    while let Some(id) = queue.pop_front() {
+        let block = blocks
+            .get(&id)
+            .copied()
+            .ok_or_else(|| JitError::Unsupported("a branch to a missing block".into()))?;
+        offsets.insert(id, emitter.words.len());
+        for instruction in &block.instrs {
+            emit_instruction(instruction, &mut frame, &mut emitter)?;
+        }
+        for successor in emit_terminator(block, &blocks, &mut frame, &mut emitter)? {
+            if scheduled.insert(successor) {
+                queue.push_back(successor);
+            }
+        }
+    }
+    emitter.resolve(&offsets)?;
+
+    let size = frame.size();
+    if size > MAX_FRAME {
+        return Err(JitError::Unsupported(format!(
+            "a frame of {size} bytes; the largest emitted is {MAX_FRAME}"
+        )));
+    }
+    // The prologue: save s0, point s0 at the caller's sp less 16, and reserve the frame.
+    let mut words = vec![
+        addi(SP, SP, -16),
+        store(3, S0, SP, 0),
+        addi(S0, SP, 16),
+        addi(SP, SP, -(size as i32)),
+    ];
+    words.extend(emitter.words);
+    Ok(words
+        .into_iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect())
+}
+
+/// Emit a block's terminator, and return the blocks it can transfer control to.
+fn emit_terminator(
+    block: &BasicBlock,
+    blocks: &HashMap<BlockId, &BasicBlock>,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<Vec<BlockId>, JitError> {
+    match &block.terminator {
+        Terminator::Return(values) if values.len() == 1 => {
+            let slot = frame.slot(values[0]);
+            emitter.push(load(3, A0, SP, slot as i32));
+            epilogue(emitter);
+            Ok(Vec::new())
+        }
+        Terminator::Return(values) => Err(JitError::Unsupported(format!(
+            "a return of {} values",
+            values.len()
+        ))),
+        Terminator::Branch { target, values } => {
+            let next = target_block(blocks, *target)?;
+            check_arity(next, values)?;
+            copy_into_parameters(&next.params, values, frame, emitter);
+            emitter.branch(JAL_ZERO, Target::Block(*target), Fixup::Jump21);
+            Ok(vec![*target])
+        }
+        Terminator::CondBranch {
+            condition,
+            then_target,
+            then_values,
+            else_target,
+            else_values,
+        } => {
+            let then_block = target_block(blocks, *then_target)?;
+            let else_block = target_block(blocks, *else_target)?;
+            check_arity(then_block, then_values)?;
+            check_arity(else_block, else_values)?;
+            let slot = frame.slot(*condition);
+            emitter.push(load(3, T0, SP, slot as i32));
+            let else_path = emitter.new_label();
+            // beq t0, zero, else: a zero condition takes the else edge.
+            emitter.branch(
+                branch(0, T0, ZERO),
+                Target::Label(else_path),
+                Fixup::Branch13,
+            );
+            copy_into_parameters(&then_block.params, then_values, frame, emitter);
+            emitter.branch(JAL_ZERO, Target::Block(*then_target), Fixup::Jump21);
+            emitter.bind(else_path);
+            copy_into_parameters(&else_block.params, else_values, frame, emitter);
+            emitter.branch(JAL_ZERO, Target::Block(*else_target), Fixup::Jump21);
+            Ok(vec![*then_target, *else_target])
+        }
+        other => Err(JitError::Unsupported(format!(
+            "the {} terminator",
+            terminator_name(other)
+        ))),
+    }
+}
+
+/// Restore `s0` and `sp`, then return. `s0` holds the caller's `sp` less 16, so `sp` is recovered
+/// from it and does not depend on the frame size.
+fn epilogue(emitter: &mut Emitter) {
+    emitter.push(addi(SP, S0, -16));
+    emitter.push(load(3, S0, SP, 0));
+    emitter.push(addi(SP, SP, 16));
+    emitter.push(RET);
+}
+
+/// Store `status` in the context and return zero.
+fn trap(frame: &Frame, status: u32, emitter: &mut Emitter) {
+    emitter.push(load(3, T4, SP, frame.context as i32)); // the context
+    emitter.push(addi(T3, ZERO, status as i32));
+    emitter.push(store(3, T3, T4, STATUS_OFFSET));
+    emitter.push(addi(A0, ZERO, 0));
+    epilogue(emitter);
+}
+
+fn target_block<'a>(
+    blocks: &HashMap<BlockId, &'a BasicBlock>,
+    target: BlockId,
+) -> Result<&'a BasicBlock, JitError> {
+    blocks
+        .get(&target)
+        .copied()
+        .ok_or_else(|| JitError::Unsupported("a branch to a missing block".into()))
+}
+
+fn check_arity(block: &BasicBlock, values: &[ValueId]) -> Result<(), JitError> {
+    if block.params.len() != values.len() {
+        return Err(JitError::Unsupported(
+            "a branch with the wrong arity".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Copy branch values into the target's parameter slots, through temporaries so that the order of
+/// the copies cannot change what a value means. Each copy is eight bytes.
+fn copy_into_parameters(
+    parameters: &[ValueId],
+    values: &[ValueId],
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let temporaries: Vec<u32> = values
+        .iter()
+        .map(|value| {
+            let source = frame.slot(*value);
+            let temporary = frame.temporary();
+            emitter.push(load(3, T0, SP, source as i32));
+            emitter.push(store(3, T0, SP, temporary as i32));
+            temporary
+        })
+        .collect();
+    for (parameter, temporary) in parameters.iter().zip(temporaries) {
+        let destination = frame.slot(*parameter);
+        emitter.push(load(3, T0, SP, temporary as i32));
+        emitter.push(store(3, T0, SP, destination as i32));
+    }
+}
+
+fn emit_instruction(
+    instruction: &IrInstr,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    match instruction {
+        IrInstr::ConstI32 { result, value } => {
+            let slot = frame.slot(*result);
+            load_constant32(T0, *value, emitter);
+            emitter.push(store(3, T0, SP, slot as i32));
+        }
+        IrInstr::ConstI64 { result, value } => {
+            let slot = frame.slot(*result);
+            load_constant64(T0, *value, emitter);
+            emitter.push(store(3, T0, SP, slot as i32));
+        }
+        IrInstr::Drop { .. } => {}
+        IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
+        IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),
+        IrInstr::LocalTee {
+            result,
+            local,
+            value,
+        } => {
+            let source = frame.slot(*value);
+            let local_slot = frame.slot(*local);
+            let result_slot = frame.slot(*result);
+            emitter.push(load(3, T0, SP, source as i32));
+            emitter.push(store(3, T0, SP, local_slot as i32));
+            emitter.push(store(3, T0, SP, result_slot as i32));
+        }
+        // The `W` forms compute 32-bit results, sign-extended to 64 bits. Their shift counts are
+        // the low five bits of the second operand, which is the Wasm masking rule.
+        IrInstr::I32Add {
+            result,
+            left,
+            right,
+        } => binary(
+            op_w(0x00, 0, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32Sub {
+            result,
+            left,
+            right,
+        } => binary(
+            op_w(0x20, 0, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32Mul {
+            result,
+            left,
+            right,
+        } => binary(
+            op_w(0x01, 0, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32Shl {
+            result,
+            left,
+            right,
+        } => binary(
+            op_w(0x00, 1, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32ShrU {
+            result,
+            left,
+            right,
+        } => binary(
+            op_w(0x00, 5, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32ShrS {
+            result,
+            left,
+            right,
+        } => binary(
+            op_w(0x20, 5, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        // The 64-bit forms. The bitwise operations need no `W` form: on sign-extended operands they
+        // produce sign-extended results.
+        IrInstr::I32And {
+            result,
+            left,
+            right,
+        }
+        | IrInstr::I64And {
+            result,
+            left,
+            right,
+        } => binary(
+            op(0x00, 7, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32Or {
+            result,
+            left,
+            right,
+        }
+        | IrInstr::I64Or {
+            result,
+            left,
+            right,
+        } => binary(
+            op(0x00, 6, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32Xor {
+            result,
+            left,
+            right,
+        }
+        | IrInstr::I64Xor {
+            result,
+            left,
+            right,
+        } => binary(
+            op(0x00, 4, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64Add {
+            result,
+            left,
+            right,
+        } => binary(
+            op(0x00, 0, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64Sub {
+            result,
+            left,
+            right,
+        } => binary(
+            op(0x20, 0, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64Mul {
+            result,
+            left,
+            right,
+        } => binary(
+            op(0x01, 0, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64Shl {
+            result,
+            left,
+            right,
+        } => binary(
+            op(0x00, 1, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64ShrU {
+            result,
+            left,
+            right,
+        } => binary(
+            op(0x00, 5, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64ShrS {
+            result,
+            left,
+            right,
+        } => binary(
+            op(0x20, 5, T0, T0, T1),
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32DivU {
+            result,
+            left,
+            right,
+        } => divide(false, false, false, *result, *left, *right, frame, emitter),
+        IrInstr::I32RemU {
+            result,
+            left,
+            right,
+        } => divide(false, true, false, *result, *left, *right, frame, emitter),
+        IrInstr::I32DivS {
+            result,
+            left,
+            right,
+        } => divide(true, false, false, *result, *left, *right, frame, emitter),
+        IrInstr::I32RemS {
+            result,
+            left,
+            right,
+        } => divide(true, true, false, *result, *left, *right, frame, emitter),
+        IrInstr::I64DivU {
+            result,
+            left,
+            right,
+        } => divide(false, false, true, *result, *left, *right, frame, emitter),
+        IrInstr::I64RemU {
+            result,
+            left,
+            right,
+        } => divide(false, true, true, *result, *left, *right, frame, emitter),
+        IrInstr::I64DivS {
+            result,
+            left,
+            right,
+        } => divide(true, false, true, *result, *left, *right, frame, emitter),
+        IrInstr::I64RemS {
+            result,
+            left,
+            right,
+        } => divide(true, true, true, *result, *left, *right, frame, emitter),
+        IrInstr::I32Eqz { result, value } | IrInstr::I64Eqz { result, value } => {
+            let source = frame.slot(*value);
+            let destination = frame.slot(*result);
+            emitter.push(load(3, T0, SP, source as i32));
+            emitter.push(sltiu(T0, T0, 1));
+            emitter.push(store(3, T0, SP, destination as i32));
+        }
+        IrInstr::I32Compare {
+            result,
+            left,
+            right,
+            comparison,
+        }
+        | IrInstr::I64Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => {
+            let left = frame.slot(*left);
+            let right = frame.slot(*right);
+            let destination = frame.slot(*result);
+            emitter.push(load(3, T0, SP, left as i32));
+            emitter.push(load(3, T1, SP, right as i32));
+            compare(*comparison, emitter);
+            emitter.push(store(3, T0, SP, destination as i32));
+        }
+        IrInstr::Select {
+            result,
+            condition,
+            left,
+            right,
+        } => {
+            // The result is `left` when the condition is non-zero, else `right`. A branch picks
+            // which operand is copied.
+            let condition = frame.slot(*condition);
+            let left = frame.slot(*left);
+            let right = frame.slot(*right);
+            let destination = frame.slot(*result);
+            emitter.push(load(3, T0, SP, condition as i32));
+            emitter.push(load(3, T1, SP, right as i32));
+            emitter.push(load(3, T2, SP, left as i32));
+            let take_left = emitter.new_label();
+            let done = emitter.new_label();
+            // bne t0, zero, take_left
+            emitter.branch(
+                branch(1, T0, ZERO),
+                Target::Label(take_left),
+                Fixup::Branch13,
+            );
+            emitter.push(addi(T0, T1, 0));
+            emitter.branch(JAL_ZERO, Target::Label(done), Fixup::Jump21);
+            emitter.bind(take_left);
+            emitter.push(addi(T0, T2, 0));
+            emitter.bind(done);
+            emitter.push(store(3, T0, SP, destination as i32));
+        }
+        IrInstr::IntConvert {
+            result,
+            value,
+            operation,
+        } => {
+            let source = frame.slot(*value);
+            let destination = frame.slot(*result);
+            emitter.push(load(3, T0, SP, source as i32));
+            match operation {
+                // addiw by zero sign-extends the low 32 bits.
+                IntConversion::I32WrapI64 => emitter.push(addiw(T0, T0, 0)),
+                // The slot already holds the sign-extended 32-bit value.
+                IntConversion::I64ExtendI32S => {}
+                // Keep the low 32 bits, zero-extended.
+                IntConversion::I64ExtendI32U => {
+                    emitter.push(slli(T0, T0, 32));
+                    emitter.push(srli(T0, T0, 32));
+                }
+            }
+            emitter.push(store(3, T0, SP, destination as i32));
+        }
+        IrInstr::SignExtend {
+            result,
+            value,
+            operation,
+        } => {
+            let source = frame.slot(*value);
+            let destination = frame.slot(*result);
+            let shift = match operation {
+                SignExtend::I32Extend8S | SignExtend::I64Extend8S => 56,
+                SignExtend::I32Extend16S | SignExtend::I64Extend16S => 48,
+                SignExtend::I64Extend32S => 32,
+            };
+            emitter.push(load(3, T0, SP, source as i32));
+            emitter.push(slli(T0, T0, shift));
+            emitter.push(srai(T0, T0, shift));
+            emitter.push(store(3, T0, SP, destination as i32));
+        }
+        IrInstr::Load {
+            result,
+            address,
+            offset,
+            operation,
+            bounds: _,
+        } => {
+            // The bounds hint is ignored: every access is checked here.
+            let (width, funct3) = match operation {
+                MemoryLoad::I32 | MemoryLoad::I64_32S => (4, 2),
+                MemoryLoad::I64_32U => (4, 6),
+                MemoryLoad::I64 => (8, 3),
+                MemoryLoad::I32_8U | MemoryLoad::I64_8U => (1, 4),
+                MemoryLoad::I32_8S | MemoryLoad::I64_8S => (1, 0),
+                MemoryLoad::I32_16U | MemoryLoad::I64_16U => (2, 5),
+                MemoryLoad::I32_16S | MemoryLoad::I64_16S => (2, 1),
+                other => return Err(JitError::Unsupported(format!("the {other:?} load"))),
+            };
+            emit_address(*address, *offset, width, frame, emitter)?;
+            emitter.push(load(funct3, T0, T3, 0));
+            let destination = frame.slot(*result);
+            emitter.push(store(3, T0, SP, destination as i32));
+        }
+        IrInstr::Store {
+            address,
+            value,
+            offset,
+            operation,
+            bounds: _,
+        } => {
+            let (width, funct3) = match operation {
+                MemoryStore::I32 | MemoryStore::I64_32 => (4, 2),
+                MemoryStore::I64 => (8, 3),
+                MemoryStore::I32_8 | MemoryStore::I64_8 => (1, 0),
+                MemoryStore::I32_16 | MemoryStore::I64_16 => (2, 1),
+                other => return Err(JitError::Unsupported(format!("the {other:?} store"))),
+            };
+            emit_address(*address, *offset, width, frame, emitter)?;
+            let source = frame.slot(*value);
+            emitter.push(load(3, T1, SP, source as i32));
+            emitter.push(store(funct3, T1, T3, 0));
+        }
+        other => {
+            return Err(JitError::Unsupported(format!(
+                "the {} instruction",
+                instruction_name(other)
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// Copy a value's slot to another, eight bytes at a time.
+fn copy(from: ValueId, to: ValueId, frame: &mut Frame, emitter: &mut Emitter) {
+    let source = frame.slot(from);
+    let destination = frame.slot(to);
+    emitter.push(load(3, T0, SP, source as i32));
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
+/// Leave the result of comparing `t0` with `t1` in `t0`, as 0 or 1.
+///
+/// The operands are sign-extended 32-bit values for `i32` and full values for `i64`. In both cases
+/// the 64-bit comparisons order them correctly: signed comparisons agree with the signed order, and
+/// unsigned comparisons agree with the unsigned order of the sign-extended values.
+fn compare(comparison: IntComparison, emitter: &mut Emitter) {
+    match comparison {
+        IntComparison::Eq => {
+            emitter.push(op(0x00, 4, T0, T0, T1)); // xor
+            emitter.push(sltiu(T0, T0, 1));
+        }
+        IntComparison::Ne => {
+            emitter.push(op(0x00, 4, T0, T0, T1)); // xor
+            emitter.push(op(0x00, 3, T0, ZERO, T0)); // sltu t0, zero, t0
+        }
+        IntComparison::LtS => emitter.push(op(0x00, 2, T0, T0, T1)), // slt
+        IntComparison::GtS => emitter.push(op(0x00, 2, T0, T1, T0)),
+        IntComparison::LeS => {
+            emitter.push(op(0x00, 2, T0, T1, T0));
+            emitter.push(xori(T0, T0, 1));
+        }
+        IntComparison::GeS => {
+            emitter.push(op(0x00, 2, T0, T0, T1));
+            emitter.push(xori(T0, T0, 1));
+        }
+        IntComparison::LtU => emitter.push(op(0x00, 3, T0, T0, T1)), // sltu
+        IntComparison::GtU => emitter.push(op(0x00, 3, T0, T1, T0)),
+        IntComparison::LeU => {
+            emitter.push(op(0x00, 3, T0, T1, T0));
+            emitter.push(xori(T0, T0, 1));
+        }
+        IntComparison::GeU => {
+            emitter.push(op(0x00, 3, T0, T0, T1));
+            emitter.push(xori(T0, T0, 1));
+        }
+    }
+}
+
+/// `result = left op right` on `t0` and `t1`.
+fn binary(
+    word: u32,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let left = frame.slot(left);
+    let right = frame.slot(right);
+    let destination = frame.slot(result);
+    emitter.push(load(3, T0, SP, left as i32));
+    emitter.push(load(3, T1, SP, right as i32));
+    emitter.push(word);
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
+/// Division and remainder, signed or unsigned, at 32 or 64 bits, with Wasm's traps.
+///
+/// A zero divisor traps. For signed division, the minimum value divided by -1 traps, and its
+/// remainder is zero, so a divisor of -1 takes a path that does not divide.
+#[allow(clippy::too_many_arguments)]
+fn divide(
+    signed: bool,
+    remainder: bool,
+    wide: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let left = frame.slot(left);
+    let right = frame.slot(right);
+    let destination = frame.slot(result);
+    emitter.push(load(3, T0, SP, left as i32));
+    emitter.push(load(3, T1, SP, right as i32));
+
+    // A zero divisor is a trap: `bne t1, zero, ok; trap; ok:`. The sign-extended form of a 32-bit
+    // zero is zero, so the 64-bit test is right at both widths.
+    let nonzero = emitter.new_label();
+    emitter.branch(branch(1, T1, ZERO), Target::Label(nonzero), Fixup::Branch13);
+    trap(frame, crate::STATUS_DIVIDE_BY_ZERO, emitter);
+    emitter.bind(nonzero);
+
+    let done = emitter.new_label();
+    let normal = emitter.new_label();
+    if signed {
+        // t2 = -1. A divisor of -1 is the case that can overflow.
+        emitter.push(addi(T2, ZERO, -1));
+        emitter.branch(branch(1, T1, T2), Target::Label(normal), Fixup::Branch13); // bne t1, t2
+        if remainder {
+            // The remainder by -1 is zero.
+            emitter.push(addi(T0, ZERO, 0));
+            emitter.branch(JAL_ZERO, Target::Label(done), Fixup::Jump21);
+        } else {
+            // t2 = the minimum value at this width, sign-extended. Its quotient by -1 traps.
+            if wide {
+                emitter.push(addi(T2, ZERO, 1));
+                emitter.push(slli(T2, T2, 63));
+            } else {
+                emitter.push(lui(T2, 0x80000)); // sign-extends to i32::MIN
+            }
+            emitter.branch(branch(1, T0, T2), Target::Label(normal), Fixup::Branch13); // bne t0, t2
+            trap(frame, crate::STATUS_OVERFLOW, emitter);
+        }
+    }
+    emitter.bind(normal);
+    let word = match (signed, remainder, wide) {
+        (true, false, true) => op(0x01, 4, T0, T0, T1), // div
+        (true, true, true) => op(0x01, 6, T0, T0, T1),  // rem
+        (false, false, true) => op(0x01, 5, T0, T0, T1), // divu
+        (false, true, true) => op(0x01, 7, T0, T0, T1), // remu
+        (true, false, false) => op_w(0x01, 4, T0, T0, T1), // divw
+        (true, true, false) => op_w(0x01, 6, T0, T0, T1), // remw
+        (false, false, false) => op_w(0x01, 5, T0, T0, T1), // divuw
+        (false, true, false) => op_w(0x01, 7, T0, T0, T1), // remuw
+    };
+    emitter.push(word);
+    emitter.bind(done);
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
+/// Compute the address of an access of `width` bytes into `t3`, after checking it against the
+/// memory and loading the memory base.
+///
+/// The effective address is the 32-bit operand plus the offset, computed in 64 bits, so it cannot
+/// wrap. The check is `address + width <= memory_len`, read from the context.
+fn emit_address(
+    address: ValueId,
+    offset: u32,
+    width: u32,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    if offset > MAX_OFFSET {
+        return Err(JitError::Unsupported(
+            "a memory offset too large for the RISC-V encoder".into(),
+        ));
+    }
+    let address = frame.slot(address);
+    emitter.push(load(3, T0, SP, address as i32));
+    // Zero-extend the 32-bit operand: the slot holds it sign-extended.
+    emitter.push(slli(T0, T0, 32));
+    emitter.push(srli(T0, T0, 32));
+    load_constant32(T1, offset as i32, emitter);
+    emitter.push(op(0x00, 0, T0, T0, T1)); // add t0, t0, t1: the effective address
+    emitter.push(addi(T2, T0, width as i32)); // the end of the access
+    emitter.push(load(3, T3, SP, frame.context as i32)); // the context
+    emitter.push(load(3, T4, T3, MEMORY_LENGTH_OFFSET)); // the memory length
+    let inside = emitter.new_label();
+    // bgeu t4, t2, inside: the access ends at or before the end of the memory.
+    emitter.branch(branch(7, T4, T2), Target::Label(inside), Fixup::Branch13);
+    trap(frame, crate::STATUS_MEMORY_OUT_OF_BOUNDS, emitter);
+    emitter.bind(inside);
+    emitter.push(load(3, T3, T3, MEMORY_BASE_OFFSET)); // the memory base
+    emitter.push(op(0x00, 0, T3, T3, T0)); // add t3, t3, t0: the address of the access
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_context_offsets_match_the_context_layout() {
+        assert_eq!(MEMORY_BASE_OFFSET, 0);
+        assert_eq!(MEMORY_LENGTH_OFFSET, 8);
+        assert_eq!(STATUS_OFFSET, 16);
+    }
+
+    #[test]
+    fn a_constant_loads_with_addi_when_it_fits_and_lui_addiw_otherwise() {
+        let mut emitter = Emitter::new();
+        load_constant32(T0, 7, &mut emitter);
+        assert_eq!(emitter.words, vec![0x0070_0293]); // addi t0, zero, 7
+        let mut emitter = Emitter::new();
+        load_constant32(T0, 0x1234_5678, &mut emitter);
+        assert_eq!(emitter.words.len(), 2);
+    }
+
+    #[test]
+    fn a_return_ends_with_the_return_instruction() {
+        use tpt_wasm_ir::IrValue;
+        use tpt_wasm_types::{FunctionType, ResultType, ValueType};
+        let function = IrFunction {
+            function_type: FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(vec![ValueType::I32]),
+            },
+            params: Vec::new(),
+            locals: Vec::new(),
+            values: vec![IrValue {
+                id: ValueId(0),
+                value_type: ValueType::I32,
+            }],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                instrs: vec![IrInstr::ConstI32 {
+                    result: ValueId(0),
+                    value: 7,
+                }],
+                terminator: Terminator::Return(vec![ValueId(0)]),
+            }],
+        };
+        let code = encode(&function).expect("compiles");
+        let last = u32::from_le_bytes(code[code.len() - 4..].try_into().unwrap());
+        assert_eq!(last, RET, "jalr x0, 0(ra)");
+    }
+}
