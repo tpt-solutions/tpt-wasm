@@ -1538,6 +1538,14 @@ impl BaselineMemory {
         self.data.get(start..end).map(<[u8]>::to_vec)
     }
 
+    /// The whole memory, for a native tier that reads and writes it directly.
+    ///
+    /// Only the engine calls this, and only while it holds the memory's lock, so the
+    /// slice cannot outlive the call that asked for it.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     pub fn max_pages(&self) -> Option<u64> {
         self.max_pages
     }
