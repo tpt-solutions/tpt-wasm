@@ -144,7 +144,7 @@ impl Generator<'_, '_> {
         if depth == 0 {
             return self.leaf(kind, params);
         }
-        let choice = self.bytes.byte() % 10;
+        let choice = self.bytes.byte() % 12;
         match (kind, choice) {
             (_, 0 | 1) => self.leaf(kind, params),
             (Kind::I32, 2 | 3) => {
@@ -176,6 +176,19 @@ impl Generator<'_, '_> {
                 let mut out = self.expression(Kind::F64, depth - 1, params);
                 // abs, neg, sqrt, ceil, floor, trunc, nearest
                 out.push([0x99, 0x9A, 0x9F, 0x9B, 0x9C, 0x9D, 0x9E][self.pick(7)]);
+                out
+            }
+            (Kind::I32, 10 | 11) => {
+                // A truncation of an f64, which traps on a NaN, an infinity, or an out-of-range
+                // value: the trap is part of what is compared.
+                let mut out = self.expression(Kind::F64, depth - 1, params);
+                out.push(if self.bytes.byte() % 2 == 0 { 0xAA } else { 0xAB });
+                out
+            }
+            (Kind::F64, 10 | 11) => {
+                // An i32 converted to an f64, signed or unsigned.
+                let mut out = self.expression(Kind::I32, depth - 1, params);
+                out.push(if self.bytes.byte() % 2 == 0 { 0xB7 } else { 0xB8 });
                 out
             }
             (_, 6) => self.call(kind, depth, params),
