@@ -31,7 +31,7 @@
 //!
 //! Each value lives in a stack slot, so each IR instruction is a load, at most one operation,
 //! and a store. Anything else is refused with [`JitError::Unsupported`] rather than compiled
-//! approximately: rotations, bit counting, calls through imported or exported tables, memory growth and size, and a frame larger than the
+//! approximately: rotations, bit counting, calls through imported or exported tables, `memory.grow`, and a frame larger than the
 //! encoder's limit are left to the interpreter or the baseline. A call to a function that is not
 //! compiled refuses the caller too, so [`compile_module`] leaves that caller out as well.
 //!

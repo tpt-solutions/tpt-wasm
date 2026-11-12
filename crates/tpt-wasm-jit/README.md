@@ -19,7 +19,7 @@ A function whose parameters and result are `i32`, `i64`, `f32`, or `f64`, and wh
   functions `ceil`, `floor`, `trunc`, and `nearest`, the comparisons (with NaN handled as Wasm
   requires), and `neg` and `abs`. On x86-64 the rounding functions need SSE4.1, so the target name
   records it, and they are refused on a host without it;
-- integer loads and stores of every width, and `f32` and `f64` loads and stores;
+- integer loads and stores of every width, `f32` and `f64` loads and stores, and `memory.size`, which is fixed during a call;
 - direct calls to other functions of the same module, when they are compiled together with
   `compile_module`; a call is made through a table of entry points in the call context, and
   a call past the call-depth limit traps as it does on Micro;
@@ -33,7 +33,7 @@ A function whose parameters and result are `i32`, `i64`, `f32`, or `f64`, and wh
 - unconditional and conditional branches, including loops, and a return.
 
 Everything else is refused with `JitError::Unsupported`. That includes calls through an imported
-or exported table, globals, memory growth, and frames larger than one page. A function that calls one of those is refused too. A single function compiled with
+or exported table, globals, `memory.grow` (which changes the memory during a call, so it stays on the baseline), and frames larger than one page. A function that calls one of those is refused too. A single function compiled with
 `compile` on its own cannot call anything, since a call needs the module it belongs to.
 
 Division and remainder, signed and unsigned, are compiled with Wasm's traps. A zero divisor

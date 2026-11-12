@@ -1435,6 +1435,17 @@ fn emit_instruction(
             value,
             operation,
         } => float_trunc_into(*operation, *result, *value, frame, emitter)?,
+        IrInstr::MemorySize { result } => {
+            // The memory cannot grow during a native call, so its length, in bytes, is fixed for
+            // the call. The size in pages is that length shifted right by 16 bits.
+            let destination = frame.slot(*result);
+            emitter.memory_wide(&[0x8B], EAX, frame.context); // mov rax, [ctx]
+            emitter
+                .bytes
+                .extend_from_slice(&[0x48, 0x8B, 0x40, MEMORY_LENGTH_OFFSET]); // mov rax, [rax + len]
+            emitter.bytes.extend_from_slice(&[0x48, 0xC1, 0xE8, 0x10]); // shr rax, 16
+            emitter.store64(EAX, destination);
+        }
         IrInstr::Drop { .. } => {}
         IrInstr::Call {
             function,

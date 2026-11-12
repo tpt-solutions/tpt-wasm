@@ -924,6 +924,14 @@ fn emit_instruction(
             value,
             operation,
         } => float_trunc_into(*operation, *result, *value, frame, emitter),
+        IrInstr::MemorySize { result } => {
+            // Fixed for the call, as on x86-64: the length in bytes, shifted right by 16 bits.
+            let destination = frame.slot(*result);
+            emitter.push(ldr_x(R9, SP, frame.context));
+            emitter.push(ldr_x(R9, R9, MEMORY_LENGTH_OFFSET));
+            emitter.push(0xD340_FC00 | (16 << 16) | (9 << 5) | 9); // lsr x9, x9, #16
+            emitter.push(str_x(R9, SP, destination));
+        }
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
         IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),

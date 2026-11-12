@@ -407,18 +407,18 @@ fn a_deep_caller_with_a_large_frame_is_left_to_the_baseline() {
 ))]
 #[test]
 fn a_caller_of_a_refused_function_is_not_compiled() {
-    // f0() = memory.size, which the compiler refuses; f1() = f0(); f2() = 7.
-    let memory_size = vec![0x3F, 0x00, 0x0B];
+    // f0() = memory.grow, which the compiler refuses; f1() = f0(); f2() = 7.
+    let memory_grow = vec![0x41, 0x01, 0x40, 0x00, 0x0B]; // i32.const 1; memory.grow; end
     let calls_refused = vec![0x10, 0x00, 0x0B];
     let seven = vec![0x41, 0x07, 0x0B];
     let module = module(
         vec![0, 0, 0],
-        vec![memory_size, calls_refused, seven],
+        vec![memory_grow, calls_refused, seven],
         vec![ValueType::I32; 3],
         true,
     );
     let code = compiled(&module, 1_000);
-    assert!(!code.is_compiled(0), "memory.size is refused");
+    assert!(!code.is_compiled(0), "memory.grow is refused");
     assert!(
         !code.is_compiled(1),
         "a caller of a refused function is left out"
