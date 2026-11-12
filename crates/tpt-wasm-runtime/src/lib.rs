@@ -29,6 +29,9 @@ use tpt_wasm_validate::{ValidatedModule, ValidationError, Validator};
 mod cache;
 mod debug;
 mod jit_tier;
+mod native_cache;
+
+pub use native_cache::default_native_cache_dir;
 mod optimizing;
 mod provenance;
 
@@ -136,6 +139,10 @@ pub struct Config {
     pub deterministic: bool,
     pub debugging: bool,
     pub profiling: bool,
+    /// Where compiled native code is cached between processes, or `None` for no cache. The directory
+    /// must belong to the current user and be writable by no one else; see `default_native_cache_dir`.
+    /// Only the native tier uses it, so it needs the `jit` feature, and it works on Unix only.
+    pub native_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -147,6 +154,7 @@ impl Default for Config {
             deterministic: true,
             debugging: false,
             profiling: false,
+            native_cache_dir: None,
         }
     }
 }
@@ -546,6 +554,7 @@ impl Linker {
             execution,
             &Config::default(),
             None,
+            None,
         )
     }
 }
@@ -557,6 +566,8 @@ pub struct Engine {
     linker: Linker,
     context: RuntimeContext,
     cache: CompilationCache,
+    /// The on-disk cache of compiled native code, when `Config::native_cache_dir` asks for one.
+    native_cache: Option<native_cache::NativeCache>,
 }
 
 impl Engine {
@@ -577,7 +588,13 @@ impl Engine {
                 "the jit engine mode needs the `jit` feature",
             ));
         }
+        let native_cache = config
+            .native_cache_dir
+            .as_deref()
+            .map(native_cache::NativeCache::open)
+            .transpose()?;
         Ok(Self {
+            native_cache,
             context: RuntimeContext::new(config.limits),
             config,
             linker: Linker::new(),
@@ -597,7 +614,8 @@ impl Engine {
             .validate(module)
             .map_err(RuntimeError::Validation)?;
         let ir = self.cached_ir(bytes, &validated)?;
-        self.instantiate_prepared(validated, ir)
+        let key = native_cache::module_key(bytes);
+        self.instantiate_prepared(validated, ir, Some(&key))
     }
 
     /// Hit, miss, and entry counts for the compilation cache.
@@ -630,15 +648,22 @@ impl Engine {
         Ok(Some(ir))
     }
 
+    /// `key` is the module's cache key, when the module came from bytes; a module given as a
+    /// structure has none, and is compiled every time.
     fn instantiate_prepared(
         &self,
         validated: ValidatedModule,
         ir: Option<Arc<IrModule>>,
+        key: Option<&str>,
     ) -> Result<Instance, RuntimeError> {
         let execution = if self.config.deterministic {
             ExecutionConfig::deterministic(0)
         } else {
             ExecutionConfig::host_dependent()
+        };
+        let native = match (self.native_cache.as_ref(), key) {
+            (Some(cache), Some(key)) => Some((cache, key)),
+            _ => None,
         };
         instantiate_module(
             validated.module,
@@ -647,6 +672,7 @@ impl Engine {
             execution,
             &self.config,
             ir.as_deref(),
+            native,
         )
     }
 
@@ -672,11 +698,19 @@ impl Engine {
         // No bytes to key a cache entry by, so a structural module is compiled
         // every time. `instantiate_bytes` is the cached path.
         let ir = compile_ir(&validated, &self.config)?.map(Arc::new);
-        self.instantiate_prepared(validated, ir)
+        self.instantiate_prepared(validated, ir, None)
     }
 
     pub fn linker_mut(&mut self) -> &mut Linker {
         &mut self.linker
+    }
+
+    /// How many native compilations this engine has answered from its on-disk cache, or `None` when
+    /// no cache is configured.
+    pub fn native_cache_hits(&self) -> Option<u64> {
+        self.native_cache
+            .as_ref()
+            .map(native_cache::NativeCache::hits)
     }
 
     /// The configuration this engine was built with.
@@ -1122,6 +1156,7 @@ fn instantiate_module(
     execution: ExecutionConfig,
     config: &Config,
     ir: Option<&IrModule>,
+    native_cache: Option<(&native_cache::NativeCache, &str)>,
 ) -> Result<Instance, RuntimeError> {
     // Lowered first, while the module is still whole: the instantiation below
     // takes its sections apart, after which it can no longer be borrowed. The IR
@@ -1436,9 +1471,12 @@ fn instantiate_module(
         && !config.debugging
         && config.limits.max_execution_steps.is_none();
     let jit = match ir {
-        Some(ir) if native_allowed => {
-            jit_tier::JitTier::compile(ir, config.limits.max_call_depth as u64, table_private)
-        }
+        Some(ir) if native_allowed => jit_tier::JitTier::compile_cached(
+            ir,
+            config.limits.max_call_depth as u64,
+            table_private,
+            native_cache,
+        ),
         _ => jit_tier::JitTier::default(),
     };
     let mut instance = Instance {

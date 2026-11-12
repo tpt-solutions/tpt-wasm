@@ -16,6 +16,7 @@ use tpt_wasm_types::Value;
 #[cfg(feature = "jit")]
 use tpt_wasm_types::ValueType;
 
+use crate::native_cache::NativeCache;
 use crate::RuntimeError;
 
 #[derive(Default)]
@@ -32,6 +33,16 @@ impl JitTier {
     /// native. `max_call_depth` is the call-depth limit the native calls enforce.
     #[cfg(feature = "jit")]
     pub(crate) fn compile(ir: &IrModule, max_call_depth: u64, table_private: bool) -> Self {
+        Self::from_compiled(
+            ir,
+            tpt_wasm_jit::compile_module(ir, max_call_depth, table_private),
+        )
+    }
+
+    /// The tier for a module already compiled. The signatures come from the IR, which the baseline
+    /// lowers from the same bytes, so they match the compiled functions.
+    #[cfg(feature = "jit")]
+    fn from_compiled(ir: &IrModule, module: tpt_wasm_jit::CompiledModule) -> Self {
         let signatures = ir
             .functions
             .iter()
@@ -48,13 +59,41 @@ impl JitTier {
             })
             .collect();
         Self {
-            module: Some(tpt_wasm_jit::compile_module(
-                ir,
-                max_call_depth,
-                table_private,
-            )),
+            module: Some(module),
             signatures,
         }
+    }
+
+    /// As `compile`, but the module is loaded from the native cache when the cache holds a trusted
+    /// entry for it, and is stored there after a compile. A store that fails means only that the next
+    /// instantiation compiles the module again.
+    #[cfg(all(feature = "jit", unix))]
+    pub(crate) fn compile_cached(
+        ir: &IrModule,
+        max_call_depth: u64,
+        table_private: bool,
+        cache: Option<(&NativeCache, &str)>,
+    ) -> Self {
+        let Some((cache, key)) = cache else {
+            return Self::compile(ir, max_call_depth, table_private);
+        };
+        if let Some(module) = cache.load(key, ir.functions.len(), max_call_depth) {
+            return Self::from_compiled(ir, module);
+        }
+        let module = tpt_wasm_jit::compile_module(ir, max_call_depth, table_private);
+        let _ = cache.store(key, &module, max_call_depth);
+        Self::from_compiled(ir, module)
+    }
+
+    /// Without a cache that can be used on this platform, the module is compiled.
+    #[cfg(not(all(feature = "jit", unix)))]
+    pub(crate) fn compile_cached(
+        ir: &IrModule,
+        max_call_depth: u64,
+        table_private: bool,
+        _cache: Option<(&NativeCache, &str)>,
+    ) -> Self {
+        Self::compile(ir, max_call_depth, table_private)
     }
 
     /// Without the feature there is no native code to compile.

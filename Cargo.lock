@@ -270,6 +270,7 @@ name = "tpt-wasm-runtime"
 version = "0.1.0"
 dependencies = [
  "sha2",
+ "tpt-wasm-aot",
  "tpt-wasm-capability",
  "tpt-wasm-codegen",
  "tpt-wasm-decode",

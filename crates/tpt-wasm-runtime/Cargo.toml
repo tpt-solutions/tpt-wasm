@@ -25,7 +25,9 @@ sha2 = "0.11"
 # The native tier. Off by default: the JIT carries the only `unsafe` in the
 # compiled path, so a build that does not ask for it does not contain it.
 tpt-wasm-jit = { workspace = true, optional = true }
+# The on-disk cache of compiled native code stores module artifacts, so it needs the AOT format.
+tpt-wasm-aot = { workspace = true, optional = true }
 
 [features]
 default = []
-jit = ["dep:tpt-wasm-jit"]
+jit = ["dep:tpt-wasm-jit", "dep:tpt-wasm-aot"]
