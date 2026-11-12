@@ -1,0 +1,118 @@
+# Threat model
+
+This document covers the subsystems `spec.txt` section 43 names as security boundaries:
+decoder, validator, interpreter, host, resource system, compiler, and executable memory.
+For each threat it says which mechanism addresses it and which test or tool checks that
+mechanism. Where nothing checks a claim, the entry says so. A threat with no mechanism is
+listed under **Open**.
+
+Evidence is named by test or file, so each claim can be re-run. Fuzzing evidence is a count
+of runs without a failure. It is evidence, not a proof of absence.
+
+## Decoder (`tpt-wasm-decode`)
+
+| Threat | Mechanism | Evidence |
+|---|---|---|
+| Malformed binaries | Every read is bounds-checked; EOF and bad LEB128 are errors, not panics | Malformed-binary rejection tests (M1); `decode` fuzz target: 14.4M runs in 5 minutes, no failure |
+| Oversized allocations | Vectors grow one decoded element at a time, so a declared length cannot allocate more than the input supplies. Local counts are summed in `u64` and capped at 2^32-1 | `decoder.rs` `vector` and the local-count check; fuzzing as above |
+| Integer overflow | Offsets use `checked_add` (`decoder.rs`); LEB128 widths are checked against the target type | Decoder tests; fuzzing as above |
+| Recursion | Body decoding and validation are iterative. The validator keeps an explicit control stack | `tpt-wasm-micro/src/instr.rs` `decode_body`; `tpt-wasm-validate/src/body.rs` |
+| Nesting exhaustion | No recursion on nesting, so depth costs heap, not host stack. A module nesting 100,000 blocks runs on every engine in about a second | `deeply_nested_blocks_do_not_exhaust_the_host_stack` (runtime) |
+| Oversized memory declaration | Declared memories above the resource limit are refused by every backend | `an_oversized_memory_is_refused_everywhere_and_not_allocated` (oracle). Found by the `differential` fuzzer, kept as `fuzz/artifacts/differential/oom-*` |
+
+## Validator (`tpt-wasm-validate`, `tpt-wasm-ir` verifier)
+
+| Threat | Mechanism | Evidence |
+|---|---|---|
+| Type confusion | Full type checking of every instruction before execution; the IR verifier checks types again after lowering | Validation error tests (M1); IR verifier tests (M6) |
+| Out-of-range branch labels | Label lookup is checked (`label_types`, `checked_sub`) | Validator tests |
+| Lowering that breaks typing | The IR verifier runs after lowering and after optimization, and the contract checker compares optimized and original traces | `tpt-wasm-opt/src/contract.rs`; the optimizer tests |
+
+## Interpreter (`tpt-wasm-micro`)
+
+| Threat | Mechanism | Evidence |
+|---|---|---|
+| Memory out-of-bounds | Every load and store is range-checked and traps | Core spec suite on Micro (16,075 assertions); memory tests |
+| Table out-of-bounds | Indirect calls check the index against the table and trap | Core spec suite; `an_indirect_call_out_of_range_traps_like_micro` |
+| Stack exhaustion | Operand stack depth is limited by `max_stack_depth`; call depth by `max_call_depth`. Both trap with `StackOverflow` or `CallDepthExceeded` | `machine.rs` (`StackOverflow` at push); call-depth tests |
+| Runaway execution | Instruction budget (`max_execution_steps`) charged per step | `both_backends_enforce_the_instruction_budget` |
+| Reference errors | Null and out-of-range references trap; `ref.func` to a missing function is refused | `a_ref_func_to_a_missing_function_is_refused`; reference tests on both backends |
+
+## Host (`tpt-wasm-host`, `tpt-wasm-capability`, `tpt-wasm-resource`, `tpt-wasm-wasi`)
+
+| Threat | Mechanism | Evidence |
+|---|---|---|
+| Capability escalation | A capability is invoked only with a matching grant on the exact operation. Grants are explicit | `ungranted_and_undergranted_operations_cannot_invoke`; `malicious_module_cannot_use_ungranted_capability_and_hosts_are_isolated` |
+| Confused deputy | Each invocation names the capability and operation; no ambient identity is consulted | Host tests above |
+| Ambient authority | No filesystem, clock, random, or stdio authority unless granted. The WASI adapter installs only explicit bindings. The Preview 1 core takes every stream, clock seed and argument as an explicit grant | `wasi_adapter_installs_only_explicit_bindings`; `unbound_preview1_import_is_not_installed`; the Preview 1 tests |
+| Resource lifetime | Handles are opaque and monotonic; a removed handle is invalid; a wrong-type removal keeps the resource | `handles_are_opaque_monotonic_and_invalidated_on_remove`; `wrong_type_removal_preserves_the_resource` |
+| Revocation | Revoking a capability removes authority for later calls | `matching_grant_invokes_and_revocation_removes_authority` |
+| Reentrancy | Calls on one engine are serialized by a call gate. A host function receives only its arguments and the caller's memory, not an engine handle, so it cannot call back into the engine | `call_gate` in `tpt-wasm-runtime`; while a debug session is open, other calls and instantiation are refused (`while_a_session_is_open_no_other_instance_can_call_or_instantiate`). No dedicated test for host-side reentrancy, because the structure rules it out rather than a check |
+| Host-side memory access | A host function's view of memory is a bounds-checked `GuestMemory`; an out-of-range access is reported, not a panic | `host_function_reaches_the_callers_memory_on_both_backends` (an out-of-range write is a host failure) |
+
+## Resource system (`tpt-wasm-runtime` limits)
+
+| Threat | Mechanism | Evidence |
+|---|---|---|
+| Unbounded memory | `max_memory_pages` caps growth; `memory.grow` past the cap returns -1 | `memory_growth_per_call_agrees_on_both_backends` |
+| Unbounded tables | `max_table_elements` caps table size; growth past it is refused | `table_allocation_bounds_and_reference_types_are_checked` (`tpt-wasm-micro` store) |
+| Unbounded instances | `max_instances` caps the store; the instance past the cap is refused | `the_instance_limit_refuses_the_instance_past_it` (`tpt-wasm-micro` store) |
+| Unbounded time | `max_execution_steps` (see Interpreter) | Budget tests |
+
+## Compiler (`tpt-wasm-opt`, `tpt-wasm-codegen`, `tpt-wasm-ir`)
+
+| Threat | Mechanism | Evidence |
+|---|---|---|
+| Incorrect bounds elimination | A bounds check is removed only when the access provably fits the memory | `bounds_checks_are_removed_only_when_the_access_fits_the_memory`; the contract checker |
+| Control-flow corruption | The IR verifier checks dominance, edge arity and types after every pass; the contract checker compares traces | IR verifier tests; `contract.rs`; `differential` fuzzer: 9.46M runs after the optimizer fixes |
+| Register allocation bugs | Allocation runs last and is covered by the same differential tests | Optimizer differential tests; `differential` fuzzer |
+| Calling-convention errors | The baseline's internal convention is checked by the same call tests as Micro | `baseline_matches_micro_for_a_direct_call`; recursion-depth tests |
+| Super-linear compile time | Fixed in this round: the CFG pass, dominance fixpoint, branch-type check and contract walk were quadratic or worse on nested blocks. A 100,000-block nest compiles and runs in about a second on the optimizing engine | `deeply_nested_blocks_do_not_exhaust_the_host_stack` |
+
+## Executable memory (`tpt-wasm-jit`, `tpt-wasm-aot`)
+
+`tpt-wasm-jit` generates x86-64 machine code for a subset of the IR (see its crate
+documentation). `tpt-wasm-aot` stores that code as an artifact and loads it back. The
+executable-memory boundary is the one place in the workspace where `unsafe` code is allowed to run
+generated code.
+
+| Threat | Mechanism | Evidence |
+|---|---|---|
+| Writable and executable pages at the same time | Write-then-execute: a page is mapped read-write, the code is copied in, then the page is changed to read-execute. No page is both writable and executable | `exec.rs` (`ExecutableCode::new`); the protection sequence is in the module's documentation |
+| Patching installed code | The mapping is read-execute once installed and is never written again | `exec.rs`; the `Send`/`Sync` impls rely on this and say so |
+| Unsafe code outside the boundary | `#![deny(unsafe_code)]` at the crate root; the only `allow` is on the `exec` module | `crates/tpt-wasm-jit/src/lib.rs` |
+| Generated code that does not match the IR | Encoder is safe code, tested on every target: golden encodings for the prologue and a constant return, register and ABI tests, and a back-edge test. Generated code is run against Micro on generated programs, including loops, conditional branches, `select`, `local.tee`, shifts past the operand width, and comparisons | `tests/differential.rs` (straight-line: 600 functions) and `tests/control_flow.rs` (control flow: 2,880 runs), on Windows x64 and, under WSL, Linux System V. All pass; a guard requires varied results |
+| Code that the encoder cannot handle is compiled anyway | Anything outside the subset is refused with `Unsupported`, so no approximation is generated. Division is compiled with its traps, and each trap is reported in a status half of the 64-bit return value. `i32` and `i64` arithmetic, comparison, conversion and memory access are compiled; operations outside the subset (floats, calls, memory growth) are refused | `an_f32_value_is_refused_on_every_target` (an `f32` value); `tests/wide.rs` (`i64` arithmetic, memory widths and traps agree with Micro); `tests/division.rs` (every trap and value outcome agrees with Micro, all four operations). A branch to a missing block and a branch with the wrong arity are refused by the encoder, with no test of their own yet |
+| Native code runs where the engine's own accounting should apply | The `EngineMode::Jit` native tier is off for an instance with a step limit, profiling or debugging, since native code charges no steps and keeps no profile. A native function reads memory only through the baseline's memory under its lock, and makes no calls | `tests/jit_tier.rs` (`a_step_limit_keeps_every_call_on_the_baseline`, `a_native_load_sees_what_a_baseline_store_wrote`), run with `--features jit` |
+| Calls with the wrong arity | The call checks the argument count before entering the code | `a_call_with_the_wrong_arity_is_refused` |
+| Unbounded resources | One mapping per compiled function, page-rounded; the mapping is released when the handle is dropped | `Drop for ExecutableCode`. No test measures leaks yet |
+| Calling convention errors | The compiled function takes a pointer to its arguments and a pointer to a context, in the first two integer argument registers of the host ABI (System V: `rdi`, `rsi`; Win64: `rcx`, `rdx`). Both are kept in frame slots, because the code uses every scratch register. The Win64 and System V registers are distinct and tested | `Abi` in `x86.rs`; the golden prologue encoding |
+| Calling convention errors on AArch64 and RISC-V | The same two-pointer convention on AAPCS64 (`x0`, `x1`) and LP64 (`a0`, `a1`), with the result in the first return register. Each is run under QEMU against Micro | the aarch64 and riscv64 differential runs (`tests/*.rs` under `qemu-aarch64` and `qemu-riscv64`) |
+| Stale instruction cache | AArch64 cleans the data cache and invalidates the instruction cache for the written range, with barriers. RISC-V runs `fence.i`. x86-64 keeps the two coherent. A missing flush would run old bytes | `flush_instruction_cache` in `exec.rs`. Not tested directly: QEMU does not model a stale cache, so the flush is checked by the code and the barrier order, not by a test |
+
+| Out-of-bounds linear memory access in compiled code | Every load and store computes its effective address in 64 bits (so it cannot wrap), checks `address + width <= memory_len` from the context, and traps before touching memory. The bounds hint in the IR is ignored, so an access the optimizer believed safe is still checked | `tests/memory.rs`: 240 programs with random widths, signedness and offsets, addresses near the page end, and each result and the full page compared with Micro. A call without memory traps |
+| Memory access through a wrong context | The context is a `#[repr(C)]` struct owned by the call frame; the base pointer is read only after the check, and a call with no memory gets a null base with length zero, so no access reaches it | `Context` in `lib.rs`; `a_call_without_memory_traps_on_any_access` |
+| Corrupted artifact | FNV-1a 64 checksum over the whole artifact; truncation at every length, a flipped byte, a wrong magic, and trailing bytes are each refused | `tpt-wasm-aot` tests (`a_flipped_byte_is_a_checksum_mismatch`, `a_truncated_artifact_is_refused_at_every_length`, and others) |
+| Forged artifact | Not defended. The checksum is not a signature. Loading an artifact runs its code, so artifacts must come from a store the loader trusts | Stated in the crate documentation. Signing is not implemented |
+| Artifact run on the wrong target | The target name is recorded and checked before the code is installed | `an_artifact_for_another_target_does_not_load` |
+| Encoder bugs found by fuzzing | The `jit` fuzz target compares compiled code with Micro on random stack programs, including division and control flow | `fuzz/fuzz_targets/jit.rs`: 370,666 runs in eight minutes and 132,311 in two, no divergence and no crash |
+
+Open for this boundary: no test that a freed mapping is unreachable; no defence against a host that changes page permissions underneath the JIT.
+The JIT is not yet reachable from `Engine`: an embedder who calls it directly accepts these
+risks, and the engine modes do not change until the same differential tests cover the mode.
+
+## Open
+
+- **Host stack per baseline frame.** The depth limit of 1000 needs about 1.0–1.3 MiB of host
+  stack in a debug build and about 0.5–0.75 MiB in release. An embedder on a smaller thread has
+  no guarantee that the limit is reached before the stack is exhausted. Tracked in `todo.md`.
+- **Super-linear worst cases beyond nesting.** The nesting fixes address the shapes the fuzzers
+  and this test produce. Other shapes, such as many uses of values defined deep in a chain, may
+  still cost O(depth) per use in `dominates`. Not measured for every pass.
+- **Compile-time bounds.** Validation and optimization time is not bounded by a resource limit.
+  Only execution is. A module can still be expensive to compile even though it is small to
+  download.
+- **Miri.** `tpt-wasm-codegen` did not finish within the Miri time limit, and `tpt-wasm-opt`
+  was not clean within it earlier. Those crates have no Miri result yet. Miri cannot run the
+  JIT's generated code, so the JIT's encoder tests are its only Miri-checkable part.
+- **Fuzzing duration.** The fuzzing above is 5-minute runs. Longer campaigns have not been run.
