@@ -68,6 +68,7 @@ fn sleb(mut value: i64) -> Vec<u8> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     I32,
+    F32,
     F64,
 }
 
@@ -75,17 +76,20 @@ impl Kind {
     fn value_type(self) -> ValueType {
         match self {
             Kind::I32 => ValueType::I32,
+            Kind::F32 => ValueType::F32,
             Kind::F64 => ValueType::F64,
         }
     }
 }
 
 /// The module's function types. Type 0 is `(i32, i32) -> i32`, the type indirect calls name.
-const TYPES: [(&[Kind], Kind); 4] = [
+const TYPES: [(&[Kind], Kind); 6] = [
     (&[Kind::I32, Kind::I32], Kind::I32),
     (&[Kind::I32], Kind::I32),
     (&[Kind::F64, Kind::F64], Kind::F64),
     (&[Kind::F64], Kind::I32),
+    (&[Kind::F32, Kind::F32], Kind::F32),
+    (&[Kind::F32], Kind::I32),
 ];
 
 const I32_BINARY: [u8; 21] = [
@@ -131,6 +135,11 @@ impl Generator<'_, '_> {
                 out.extend(sleb(i64::from(self.bytes.word())));
                 out
             }
+            Kind::F32 => {
+                let mut out = vec![0x43];
+                out.extend((self.bytes.word() as u32).to_le_bytes());
+                out
+            }
             Kind::F64 => {
                 let mut out = vec![0x44];
                 out.extend(self.bytes.quad().to_le_bytes());
@@ -144,7 +153,7 @@ impl Generator<'_, '_> {
         if depth == 0 {
             return self.leaf(kind, params);
         }
-        let choice = self.bytes.byte() % 12;
+        let choice = self.bytes.byte() % 14;
         match (kind, choice) {
             (_, 0 | 1) => self.leaf(kind, params),
             (Kind::I32, 2 | 3) => {
@@ -154,10 +163,29 @@ impl Generator<'_, '_> {
                 out
             }
             (Kind::I32, 4) => {
-                // f64 comparisons, which yield an i32.
-                let mut out = self.expression(Kind::F64, depth - 1, params);
-                out.extend(self.expression(Kind::F64, depth - 1, params));
-                out.push(0x61 + self.pick(6) as u8);
+                // f32 or f64 comparisons, which yield an i32: eq ne lt gt le ge.
+                let width = if self.bytes.byte() % 2 == 0 {
+                    Kind::F32
+                } else {
+                    Kind::F64
+                };
+                let base = if width == Kind::F32 { 0x5B } else { 0x61 };
+                let mut out = self.expression(width, depth - 1, params);
+                out.extend(self.expression(width, depth - 1, params));
+                out.push(base + self.pick(6) as u8);
+                out
+            }
+            (Kind::F32, 2 | 3) => {
+                let mut out = self.expression(Kind::F32, depth - 1, params);
+                out.extend(self.expression(Kind::F32, depth - 1, params));
+                // add sub mul div min max copysign
+                out.push([0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98][self.pick(7)]);
+                out
+            }
+            (Kind::F32, 4) => {
+                let mut out = self.expression(Kind::F32, depth - 1, params);
+                // abs, neg, ceil, floor, trunc, nearest, sqrt
+                out.push([0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x91][self.pick(7)]);
                 out
             }
             (Kind::I32, 5) => {
@@ -179,17 +207,45 @@ impl Generator<'_, '_> {
                 out
             }
             (Kind::I32, 10 | 11) => {
-                // A truncation of an f64, which traps on a NaN, an infinity, or an out-of-range
+                // A truncation of a float, which traps on a NaN, an infinity, or an out-of-range
                 // value: the trap is part of what is compared.
-                let mut out = self.expression(Kind::F64, depth - 1, params);
-                out.push(if self.bytes.byte() % 2 == 0 { 0xAA } else { 0xAB });
-                out
+                if self.bytes.byte() % 2 == 0 {
+                    let mut out = self.expression(Kind::F64, depth - 1, params);
+                    out.push(if self.bytes.byte() % 2 == 0 { 0xAA } else { 0xAB });
+                    out
+                } else {
+                    let mut out = self.expression(Kind::F32, depth - 1, params);
+                    out.push(if self.bytes.byte() % 2 == 0 { 0xA8 } else { 0xA9 });
+                    out
+                }
             }
             (Kind::F64, 10 | 11) => {
                 // An i32 converted to an f64, signed or unsigned.
                 let mut out = self.expression(Kind::I32, depth - 1, params);
                 out.push(if self.bytes.byte() % 2 == 0 { 0xB7 } else { 0xB8 });
                 out
+            }
+            (Kind::F32, 10 | 11) => {
+                // An f64 demoted to an f32, or an i32 converted to one, signed or unsigned.
+                if self.bytes.byte() % 2 == 0 {
+                    let mut out = self.expression(Kind::F64, depth - 1, params);
+                    out.push(0xB6); // f32.demote_f64
+                    out
+                } else {
+                    let mut out = self.expression(Kind::I32, depth - 1, params);
+                    out.push(if self.bytes.byte() % 2 == 0 { 0xB2 } else { 0xB3 });
+                    out
+                }
+            }
+            (Kind::F64, 12 | 13) => {
+                // An f32 promoted to an f64.
+                let mut out = self.expression(Kind::F32, depth - 1, params);
+                out.push(0xBB); // f64.promote_f32
+                out
+            }
+            (Kind::I32, 12 | 13) => {
+                // memory.size: the memory's length in pages, which is fixed during a call.
+                vec![0x3F, 0x00]
             }
             (_, 6) => self.call(kind, depth, params),
             (Kind::I32, 7) => self.indirect_call(depth, params),
@@ -200,6 +256,10 @@ impl Generator<'_, '_> {
                     Kind::I32 => {
                         out.extend(self.expression(Kind::I32, depth - 1, params));
                         out.extend([0x36, 0x02, 0x00]); // i32.store
+                    }
+                    Kind::F32 => {
+                        out.extend(self.expression(Kind::F32, depth - 1, params));
+                        out.extend([0x38, 0x02, 0x00]); // f32.store
                     }
                     Kind::F64 => {
                         out.extend(self.expression(Kind::F64, depth - 1, params));
@@ -214,6 +274,7 @@ impl Generator<'_, '_> {
                 let mut out = self.address(depth, params);
                 match kind {
                     Kind::I32 => out.extend([0x28, 0x02, 0x00]), // i32.load
+                    Kind::F32 => out.extend([0x2A, 0x02, 0x00]), // f32.load
                     Kind::F64 => out.extend([0x2B, 0x03, 0x00]), // f64.load
                 }
                 out
@@ -400,6 +461,7 @@ fn micro_instance(module: &Module) -> tpt_wasm_runtime::Instance {
 fn to_value(kind: Kind, bits: u64) -> Value {
     match kind {
         Kind::I32 => Value::I32(bits as u32 as i32),
+        Kind::F32 => Value::F32(bits as u32),
         Kind::F64 => Value::F64(bits),
     }
 }
@@ -425,6 +487,7 @@ fuzz_target!(|data: &[u8]| {
         let index = usize::from(bytes.byte()) % module.functions.len();
         let function_type = &module.types[module.functions[index].type_index as usize];
         let result_kind = match function_type.results.0[0] {
+            ValueType::F32 => Kind::F32,
             ValueType::F64 => Kind::F64,
             _ => Kind::I32,
         };
@@ -433,10 +496,10 @@ fuzz_target!(|data: &[u8]| {
             .0
             .iter()
             .map(|parameter| {
-                let kind = if *parameter == ValueType::F64 {
-                    Kind::F64
-                } else {
-                    Kind::I32
+                let kind = match parameter {
+                    ValueType::F32 => Kind::F32,
+                    ValueType::F64 => Kind::F64,
+                    _ => Kind::I32,
                 };
                 (kind, bytes.quad())
             })
