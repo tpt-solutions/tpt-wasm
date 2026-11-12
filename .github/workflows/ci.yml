@@ -53,6 +53,12 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      # The native tier is behind a feature, so the workspace run above does not build it.
+      - name: cargo clippy and test with the native tier
+        run: |
+          cargo clippy -p tpt-wasm-runtime --all-targets --features jit -- -D warnings
+          cargo test -p tpt-wasm-runtime --features jit
+
   # Builds the CLI twice in fresh target directories and fails unless the binaries
   # match. See scripts/repro-check.sh for what is controlled and why.
   reproducible:
@@ -146,6 +152,9 @@ jobs:
 
       - name: cargo test --target ${{ matrix.target }}
         run: cargo test --workspace --target ${{ matrix.target }}
+
+      - name: cargo test with the native tier --target ${{ matrix.target }}
+        run: cargo test -p tpt-wasm-runtime --features jit --target ${{ matrix.target }}
 
   deny:
     name: License and advisory audit
