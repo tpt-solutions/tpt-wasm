@@ -878,6 +878,36 @@ fn emit_instruction(
             }
             emit_call_indirect(*type_index, *operand, arguments, results, frame, emitter)?
         }
+        IrInstr::F32Min {
+            result,
+            left,
+            right,
+        } => float_min_max(false, false, *result, *left, *right, frame, emitter),
+        IrInstr::F32Max {
+            result,
+            left,
+            right,
+        } => float_min_max(false, true, *result, *left, *right, frame, emitter),
+        IrInstr::F64Min {
+            result,
+            left,
+            right,
+        } => float_min_max(true, false, *result, *left, *right, frame, emitter),
+        IrInstr::F64Max {
+            result,
+            left,
+            right,
+        } => float_min_max(true, true, *result, *left, *right, frame, emitter),
+        IrInstr::F32Copysign {
+            result,
+            left,
+            right,
+        } => float_copysign(false, *result, *left, *right, frame, emitter),
+        IrInstr::F64Copysign {
+            result,
+            left,
+            right,
+        } => float_copysign(true, *result, *left, *right, frame, emitter),
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
         IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),
@@ -1248,6 +1278,88 @@ fn float_binary(
     emitter.push(str_x(R9, SP, destination));
 }
 
+/// `fsqrt <vd>, <vn>`, on a single or double register.
+fn float_sqrt(wide: bool, vd: u32, vn: u32) -> u32 {
+    let base = if wide { 0x1E61_C000 } else { 0x1E21_C000 };
+    base | (vn << 5) | vd
+}
+
+/// `min` or, when `maximum`, `max`, with Micro's rules. An unordered comparison takes the canonical
+/// NaN. Equal operands take the OR of their bits for `min` and the AND for `max`, which picks the
+/// negative zero for `min` and the positive one for `max`. Otherwise `min` takes the smaller operand
+/// and `max` the larger.
+fn float_min_max(
+    wide: bool,
+    maximum: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    /// The `vs` condition, set by an unordered comparison, and the `lt` condition.
+    const VS: u32 = 6;
+    const LT: u32 = 11;
+    let destination = load_operands(left, right, result, frame, emitter);
+    emitter.push(fmov_to_float(wide, 0, R9));
+    emitter.push(fmov_to_float(wide, 1, R10));
+    emitter.push(float_compare(wide, 0, 1));
+    let nan = emitter.new_label();
+    let unequal = emitter.new_label();
+    let less = emitter.new_label();
+    let done = emitter.new_label();
+    emitter.branch(b_cond(VS), Target::Label(nan), Fixup::Branch19);
+    emitter.branch(b_cond(NE), Target::Label(unequal), Fixup::Branch19);
+    let combine = if maximum { AND } else { ORR };
+    emitter.push(alu(wide, combine, R9, R9, R10));
+    emitter.branch(B, Target::Label(done), Fixup::Branch26);
+    emitter.bind(unequal);
+    emitter.branch(b_cond(LT), Target::Label(less), Fixup::Branch19);
+    // Greater: `min` takes the right operand, `max` keeps the left.
+    if !maximum {
+        emitter.push(mov_x(R9, R10));
+    }
+    emitter.branch(B, Target::Label(done), Fixup::Branch26);
+    emitter.bind(less);
+    // Less: `max` takes the right operand, `min` keeps the left.
+    if maximum {
+        emitter.push(mov_x(R9, R10));
+    }
+    emitter.branch(B, Target::Label(done), Fixup::Branch26);
+    emitter.bind(nan);
+    let bits = if wide {
+        0x7ff8_0000_0000_0000
+    } else {
+        u64::from(0x7fc0_0000u32)
+    };
+    emit_constant(bits, R9, emitter);
+    emitter.bind(done);
+    emitter.push(str_x(R9, SP, destination));
+}
+
+/// `copysign`: the left operand's magnitude with the right operand's sign, bit for bit.
+fn float_copysign(
+    wide: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let destination = load_operands(left, right, result, frame, emitter);
+    let (magnitude, sign) = if wide {
+        (u64::MAX >> 1, 1u64 << 63)
+    } else {
+        (0x7fff_ffff, 0x8000_0000)
+    };
+    emit_constant(magnitude, R11, emitter);
+    emitter.push(alu(wide, AND, R9, R9, R11));
+    emit_constant(sign, R12, emitter);
+    emitter.push(alu(wide, AND, R10, R10, R12));
+    emitter.push(alu(wide, ORR, R9, R9, R10));
+    emitter.push(str_x(R9, SP, destination));
+}
+
 /// Replace a NaN in `v0` with the canonical NaN that Micro produces. An unordered `fcmp` sets V,
 /// so the replacement is skipped unless the value is a NaN.
 fn canonicalize_nan(wide: bool, emitter: &mut Emitter) {
@@ -1349,6 +1461,16 @@ fn float_unary_arm(
     match operation {
         FloatUnary::Neg => float_unary_into(wide, false, result, value, frame, emitter),
         FloatUnary::Abs => float_unary_into(wide, true, result, value, frame, emitter),
+        FloatUnary::Sqrt => {
+            let source = frame.slot(value);
+            let destination = frame.slot(result);
+            emitter.push(ldr_x(R9, SP, source));
+            emitter.push(fmov_to_float(wide, 0, R9));
+            emitter.push(float_sqrt(wide, 0, 0));
+            canonicalize_nan(wide, emitter);
+            emitter.push(fmov_from_float(wide, R9, 0));
+            emitter.push(str_x(R9, SP, destination));
+        }
         other => {
             return Err(JitError::Unsupported(format!(
                 "the {other:?} float operation"

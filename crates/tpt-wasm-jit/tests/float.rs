@@ -323,6 +323,50 @@ const F64_COMPARE: [(u8, &str); 6] = [
     (0x66, "f64.ge"),
 ];
 
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        unix,
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    )
+))]
+#[test]
+fn compiled_float_sqrt_min_max_and_copysign_agree_with_micro() {
+    // The operands include both zeros, NaNs, infinities and negatives, which are the cases where
+    // min and max take their special rules, and sqrt of a negative gives a NaN.
+    let mut rng = Lcg(0x7070_7070);
+    let mut cases = binary_cases(
+        ValueType::F32,
+        &[(0x96, "f32.min"), (0x97, "f32.max"), (0x98, "f32.copysign")],
+        ValueType::F32,
+    );
+    cases.extend(binary_cases(
+        ValueType::F64,
+        &[(0xA4, "f64.min"), (0xA5, "f64.max"), (0xA6, "f64.copysign")],
+        ValueType::F64,
+    ));
+    for (op, name, width) in [
+        (0x91, "f32.sqrt", ValueType::F32),
+        (0x9F, "f64.sqrt", ValueType::F64),
+    ] {
+        cases.push(Case {
+            params: vec![width],
+            result: width,
+            body: vec![0x20, 0x00, op, 0x0B],
+            memory: false,
+            name: name.into(),
+        });
+    }
+    let (values, traps, _) = check(&cases, &mut rng, 300);
+    // Eight cases at three hundred operands each, every one a value: none is skipped.
+    assert_eq!(values, cases.len() * 300);
+    assert_eq!(traps, 0, "float operations do not trap");
+}
+
 fn binary_cases(width: ValueType, table: &[(u8, &str)], result: ValueType) -> Vec<Case> {
     table
         .iter()

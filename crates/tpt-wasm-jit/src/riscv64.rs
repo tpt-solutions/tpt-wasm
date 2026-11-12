@@ -819,6 +819,36 @@ fn emit_instruction(
             }
             emit_call_indirect(*type_index, *operand, arguments, results, frame, emitter)?
         }
+        IrInstr::F32Min {
+            result,
+            left,
+            right,
+        } => float_min_max(false, false, *result, *left, *right, frame, emitter),
+        IrInstr::F32Max {
+            result,
+            left,
+            right,
+        } => float_min_max(false, true, *result, *left, *right, frame, emitter),
+        IrInstr::F64Min {
+            result,
+            left,
+            right,
+        } => float_min_max(true, false, *result, *left, *right, frame, emitter),
+        IrInstr::F64Max {
+            result,
+            left,
+            right,
+        } => float_min_max(true, true, *result, *left, *right, frame, emitter),
+        IrInstr::F32Copysign {
+            result,
+            left,
+            right,
+        } => float_copysign(false, *result, *left, *right, frame, emitter),
+        IrInstr::F64Copysign {
+            result,
+            left,
+            right,
+        } => float_copysign(true, *result, *left, *right, frame, emitter),
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
         IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),
@@ -1324,6 +1354,97 @@ fn float_compare_into(
     emitter.push(store(3, T0, SP, destination as i32));
 }
 
+/// `fsqrt.s` or, when `wide`, `fsqrt.d`, rounding to nearest even, on `f<fs1>` into `f<fd>`.
+fn float_sqrt_op(wide: bool, fd: u32, fs1: u32) -> u32 {
+    r_type(0x2C | u32::from(wide), 0, fs1, 0, fd, 0x53)
+}
+
+/// `min` or, when `maximum`, `max`, with Micro's rules: a NaN in either operand gives the canonical
+/// NaN; equal operands take the OR of their bits for `min` and the AND for `max`, which picks the
+/// negative zero for `min` and the positive one for `max`; otherwise `min` takes the smaller and
+/// `max` the larger. The comparisons run on `f0` and `f1`, the bits on `t0` and `t1`.
+fn float_min_max(
+    wide: bool,
+    maximum: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let left = frame.slot(left);
+    let right = frame.slot(right);
+    let destination = frame.slot(result);
+    emitter.push(load(3, T0, SP, left as i32));
+    emitter.push(load(3, T1, SP, right as i32));
+    emitter.push(fmv_to_float(wide, 0, T0));
+    emitter.push(fmv_to_float(wide, 1, T1));
+    let nan = emitter.new_label();
+    let equal = emitter.new_label();
+    let less = emitter.new_label();
+    let done = emitter.new_label();
+    // A NaN makes `feq x, x` zero: branch to the canonical NaN when either operand is one.
+    emitter.push(float_compare_bit(wide, 2, T2, 0, 0));
+    emitter.branch(branch(0, T2, ZERO), Target::Label(nan), Fixup::Branch13);
+    emitter.push(float_compare_bit(wide, 2, T2, 1, 1));
+    emitter.branch(branch(0, T2, ZERO), Target::Label(nan), Fixup::Branch13);
+    emitter.push(float_compare_bit(wide, 2, T2, 0, 1));
+    emitter.branch(branch(1, T2, ZERO), Target::Label(equal), Fixup::Branch13);
+    emitter.push(float_compare_bit(wide, 1, T2, 0, 1));
+    emitter.branch(branch(1, T2, ZERO), Target::Label(less), Fixup::Branch13);
+    // Greater: `min` takes the right operand, `max` keeps the left.
+    if !maximum {
+        emitter.push(addi(T0, T1, 0));
+    }
+    emitter.branch(JAL_ZERO, Target::Label(done), Fixup::Jump21);
+    emitter.bind(less);
+    // Less: `max` takes the right operand, `min` keeps the left.
+    if maximum {
+        emitter.push(addi(T0, T1, 0));
+    }
+    emitter.branch(JAL_ZERO, Target::Label(done), Fixup::Jump21);
+    emitter.bind(equal);
+    emitter.push(op(0, if maximum { 7 } else { 6 }, T0, T0, T1)); // and for max, or for min
+    emitter.branch(JAL_ZERO, Target::Label(done), Fixup::Jump21);
+    emitter.bind(nan);
+    let bits = if wide {
+        0x7ff8_0000_0000_0000i64
+    } else {
+        0x7fc0_0000i64
+    };
+    load_constant64(T0, bits, emitter);
+    emitter.bind(done);
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
+/// `copysign`: the left operand's magnitude with the right operand's sign, bit for bit. A 32-bit
+/// result is masked to its low half, so its upper half is zero, as the other backends leave it.
+fn float_copysign(
+    wide: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let left = frame.slot(left);
+    let right = frame.slot(right);
+    let destination = frame.slot(result);
+    let (magnitude, sign) = if wide {
+        (i64::MAX, i64::MIN)
+    } else {
+        (0x7fff_ffff, 0x8000_0000)
+    };
+    emitter.push(load(3, T0, SP, left as i32));
+    emitter.push(load(3, T1, SP, right as i32));
+    load_constant64(T2, magnitude, emitter);
+    emitter.push(op(0, 7, T0, T0, T2)); // and t0, t0, t2
+    load_constant64(T2, sign, emitter);
+    emitter.push(op(0, 7, T1, T1, T2)); // and t1, t1, t2
+    emitter.push(op(0, 6, T0, T0, T1)); // or t0, t0, t1
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
 /// Negation and absolute value, the only unary floats the native code covers. The rest are refused.
 fn float_unary_arm(
     wide: bool,
@@ -1333,6 +1454,17 @@ fn float_unary_arm(
     frame: &mut Frame,
     emitter: &mut Emitter,
 ) -> Result<(), JitError> {
+    if operation == FloatUnary::Sqrt {
+        let source = frame.slot(value);
+        let destination = frame.slot(result);
+        emitter.push(load(3, T0, SP, source as i32));
+        emitter.push(fmv_to_float(wide, 0, T0));
+        emitter.push(float_sqrt_op(wide, 0, 0));
+        canonicalize_nan(wide, emitter);
+        emitter.push(fmv_from_float(wide, T0, 0));
+        emitter.push(store(3, T0, SP, destination as i32));
+        return Ok(());
+    }
     let abs = match operation {
         FloatUnary::Neg => false,
         FloatUnary::Abs => true,

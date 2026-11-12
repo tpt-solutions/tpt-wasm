@@ -737,6 +737,16 @@ fn float_unary(
 ) -> Result<(), JitError> {
     let value = frame.slot(value);
     let destination = frame.slot(result);
+    if operation == FloatUnary::Sqrt {
+        // sqrtss/sqrtsd xmm0, xmm0. A negative operand gives the hardware's NaN, which is replaced.
+        let prefix = if wide { 0xF2 } else { 0xF3 };
+        emitter.scalar_load_xmm0(prefix, value);
+        emitter.bytes.extend_from_slice(&[prefix, 0x0F, 0x51, 0xC0]);
+        canonicalize_nan_xmm0(wide, emitter);
+        emitter.move_xmm0_to_rax(wide);
+        emitter.store64(EAX, destination);
+        return Ok(());
+    }
     match (wide, operation) {
         (false, FloatUnary::Neg) => {
             // mov eax, [value]; xor eax, 0x8000_0000
@@ -774,6 +784,126 @@ fn float_unary(
     }
     emitter.store64(EAX, destination);
     Ok(())
+}
+
+/// `min` or, when `maximum`, `max`, with Micro's rules. A NaN in either operand gives the canonical
+/// NaN. Two equal values have the same bits, except for zeros of different sign, where the sign bits
+/// decide: `min` takes the OR of the bits, negative if either is, and `max` the AND, positive if
+/// either is. Otherwise `min` takes the smaller operand and `max` the larger.
+fn float_min_max(
+    wide: bool,
+    maximum: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let left = frame.slot(left);
+    let right = frame.slot(right);
+    let destination = frame.slot(result);
+    // eax = left, ecx = right; then xmm0 and xmm1 hold the same two values.
+    if wide {
+        emitter.load64(EAX, left);
+        emitter.load64(ECX, right);
+        emitter
+            .bytes
+            .extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // movq xmm0, rax
+        emitter
+            .bytes
+            .extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC9]); // movq xmm1, rcx
+        emitter.bytes.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC1]); // ucomisd xmm0, xmm1
+    } else {
+        emitter.load32(EAX, left);
+        emitter.load32(ECX, right);
+        emitter.bytes.extend_from_slice(&[0x66, 0x0F, 0x6E, 0xC0]); // movd xmm0, eax
+        emitter.bytes.extend_from_slice(&[0x66, 0x0F, 0x6E, 0xC9]); // movd xmm1, ecx
+        emitter.bytes.extend_from_slice(&[0x0F, 0x2E, 0xC1]); // ucomiss xmm0, xmm1
+    }
+    let nan = emitter.new_label();
+    let unequal = emitter.new_label();
+    let less = emitter.new_label();
+    let done = emitter.new_label();
+    emitter.jump(&[0x0F, 0x8A], Target::Label(nan)); // jp: unordered, a NaN
+    emitter.jump(&[0x0F, 0x85], Target::Label(unequal)); // jne
+                                                         // Equal: the bits combine. `or` for `min`, `and` for `max`.
+    let combine: &[u8] = match (wide, maximum) {
+        (true, false) => &[0x48, 0x09, 0xC8],
+        (true, true) => &[0x48, 0x21, 0xC8],
+        (false, false) => &[0x09, 0xC8],
+        (false, true) => &[0x21, 0xC8],
+    };
+    emitter.bytes.extend_from_slice(combine);
+    emitter.jump(&[0xE9], Target::Label(done));
+    emitter.bind(unequal);
+    emitter.jump(&[0x0F, 0x82], Target::Label(less)); // jb: left < right
+                                                      // Greater: `min` takes the right operand, `max` keeps the left.
+    if !maximum {
+        emitter.bytes.extend_from_slice(if wide {
+            &[0x48, 0x89, 0xC8]
+        } else {
+            &[0x89, 0xC8]
+        }); // mov rax/eax, rcx/ecx
+    }
+    emitter.jump(&[0xE9], Target::Label(done));
+    emitter.bind(less);
+    // Less: `max` takes the right operand, `min` keeps the left.
+    if maximum {
+        emitter.bytes.extend_from_slice(if wide {
+            &[0x48, 0x89, 0xC8]
+        } else {
+            &[0x89, 0xC8]
+        });
+    }
+    emitter.jump(&[0xE9], Target::Label(done));
+    emitter.bind(nan);
+    if wide {
+        emitter.movabs(EAX, CANONICAL_F64 as i64);
+    } else {
+        emitter.bytes.push(0xB8); // mov eax, imm32
+        emitter
+            .bytes
+            .extend_from_slice(&CANONICAL_F32.to_le_bytes());
+    }
+    emitter.bind(done);
+    emitter.store64(EAX, destination);
+}
+
+/// `copysign`: the magnitude of the left operand with the sign of the right, bit for bit, so a NaN
+/// on the left keeps its payload, as Micro's `copysign` does.
+fn float_copysign(
+    wide: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let left = frame.slot(left);
+    let right = frame.slot(right);
+    let destination = frame.slot(result);
+    if wide {
+        emitter.load64(EAX, left);
+        emitter.load64(ECX, right);
+        emitter.movabs(EDX, i64::MAX);
+        emitter.bytes.extend_from_slice(&[0x48, 0x21, 0xD0]); // and rax, rdx
+        emitter.movabs(EDX, i64::MIN);
+        emitter.bytes.extend_from_slice(&[0x48, 0x21, 0xD1]); // and rcx, rdx
+        emitter.bytes.extend_from_slice(&[0x48, 0x09, 0xC8]); // or rax, rcx
+    } else {
+        emitter.load32(EAX, left);
+        emitter.load32(ECX, right);
+        emitter.bytes.push(0x25); // and eax, 0x7fff_ffff
+        emitter
+            .bytes
+            .extend_from_slice(&0x7fff_ffffu32.to_le_bytes());
+        emitter.bytes.extend_from_slice(&[0x81, 0xE1]); // and ecx, 0x8000_0000
+        emitter
+            .bytes
+            .extend_from_slice(&0x8000_0000u32.to_le_bytes());
+        emitter.bytes.extend_from_slice(&[0x09, 0xC8]); // or eax, ecx
+    }
+    emitter.store64(EAX, destination);
 }
 
 /// A direct call to another function of the module, through the call table in the context.
@@ -974,6 +1104,36 @@ fn emit_instruction(
             emitter.movabs(EAX, *value);
             emitter.store64(EAX, slot);
         }
+        IrInstr::F32Min {
+            result,
+            left,
+            right,
+        } => float_min_max(false, false, *result, *left, *right, frame, emitter),
+        IrInstr::F32Max {
+            result,
+            left,
+            right,
+        } => float_min_max(false, true, *result, *left, *right, frame, emitter),
+        IrInstr::F64Min {
+            result,
+            left,
+            right,
+        } => float_min_max(true, false, *result, *left, *right, frame, emitter),
+        IrInstr::F64Max {
+            result,
+            left,
+            right,
+        } => float_min_max(true, true, *result, *left, *right, frame, emitter),
+        IrInstr::F32Copysign {
+            result,
+            left,
+            right,
+        } => float_copysign(false, *result, *left, *right, frame, emitter),
+        IrInstr::F64Copysign {
+            result,
+            left,
+            right,
+        } => float_copysign(true, *result, *left, *right, frame, emitter),
         IrInstr::Drop { .. } => {}
         IrInstr::Call {
             function,

@@ -16,7 +16,8 @@
 //!   (signed and unsigned, with Wasm's traps), the comparisons, `eqz`, `select`, the integer
 //!   width conversions (`wrap`, `extend`), and the sign extensions `extend8_s`, `extend16_s`,
 //!   and `extend32_s`;
-//! - the float operations `add`, `sub`, `mul`, `div`, the comparisons, `neg`, and `abs`;
+//! - the float operations `add`, `sub`, `mul`, `div`, `min`, `max`, `copysign`, `sqrt`, the
+//!   comparisons, `neg`, and `abs`;
 //! - linear memory: loads and stores of all the integer widths and of both float widths, each
 //!   checked against the memory's length;
 //! - direct calls to other functions of the same module, when they are compiled with

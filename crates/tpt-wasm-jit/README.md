@@ -15,7 +15,7 @@ A function whose parameters and result are `i32`, `i64`, `f32`, or `f64`, and wh
   (`local.get`, `local.set`, `local.tee`);
 - the integer operations `add`, `sub`, `mul`, `and`, `or`, `xor`, the shifts `shl`, `shr_s`,
   and `shr_u`, the comparisons, `eqz`, and `select`, at both widths;
-- the float operations `add`, `sub`, `mul`, and `div`, the comparisons (with NaN handled as
+- the float operations `add`, `sub`, `mul`, `div`, `min`, `max`, `copysign`, `sqrt`, the comparisons (with NaN handled as
   Wasm requires), and `neg` and `abs`;
 - integer loads and stores of every width, and `f32` and `f64` loads and stores;
 - direct calls to other functions of the same module, when they are compiled together with
@@ -26,8 +26,9 @@ A function whose parameters and result are `i32`, `i64`, `f32`, or `f64`, and wh
   in the order Micro checks them, and each slot must hold a function compiled in the same module;
 - unconditional and conditional branches, including loops, and a return.
 
-Everything else is refused with `JitError::Unsupported`. That includes the other float
-operations (`sqrt`, the rounding functions, `min`, `max`, `copysign`), the conversions between
+Everything else is refused with `JitError::Unsupported`. That includes the float rounding
+functions (`ceil`, `floor`, `trunc`, `nearest`), which need an SSE4.1 instruction on x86-64 and so
+wait on a decision about the minimum CPU, the conversions between
 integers and floats, calls through an imported or exported table, globals, memory growth, and
 frames larger than one page. A function that calls one of those is refused too. A single function compiled with
 `compile` on its own cannot call anything, since a call needs the module it belongs to.
