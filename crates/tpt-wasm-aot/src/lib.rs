@@ -309,6 +309,15 @@ impl ModuleArtifact {
         &self.target
     }
 
+    /// The artifact for a module that is already compiled, for the host the module was compiled on.
+    /// This avoids compiling the module a second time to store it.
+    pub fn from_module(module: &CompiledModule) -> Self {
+        Self {
+            target: target_id().to_owned(),
+            parts: module.parts(),
+        }
+    }
+
     /// Each function by index: its code, or `None` where it was not compiled.
     pub fn functions(&self) -> &[Option<FunctionParts>] {
         &self.parts.functions
