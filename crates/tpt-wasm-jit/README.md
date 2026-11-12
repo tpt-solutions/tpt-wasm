@@ -3,23 +3,34 @@
 The JIT compiler for [TPT-Wasm](https://github.com/tpt-solutions/tpt-wasm).
 
 > **Status: partial.** The crate compiles a subset of the IR to x86-64, AArch64, and RISC-V 64
-> machine code, and that
-> subset is checked against the Micro interpreter. It is not yet reachable from the `Engine`:
-> there is no engine mode for it. Use the `Baseline` or `Optimizing` modes of
-> [`tpt-wasm`](https://docs.rs/tpt-wasm) for execution through the engine.
+> machine code, and that subset is checked against the Micro interpreter. The `Engine` reaches it
+> through `EngineMode::Jit` in `tpt-wasm-runtime`, which needs that crate's `jit` feature: each
+> function the compiler accepts runs natively, and the rest run on the baseline.
 
 ## What it compiles
 
-A function over `i32` values, returning one `i32`, whose body is:
+A function whose parameters and result are `i32`, `i64`, `f32`, or `f64`, and whose body is:
 
-- `i32` constants; reads and writes of parameters and declared locals (`local.get`,
-  `local.set`, `local.tee`);
+- `i32`, `i64`, `f32`, and `f64` constants; reads and writes of parameters and declared locals
+  (`local.get`, `local.set`, `local.tee`);
 - the integer operations `add`, `sub`, `mul`, `and`, `or`, `xor`, the shifts `shl`, `shr_s`,
-  and `shr_u`, the comparisons, `eqz`, and `select`;
+  and `shr_u`, the comparisons, `eqz`, and `select`, at both widths;
+- the float operations `add`, `sub`, `mul`, and `div`, the comparisons (with NaN handled as
+  Wasm requires), and `neg` and `abs`;
+- integer loads and stores of every width, and `f32` and `f64` loads and stores;
+- direct calls to other functions of the same module, when they are compiled together with
+  `compile_module`; a call is made through a table of entry points in the call context, and
+  a call past the call-depth limit traps as it does on Micro;
+- indirect calls through the module's table, when that table is defined in the module and not
+  exported (so no other instance can write it). The index and the slot's signature are checked
+  in the order Micro checks them, and each slot must hold a function compiled in the same module;
 - unconditional and conditional branches, including loops, and a return.
 
-Everything else is refused with `JitError::Unsupported`. That includes `i64`, floats, memory,
-calls, and frames larger than one page.
+Everything else is refused with `JitError::Unsupported`. That includes the other float
+operations (`sqrt`, the rounding functions, `min`, `max`, `copysign`), the conversions between
+integers and floats, calls through an imported or exported table, globals, memory growth, and
+frames larger than one page. A function that calls one of those is refused too. A single function compiled with
+`compile` on its own cannot call anything, since a call needs the module it belongs to.
 
 Division and remainder, signed and unsigned, are compiled with Wasm's traps. A zero divisor
 and `i32::MIN / -1` return `JitError::Trap`, the same trap Micro reports. The return value

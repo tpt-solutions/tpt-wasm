@@ -20,12 +20,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
-    BasicBlock, BlockId, IntComparison, IntConversion, IrFunction, IrInstr, MemoryLoad,
-    MemoryStore, SignExtend, Terminator, ValueId,
+    BasicBlock, BlockId, FloatComparison, FloatUnary, IntComparison, IntConversion, IrFunction,
+    IrInstr, MemoryLoad, MemoryStore, SignExtend, Terminator, ValueId,
 };
 use tpt_wasm_types::ValueType;
 
-use crate::{Context, JitError};
+use crate::{
+    CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_INDIRECT_TYPE_MISMATCH,
+    STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
+};
 
 /// The calling convention whose argument registers the code reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +79,12 @@ const MAX_FRAME: i32 = 4096;
 const STATUS_OFFSET: u8 = std::mem::offset_of!(Context, status) as u8;
 /// The byte offset of the memory length inside the context.
 const MEMORY_LENGTH_OFFSET: u8 = std::mem::offset_of!(Context, memory_len) as u8;
+const FUNCTIONS_OFFSET: u8 = std::mem::offset_of!(Context, functions) as u8;
+const DEPTH_OFFSET: u8 = std::mem::offset_of!(Context, depth) as u8;
+const DEPTH_LIMIT_OFFSET: u8 = std::mem::offset_of!(Context, depth_limit) as u8;
+const TABLE_ENTRIES_OFFSET: u8 = std::mem::offset_of!(Context, table_entries) as u8;
+const TABLE_TYPES_OFFSET: u8 = std::mem::offset_of!(Context, table_types) as u8;
+const TABLE_LEN_OFFSET: u8 = std::mem::offset_of!(Context, table_len) as u8;
 
 /// Two-operand opcodes with `rax` as the destination and a memory source.
 const OP_ADD: &[u8] = &[0x03];
@@ -109,10 +118,15 @@ struct Frame {
     used: i32,
     /// The slot holding the context pointer.
     context: i32,
+    /// What the function's calls may name, and the table they may index.
+    env: CallEnv,
+    abi: Abi,
+    /// Bytes reserved below the slots for a callee's shadow space. Set when the function calls.
+    shadow: i32,
 }
 
 impl Frame {
-    fn new(function: &IrFunction) -> Self {
+    fn new(function: &IrFunction, abi: Abi, env: &CallEnv) -> Self {
         Self {
             slots: HashMap::new(),
             types: function
@@ -122,7 +136,25 @@ impl Frame {
                 .collect(),
             used: 0,
             context: 0,
+            env: env.clone(),
+            abi,
+            shadow: 0,
         }
+    }
+
+    /// A block of `words` consecutive slots, and the offset of its first word. The words ascend
+    /// in memory from that offset, so the block can be passed as an array of arguments.
+    fn block(&mut self, words: usize) -> i32 {
+        self.used += 8 * words as i32;
+        -self.used
+    }
+
+    fn is_callable(&self, function: u32) -> bool {
+        self.env
+            .callable
+            .get(function as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// The `rbp`-relative offset of a value's slot, allocated on first use.
@@ -142,9 +174,10 @@ impl Frame {
         -self.used
     }
 
-    /// The frame size: the slots, rounded up to a multiple of 16.
+    /// The frame size: the slots and any shadow space, rounded up to a multiple of 16, which keeps
+    /// the stack aligned at every call.
     fn size(&self) -> i32 {
-        (self.used + 15) / 16 * 16
+        (self.used + self.shadow + 15) / 16 * 16
     }
 
     fn value_type(&self, value: ValueId) -> Option<ValueType> {
@@ -253,6 +286,38 @@ impl Emitter {
         self.bytes.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
     }
 
+    /// `movss xmm0, [rbp + disp]` (`prefix` 0xF3) or `movsd xmm0, [rbp + disp]` (0xF2).
+    fn scalar_load_xmm0(&mut self, prefix: u8, disp: i32) {
+        self.bytes.push(prefix);
+        self.memory(&[0x0F, 0x10], 0, disp);
+    }
+
+    /// `addss`/`subss`/`mulss`/`divss` (or the `sd` forms) `xmm0, [rbp + disp]`, selected by
+    /// `opcode` (0x58, 0x5C, 0x59, 0x5E) and the same `prefix` as the load.
+    fn scalar_op_xmm0(&mut self, prefix: u8, opcode: u8, disp: i32) {
+        self.bytes.push(prefix);
+        self.memory(&[0x0F, opcode], 0, disp);
+    }
+
+    /// `movd eax, xmm0` or, when `wide`, `movq rax, xmm0`. The 32-bit form zero-extends.
+    fn move_xmm0_to_rax(&mut self, wide: bool) {
+        if wide {
+            self.bytes
+                .extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]);
+        } else {
+            self.bytes.extend_from_slice(&[0x66, 0x0F, 0x7E, 0xC0]);
+        }
+    }
+
+    /// `ucomiss xmm0, [rbp + disp]` (or `ucomisd` when `wide`). Sets ZF, PF and CF; an unordered
+    /// pair sets all three, so it reads as neither "above" nor "equal".
+    fn unordered_compare_xmm0(&mut self, wide: bool, disp: i32) {
+        if wide {
+            self.bytes.push(0x66);
+        }
+        self.memory(&[0x0F, 0x2E], 0, disp);
+    }
+
     /// A shift of `rax` by `cl`, 64 bits wide: `shl` (/4), `shr` (/5), or `sar` (/7).
     fn shift_by_cl_wide(&mut self, extension: u8) {
         self.bytes
@@ -327,7 +392,7 @@ impl Emitter {
 }
 
 /// Compile `function` to machine code for `abi`.
-pub(crate) fn encode(function: &IrFunction, abi: Abi) -> Result<Vec<u8>, JitError> {
+pub(crate) fn encode(function: &IrFunction, abi: Abi, env: &CallEnv) -> Result<Vec<u8>, JitError> {
     check_supported(function)?;
     let blocks: HashMap<BlockId, &BasicBlock> = function
         .blocks
@@ -335,7 +400,7 @@ pub(crate) fn encode(function: &IrFunction, abi: Abi) -> Result<Vec<u8>, JitErro
         .map(|block| (block.id, block))
         .collect();
 
-    let mut frame = Frame::new(function);
+    let mut frame = Frame::new(function, abi, env);
     let mut emitter = Emitter::new();
 
     // The two pointers arrive in argument registers. They are kept in slots, because the code
@@ -407,7 +472,7 @@ fn emit_terminator(
             let slot = frame.slot(values[0]);
             // A 32-bit result is loaded at 32 bits, which zero-extends; a 64-bit one at 64.
             match frame.value_type(values[0]) {
-                Some(ValueType::I64) => emitter.load64(EAX, slot),
+                Some(ValueType::I64 | ValueType::F64) => emitter.load64(EAX, slot),
                 _ => emitter.load32(EAX, slot),
             }
             emitter.epilogue();
@@ -543,6 +608,357 @@ fn is_scalar(value_type: ValueType) -> bool {
     )
 }
 
+/// Scalar arithmetic on floats held as raw bits: the left operand goes into `xmm0`, the right
+/// operates on it from its slot, and the result's bits go back to its slot. The slots are
+/// zero-extended, so an `f32` never leaves stale bits in its upper half.
+fn float_binary(
+    opcode: u8,
+    wide: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let prefix = if wide { 0xF2 } else { 0xF3 };
+    let left = frame.slot(left);
+    let right = frame.slot(right);
+    let destination = frame.slot(result);
+    emitter.scalar_load_xmm0(prefix, left);
+    emitter.scalar_op_xmm0(prefix, opcode, right);
+    canonicalize_nan_xmm0(wide, emitter);
+    emitter.move_xmm0_to_rax(wide);
+    emitter.store64(EAX, destination);
+}
+
+/// Replace a NaN in `xmm0` with the canonical NaN that Micro produces, so the bits agree. The
+/// hardware's own NaN differs: x86 makes a negative one for `inf - inf`, for example.
+///
+/// `ucomis xmm0, xmm0` is unordered exactly for a NaN, which sets PF, so the replacement is
+/// skipped when PF is clear.
+fn canonicalize_nan_xmm0(wide: bool, emitter: &mut Emitter) {
+    if wide {
+        emitter.bytes.push(0x66);
+    }
+    emitter.bytes.extend_from_slice(&[0x0F, 0x2E, 0xC0]); // ucomis xmm0, xmm0
+    let jump = emitter.bytes.len();
+    emitter.bytes.extend_from_slice(&[0x7B, 0]); // jnp, patched below
+    let block = emitter.bytes.len();
+    if wide {
+        emitter.movabs(EAX, CANONICAL_F64 as i64);
+        emitter
+            .bytes
+            .extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // movq xmm0, rax
+    } else {
+        emitter.bytes.push(0xB8); // mov eax, imm32
+        emitter
+            .bytes
+            .extend_from_slice(&CANONICAL_F32.to_le_bytes());
+        emitter.bytes.extend_from_slice(&[0x66, 0x0F, 0x6E, 0xC0]); // movd xmm0, eax
+    }
+    emitter.bytes[jump + 1] =
+        u8::try_from(emitter.bytes.len() - block).expect("the replacement is a few instructions");
+}
+
+/// The canonical NaNs Micro's deterministic mode produces for arithmetic.
+const CANONICAL_F32: u32 = 0x7fc0_0000;
+const CANONICAL_F64: u64 = 0x7ff8_0000_0000_0000;
+
+/// A float comparison as a 0 or 1 in the result slot.
+///
+/// The ordered comparisons use `ucomis`, whose "above" flags are false for an unordered pair,
+/// so `<` and `<=` swap the operands to reuse "above". `==` needs the zero flag and no parity;
+/// `!=` is its exact complement, so a NaN compares unequal to everything, as Wasm requires.
+fn float_compare(
+    wide: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    comparison: FloatComparison,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let prefix = if wide { 0xF2 } else { 0xF3 };
+    let left = frame.slot(left);
+    let right = frame.slot(right);
+    let destination = frame.slot(result);
+    const ABOVE: u8 = 0x7;
+    const ABOVE_OR_EQUAL: u8 = 0x3;
+    match comparison {
+        FloatComparison::Eq | FloatComparison::Ne => {
+            emitter.scalar_load_xmm0(prefix, left);
+            emitter.unordered_compare_xmm0(wide, right);
+            if comparison == FloatComparison::Eq {
+                // sete al; setnp cl; and al, cl
+                emitter
+                    .bytes
+                    .extend_from_slice(&[0x0F, 0x94, 0xC0, 0x0F, 0x9B, 0xC1, 0x20, 0xC8]);
+            } else {
+                // setne al; setp cl; or al, cl
+                emitter
+                    .bytes
+                    .extend_from_slice(&[0x0F, 0x95, 0xC0, 0x0F, 0x9A, 0xC1, 0x08, 0xC8]);
+            }
+            emitter.bytes.extend_from_slice(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
+        }
+        FloatComparison::Gt | FloatComparison::Ge => {
+            let condition = if comparison == FloatComparison::Gt {
+                ABOVE
+            } else {
+                ABOVE_OR_EQUAL
+            };
+            emitter.scalar_load_xmm0(prefix, left);
+            emitter.unordered_compare_xmm0(wide, right);
+            emitter.set_from_flags(condition);
+        }
+        FloatComparison::Lt | FloatComparison::Le => {
+            let condition = if comparison == FloatComparison::Lt {
+                ABOVE
+            } else {
+                ABOVE_OR_EQUAL
+            };
+            emitter.scalar_load_xmm0(prefix, right);
+            emitter.unordered_compare_xmm0(wide, left);
+            emitter.set_from_flags(condition);
+        }
+    }
+    emitter.store64(EAX, destination);
+}
+
+/// Negation and absolute value, done on the sign bit rather than in the FPU: clearing or
+/// flipping it is exact for every input, NaN included, and it is what the reference does.
+fn float_unary(
+    wide: bool,
+    result: ValueId,
+    value: ValueId,
+    operation: FloatUnary,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    let value = frame.slot(value);
+    let destination = frame.slot(result);
+    match (wide, operation) {
+        (false, FloatUnary::Neg) => {
+            // mov eax, [value]; xor eax, 0x8000_0000
+            emitter.load32(EAX, value);
+            emitter.bytes.push(0x35);
+            emitter
+                .bytes
+                .extend_from_slice(&0x8000_0000u32.to_le_bytes());
+        }
+        (false, FloatUnary::Abs) => {
+            // mov eax, [value]; and eax, 0x7fff_ffff
+            emitter.load32(EAX, value);
+            emitter.bytes.push(0x25);
+            emitter
+                .bytes
+                .extend_from_slice(&0x7fff_ffffu32.to_le_bytes());
+        }
+        (true, FloatUnary::Neg) => {
+            // mov rax, [value]; movabs rcx, 1 << 63; xor rax, rcx
+            emitter.load64(EAX, value);
+            emitter.movabs(ECX, i64::MIN);
+            emitter.bytes.extend_from_slice(&[0x48, 0x31, 0xC8]);
+        }
+        (true, FloatUnary::Abs) => {
+            // mov rax, [value]; movabs rcx, i64::MAX; and rax, rcx
+            emitter.load64(EAX, value);
+            emitter.movabs(ECX, i64::MAX);
+            emitter.bytes.extend_from_slice(&[0x48, 0x21, 0xC8]);
+        }
+        (_, other) => {
+            return Err(JitError::Unsupported(format!(
+                "the {other:?} float operation"
+            )))
+        }
+    }
+    emitter.store64(EAX, destination);
+    Ok(())
+}
+
+/// A direct call to another function of the module, through the call table in the context.
+///
+/// The arguments are copied to a block of slots in this frame, and the block's address is the
+/// callee's argument pointer. The call counts a frame against the depth limit first, and a call
+/// past the limit traps. A trap in the callee leaves its status in the context and returns zero,
+/// so this function checks the status after the call and returns zero too, before it stores
+/// anything. The return value is the callee's result register.
+fn emit_call(
+    function: u32,
+    arguments: &[ValueId],
+    results: &[ValueId],
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    if !frame.is_callable(function) {
+        return Err(JitError::Unsupported(
+            "a call to a function that is not compiled".into(),
+        ));
+    }
+    let [result] = results else {
+        return Err(JitError::Unsupported(
+            "a call with other than one result".into(),
+        ));
+    };
+    let block = frame.block(arguments.len().max(1));
+    store_arguments(arguments, block, frame, emitter);
+    let destination = frame.slot(*result);
+    enter_callee(frame, emitter)?;
+    set_call_registers(block, frame, emitter);
+    // mov rax, [rax + functions]; call [rax + 8 * function]
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x8B, 0x40, FUNCTIONS_OFFSET]);
+    emitter.bytes.extend_from_slice(&[0xFF, 0x90]);
+    emitter
+        .bytes
+        .extend_from_slice(&(8 * function as i32).to_le_bytes());
+    leave_callee(frame, destination, emitter);
+    Ok(())
+}
+
+/// An indirect call through the module's table: the index is checked against the table's length,
+/// the slot's type against the call's type, and then the slot's entry is called. The checks come
+/// in the order Micro makes them, so the same trap is reported for the same input.
+///
+/// The table's contents are fixed for the life of the module, and every entry is a function
+/// compiled in this module (see [`Frame::env`]), so the entry the slot names can be called.
+fn emit_call_indirect(
+    type_index: u32,
+    operand: ValueId,
+    arguments: &[ValueId],
+    results: &[ValueId],
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    if !frame.env.indirect {
+        return Err(JitError::Unsupported(
+            "an indirect call the native tier cannot resolve".into(),
+        ));
+    }
+    let expected = frame
+        .env
+        .type_ids
+        .get(type_index as usize)
+        .copied()
+        .and_then(|id| i32::try_from(id).ok())
+        .ok_or_else(|| JitError::Unsupported("an indirect call to an unknown type".into()))?;
+    let [result] = results else {
+        return Err(JitError::Unsupported(
+            "a call with other than one result".into(),
+        ));
+    };
+    let block = frame.block(arguments.len().max(1));
+    store_arguments(arguments, block, frame, emitter);
+    let operand_slot = frame.slot(operand);
+    let destination = frame.slot(*result);
+    let entry = frame.temporary();
+    let context = frame.context;
+
+    // rcx = the index, zero-extended from its i32 slot; rax = the context.
+    emitter.memory(&[0x8B], ECX, operand_slot);
+    emitter.memory_wide(&[0x8B], EAX, context);
+    // Out of range traps: cmp rcx, [rax + table_len]; jb ok.
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x3B, 0x48, TABLE_LEN_OFFSET]);
+    guard_trap(frame, 0x72, STATUS_TABLE_OUT_OF_BOUNDS, emitter)?;
+    // rdx = the slot's type: `-1` for a null slot, else the canonical id of its signature.
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x8B, 0x50, TABLE_TYPES_OFFSET]); // mov rdx, [rax + types]
+    emitter.bytes.extend_from_slice(&[0x48, 0x8B, 0x14, 0xCA]); // mov rdx, [rdx + rcx * 8]
+    emitter.bytes.extend_from_slice(&[0x48, 0x83, 0xFA, 0xFF]); // cmp rdx, -1
+    guard_trap(frame, 0x75, STATUS_NULL_REFERENCE, emitter)?; // jne ok
+    emitter.bytes.extend_from_slice(&[0x48, 0x81, 0xFA]); // cmp rdx, imm32
+    emitter.bytes.extend_from_slice(&expected.to_le_bytes());
+    guard_trap(frame, 0x74, STATUS_INDIRECT_TYPE_MISMATCH, emitter)?; // je ok
+                                                                      // rdx = the slot's entry, kept in a slot because the call's registers are set after the depth
+                                                                      // check, and the context register may be rdx itself.
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x8B, 0x50, TABLE_ENTRIES_OFFSET]); // mov rdx, [rax + entries]
+    emitter.bytes.extend_from_slice(&[0x48, 0x8B, 0x14, 0xCA]); // mov rdx, [rdx + rcx * 8]
+    emitter.memory_wide(&[0x89], EDX, entry); // mov [entry], rdx
+
+    enter_callee(frame, emitter)?;
+    set_call_registers(block, frame, emitter);
+    emitter.memory(&[0xFF], 2, entry); // call qword [entry]
+    leave_callee(frame, destination, emitter);
+    Ok(())
+}
+
+/// Copy each argument into the block that the callee reads as its argument array.
+fn store_arguments(arguments: &[ValueId], block: i32, frame: &mut Frame, emitter: &mut Emitter) {
+    for (index, argument) in arguments.iter().enumerate() {
+        let source = frame.slot(*argument);
+        emitter.load64(EAX, source);
+        emitter.store64(EAX, block + 8 * index as i32);
+    }
+}
+
+/// Count one more active frame against the depth limit, and trap if that is past it. Leaves the
+/// context in `rax`.
+fn enter_callee(frame: &Frame, emitter: &mut Emitter) -> Result<(), JitError> {
+    // mov rax, [ctx]; mov rcx, [rax + depth]; cmp rcx, [rax + depth_limit]; jb ok; <trap>; ok:
+    emitter.memory_wide(&[0x8B], EAX, frame.context);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x8B, 0x48, DEPTH_OFFSET]);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x3B, 0x48, DEPTH_LIMIT_OFFSET]);
+    guard_trap(frame, 0x72, STATUS_CALL_DEPTH, emitter)?;
+    // add rcx, 1; mov [rax + depth], rcx
+    emitter.bytes.extend_from_slice(&[0x48, 0x83, 0xC1, 0x01]);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x89, 0x48, DEPTH_OFFSET]);
+    Ok(())
+}
+
+/// The callee's registers: `lea <args>, [rbp + block]` and the context into its register, from
+/// `rax`, which still holds the context.
+fn set_call_registers(block: i32, frame: &Frame, emitter: &mut Emitter) {
+    let args_register = frame.abi.args_register();
+    let context_register = frame.abi.context_register();
+    emitter.memory_wide(&[0x8D], args_register, block);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x89, 0xC0 | context_register]);
+}
+
+/// After the callee returns: count the frame off, and if the callee left a status behind, return
+/// zero without storing anything. Otherwise store the callee's result, which is in `rax`.
+fn leave_callee(frame: &mut Frame, destination: i32, emitter: &mut Emitter) {
+    // mov rcx, [ctx]; sub qword [rcx + depth], 1; cmp qword [rcx + status], 0; je ok;
+    // xor eax, eax; leave; ret; ok:
+    emitter.memory_wide(&[0x8B], ECX, frame.context);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x83, 0x69, DEPTH_OFFSET, 0x01]);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x83, 0x79, STATUS_OFFSET, 0x00]);
+    emitter.bytes.extend_from_slice(&[0x74, 0x04]); // je past the four bytes below
+    emitter.bytes.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    emitter.epilogue();
+    emitter.store64(EAX, destination);
+    frame.shadow = 32;
+}
+
+/// A short conditional jump, `jump`, that skips a trap with `status` when it is taken. The trap is
+/// emitted in place, after the jump.
+fn guard_trap(frame: &Frame, jump: u8, status: u32, emitter: &mut Emitter) -> Result<(), JitError> {
+    let at = emitter.bytes.len();
+    emitter.bytes.extend_from_slice(&[jump, 0]);
+    emitter.trap(frame, status);
+    let distance = emitter.bytes.len() - (at + 2);
+    emitter.bytes[at + 1] = u8::try_from(distance)
+        .map_err(|_| JitError::Unsupported("a trap sequence too long for a short jump".into()))?;
+    Ok(())
+}
+
 fn emit_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
@@ -559,6 +975,96 @@ fn emit_instruction(
             emitter.store64(EAX, slot);
         }
         IrInstr::Drop { .. } => {}
+        IrInstr::Call {
+            function,
+            arguments,
+            results,
+        } => emit_call(*function, arguments, results, frame, emitter)?,
+        IrInstr::CallIndirect {
+            type_index,
+            table,
+            operand,
+            arguments,
+            results,
+        } => {
+            // MVP has one table, the one at index 0.
+            if *table != 0 {
+                return Err(JitError::Unsupported("a call through another table".into()));
+            }
+            emit_call_indirect(*type_index, *operand, arguments, results, frame, emitter)?
+        }
+        IrInstr::ConstF32 { result, value } => {
+            let slot = frame.slot(*result);
+            emitter.movabs(EAX, i64::from(*value));
+            emitter.store64(EAX, slot);
+        }
+        IrInstr::ConstF64 { result, value } => {
+            let slot = frame.slot(*result);
+            emitter.movabs(EAX, *value as i64);
+            emitter.store64(EAX, slot);
+        }
+        IrInstr::F32Add {
+            result,
+            left,
+            right,
+        } => float_binary(0x58, false, *result, *left, *right, frame, emitter),
+        IrInstr::F32Sub {
+            result,
+            left,
+            right,
+        } => float_binary(0x5C, false, *result, *left, *right, frame, emitter),
+        IrInstr::F32Mul {
+            result,
+            left,
+            right,
+        } => float_binary(0x59, false, *result, *left, *right, frame, emitter),
+        IrInstr::F32Div {
+            result,
+            left,
+            right,
+        } => float_binary(0x5E, false, *result, *left, *right, frame, emitter),
+        IrInstr::F64Add {
+            result,
+            left,
+            right,
+        } => float_binary(0x58, true, *result, *left, *right, frame, emitter),
+        IrInstr::F64Sub {
+            result,
+            left,
+            right,
+        } => float_binary(0x5C, true, *result, *left, *right, frame, emitter),
+        IrInstr::F64Mul {
+            result,
+            left,
+            right,
+        } => float_binary(0x59, true, *result, *left, *right, frame, emitter),
+        IrInstr::F64Div {
+            result,
+            left,
+            right,
+        } => float_binary(0x5E, true, *result, *left, *right, frame, emitter),
+        IrInstr::F32Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => float_compare(false, *result, *left, *right, *comparison, frame, emitter),
+        IrInstr::F64Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => float_compare(true, *result, *left, *right, *comparison, frame, emitter),
+        IrInstr::F32Unary {
+            result,
+            value,
+            operation,
+        } => float_unary(false, *result, *value, *operation, frame, emitter)?,
+        IrInstr::F64Unary {
+            result,
+            value,
+            operation,
+        } => float_unary(true, *result, *value, *operation, frame, emitter)?,
         IrInstr::LocalGet { result, local } => {
             let source = frame.slot(*local);
             let destination = frame.slot(*result);
@@ -763,7 +1269,10 @@ fn emit_instruction(
         } => {
             // The result is `left` when the condition is non-zero, else `right`. `mov` leaves the
             // flags alone, so the comparison still holds for the `cmovne`.
-            let wide = frame.value_type(*result) == Some(ValueType::I64);
+            let wide = matches!(
+                frame.value_type(*result),
+                Some(ValueType::I64 | ValueType::F64)
+            );
             let condition = frame.slot(*condition);
             let left = frame.slot(*left);
             let right = frame.slot(*right);
@@ -851,19 +1360,19 @@ fn emit_instruction(
             // The bounds hint is ignored: every access is checked here. Each variant names the
             // access width and the extension to the 64-bit slot.
             let (width, access): (u32, &[u8]) = match operation {
-                MemoryLoad::I32 => (4, &[0x8B, 0x04, 0x02]),
+                // An f32 or f64 load moves the same bits as the integer load of that width.
+                MemoryLoad::I32 | MemoryLoad::F32 => (4, &[0x8B, 0x04, 0x02]),
                 MemoryLoad::I32_8U => (1, &[0x0F, 0xB6, 0x04, 0x02]),
                 MemoryLoad::I32_8S => (1, &[0x0F, 0xBE, 0x04, 0x02]),
                 MemoryLoad::I32_16U => (2, &[0x0F, 0xB7, 0x04, 0x02]),
                 MemoryLoad::I32_16S => (2, &[0x0F, 0xBF, 0x04, 0x02]),
-                MemoryLoad::I64 => (8, &[0x48, 0x8B, 0x04, 0x02]),
+                MemoryLoad::I64 | MemoryLoad::F64 => (8, &[0x48, 0x8B, 0x04, 0x02]),
                 MemoryLoad::I64_8U => (1, &[0x0F, 0xB6, 0x04, 0x02]),
                 MemoryLoad::I64_8S => (1, &[0x48, 0x0F, 0xBE, 0x04, 0x02]),
                 MemoryLoad::I64_16U => (2, &[0x0F, 0xB7, 0x04, 0x02]),
                 MemoryLoad::I64_16S => (2, &[0x48, 0x0F, 0xBF, 0x04, 0x02]),
                 MemoryLoad::I64_32U => (4, &[0x8B, 0x04, 0x02]),
                 MemoryLoad::I64_32S => (4, &[0x48, 0x63, 0x04, 0x02]),
-                other => return Err(JitError::Unsupported(format!("the {other:?} load"))),
             };
             emit_address(*address, *offset, width, frame, emitter);
             emitter.bytes.extend_from_slice(access);
@@ -880,14 +1389,13 @@ fn emit_instruction(
             // The value is loaded into r8 and the store takes its low bits. An eight-byte store
             // uses the wide forms; the narrower ones store the low 8, 16, or 32 bits.
             let (width, access, wide): (u32, &[u8], bool) = match operation {
-                MemoryStore::I32 => (4, &[0x44, 0x89, 0x04, 0x02], false),
+                MemoryStore::I32 | MemoryStore::F32 => (4, &[0x44, 0x89, 0x04, 0x02], false),
                 MemoryStore::I32_8 | MemoryStore::I64_8 => (1, &[0x44, 0x88, 0x04, 0x02], false),
                 MemoryStore::I32_16 | MemoryStore::I64_16 => {
                     (2, &[0x66, 0x44, 0x89, 0x04, 0x02], false)
                 }
-                MemoryStore::I64 => (8, &[0x4C, 0x89, 0x04, 0x02], true),
+                MemoryStore::I64 | MemoryStore::F64 => (8, &[0x4C, 0x89, 0x04, 0x02], true),
                 MemoryStore::I64_32 => (4, &[0x44, 0x89, 0x04, 0x02], false),
-                other => return Err(JitError::Unsupported(format!("the {other:?} store"))),
             };
             emit_address(*address, *offset, width, frame, emitter);
             let source = frame.slot(*value);
@@ -1143,7 +1651,7 @@ mod tests {
             ValueId(0),
             vec![i32_value(0)],
         );
-        let code = encode(&function, Abi::SysV).expect("compiles");
+        let code = encode(&function, Abi::SysV, &CallEnv::default()).expect("compiles");
         assert_eq!(
             code,
             vec![
@@ -1210,7 +1718,7 @@ mod tests {
                 },
             ],
         };
-        let code = encode(&function, Abi::SysV).expect("compiles");
+        let code = encode(&function, Abi::SysV, &CallEnv::default()).expect("compiles");
         let tail = &code[code.len() - 5..];
         assert_eq!(tail[0], 0xE9);
         let displacement = i32::from_le_bytes(tail[1..5].try_into().unwrap());

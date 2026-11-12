@@ -248,6 +248,12 @@ impl ExecutableCode {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// The entry address, as an integer for the call table. The mapping outlives the caller
+    /// only while `self` does, which the module that holds the table ensures.
+    pub(crate) fn address(&self) -> usize {
+        self.address as usize
+    }
 }
 
 #[cfg(any(

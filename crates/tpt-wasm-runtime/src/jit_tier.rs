@@ -2,16 +2,14 @@
 //!
 //! Each function the JIT accepts runs as machine code; every other function runs on the
 //! baseline, which owns the module's state. The split is per function, so one function the
-//! compiler refuses does not hold back the rest of its module.
+//! compiler refuses does not hold back the rest of its module. A function that calls a function
+//! the compiler refuses is itself refused, since the call would have nowhere to go; the baseline
+//! runs it, and its calls reach the baseline's copy of the callee.
 //!
-//! A native function is a leaf in the compiler's subset: it makes no calls, reads no
-//! globals, and touches no table. It reads and writes linear memory through the baseline's
-//! own memory, under that memory's lock, so the two tiers observe one memory. It charges no
-//! execution steps, which is why the engine turns this tier off when a step limit, profiling
-//! or debugging is in effect.
-
-#[cfg(feature = "jit")]
-use std::collections::BTreeMap;
+//! A native function may call other native functions of its module. It reads and writes linear
+//! memory through the baseline's own memory, under that memory's lock, so the two tiers observe
+//! one memory. It charges no execution steps, which is why the engine turns this tier off when a
+//! step limit, profiling or debugging is in effect.
 
 use tpt_wasm_ir::IrModule;
 use tpt_wasm_types::Value;
@@ -23,31 +21,45 @@ use crate::RuntimeError;
 #[derive(Default)]
 pub(crate) struct JitTier {
     #[cfg(feature = "jit")]
-    functions: BTreeMap<usize, tpt_wasm_jit::CompiledFunction>,
+    module: Option<tpt_wasm_jit::CompiledModule>,
+    /// The parameter types and result type of every function, by index, for checking arguments.
+    #[cfg(feature = "jit")]
+    signatures: Vec<(Vec<ValueType>, ValueType)>,
 }
 
 impl JitTier {
-    /// Compile every function of `ir` that the JIT accepts with an integer signature.
+    /// Compile the functions of `ir` that the JIT accepts, together, so calls between them stay
+    /// native. `max_call_depth` is the call-depth limit the native calls enforce.
     #[cfg(feature = "jit")]
-    pub(crate) fn compile(ir: &IrModule) -> Self {
-        let integer =
-            |value_type: &ValueType| matches!(value_type, ValueType::I32 | ValueType::I64);
-        let functions = ir
+    pub(crate) fn compile(ir: &IrModule, max_call_depth: u64, table_private: bool) -> Self {
+        let signatures = ir
             .functions
             .iter()
-            .enumerate()
-            .filter_map(|(index, function)| {
-                let compiled = tpt_wasm_jit::compile(function).ok()?;
-                let integers = compiled.params().iter().all(integer) && integer(&compiled.result());
-                integers.then_some((index, compiled))
+            .map(|function| {
+                let params = function.function_type.params.0.clone();
+                let result = function
+                    .function_type
+                    .results
+                    .0
+                    .first()
+                    .copied()
+                    .unwrap_or(ValueType::I32);
+                (params, result)
             })
             .collect();
-        Self { functions }
+        Self {
+            module: Some(tpt_wasm_jit::compile_module(
+                ir,
+                max_call_depth,
+                table_private,
+            )),
+            signatures,
+        }
     }
 
     /// Without the feature there is no native code to compile.
     #[cfg(not(feature = "jit"))]
-    pub(crate) fn compile(_ir: &IrModule) -> Self {
+    pub(crate) fn compile(_ir: &IrModule, _max_call_depth: u64, _table_private: bool) -> Self {
         Self::default()
     }
 
@@ -55,7 +67,9 @@ impl JitTier {
     pub(crate) fn contains(&self, index: usize) -> bool {
         #[cfg(feature = "jit")]
         {
-            self.functions.contains_key(&index)
+            self.module
+                .as_ref()
+                .is_some_and(|module| module.is_compiled(index))
         }
         #[cfg(not(feature = "jit"))]
         {
@@ -72,37 +86,53 @@ impl JitTier {
         args: &[Value],
         memory: Option<&mut [u8]>,
     ) -> Result<Vec<Value>, RuntimeError> {
-        let function = self
-            .functions
-            .get(&index)
+        let module = self
+            .module
+            .as_ref()
             .ok_or(RuntimeError::UnsupportedFeature(
                 "a function without native code",
             ))?;
+        let (params, result) =
+            self.signatures
+                .get(index)
+                .ok_or(RuntimeError::UnsupportedFeature(
+                    "a function without native code",
+                ))?;
         // The same check the baseline makes, so a wrong argument is reported the same way.
-        crate::check_values("argument", function.params(), args)?;
+        crate::check_values("argument", params, args)?;
         let mut slots = Vec::with_capacity(args.len());
         for value in args {
             slots.push(match value {
                 Value::I32(value) => i64::from(*value),
                 Value::I64(value) => *value,
+                // A float travels as its bits, which the compiled code reads from the slot.
+                Value::F32(bits) => i64::from(*bits),
+                Value::F64(bits) => *bits as i64,
                 _ => {
                     return Err(RuntimeError::UnsupportedFeature(
-                        "a non-integer argument to a native function",
+                        "a reference argument to a native function",
                     ))
                 }
             });
         }
-        let raw = function
-            .call_raw(&slots, memory)
+        let raw = module
+            .call(index, &slots, memory)
             .map_err(|error| match error {
                 tpt_wasm_jit::JitError::Trap(trap) => RuntimeError::Trap(trap),
                 _ => RuntimeError::UnsupportedFeature("a native function that could not run"),
             })?;
-        let result = match function.result() {
+        let value = match result {
             ValueType::I32 => Value::I32(raw as u32 as i32),
-            _ => Value::I64(raw as i64),
+            ValueType::I64 => Value::I64(raw as i64),
+            ValueType::F32 => Value::F32(raw as u32),
+            ValueType::F64 => Value::F64(raw),
+            _ => {
+                return Err(RuntimeError::UnsupportedFeature(
+                    "a reference result from a native function",
+                ))
+            }
         };
-        Ok(vec![result])
+        Ok(vec![value])
     }
 
     /// Without the feature no function has native code, so this is never reached.

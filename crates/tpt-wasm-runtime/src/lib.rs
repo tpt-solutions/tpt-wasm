@@ -1131,6 +1131,12 @@ fn instantiate_module(
         None => None,
     };
     let start = module.start;
+    // A table another instance can name could be written by that instance, so a native indirect
+    // call is compiled only for a table this module exports to nobody.
+    let table_private = !module
+        .exports
+        .iter()
+        .any(|export| matches!(export.desc, ExportDesc::Table(_)));
     let _call_gate = lock_call_gate(&context.call_gate)?;
     if context
         .debug_active
@@ -1430,7 +1436,9 @@ fn instantiate_module(
         && !config.debugging
         && config.limits.max_execution_steps.is_none();
     let jit = match ir {
-        Some(ir) if native_allowed => jit_tier::JitTier::compile(ir),
+        Some(ir) if native_allowed => {
+            jit_tier::JitTier::compile(ir, config.limits.max_call_depth as u64, table_private)
+        }
         _ => jit_tier::JitTier::default(),
     };
     let mut instance = Instance {

@@ -17,13 +17,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
-    BasicBlock, BlockId, IntComparison, IntConversion, IrFunction, IrInstr, MemoryLoad,
-    MemoryStore, SignExtend, Terminator, ValueId,
+    BasicBlock, BlockId, FloatComparison, FloatUnary, IntComparison, IntConversion, IrFunction,
+    IrInstr, MemoryLoad, MemoryStore, SignExtend, Terminator, ValueId,
 };
 use tpt_wasm_types::ValueType;
 
 use crate::x86::{check_supported, instruction_name, terminator_name};
-use crate::{Context, JitError};
+use crate::{
+    CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_INDIRECT_TYPE_MISMATCH,
+    STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
+};
 
 /// Scratch registers. `9` holds the first operand, `10` the second, `11` a temporary, and `12`
 /// and `13` the memory base and length. The numbers serve as both `w` and `x` registers.
@@ -47,6 +50,14 @@ const MAX_FRAME: u32 = 4096;
 const MEMORY_BASE_OFFSET: u32 = std::mem::offset_of!(Context, memory) as u32;
 const MEMORY_LENGTH_OFFSET: u32 = std::mem::offset_of!(Context, memory_len) as u32;
 const STATUS_OFFSET: u32 = std::mem::offset_of!(Context, status) as u32;
+const FUNCTIONS_OFFSET: u32 = std::mem::offset_of!(Context, functions) as u32;
+const DEPTH_OFFSET: u32 = std::mem::offset_of!(Context, depth) as u32;
+const DEPTH_LIMIT_OFFSET: u32 = std::mem::offset_of!(Context, depth_limit) as u32;
+const TABLE_ENTRIES_OFFSET: u32 = std::mem::offset_of!(Context, table_entries) as u32;
+const TABLE_TYPES_OFFSET: u32 = std::mem::offset_of!(Context, table_types) as u32;
+const TABLE_LEN_OFFSET: u32 = std::mem::offset_of!(Context, table_len) as u32;
+/// The `lo` condition: unsigned less than, the test that keeps a call within the depth limit.
+const LO: u32 = 3;
 
 /// A place a branch can go: a block of the function, or a label inside the emitted code.
 #[derive(Clone, Copy, Debug)]
@@ -69,11 +80,14 @@ struct Frame {
     types: HashMap<ValueId, ValueType>,
     used: u32,
     context: u32,
+    /// What the function's calls may name, and the table they may index.
+    env: CallEnv,
 }
 
 impl Frame {
-    fn new(function: &IrFunction) -> Self {
+    fn new(function: &IrFunction, env: &CallEnv) -> Self {
         Self {
+            env: env.clone(),
             slots: HashMap::new(),
             types: function
                 .values
@@ -101,13 +115,33 @@ impl Frame {
         offset
     }
 
+    /// A block of `words` consecutive slots, and the offset of its first word. The words ascend
+    /// from that offset, so the block can be passed as an array of arguments.
+    fn block(&mut self, words: usize) -> u32 {
+        let offset = self.used;
+        self.used += 8 * words as u32;
+        offset
+    }
+
+    fn is_callable(&self, function: u32) -> bool {
+        self.env
+            .callable
+            .get(function as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// The frame size: the slots, rounded up to 16 as AAPCS64 requires.
     fn size(&self) -> u32 {
         self.used.div_ceil(16) * 16
     }
 
+    /// Whether the slot is read and written at 64 bits: `i64`, and `f64`, whose bits fill the slot.
     fn is_wide(&self, value: ValueId) -> bool {
-        self.types.get(&value) == Some(&ValueType::I64)
+        matches!(
+            self.types.get(&value),
+            Some(ValueType::I64 | ValueType::F64)
+        )
     }
 }
 
@@ -363,7 +397,7 @@ fn movz_status(rd: u32, status: u32) -> u32 {
 // ---- the encoder.
 
 /// Compile `function` to AArch64 machine code.
-pub(crate) fn encode(function: &IrFunction) -> Result<Vec<u8>, JitError> {
+pub(crate) fn encode(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, JitError> {
     check_supported(function)?;
     let blocks: HashMap<BlockId, &BasicBlock> = function
         .blocks
@@ -371,7 +405,7 @@ pub(crate) fn encode(function: &IrFunction) -> Result<Vec<u8>, JitError> {
         .map(|block| (block.id, block))
         .collect();
 
-    let mut frame = Frame::new(function);
+    let mut frame = Frame::new(function, env);
     let mut emitter = Emitter::new();
 
     // The two pointers arrive in x0 and x1, and are kept in slots, because the code below uses
@@ -554,6 +588,184 @@ fn copy_into_parameters(
     }
 }
 
+/// `mov x<rd>, x<rm>` (the `orr` with `xzr`).
+fn mov_x(rd: u32, rm: u32) -> u32 {
+    0xAA00_03E0 | (rm << 16) | rd
+}
+
+/// `sub x<rd>, x<rn>, #imm12`.
+fn sub_x_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+    0xD100_0000 | (imm12 << 10) | (rn << 5) | rd
+}
+
+/// `blr x<rn>`: call through a register, with the return address in `x30`.
+fn blr(rn: u32) -> u32 {
+    0xD63F_0000 | (rn << 5)
+}
+
+/// A direct call to another function of the module, through the call table in the context.
+///
+/// The arguments are copied to a block of slots in this frame, and `x0` points at the block. The
+/// context is passed in `x1`. The call counts a frame against the depth limit first, and a call
+/// past the limit traps. A trap in the callee leaves its status in the context and returns zero,
+/// so the status is checked after the call, and a non-zero status returns zero from here too.
+fn emit_call(
+    function: u32,
+    arguments: &[ValueId],
+    results: &[ValueId],
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    if !frame.is_callable(function) {
+        return Err(JitError::Unsupported(
+            "a call to a function that is not compiled".into(),
+        ));
+    }
+    let [result] = results else {
+        return Err(JitError::Unsupported(
+            "a call with other than one result".into(),
+        ));
+    };
+    // The table entry is loaded with an unsigned 12-bit offset, scaled by eight.
+    let entry = 8 * function;
+    if entry > 4095 * 8 {
+        return Err(JitError::Unsupported(
+            "a call to a function beyond the reach of the call table".into(),
+        ));
+    }
+    let block = frame.block(arguments.len().max(1));
+    store_arguments(arguments, block, frame, emitter);
+    let destination = frame.slot(*result);
+    enter_callee(frame, emitter);
+    // x0 = the argument block; x1 = the context; x12 = the callee's entry.
+    emitter.push(add_x_imm(0, SP, block));
+    emitter.push(mov_x(1, R9));
+    emitter.push(ldr_x(R12, R9, FUNCTIONS_OFFSET));
+    emitter.push(ldr_x(R12, R12, entry));
+    emitter.push(blr(R12));
+    leave_callee(frame, destination, emitter);
+    Ok(())
+}
+
+/// An indirect call through the module's table, checked in Micro's order: the index against the
+/// table's length, then the slot against null, then the slot's signature against the call's.
+fn emit_call_indirect(
+    type_index: u32,
+    operand: ValueId,
+    arguments: &[ValueId],
+    results: &[ValueId],
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    if !frame.env.indirect {
+        return Err(JitError::Unsupported(
+            "an indirect call the native tier cannot resolve".into(),
+        ));
+    }
+    let expected = frame
+        .env
+        .type_ids
+        .get(type_index as usize)
+        .copied()
+        .ok_or_else(|| JitError::Unsupported("an indirect call to an unknown type".into()))?;
+    let [result] = results else {
+        return Err(JitError::Unsupported(
+            "a call with other than one result".into(),
+        ));
+    };
+    let block = frame.block(arguments.len().max(1));
+    store_arguments(arguments, block, frame, emitter);
+    let operand_slot = frame.slot(operand);
+    let destination = frame.slot(*result);
+    let entry = frame.temporary();
+    let context = frame.context;
+
+    // x11 = the index, from its low 32 bits; x9 = the context.
+    emitter.push(ldr_w(R11, SP, operand_slot));
+    emitter.push(ldr_x(R9, SP, context));
+    // Out of range traps: cmp x11, [len]; b.lo ok.
+    emitter.push(ldr_x(R10, R9, TABLE_LEN_OFFSET));
+    emitter.push(cmp(true, R11, R10));
+    guard_trap(frame, LO, STATUS_TABLE_OUT_OF_BOUNDS, emitter);
+    // x10 = the slot's type, `-1` for a null slot.
+    emitter.push(ldr_x(R12, R9, TABLE_TYPES_OFFSET));
+    emitter.push(indexed_scaled(LOAD_X, R10, R12, R11));
+    emitter.push(cmn_imm(true, R10, 1));
+    guard_trap(frame, NE, STATUS_NULL_REFERENCE, emitter);
+    // The slot's type against the call's: b.eq ok, else trap.
+    emit_constant(expected, R13, emitter);
+    emitter.push(cmp(true, R10, R13));
+    guard_trap(frame, EQ, STATUS_INDIRECT_TYPE_MISMATCH, emitter);
+    // x12 = the slot's entry, kept in a slot for the call.
+    emitter.push(ldr_x(R12, R9, TABLE_ENTRIES_OFFSET));
+    emitter.push(indexed_scaled(LOAD_X, R12, R12, R11));
+    emitter.push(str_x(R12, SP, entry));
+
+    enter_callee(frame, emitter);
+    emitter.push(add_x_imm(0, SP, block));
+    emitter.push(mov_x(1, R9));
+    emitter.push(ldr_x(R12, SP, entry));
+    emitter.push(blr(R12));
+    leave_callee(frame, destination, emitter);
+    Ok(())
+}
+
+/// Copy each argument into the block that the callee reads as its argument array.
+fn store_arguments(arguments: &[ValueId], block: u32, frame: &mut Frame, emitter: &mut Emitter) {
+    for (index, argument) in arguments.iter().enumerate() {
+        let source = frame.slot(*argument);
+        emitter.push(ldr_x(R9, SP, source));
+        emitter.push(str_x(R9, SP, block + 8 * index as u32));
+    }
+}
+
+/// Count one more active frame against the depth limit, and trap if that is past it. Leaves the
+/// context in `x9`.
+fn enter_callee(frame: &Frame, emitter: &mut Emitter) {
+    // x9 = context; x10 = depth; x11 = limit; trap unless depth < limit.
+    emitter.push(ldr_x(R9, SP, frame.context));
+    emitter.push(ldr_x(R10, R9, DEPTH_OFFSET));
+    emitter.push(ldr_x(R11, R9, DEPTH_LIMIT_OFFSET));
+    emitter.push(cmp(true, R10, R11));
+    guard_trap(frame, LO, STATUS_CALL_DEPTH, emitter);
+    // depth += 1
+    emitter.push(add_x_imm(R10, R10, 1));
+    emitter.push(str_x(R10, R9, DEPTH_OFFSET));
+}
+
+/// After the callee returns: count the frame off, and if the callee left a status behind, return
+/// zero without storing anything. Otherwise store the callee's result, which is in `x0`.
+fn leave_callee(frame: &mut Frame, destination: u32, emitter: &mut Emitter) {
+    // depth -= 1, then return zero if the callee left a status behind.
+    emitter.push(ldr_x(R9, SP, frame.context));
+    emitter.push(ldr_x(R10, R9, DEPTH_OFFSET));
+    emitter.push(sub_x_imm(R10, R10, 1));
+    emitter.push(str_x(R10, R9, DEPTH_OFFSET));
+    emitter.push(ldr_x(R10, R9, STATUS_OFFSET));
+    let propagate = emitter.words.len();
+    emitter.push(0); // cbz past the return below, patched below
+    emitter.push(movz_w(0, 0));
+    epilogue(emitter);
+    let skip = (emitter.words.len() - propagate) as u32;
+    emitter.words[propagate] = cbz(true, R10) | (skip << 5);
+    emitter.push(str_x(0, SP, destination));
+}
+
+/// A conditional branch that skips a trap with `status` when `condition` holds. The trap is emitted
+/// in place, after the branch.
+fn guard_trap(frame: &Frame, condition: u32, status: u32, emitter: &mut Emitter) {
+    let at = emitter.words.len();
+    emitter.push(0); // patched below
+    trap(frame, status, emitter);
+    let distance = (emitter.words.len() - at) as u32;
+    emitter.words[at] = b_cond(condition) | (distance << 5);
+}
+
+/// `ldr x<rt>, [x<rn>, x<rm>, lsl #3]`: the base with the scaled-index bit set.
+fn indexed_scaled(base: u32, rt: u32, rn: u32, rm: u32) -> u32 {
+    base | 0x1000 | (rm << 16) | (rn << 5) | rt
+}
+
 fn emit_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
@@ -577,6 +789,94 @@ fn emit_instruction(
             emitter.push(movk_x(R9, ((bits >> 32) & 0xFFFF) as u32, 2));
             emitter.push(movk_x(R9, ((bits >> 48) & 0xFFFF) as u32, 3));
             emitter.push(str_x(R9, SP, slot));
+        }
+        IrInstr::ConstF32 { result, value } => {
+            let slot = frame.slot(*result);
+            store_constant(u64::from(*value), slot, emitter);
+        }
+        IrInstr::ConstF64 { result, value } => {
+            let slot = frame.slot(*result);
+            store_constant(*value, slot, emitter);
+        }
+        IrInstr::F32Add {
+            result,
+            left,
+            right,
+        } => float_binary(false, 0x2800, *result, *left, *right, frame, emitter),
+        IrInstr::F32Sub {
+            result,
+            left,
+            right,
+        } => float_binary(false, 0x3800, *result, *left, *right, frame, emitter),
+        IrInstr::F32Mul {
+            result,
+            left,
+            right,
+        } => float_binary(false, 0x0800, *result, *left, *right, frame, emitter),
+        IrInstr::F32Div {
+            result,
+            left,
+            right,
+        } => float_binary(false, 0x1800, *result, *left, *right, frame, emitter),
+        IrInstr::F64Add {
+            result,
+            left,
+            right,
+        } => float_binary(true, 0x2800, *result, *left, *right, frame, emitter),
+        IrInstr::F64Sub {
+            result,
+            left,
+            right,
+        } => float_binary(true, 0x3800, *result, *left, *right, frame, emitter),
+        IrInstr::F64Mul {
+            result,
+            left,
+            right,
+        } => float_binary(true, 0x0800, *result, *left, *right, frame, emitter),
+        IrInstr::F64Div {
+            result,
+            left,
+            right,
+        } => float_binary(true, 0x1800, *result, *left, *right, frame, emitter),
+        IrInstr::F32Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => float_compare_into(false, *result, *left, *right, *comparison, frame, emitter),
+        IrInstr::F64Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => float_compare_into(true, *result, *left, *right, *comparison, frame, emitter),
+        IrInstr::F32Unary {
+            result,
+            value,
+            operation,
+        } => float_unary_arm(false, *result, *value, *operation, frame, emitter)?,
+        IrInstr::F64Unary {
+            result,
+            value,
+            operation,
+        } => float_unary_arm(true, *result, *value, *operation, frame, emitter)?,
+        IrInstr::Call {
+            function,
+            arguments,
+            results,
+        } => emit_call(*function, arguments, results, frame, emitter)?,
+        IrInstr::CallIndirect {
+            type_index,
+            table,
+            operand,
+            arguments,
+            results,
+        } => {
+            // MVP has one table, the one at index 0.
+            if *table != 0 {
+                return Err(JitError::Unsupported("a call through another table".into()));
+            }
+            emit_call_indirect(*type_index, *operand, arguments, results, frame, emitter)?
         }
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
@@ -826,8 +1126,11 @@ fn emit_instruction(
         } => {
             // The bounds hint is ignored: every access is checked here.
             let (width, access) = match operation {
-                MemoryLoad::I32 | MemoryLoad::I64_32U => (4, indexed(LOAD_W, R9, R12, R9)),
-                MemoryLoad::I64 => (8, indexed(LOAD_X, R9, R12, R9)),
+                // An f32 or f64 load moves the same bits as the integer load of that width.
+                MemoryLoad::I32 | MemoryLoad::F32 | MemoryLoad::I64_32U => {
+                    (4, indexed(LOAD_W, R9, R12, R9))
+                }
+                MemoryLoad::I64 | MemoryLoad::F64 => (8, indexed(LOAD_X, R9, R12, R9)),
                 MemoryLoad::I32_8U | MemoryLoad::I64_8U => (1, indexed(LOAD_BYTE_W, R9, R12, R9)),
                 MemoryLoad::I32_8S => (1, indexed(LOAD_BYTE_SIGNED_W, R9, R12, R9)),
                 MemoryLoad::I64_8S => (1, indexed(LOAD_BYTE_SIGNED_X, R9, R12, R9)),
@@ -835,7 +1138,6 @@ fn emit_instruction(
                 MemoryLoad::I32_16S => (2, indexed(LOAD_HALF_SIGNED_W, R9, R12, R9)),
                 MemoryLoad::I64_16S => (2, indexed(LOAD_HALF_SIGNED_X, R9, R12, R9)),
                 MemoryLoad::I64_32S => (4, indexed(LOAD_WORD_SIGNED_X, R9, R12, R9)),
-                other => return Err(JitError::Unsupported(format!("the {other:?} load"))),
             };
             emit_address(*address, *offset, width, frame, emitter);
             emitter.push(access);
@@ -850,11 +1152,12 @@ fn emit_instruction(
             bounds: _,
         } => {
             let (width, access) = match operation {
-                MemoryStore::I32 | MemoryStore::I64_32 => (4, indexed(STORE_W, R10, R12, R9)),
-                MemoryStore::I64 => (8, indexed(STORE_X, R10, R12, R9)),
+                MemoryStore::I32 | MemoryStore::F32 | MemoryStore::I64_32 => {
+                    (4, indexed(STORE_W, R10, R12, R9))
+                }
+                MemoryStore::I64 | MemoryStore::F64 => (8, indexed(STORE_X, R10, R12, R9)),
                 MemoryStore::I32_8 | MemoryStore::I64_8 => (1, indexed(STORE_BYTE, R10, R12, R9)),
                 MemoryStore::I32_16 | MemoryStore::I64_16 => (2, indexed(STORE_HALF, R10, R12, R9)),
-                other => return Err(JitError::Unsupported(format!("the {other:?} store"))),
             };
             emit_address(*address, *offset, width, frame, emitter);
             let source = frame.slot(*value);
@@ -872,6 +1175,189 @@ fn emit_instruction(
 }
 
 /// `ldrsw x<rt>, [sp, #imm]`: a 32-bit load, sign-extended to 64 bits.
+/// `fmov s<vd>, w<rn>` or, when `wide`, `fmov d<vd>, x<rn>`: a slot's bits into a float register.
+fn fmov_to_float(wide: bool, vd: u32, rn: u32) -> u32 {
+    let base = if wide { 0x9E67_0000 } else { 0x1E27_0000 };
+    base | (rn << 5) | vd
+}
+
+/// `fmov w<rd>, s<vn>` or `fmov x<rd>, d<vn>`: a float register's bits back into a slot. The
+/// 32-bit form zeroes the upper half of `x<rd>`.
+fn fmov_from_float(wide: bool, rd: u32, vn: u32) -> u32 {
+    let base = if wide { 0x9E66_0000 } else { 0x1E26_0000 };
+    base | (vn << 5) | rd
+}
+
+/// `fadd`, `fsub`, `fmul`, or `fdiv` (by `opcode`: 0x2800, 0x3800, 0x0800, 0x1800), on single or
+/// double registers.
+fn float_arithmetic(wide: bool, opcode: u32, vd: u32, vn: u32, vm: u32) -> u32 {
+    let base = if wide { 0x1E60_0000 } else { 0x1E20_0000 };
+    base | (vm << 16) | opcode | (vn << 5) | vd
+}
+
+/// `fcmp <vn>, <vm>`: sets the flags for the two floats. An unordered pair sets C and V and clears
+/// N and Z, so no ordered condition holds for it.
+fn float_compare(wide: bool, vn: u32, vm: u32) -> u32 {
+    let base = if wide { 0x1E60_2000 } else { 0x1E20_2000 };
+    base | (vm << 16) | (vn << 5)
+}
+
+/// `fneg` or, when `abs`, `fabs` on a single or double register. A sign-bit operation: exact on
+/// every input, NaNs included.
+fn float_sign(wide: bool, abs: bool, vd: u32, vn: u32) -> u32 {
+    let base = match (wide, abs) {
+        (false, false) => 0x1E21_4000,
+        (false, true) => 0x1E20_C000,
+        (true, false) => 0x1E61_4000,
+        (true, true) => 0x1E60_C000,
+    };
+    base | (vn << 5) | vd
+}
+
+/// A constant's bits in register `rd`, as four 16-bit moves.
+fn emit_constant(bits: u64, rd: u32, emitter: &mut Emitter) {
+    emitter.push(movz_x(rd, (bits & 0xFFFF) as u32, 0));
+    emitter.push(movk_x(rd, ((bits >> 16) & 0xFFFF) as u32, 1));
+    emitter.push(movk_x(rd, ((bits >> 32) & 0xFFFF) as u32, 2));
+    emitter.push(movk_x(rd, ((bits >> 48) & 0xFFFF) as u32, 3));
+}
+
+/// A constant's bits into a slot, through `x9`.
+fn store_constant(bits: u64, slot: u32, emitter: &mut Emitter) {
+    emit_constant(bits, R9, emitter);
+    emitter.push(str_x(R9, SP, slot));
+}
+
+/// `result = left op right` on floats: both operands go through `v0` and `v1`, and the result's
+/// bits go back to the slot.
+fn float_binary(
+    wide: bool,
+    opcode: u32,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let destination = load_operands(left, right, result, frame, emitter);
+    emitter.push(fmov_to_float(wide, 0, R9));
+    emitter.push(fmov_to_float(wide, 1, R10));
+    emitter.push(float_arithmetic(wide, opcode, 0, 0, 1));
+    canonicalize_nan(wide, emitter);
+    emitter.push(fmov_from_float(wide, R9, 0));
+    emitter.push(str_x(R9, SP, destination));
+}
+
+/// Replace a NaN in `v0` with the canonical NaN that Micro produces. An unordered `fcmp` sets V,
+/// so the replacement is skipped unless the value is a NaN.
+fn canonicalize_nan(wide: bool, emitter: &mut Emitter) {
+    /// The `vc` condition: no overflow, which an unordered comparison sets.
+    const VC: u32 = 7;
+    emitter.push(float_compare(wide, 0, 0));
+    let guard = emitter.words.len();
+    emitter.push(0); // b.vc past the replacement, patched below
+    let bits = if wide {
+        0x7ff8_0000_0000_0000
+    } else {
+        u64::from(0x7fc0_0000u32)
+    };
+    emit_constant(bits, R9, emitter);
+    emitter.push(fmov_to_float(wide, 0, R9));
+    let distance = (emitter.words.len() - guard) as u32;
+    emitter.words[guard] = b_cond(VC) | (distance << 5);
+}
+
+/// A float comparison as a 0 or 1 in the result slot. `<` and `<=` compare the right operand with
+/// the left, so that "greater" (which an unordered pair fails) is the wanted order.
+fn float_compare_into(
+    wide: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    comparison: FloatComparison,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    const GE: u32 = 10;
+    const GT: u32 = 12;
+    let destination = load_operands(left, right, result, frame, emitter);
+    match comparison {
+        FloatComparison::Eq | FloatComparison::Ne => {
+            emitter.push(fmov_to_float(wide, 0, R9));
+            emitter.push(fmov_to_float(wide, 1, R10));
+            emitter.push(float_compare(wide, 0, 1));
+            let condition = if comparison == FloatComparison::Eq {
+                EQ
+            } else {
+                NE
+            };
+            emitter.push(cset(false, R9, condition));
+        }
+        FloatComparison::Gt | FloatComparison::Ge => {
+            let condition = if comparison == FloatComparison::Gt {
+                GT
+            } else {
+                GE
+            };
+            emitter.push(fmov_to_float(wide, 0, R9));
+            emitter.push(fmov_to_float(wide, 1, R10));
+            emitter.push(float_compare(wide, 0, 1));
+            emitter.push(cset(false, R9, condition));
+        }
+        FloatComparison::Lt | FloatComparison::Le => {
+            let condition = if comparison == FloatComparison::Lt {
+                GT
+            } else {
+                GE
+            };
+            emitter.push(fmov_to_float(wide, 0, R10));
+            emitter.push(fmov_to_float(wide, 1, R9));
+            emitter.push(float_compare(wide, 0, 1));
+            emitter.push(cset(false, R9, condition));
+        }
+    }
+    emitter.push(str_x(R9, SP, destination));
+}
+
+/// Negation and absolute value on a float slot.
+fn float_unary_into(
+    wide: bool,
+    abs: bool,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    emitter.push(ldr_x(R9, SP, source));
+    emitter.push(fmov_to_float(wide, 0, R9));
+    emitter.push(float_sign(wide, abs, 0, 0));
+    emitter.push(fmov_from_float(wide, R9, 0));
+    emitter.push(str_x(R9, SP, destination));
+}
+
+/// The unary floats the native code covers: negation and absolute value. The rest are refused.
+fn float_unary_arm(
+    wide: bool,
+    result: ValueId,
+    value: ValueId,
+    operation: FloatUnary,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    match operation {
+        FloatUnary::Neg => float_unary_into(wide, false, result, value, frame, emitter),
+        FloatUnary::Abs => float_unary_into(wide, true, result, value, frame, emitter),
+        other => {
+            return Err(JitError::Unsupported(format!(
+                "the {other:?} float operation"
+            )))
+        }
+    }
+    Ok(())
+}
+
 fn ldr_x_sign_word(rt: u32, rn: u32, imm: u32) -> u32 {
     0xB980_0000 | ((imm / 4) << 10) | (rn << 5) | rt
 }
@@ -1087,7 +1573,7 @@ mod tests {
                 terminator: Terminator::Return(vec![ValueId(0)]),
             }],
         };
-        let code = encode(&function).expect("compiles");
+        let code = encode(&function, &CallEnv::default()).expect("compiles");
         let first = u32::from_le_bytes(code[0..4].try_into().unwrap());
         assert_eq!(first, 0xA9BF_7BFD, "stp x29, x30, [sp, #-16]!");
         let last = u32::from_le_bytes(code[code.len() - 4..].try_into().unwrap());

@@ -27,20 +27,33 @@
 //! | magic | 8 | `TPTAOT\0` and the format version byte, `2` |
 //! | target length | 1 | length of the target name |
 //! | target | n | [`tpt_wasm_jit::target_id`] of the generating host |
-//! | parameters | 1 + n | the number of parameters, then one kind byte each: `0` for `i32`, `1` for `i64` |
+//! | parameters | 1 + n | the number of parameters, then one kind byte each: `0` for `i32`, `1` for `i64`, `2` for `f32`, `3` for `f64` |
 //! | result | 1 | the result kind, with the same encoding |
 //! | code length | 4 | length of the machine code |
 //! | code | m | the machine code |
 //! | checksum | 8 | FNV-1a 64 over every byte before it |
+//!
+//! A module artifact ([`ModuleArtifact`]) has the magic `TPTAOT\0\x03` and holds a whole module:
+//! its target, the call-depth limit it was compiled against, whether its indirect calls are
+//! compiled, then each function as a present byte and, when present, its signature and code, then
+//! the table as a count and one entry per slot: a function index (or `0xFFFFFFFF` for null) and
+//! the slot's signature id. Its checksum covers every byte before it, as above.
 
 use std::fmt;
 
-use tpt_wasm_ir::IrFunction;
-use tpt_wasm_jit::{compile, target_id, CompiledFunction, JitError};
+use tpt_wasm_ir::{IrFunction, IrModule};
+use tpt_wasm_jit::{
+    compile, compile_module, target_id, CompiledFunction, CompiledModule, FunctionParts, JitError,
+    ModuleParts, TableSlotParts,
+};
 use tpt_wasm_types::ValueType;
 
-/// The magic bytes, ending with the format version.
+/// The magic bytes of a single-function artifact, ending with the format version.
 const MAGIC: [u8; 8] = *b"TPTAOT\0\x02";
+/// The magic bytes of a module artifact: the same family, with its own version.
+const MODULE_MAGIC: [u8; 8] = *b"TPTAOT\0\x03";
+/// The function index a null table slot holds in a module artifact.
+const NO_FUNCTION: u32 = u32::MAX;
 
 /// Why an artifact could not be produced, read, or loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,20 +108,26 @@ pub struct Artifact {
     code: Vec<u8>,
 }
 
-/// The one-byte encoding of an integer type in an artifact header.
+/// The one-byte encoding of a scalar type in an artifact header. A type the compiler never
+/// generates code for encodes as `0xFF`, which no reader accepts, so such an artifact is refused
+/// when it is read rather than read as some other type.
 fn kind_byte(value_type: ValueType) -> u8 {
     match value_type {
+        ValueType::I32 => 0,
         ValueType::I64 => 1,
-        _ => 0,
+        ValueType::F32 => 2,
+        ValueType::F64 => 3,
+        ValueType::V128 | ValueType::Ref(_) => 0xFF,
     }
 }
 
-/// The integer type a header byte names. Any byte other than `1` names `i32`, and the format
-/// check rejects bytes above `1` before this is reached.
+/// The scalar type a header byte names.
 fn kind_from_byte(byte: u8) -> Result<ValueType, AotError> {
     match byte {
         0 => Ok(ValueType::I32),
         1 => Ok(ValueType::I64),
+        2 => Ok(ValueType::F32),
+        3 => Ok(ValueType::F64),
         other => Err(AotError::Malformed(format!(
             "an unknown value kind {other}"
         ))),
@@ -240,6 +259,233 @@ impl Artifact {
     }
 }
 
+#[cfg(test)]
+mod module_tests;
+
+/// A module compiled together, in portable form: each function's code, and the module's table.
+///
+/// The table is stored as function indices and signature ids, not as addresses. The addresses
+/// exist only once the code is installed, so [`ModuleArtifact::load`] rebuilds them. Calls need no
+/// relocation for the same reason: a compiled caller reaches its callee through the table in its
+/// context, which is filled at load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleArtifact {
+    target: String,
+    parts: ModuleParts,
+}
+
+/// Compile every function of `module` together, as the runtime does, and wrap the result.
+///
+/// `table_private` says whether no other instance can write the module's table, which is what
+/// lets its indirect calls be compiled. It is the caller's statement, and the runtime derives it
+/// from the module's exports; see [`tpt_wasm_jit::compile_module`].
+///
+/// # Errors
+///
+/// A function with more parameters than a header can count is refused, since the artifact could
+/// not describe it.
+pub fn compile_module_artifact(
+    module: &IrModule,
+    max_call_depth: u64,
+    table_private: bool,
+) -> Result<ModuleArtifact, AotError> {
+    let parts = compile_module(module, max_call_depth, table_private).parts();
+    for function in parts.functions.iter().flatten() {
+        if function.params.len() > usize::from(u8::MAX) {
+            return Err(AotError::Compile(JitError::Unsupported(
+                "a function with more parameters than an artifact header counts".into(),
+            )));
+        }
+    }
+    Ok(ModuleArtifact {
+        target: target_id().to_owned(),
+        parts,
+    })
+}
+
+impl ModuleArtifact {
+    /// The target the code was generated for.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Each function by index: its code, or `None` where it was not compiled.
+    pub fn functions(&self) -> &[Option<FunctionParts>] {
+        &self.parts.functions
+    }
+
+    /// The module's table, slot by slot.
+    pub fn table(&self) -> &[TableSlotParts] {
+        &self.parts.table
+    }
+
+    /// Whether the module's indirect calls are compiled.
+    pub fn indirect(&self) -> bool {
+        self.parts.indirect
+    }
+
+    /// The call-depth limit the calls were compiled against.
+    pub fn max_call_depth(&self) -> u64 {
+        self.parts.max_call_depth
+    }
+
+    /// Serialize the artifact: the header, each function, the table, and the checksum.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&MODULE_MAGIC);
+        out.push(self.target.len() as u8);
+        out.extend_from_slice(self.target.as_bytes());
+        out.extend_from_slice(&self.parts.max_call_depth.to_le_bytes());
+        out.push(u8::from(self.parts.indirect));
+        out.extend_from_slice(&(self.parts.functions.len() as u32).to_le_bytes());
+        for function in &self.parts.functions {
+            match function {
+                None => out.push(0),
+                Some(function) => {
+                    out.push(1);
+                    out.push(function.params.len() as u8);
+                    out.extend(
+                        function
+                            .params
+                            .iter()
+                            .map(|value_type| kind_byte(*value_type)),
+                    );
+                    out.push(kind_byte(function.result));
+                    out.extend_from_slice(&(function.code.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&function.code);
+                }
+            }
+        }
+        out.extend_from_slice(&(self.parts.table.len() as u32).to_le_bytes());
+        for slot in &self.parts.table {
+            let function = slot.function.unwrap_or(NO_FUNCTION);
+            out.extend_from_slice(&function.to_le_bytes());
+            out.extend_from_slice(&slot.type_id.to_le_bytes());
+        }
+        let checksum = fnv1a(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    /// Read a module artifact back, checking the magic, the lengths, the checksum, and that every
+    /// table slot names a function the artifact defines. Whether the parts are consistent with
+    /// each other is checked again at [`ModuleArtifact::load`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AotError> {
+        const CHECKSUM: usize = 8;
+        if bytes.len() < MODULE_MAGIC.len() {
+            return Err(AotError::Truncated);
+        }
+        if bytes[..MODULE_MAGIC.len()] != MODULE_MAGIC {
+            return Err(AotError::BadMagic);
+        }
+        let mut cursor = Cursor {
+            bytes,
+            position: MODULE_MAGIC.len(),
+        };
+        let target_length = usize::from(cursor.byte()?);
+        let target = std::str::from_utf8(cursor.take(target_length)?)
+            .map_err(|_| AotError::Malformed("the target name is not UTF-8".into()))?
+            .to_owned();
+        let max_call_depth = cursor.u64()?;
+        let indirect = match cursor.byte()? {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(AotError::Malformed(format!(
+                    "an indirect flag of {other}, which is neither 0 nor 1"
+                )))
+            }
+        };
+        // Each function takes at least one byte, so a count larger than the rest of the bytes
+        // cannot be honest. Checking it first keeps a hostile count from reserving memory.
+        let function_count = cursor.count(1)?;
+        let mut functions = Vec::with_capacity(function_count);
+        for _ in 0..function_count {
+            match cursor.byte()? {
+                0 => functions.push(None),
+                1 => {
+                    let parameter_count = usize::from(cursor.byte()?);
+                    let params = cursor
+                        .take(parameter_count)?
+                        .iter()
+                        .map(|byte| kind_from_byte(*byte))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let result = kind_from_byte(cursor.byte()?)?;
+                    let code_length = cursor.u32()? as usize;
+                    let code = cursor.take(code_length)?.to_vec();
+                    functions.push(Some(FunctionParts {
+                        params,
+                        result,
+                        code,
+                    }));
+                }
+                other => {
+                    return Err(AotError::Malformed(format!(
+                        "a function tag of {other}, which is neither 0 nor 1"
+                    )))
+                }
+            }
+        }
+        // Each slot takes twelve bytes.
+        let slot_count = cursor.count(12)?;
+        let mut table = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            let function = cursor.u32()?;
+            let type_id = cursor.u64()?;
+            let function = if function == NO_FUNCTION {
+                None
+            } else if (function as usize) < functions.len() {
+                Some(function)
+            } else {
+                return Err(AotError::Malformed(format!(
+                    "a table slot names function {function}, of {} defined",
+                    functions.len()
+                )));
+            };
+            table.push(TableSlotParts { function, type_id });
+        }
+
+        // The checksum covers everything before it, so it is read after the table.
+        let covered = cursor.position;
+        let stored = u64::from_le_bytes(cursor.take(CHECKSUM)?.try_into().expect("eight bytes"));
+        if cursor.position != bytes.len() {
+            return Err(AotError::Malformed("bytes after the checksum".into()));
+        }
+        let computed = fnv1a(&bytes[..covered]);
+        if computed != stored {
+            return Err(AotError::ChecksumMismatch {
+                expected: stored,
+                found: computed,
+            });
+        }
+        Ok(Self {
+            target,
+            parts: ModuleParts {
+                functions,
+                table,
+                indirect,
+                max_call_depth,
+            },
+        })
+    }
+
+    /// Install the module: each function's code, then the table, rebuilt from the installed
+    /// entries.
+    ///
+    /// Refused if the artifact was generated for another target. The code is installed as it is,
+    /// which is the trust boundary of every artifact: see the crate documentation.
+    pub fn load(&self) -> Result<CompiledModule, AotError> {
+        let host = target_id();
+        if self.target != host {
+            return Err(AotError::TargetMismatch {
+                artifact: self.target.clone(),
+                host,
+            });
+        }
+        CompiledModule::from_parts(self.parts.clone()).map_err(AotError::Load)
+    }
+}
+
 /// A reader over the artifact bytes that refuses to read past the end.
 struct Cursor<'a> {
     bytes: &'a [u8],
@@ -262,6 +508,29 @@ impl<'a> Cursor<'a> {
 
     fn byte(&mut self) -> Result<u8, AotError> {
         Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, AotError> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("four bytes"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, AotError> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?.try_into().expect("eight bytes"),
+        ))
+    }
+
+    /// A count of items that each take at least `size` bytes. A count that cannot fit in the bytes
+    /// that remain is refused before anything is reserved for it.
+    fn count(&mut self, size: usize) -> Result<usize, AotError> {
+        let count = self.u32()? as usize;
+        let remaining = self.bytes.len() - self.position;
+        if count > remaining / size {
+            return Err(AotError::Truncated);
+        }
+        Ok(count)
     }
 }
 
