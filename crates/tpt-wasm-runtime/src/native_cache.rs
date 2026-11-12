@@ -8,21 +8,30 @@
 //! so an entry is trusted exactly as far as the directory holding it is. The rules, which the
 //! threat model records:
 //!
-//! - The directory must be owned by the current user and must not be writable by anyone else.
-//! - An entry must be a regular file owned by the current user, with no group or other access.
-//!   An entry that fails the check is ignored, and the module is compiled again; the new entry then
-//!   replaces it, so a refused file does not stay in use.
+//! - The directory must belong to the current user, and no other user may be able to change what is
+//!   in it.
+//! - An entry must be a regular file belonging to the current user, and no other user may have access
+//!   to it. An entry that fails the check is ignored, and the module is compiled again; the new entry
+//!   then replaces it, so a refused file does not stay in use.
 //! - An entry is named by the module's SHA-256, the call-depth limit it was compiled against, and
 //!   the target. The artifact records the same, and a mismatch is refused.
 //! - Entries are written to a temporary file of the user's own and renamed into place, so a reader
 //!   never sees a partial one.
 //!
-//! Ownership and permissions are checked on Unix only. The standard library does not expose the
-//! owner of a file on other platforms, so on those the cache does not open at all.
+//! The ownership and access checks are per platform: Unix permission bits in `native_cache/unix.rs`,
+//! and access control lists in `native_cache/windows.rs`. Other platforms do not open the cache.
 
 use std::path::{Path, PathBuf};
 
 use crate::RuntimeError;
+
+#[cfg(all(feature = "jit", unix))]
+#[path = "native_cache/unix.rs"]
+mod platform;
+
+#[cfg(all(feature = "jit", windows))]
+#[path = "native_cache/windows.rs"]
+mod platform;
 
 /// The cache key of a module: its SHA-256, in hexadecimal.
 pub(crate) fn module_key(bytes: &[u8]) -> String {
@@ -33,57 +42,31 @@ pub(crate) fn module_key(bytes: &[u8]) -> String {
 }
 
 /// A per-user directory of compiled module artifacts.
-#[cfg(all(feature = "jit", unix))]
+#[cfg(all(feature = "jit", any(unix, windows)))]
 #[derive(Debug)]
 pub(crate) struct NativeCache {
     dir: PathBuf,
     /// The user the directory belongs to, and so the owner of every entry that may be loaded.
-    owner: u32,
+    owner: platform::Owner,
     hits: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(all(feature = "jit", unix))]
+#[cfg(all(feature = "jit", any(unix, windows)))]
 impl NativeCache {
     /// Open the cache in `dir`, creating it if needed, after checking that the current user owns it
-    /// and that no other user can write to it.
+    /// and that no other user can change it.
     pub(crate) fn open(dir: &Path) -> Result<Self, RuntimeError> {
-        use std::fs::{self, OpenOptions};
         use std::io;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-        fs::create_dir_all(dir).map_err(RuntimeError::Io)?;
-        let meta = fs::symlink_metadata(dir).map_err(RuntimeError::Io)?;
+        std::fs::create_dir_all(dir).map_err(RuntimeError::Io)?;
+        let meta = std::fs::symlink_metadata(dir).map_err(RuntimeError::Io)?;
         if !meta.file_type().is_dir() {
             return Err(RuntimeError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the native cache path is not a directory",
             )));
         }
-        if meta.permissions().mode() & 0o022 != 0 {
-            return Err(RuntimeError::Io(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the native cache directory is writable by users other than its owner",
-            )));
-        }
-        // The current user's id is the owner of a file this process creates, so a probe gives it
-        // without a platform call.
-        let probe = dir.join(format!(".probe-{}", std::process::id()));
-        let _ = fs::remove_file(&probe);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&probe)
-            .map_err(RuntimeError::Io)?;
-        let owner = file.metadata().map_err(RuntimeError::Io)?.uid();
-        drop(file);
-        fs::remove_file(&probe).map_err(RuntimeError::Io)?;
-        if meta.uid() != owner {
-            return Err(RuntimeError::Io(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the native cache directory belongs to another user",
-            )));
-        }
+        let owner = platform::open_directory(dir).map_err(RuntimeError::Io)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             owner,
@@ -112,18 +95,12 @@ impl NativeCache {
         function_count: usize,
         max_call_depth: u64,
     ) -> Option<tpt_wasm_jit::CompiledModule> {
-        use std::fs;
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
         let path = self.entry(key, max_call_depth);
-        let meta = fs::symlink_metadata(&path).ok()?;
-        if !meta.file_type().is_file()
-            || meta.uid() != self.owner
-            || meta.permissions().mode() & 0o077 != 0
-        {
+        if !platform::entry_is_trusted(&path, &self.owner) {
             return None;
         }
-        let artifact = tpt_wasm_aot::ModuleArtifact::from_bytes(&fs::read(&path).ok()?).ok()?;
+        let artifact =
+            tpt_wasm_aot::ModuleArtifact::from_bytes(&std::fs::read(&path).ok()?).ok()?;
         if artifact.max_call_depth() != max_call_depth
             || artifact.functions().len() != function_count
         {
@@ -142,9 +119,7 @@ impl NativeCache {
         module: &tpt_wasm_jit::CompiledModule,
         max_call_depth: u64,
     ) -> std::io::Result<()> {
-        use std::fs::{self, OpenOptions};
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static TEMPORARY: AtomicU64 = AtomicU64::new(0);
@@ -154,30 +129,26 @@ impl NativeCache {
             std::process::id(),
             TEMPORARY.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
+        let mut file = platform::create_private(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, self.entry(key, max_call_depth))
+        std::fs::rename(&temporary, self.entry(key, max_call_depth))
     }
 }
 
 /// Without a native cache, a stand-in that never opens.
-#[cfg(not(all(feature = "jit", unix)))]
+#[cfg(not(all(feature = "jit", any(unix, windows))))]
 #[derive(Debug)]
 pub(crate) struct NativeCache;
 
-#[cfg(not(all(feature = "jit", unix)))]
+#[cfg(not(all(feature = "jit", any(unix, windows))))]
 impl NativeCache {
-    /// Refused: the cache needs the `jit` feature, and on this platform ownership and permissions
-    /// cannot be checked.
+    /// Refused: the cache needs the `jit` feature, and on this platform ownership and access cannot
+    /// be checked.
     pub(crate) fn open(_dir: &Path) -> Result<Self, RuntimeError> {
         Err(RuntimeError::UnsupportedFeature(if cfg!(feature = "jit") {
-            "the native cache needs Unix ownership and permission checks"
+            "the native cache needs Unix or Windows ownership and access checks"
         } else {
             "the native cache needs the jit feature"
         }))

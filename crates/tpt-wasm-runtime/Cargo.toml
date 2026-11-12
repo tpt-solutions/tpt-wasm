@@ -29,6 +29,11 @@ tpt-wasm-jit = { workspace = true, optional = true }
 # The on-disk cache of compiled native code stores module artifacts, so it needs the AOT format.
 tpt-wasm-aot = { workspace = true, optional = true }
 
+# Windows has no owner or permission check in the standard library, so the native cache reads
+# the access control lists through the Win32 API.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
+
 [features]
 default = ["jit"]
 jit = ["dep:tpt-wasm-jit", "dep:tpt-wasm-aot"]

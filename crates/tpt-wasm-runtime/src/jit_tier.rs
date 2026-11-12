@@ -67,7 +67,7 @@ impl JitTier {
     /// As `compile`, but the module is loaded from the native cache when the cache holds a trusted
     /// entry for it, and is stored there after a compile. A store that fails means only that the next
     /// instantiation compiles the module again.
-    #[cfg(all(feature = "jit", unix))]
+    #[cfg(all(feature = "jit", any(unix, windows)))]
     pub(crate) fn compile_cached(
         ir: &IrModule,
         max_call_depth: u64,
@@ -86,7 +86,7 @@ impl JitTier {
     }
 
     /// Without a cache that can be used on this platform, the module is compiled.
-    #[cfg(not(all(feature = "jit", unix)))]
+    #[cfg(not(all(feature = "jit", any(unix, windows))))]
     pub(crate) fn compile_cached(
         ir: &IrModule,
         max_call_depth: u64,

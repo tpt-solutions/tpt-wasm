@@ -142,7 +142,7 @@ pub struct Config {
     pub profiling: bool,
     /// Where compiled native code is cached between processes, or `None` for no cache. The directory
     /// must belong to the current user and be writable by no one else; see `default_native_cache_dir`.
-    /// Only the native tier uses it, so it needs the `jit` feature, and it works on Unix only.
+    /// Only the native tier uses it, so it needs the `jit` feature, and it works on Unix and Windows only.
     pub native_cache_dir: Option<std::path::PathBuf>,
 }
 

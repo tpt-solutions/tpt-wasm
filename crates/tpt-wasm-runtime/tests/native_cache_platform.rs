@@ -1,5 +1,6 @@
-//! Where the native cache cannot check ownership and permissions, it does not open. Off Unix only.
-#![cfg(all(feature = "jit", not(unix)))]
+//! Where the native cache cannot check ownership and access, it does not open. Only on platforms that
+//! are neither Unix nor Windows.
+#![cfg(all(feature = "jit", not(any(unix, windows))))]
 
 use tpt_wasm_runtime::{Config, Engine, EngineMode};
 
