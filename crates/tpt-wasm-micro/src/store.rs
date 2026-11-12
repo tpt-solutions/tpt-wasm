@@ -241,7 +241,7 @@ fn value_matches(actual: ValueType, expected: ValueType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RefType, Store, StoreError};
+    use super::{Instance, RefType, Store, StoreError};
     use tpt_wasm_types::{GlobalType, RefValue, ResourceLimits, Value, ValueType};
 
     fn limits() -> ResourceLimits {
@@ -269,6 +269,29 @@ mod tests {
         assert_eq!(
             store.memory(index).unwrap().read(u64::MAX, 1),
             Err(StoreError::MemoryOutOfBounds)
+        );
+    }
+
+    /// An instance is a plain record, so a store can be filled with empty ones.
+    fn empty_instance() -> Instance {
+        Instance {
+            module_types: Vec::new(),
+            func_addrs: Vec::new(),
+            table_addrs: Vec::new(),
+            memory_addrs: Vec::new(),
+            global_addrs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_instance_limit_refuses_the_instance_past_it() {
+        // `limits()` allows one instance: the first is admitted and the second refused,
+        // so a module cannot be instantiated without bound.
+        let mut store = Store::new(limits());
+        assert_eq!(store.add_instance(empty_instance()), Ok(0));
+        assert_eq!(
+            store.add_instance(empty_instance()),
+            Err(StoreError::LimitExceeded("instance limit exceeded"))
         );
     }
 
