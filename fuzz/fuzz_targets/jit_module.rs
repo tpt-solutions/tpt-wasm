@@ -168,12 +168,14 @@ impl Generator<'_, '_> {
             (Kind::F64, 2 | 3) => {
                 let mut out = self.expression(Kind::F64, depth - 1, params);
                 out.extend(self.expression(Kind::F64, depth - 1, params));
-                out.push(0xA0 + self.pick(4) as u8); // add sub mul div
+                // add sub mul div min max copysign
+                out.push([0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6][self.pick(7)]);
                 out
             }
             (Kind::F64, 4) => {
                 let mut out = self.expression(Kind::F64, depth - 1, params);
-                out.push(if self.bytes.byte() % 2 == 0 { 0x99 } else { 0x9A }); // abs, neg
+                // abs, neg, sqrt
+                out.push([0x99, 0x9A, 0x9F][self.pick(3)]);
                 out
             }
             (_, 6) => self.call(kind, depth, params),
