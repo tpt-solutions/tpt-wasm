@@ -23,3 +23,7 @@ wast = { version = "259", default-features = false, features = ["wasm-module"] }
 # harness lives in `tests/`, and nothing in the library uses it.
 [dev-dependencies]
 tpt-wasm-format.workspace = true
+
+[features]
+# Runs the Core suite on the native tier as well, through the runtime's jit feature.
+native = ["tpt-wasm-runtime/jit"]

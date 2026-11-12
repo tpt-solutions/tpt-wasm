@@ -447,6 +447,14 @@ fn core_spec_suite_on_baseline() {
     assert_suite_passes(EngineMode::Baseline);
 }
 
+/// The same directives, on the native tier. A function the native compiler accepts runs as machine
+/// code; any other runs on the baseline, so a module can be partly native. Needs the `native` feature.
+#[cfg(feature = "native")]
+#[test]
+fn core_spec_suite_on_the_native_tier() {
+    assert_suite_passes(EngineMode::Jit);
+}
+
 /// The same directives, through the optimizing engine.
 ///
 /// This is the strongest single check in the project for the optimization
