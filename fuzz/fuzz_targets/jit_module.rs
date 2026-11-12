@@ -174,8 +174,8 @@ impl Generator<'_, '_> {
             }
             (Kind::F64, 4) => {
                 let mut out = self.expression(Kind::F64, depth - 1, params);
-                // abs, neg, sqrt
-                out.push([0x99, 0x9A, 0x9F][self.pick(3)]);
+                // abs, neg, sqrt, ceil, floor, trunc, nearest
+                out.push([0x99, 0x9A, 0x9F, 0x9B, 0x9C, 0x9D, 0x9E][self.pick(7)]);
                 out
             }
             (_, 6) => self.call(kind, depth, params),
