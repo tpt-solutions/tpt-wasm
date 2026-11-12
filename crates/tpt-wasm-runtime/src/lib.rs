@@ -51,7 +51,8 @@ pub enum EngineMode {
     Optimizing,
     /// The baseline, with each function the JIT accepts running as machine code.
     ///
-    /// Needs the `jit` feature. A function the compiler refuses runs on the baseline, and
+    /// Needs the `jit` feature, which default builds include; `--no-default-features` builds refuse
+    /// this mode. A function the compiler refuses runs on the baseline, and
     /// the native tier is off for an instance with a step limit, profiling or debugging,
     /// since native code charges no steps. Results match the baseline's.
     Jit,
