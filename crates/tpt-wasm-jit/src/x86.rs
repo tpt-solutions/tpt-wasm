@@ -253,37 +253,6 @@ impl Emitter {
         self.bytes.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
     }
 
-    /// `movss xmm0, [rbp + disp]` (`prefix` 0xF3) or `movsd xmm0, [rbp + disp]` (0xF2).
-    fn scalar_load_xmm0(&mut self, prefix: u8, disp: i32) {
-        self.bytes.push(prefix);
-        self.memory(&[0x0F, 0x10], 0, disp);
-    }
-
-    /// `addss`/`subss`/`mulss`/`divss` (or the `sd` forms) `xmm0, [rbp + disp]`, selected by
-    /// `opcode` (0x58, 0x5C, 0x59, 0x5E) and the same `prefix` as the load.
-    fn scalar_op_xmm0(&mut self, prefix: u8, opcode: u8, disp: i32) {
-        self.bytes.push(prefix);
-        self.memory(&[0x0F, opcode], 0, disp);
-    }
-
-    /// `movd eax, xmm0` or, when `wide`, `movq rax, xmm0`. The 32-bit form zero-extends.
-    fn move_xmm0_to_rax(&mut self, wide: bool) {
-        if wide {
-            self.bytes.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]);
-        } else {
-            self.bytes.extend_from_slice(&[0x66, 0x0F, 0x7E, 0xC0]);
-        }
-    }
-
-    /// `ucomiss xmm0, [rbp + disp]` (or `ucomisd` when `wide`). Sets ZF, PF and CF; an unordered
-    /// pair sets all three, so it reads as neither "above" nor "equal".
-    fn unordered_compare_xmm0(&mut self, wide: bool, disp: i32) {
-        if wide {
-            self.bytes.push(0x66);
-        }
-        self.memory(&[0x0F, 0x2E], 0, disp);
-    }
-
     /// A shift of `rax` by `cl`, 64 bits wide: `shl` (/4), `shr` (/5), or `sar` (/7).
     fn shift_by_cl_wide(&mut self, extension: u8) {
         self.bytes
