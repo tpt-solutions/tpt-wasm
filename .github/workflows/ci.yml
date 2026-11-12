@@ -225,3 +225,8 @@ jobs:
         run: cargo test --workspace --test spec -- --nocapture
         # TODO(M2): enable once spec test runner is implemented
         continue-on-error: true
+
+      # The Core suite on the native tier, which must pass: its results are held to the suite's own
+      # expected values, not to Micro's.
+      - name: Core suite on the native tier
+        run: cargo test -p tpt-wasm-spec --features native --test core_spec
