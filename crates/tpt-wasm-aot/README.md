@@ -1,52 +1,31 @@
 # tpt-wasm-aot
 
-The ahead-of-time compiler for [TPT-Wasm](https://github.com/tpt-solutions/tpt-wasm).
+Ahead-of-time compilation of the JIT subset into a portable artifact, for
+[TPT-Wasm](https://github.com/tpt-solutions/tpt-wasm).
 
-> **Status: not yet implemented.** This crate is a placeholder in the workspace. It is
-> scheduled for milestone M8. Its target-code generator does not exist yet: it depends on the
-> native code generation still pending in `tpt-wasm-codegen`.
+> **Status: partial.** Artifacts hold the machine code the JIT generates for the functions in
+> its subset, for the host that generated them. Nothing here lowers other code, and nothing
+> connects an artifact to `Engine`.
 
-## Planned design
+## Use
 
-The AOT compiler will translate a validated module into target code ahead of time, so that
-the module does not need to be compiled when it is loaded. It will use the same pipeline as
-the rest of the compiler:
+```rust
+let artifact = tpt_wasm_aot::compile_artifact(function)?;   // generate once
+std::fs::write("add.tptaot", artifact.to_bytes())?;
 
+let bytes = std::fs::read("add.tptaot")?;                    // later
+let loaded = tpt_wasm_aot::Artifact::from_bytes(&bytes)?.load()?;
+let result = loaded.call(&[2, 3])?;
 ```
-Wasm → TPT IR → optimization → code generation → target artifact
-```
 
-Its output is held to the same contract as every other backend: the compiled module must be
-indistinguishable from the Micro Interpreter's behaviour.
+## What an artifact is
 
-Use the `Baseline` or `Optimizing` engine modes of [`tpt-wasm`](https://docs.rs/tpt-wasm) for
-execution today.
+An artifact is executable code. `load` runs it, so it is a trust decision: load only artifacts
+from a store you trust. The header's FNV-1a checksum detects corruption; it does not
+authenticate the artifact, and a forged artifact can carry a valid checksum. Authentication by
+signature is not implemented.
 
-## Testing
+Artifacts are target-specific: the target names are `x86_64-windows`, `x86_64-unix`,
+`aarch64-unix`, and `riscv64-unix`. `load` refuses an artifact generated for another target.
 
-The crate currently has no tests of its own.
-
-## Dependencies
-
-- `tpt-wasm-types`
-- `tpt-wasm-ir`
-- `tpt-wasm-opt`
-- `tpt-wasm-codegen`
-
-## Safety
-
-No `unsafe` code.
-
-## Minimum supported Rust version
-
-Rust 1.80.
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md).
-
-## License
-
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
-Copyright (c) 2026 TPT Solutions. See the
-[repository](https://github.com/tpt-solutions/tpt-wasm) for the license texts.
+The format is documented in the crate's module documentation.

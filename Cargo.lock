@@ -143,9 +143,12 @@ name = "tpt-wasm-aot"
 version = "0.1.0"
 dependencies = [
  "tpt-wasm-codegen",
+ "tpt-wasm-format",
  "tpt-wasm-ir",
+ "tpt-wasm-jit",
  "tpt-wasm-opt",
  "tpt-wasm-types",
+ "tpt-wasm-validate",
 ]
 
 [[package]]
