@@ -32,9 +32,27 @@ A function whose parameters and result are `i32`, `i64`, `f32`, or `f64`, and wh
   in the order Micro checks them, and each slot must hold a function compiled in the same module;
 - unconditional and conditional branches, including loops, and a return.
 
-Everything else is refused with `JitError::Unsupported`. That includes calls through an imported
-or exported table, globals, `memory.grow` (which changes the memory during a call, so it stays on the baseline), and frames larger than one page. A function that calls one of those is refused too. A single function compiled with
-`compile` on its own cannot call anything, since a call needs the module it belongs to.
+Everything else is refused with `JitError::Unsupported`. That includes a function with more than one
+result, calls through an imported or exported table, a `memory.grow` of a memory that is not reserved
+(a memory whose maximum is above 256 pages, or none), and frames larger than the encoder's limit. A
+function that calls one of those is refused too. A single function compiled with `compile` on its own
+cannot call anything, since a call needs the module it belongs to.
+
+The rest of the subset is compiled with the module it belongs to:
+
+- **Globals** are read and written through an array the caller provides, with
+  `CompiledModule::call_with_globals`.
+- **`memory.grow`** is compiled in place for a memory whose maximum is at most 256 pages (16 MiB).
+  The caller reserves that maximum, with `CompiledModule::call_with_memory`, and the code grows into
+  it. A grow past the reservation returns -1, as a grow past the maximum does.
+- **Calls to imported functions** go through a `HostCalls` the caller provides, with
+  `CompiledModule::call_with_host`. Arguments and results are words, a failed host call ends the
+  native call with a failed status, and the host records its own failure. This is compiled on
+  x86-64, AArch64, and RISC-V.
+
+Registers: in a function that makes no call, values within a block, and locals and block parameters
+across blocks, are kept in registers where one is free. On x86-64 a leaf function saves the callee-saved
+registers it uses and restores them on every return.
 
 Division and remainder, signed and unsigned, are compiled with Wasm's traps. A zero divisor
 and `i32::MIN / -1` return `JitError::Trap`, the same trap Micro reports. The return value
@@ -59,10 +77,13 @@ let result = compiled.call_with_memory(&[16, 7], &mut memory)?;
 
 ## Safety boundary
 
-The crate denies `unsafe` code. The one module that uses it, `exec`, maps executable memory:
-it writes the code to a read-write page, then changes the page to read-execute, and never has
-a page that is both writable and executable. Each `unsafe` block states the invariant it relies
-on. The encoder is safe code and is tested on every target.
+The crate denies `unsafe` code. Two places use it. The `exec` module maps executable memory: it writes
+the code to a read-write page, then changes the page to read-execute, and never has a page that is both
+writable and executable. The host trampoline is the one function through which compiled code calls a
+host import: it rebuilds the slices of the call's words and memory, catches any panic from the host so the
+panic does not unwind through compiled frames, and reports a failure through the context status. Each
+`unsafe` block states the invariant it relies on. The encoders are safe code and are tested on every
+target.
 
 See [`docs/security/threat-model.md`](../../docs/security/threat-model.md) for what this
 boundary does and does not guard against.

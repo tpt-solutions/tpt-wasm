@@ -24,32 +24,52 @@
 //!   out-of-range value;
 //! - linear memory: loads and stores of all the integer widths and of both float widths, each
 //!   checked against the memory's length;
+//! - the bit counts `clz`, `ctz`, and `popcnt`, and the rotations `rotl` and `rotr`, on both widths;
+//! - globals: reads and writes, through an array of the module's globals that the caller provides
+//!   ([`CompiledModule::call_with_globals`]);
+//! - `memory.grow`, in place, when the memory's maximum is at most [`MAX_RESERVED_PAGES`] and the
+//!   caller reserves that maximum ([`CompiledModule::call_with_memory`]);
 //! - direct calls to other functions of the same module, when they are compiled with
 //!   [`compile_module`], and indirect calls through the module's table, when that table is defined
 //!   here and not exported, so that nothing outside the module can write it;
-//! - control flow: unconditional and conditional branches, including loops, and a return.
+//! - calls to imported functions, through a [`HostCalls`] the caller provides, on x86-64, AArch64,
+//!   and RISC-V;
+//! - control flow: unconditional and conditional branches, including loops, `unreachable`, and a
+//!   return.
 //!
-//! Each value lives in a stack slot, so each IR instruction is a load, at most one operation,
-//! and a store. Anything else is refused with [`JitError::Unsupported`] rather than compiled
-//! approximately: rotations, bit counting, calls through imported or exported tables, `memory.grow`, and a frame larger than the
-//! encoder's limit are left to the interpreter or the baseline. A call to a function that is not
-//! compiled refuses the caller too, so [`compile_module`] leaves that caller out as well.
+//! In a function that makes no call, a value that lives within one block, and a local or block
+//! parameter that lives across blocks, is kept in a register where one is free, and in a stack slot
+//! otherwise. The x86-64 encoder also keeps its most used locals in callee-saved registers, which a
+//! leaf function saves on entry and restores on every return. A function that makes a call uses
+//! only stack slots. Either way, each IR instruction is at most one operation between its operands
+//! and its result.
+//!
+//! Anything else is refused with [`JitError::Unsupported`] rather than compiled approximately: a
+//! function with more than one result, calls through an imported or exported table, a
+//! `memory.grow` of a memory that is not reserved, and a frame larger than the encoder's limit are
+//! left to the interpreter or the baseline. A call to a function that is not compiled refuses the
+//! caller too, so [`compile_module`] leaves that caller out as well.
 //!
 //! ## Calling convention
 //!
 //! Every compiled function has the one signature `(args: *const i64, ctx: *mut Context) -> u64`
 //! on the host's C convention. Each argument is an eight-byte slot in `args`, and the context
-//! gives the memory base and length and receives the trap status. The return value is the result
-//! register, so an `i64` result is the whole of it, and an `i32` result is its low half.
+//! gives the memory base and length, the globals, the memory's reservation, and the host call it
+//! may make, and receives the trap status. The return value is the result register, so an `i64`
+//! result is the whole of it, and an `i32` result is its low half.
 //!
 //! A trap stores a status in the context and returns. The status is read back after the call,
-//! and it names the trap Micro reports for the same input.
+//! and it names the trap Micro reports for the same input. A failed host call stores
+//! [`JitError::Unsupported`]'s "a host call failed" status, and the host has recorded the failure
+//! itself, so the caller reports the host's own error.
 //!
 //! ## Safety boundary
 //!
 //! The crate denies `unsafe` code except in the `exec` module, which maps executable memory and
-//! calls into it. Everything else, including the encoders, is safe code and is tested on every
-//! target. Generated code exists only where [`target_id`] names a supported target.
+//! calls into it, and in the one function through which compiled code calls the host. That function
+//! catches a panic from the host, so the panic does not unwind through compiled frames. Everything
+//! else, including the encoders, is safe code and is tested on every target. Generated code exists
+//! only where [`target_id`] names a supported target.
 
 #![deny(unsafe_code)]
 

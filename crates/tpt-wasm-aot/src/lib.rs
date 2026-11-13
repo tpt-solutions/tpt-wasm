@@ -33,9 +33,9 @@
 //! | code | m | the machine code |
 //! | checksum | 8 | FNV-1a 64 over every byte before it |
 //!
-//! A module artifact ([`ModuleArtifact`]) has the magic `TPTAOT\0\x03` and holds a whole module:
+//! A module artifact ([`ModuleArtifact`]) has the magic `TPTAOT\0\x04` and holds a whole module:
 //! its target, the call-depth limit it was compiled against, whether its indirect calls are
-//! compiled, then each function as a present byte and, when present, its signature and code, then
+//! compiled, whether the module has globals, whether its code grows memory, then each function as a present byte and, when present, its signature and code, then
 //! the table as a count and one entry per slot: a function index (or `0xFFFFFFFF` for null) and
 //! the slot's signature id. Its checksum covers every byte before it, as above.
 
