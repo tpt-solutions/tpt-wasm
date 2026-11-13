@@ -57,8 +57,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use tpt_wasm_ir::{
-    instruction_operands, instruction_results, terminator_operands, IrFunction, IrInstr, IrModule,
-    ValueId,
+    instruction_operands, instruction_results, terminator_operands, BlockId, IrFunction, IrInstr,
+    IrModule, Terminator, ValueId,
 };
 use tpt_wasm_types::{Trap, ValueType};
 
@@ -198,7 +198,12 @@ pub(crate) fn is_register_instruction(instruction: &IrInstr) -> bool {
 /// register instruction defines it and only register instructions in the same block read it, after its
 /// definition. Such a value lives only between its definition and its last read, so the registers are
 /// assigned in one pass per block, and a value that finds no free register stays in its slot.
-pub(crate) fn allocate_registers(function: &IrFunction, pool: &[u8]) -> HashMap<ValueId, u8> {
+pub(crate) fn allocate_registers(
+    function: &IrFunction,
+    pool: &[u8],
+    terminators_in_registers: bool,
+    is_register: fn(&IrInstr) -> bool,
+) -> HashMap<ValueId, u8> {
     // The (block, index) of the instruction that defines each value a register instruction defines.
     let mut definitions: HashMap<ValueId, (usize, usize)> = HashMap::new();
     // Every read of a value: (block, index, whether the reader is a register instruction). A terminator
@@ -207,7 +212,7 @@ pub(crate) fn allocate_registers(function: &IrFunction, pool: &[u8]) -> HashMap<
     let mut reads: HashMap<ValueId, Vec<(usize, usize, bool)>> = HashMap::new();
     for (block_index, block) in function.blocks.iter().enumerate() {
         for (index, instruction) in block.instrs.iter().enumerate() {
-            let register = is_register_instruction(instruction);
+            let register = is_register(instruction);
             if register {
                 for result in instruction_results(instruction) {
                     definitions.insert(result, (block_index, index));
@@ -220,11 +225,14 @@ pub(crate) fn allocate_registers(function: &IrFunction, pool: &[u8]) -> HashMap<
                     .push((block_index, index, register));
             }
         }
+        // A terminator reads after every instruction of its block. Its reads are register reads only if the
+        // encoder reads registers there.
         for operand in terminator_operands(&block.terminator) {
-            reads
-                .entry(operand)
-                .or_default()
-                .push((block_index, usize::MAX, false));
+            reads.entry(operand).or_default().push((
+                block_index,
+                block.instrs.len(),
+                terminators_in_registers,
+            ));
         }
     }
     // The live interval (definition, last read) of each value that qualifies, per block.
@@ -268,20 +276,64 @@ pub(crate) fn allocate_registers(function: &IrFunction, pool: &[u8]) -> HashMap<
     registers
 }
 
-/// The registers for the locals and parameters of a function that makes no call, drawn from `pool`. The
-/// most used locals take up to `locals` registers, so that values within a block keep the rest. Ties go to the lower value id, so the choice is the same on every run.
+/// The registers for the values that live across blocks in a function that makes no call: its parameters,
+/// its locals, and the parameters of its blocks. The most used take up to `locals` registers, so that values
+/// within a block keep the rest. Ties go to the lower value id, so the choice is the same on every run.
+///
+/// A value qualifies when no instruction outside the register instructions reads it, since such an instruction
+/// reads its operand from its slot, which a register value never fills. A terminator reads registers.
 pub(crate) fn allocate_local_registers(
     function: &IrFunction,
     pool: &[u8],
     locals: usize,
+    is_register: fn(&IrInstr) -> bool,
 ) -> HashMap<ValueId, u8> {
     let mut uses: HashMap<ValueId, usize> = HashMap::new();
-    for instruction in function.blocks.iter().flat_map(|block| &block.instrs) {
-        if let IrInstr::LocalGet { local, .. }
-        | IrInstr::LocalSet { local, .. }
-        | IrInstr::LocalTee { local, .. } = instruction
-        {
-            *uses.entry(*local).or_default() += 1;
+    let mut slot_read: HashSet<ValueId> = HashSet::new();
+    for block in &function.blocks {
+        for instruction in &block.instrs {
+            if let IrInstr::LocalGet { local, .. }
+            | IrInstr::LocalSet { local, .. }
+            | IrInstr::LocalTee { local, .. } = instruction
+            {
+                *uses.entry(*local).or_default() += 1;
+            }
+            let register = is_register(instruction);
+            for operand in instruction_operands(instruction) {
+                *uses.entry(operand).or_default() += 1;
+                if !register {
+                    slot_read.insert(operand);
+                }
+            }
+        }
+        for operand in terminator_operands(&block.terminator) {
+            *uses.entry(operand).or_default() += 1;
+        }
+    }
+    // Each branch writes the parameters of its target, which counts as a use of them.
+    let parameters: HashMap<BlockId, &Vec<ValueId>> = function
+        .blocks
+        .iter()
+        .map(|block| (block.id, &block.params))
+        .collect();
+    for block in &function.blocks {
+        let branches: Vec<(&BlockId, &Vec<ValueId>)> = match &block.terminator {
+            Terminator::Branch { target, values } => vec![(target, values)],
+            Terminator::CondBranch {
+                then_target,
+                then_values,
+                else_target,
+                else_values,
+                ..
+            } => vec![(then_target, then_values), (else_target, else_values)],
+            _ => Vec::new(),
+        };
+        for (target, values) in branches {
+            if let Some(targets) = parameters.get(target) {
+                for (parameter, _) in targets.iter().zip(values) {
+                    *uses.entry(*parameter).or_default() += 1;
+                }
+            }
         }
     }
     let mut seen = HashSet::new();
@@ -289,14 +341,15 @@ pub(crate) fn allocate_local_registers(
         .params
         .iter()
         .chain(&function.locals)
+        .chain(function.blocks.iter().flat_map(|block| &block.params))
         .filter(|value| seen.insert(**value))
+        .filter(|value| !slot_read.contains(value))
         .filter_map(|value| uses.get(value).map(|count| (*count, value.0, *value)))
         .collect();
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let capacity = locals.min(pool.len());
     candidates
         .into_iter()
-        .take(capacity)
+        .take(locals.min(pool.len()))
         .zip(pool.iter().copied())
         .map(|((_, _, value), register)| (value, register))
         .collect()

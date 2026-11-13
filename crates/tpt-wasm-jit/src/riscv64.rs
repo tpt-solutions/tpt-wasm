@@ -372,7 +372,8 @@ pub(crate) fn encode(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, Ji
 
     let mut frame = Frame::new(env);
     if !makes_calls(function) {
-        frame.registers = allocate_registers(function, &VALUE_REGISTERS);
+        frame.registers =
+            allocate_registers(function, &VALUE_REGISTERS, false, is_register_instruction);
     }
     let mut emitter = Emitter::new();
 

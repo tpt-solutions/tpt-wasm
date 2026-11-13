@@ -426,16 +426,20 @@ pub(crate) fn encode(
 
     let mut frame = Frame::new(function, abi, env, sse41);
     if !makes_calls(function) {
-        let locals = allocate_local_registers(function, &VALUE_REGISTERS, 6);
+        let locals =
+            allocate_local_registers(function, &VALUE_REGISTERS, 4, is_x86_register_instruction);
         let remaining: Vec<u8> = VALUE_REGISTERS
             .iter()
             .copied()
             .filter(|register| !locals.values().any(|taken| taken == register))
             .collect();
         frame.registers = locals;
-        frame
-            .registers
-            .extend(allocate_registers(function, &remaining));
+        frame.registers.extend(allocate_registers(
+            function,
+            &remaining,
+            true,
+            is_x86_register_instruction,
+        ));
     }
     let mut emitter = Emitter::new();
     // Save each callee-saved register the function uses, in order, before the body runs.
@@ -531,11 +535,16 @@ fn emit_terminator(
 ) -> Result<Vec<BlockId>, JitError> {
     match &block.terminator {
         Terminator::Return(values) if values.len() == 1 => {
-            let slot = frame.slot(values[0]);
-            // A 32-bit result is loaded at 32 bits, which zero-extends; a 64-bit one at 64.
-            match frame.value_type(values[0]) {
-                Some(ValueType::I64 | ValueType::F64) => emitter.load64(EAX, slot),
-                _ => emitter.load32(EAX, slot),
+            match frame.register(values[0]) {
+                Some(register) => emit_register_form(emitter, true, &[0x89], register, EAX), // mov rax, register
+                None => {
+                    let slot = frame.slot(values[0]);
+                    // A 32-bit result is loaded at 32 bits, which zero-extends; a 64-bit one at 64.
+                    match frame.value_type(values[0]) {
+                        Some(ValueType::I64 | ValueType::F64) => emitter.load64(EAX, slot),
+                        _ => emitter.load32(EAX, slot),
+                    }
+                }
             }
             emitter.epilogue();
             Ok(Vec::new())
@@ -573,8 +582,13 @@ fn emit_terminator(
             check_arity(then_block, then_values)?;
             check_arity(else_block, else_values)?;
             // Zero goes to the else edge, anything else to the then edge.
-            let condition = frame.slot(*condition);
-            emitter.compare_with_zero32(condition);
+            match frame.register(*condition) {
+                Some(register) => emit_register_form(emitter, false, &[0x85], register, register), // test r32, r32
+                None => {
+                    let condition = frame.slot(*condition);
+                    emitter.compare_with_zero32(condition);
+                }
+            }
             let else_path = emitter.new_label();
             emitter.jump(&[0x0F, 0x84], Target::Label(else_path)); // je
             copy_into_parameters(&then_block.params, then_values, frame, emitter);
@@ -618,20 +632,46 @@ fn copy_into_parameters(
     frame: &mut Frame,
     emitter: &mut Emitter,
 ) {
+    // A value is copied straight into its parameter unless a later value of the same branch reads that
+    // parameter, which the copy would have changed. Then every value goes through a temporary slot first, so
+    // each is read before any parameter is written.
+    let overwritten = parameters
+        .iter()
+        .enumerate()
+        .any(|(index, parameter)| values[index + 1..].contains(parameter));
+    if !overwritten {
+        for (parameter, value) in parameters.iter().zip(values) {
+            copy_value(*value, *parameter, frame, emitter);
+        }
+        return;
+    }
+    // Every value is copied to a temporary slot before any parameter is written, so a value that is also a
+    // parameter of the same branch is read before it changes. A register value is stored from its register,
+    // and a parameter in a register is loaded into it.
     let temporaries: Vec<i32> = values
         .iter()
         .map(|value| {
-            let source = frame.slot(*value);
             let temporary = frame.temporary();
-            emitter.load64(EAX, source);
-            emitter.store64(EAX, temporary);
+            match frame.register(*value) {
+                Some(register) => emitter.memory_with(true, &[0x89], register, temporary),
+                None => {
+                    let source = frame.slot(*value);
+                    emitter.load64(EAX, source);
+                    emitter.store64(EAX, temporary);
+                }
+            }
             temporary
         })
         .collect();
     for (parameter, temporary) in parameters.iter().zip(temporaries) {
-        let destination = frame.slot(*parameter);
-        emitter.load64(EAX, temporary);
-        emitter.store64(EAX, destination);
+        match frame.register(*parameter) {
+            Some(register) => emitter.memory_with(true, &[0x8B], register, temporary),
+            None => {
+                let destination = frame.slot(*parameter);
+                emitter.load64(EAX, temporary);
+                emitter.store64(EAX, destination);
+            }
+        }
     }
 }
 
@@ -1725,6 +1765,43 @@ fn copy_value(from: ValueId, to: ValueId, frame: &mut Frame, emitter: &mut Emitt
     }
 }
 
+/// Whether an instruction is handled by the register path on x86-64: the shared register instructions, and the
+/// integer comparisons, which read their operands from registers or slots and write their result the same way.
+fn is_x86_register_instruction(instruction: &IrInstr) -> bool {
+    is_register_instruction(instruction)
+        || matches!(
+            instruction,
+            IrInstr::I32Compare { .. } | IrInstr::I64Compare { .. }
+        )
+}
+
+/// `result = left <comparison> right` as 0 or 1, on 32 or 64 bits. The left operand goes to eax, the right is
+/// compared from its register or its slot, and the flags become the result.
+fn int_compare(
+    wide: bool,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    comparison: IntComparison,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    load_value(frame, left, wide, EAX, emitter);
+    match frame.register(right) {
+        Some(register) => emit_register_form(emitter, wide, OP_CMP, EAX, register),
+        None => {
+            let slot = frame.slot(right);
+            if wide {
+                emitter.memory_wide(OP_CMP, EAX, slot);
+            } else {
+                emitter.memory(OP_CMP, EAX, slot);
+            }
+        }
+    }
+    emitter.set_from_flags(condition_code(comparison));
+    store_value(frame, result, false, EAX, emitter);
+}
+
 /// Emit an instruction of [`is_register_instruction`].
 fn emit_register_instruction(
     instruction: &IrInstr,
@@ -1821,6 +1898,18 @@ fn emit_register_instruction(
             left,
             right,
         } => int_binary(true, OP_XOR, *result, *left, *right, frame, emitter),
+        IrInstr::I32Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => int_compare(false, *result, *left, *right, *comparison, frame, emitter),
+        IrInstr::I64Compare {
+            result,
+            left,
+            right,
+            comparison,
+        } => int_compare(true, *result, *left, *right, *comparison, frame, emitter),
         other => {
             return Err(JitError::Unsupported(format!(
                 "the {} instruction in a register",
@@ -1836,7 +1925,7 @@ fn emit_instruction(
     frame: &mut Frame,
     emitter: &mut Emitter,
 ) -> Result<(), JitError> {
-    if is_register_instruction(instruction) {
+    if is_x86_register_instruction(instruction) {
         return emit_register_instruction(instruction, frame, emitter);
     }
     match instruction {
@@ -2129,34 +2218,6 @@ fn emit_instruction(
             let destination = frame.slot(*result);
             emitter.compare_with_zero64(source);
             emitter.set_from_flags(0x4);
-            emitter.store32(EAX, destination);
-        }
-        IrInstr::I32Compare {
-            result,
-            left,
-            right,
-            comparison,
-        } => {
-            let left = frame.slot(*left);
-            let right = frame.slot(*right);
-            let destination = frame.slot(*result);
-            emitter.load32(EAX, left);
-            emitter.memory(OP_CMP, EAX, right);
-            emitter.set_from_flags(condition_code(*comparison));
-            emitter.store32(EAX, destination);
-        }
-        IrInstr::I64Compare {
-            result,
-            left,
-            right,
-            comparison,
-        } => {
-            let left = frame.slot(*left);
-            let right = frame.slot(*right);
-            let destination = frame.slot(*result);
-            emitter.load64(EAX, left);
-            emitter.memory_wide(OP_CMP, EAX, right);
-            emitter.set_from_flags(condition_code(*comparison));
             emitter.store32(EAX, destination);
         }
         IrInstr::Select {
@@ -2556,7 +2617,12 @@ mod tests {
         ];
         let values = (0..4).map(i32_value).collect();
         let function = one_block(instrs, ValueId(3), values);
-        let registers = allocate_registers(&function, &VALUE_REGISTERS);
+        let registers = allocate_registers(
+            &function,
+            &VALUE_REGISTERS,
+            false,
+            is_x86_register_instruction,
+        );
         assert!(registers.contains_key(&ValueId(0)));
         assert!(registers.contains_key(&ValueId(1)));
         assert!(registers.contains_key(&ValueId(2)));
@@ -2603,7 +2669,13 @@ mod tests {
                 },
             ],
         };
-        assert!(allocate_registers(&function, &VALUE_REGISTERS).is_empty());
+        assert!(allocate_registers(
+            &function,
+            &VALUE_REGISTERS,
+            false,
+            is_x86_register_instruction
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2622,12 +2694,13 @@ mod tests {
             vec![
                 0x55, // push rbp
                 0x48, 0x89, 0xE5, // mov rbp, rsp
-                0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, // sub rsp, 32
+                0x48, 0x81, 0xEC, 0x10, 0x00, 0x00, 0x00, // sub rsp, 16
                 0x48, 0x89, 0xBD, 0xF8, 0xFF, 0xFF,
                 0xFF, // mov [rbp-8], rdi: the args pointer
                 0x48, 0x89, 0xB5, 0xF0, 0xFF, 0xFF, 0xFF, // mov [rbp-16], rsi: the context
-                0xC7, 0x85, 0xE8, 0xFF, 0xFF, 0xFF, 0x07, 0x00, 0x00, 0x00, // mov [rbp-24], 7
-                0x8B, 0x85, 0xE8, 0xFF, 0xFF, 0xFF, // mov eax, [rbp-24]
+                0x41, 0xB8, 0x07, 0x00, 0x00,
+                0x00, // mov r8d, 7: the constant lives in a register
+                0x4C, 0x89, 0xC0, // mov rax, r8: the return
                 0xC9, // leave
                 0xC3, // ret
             ]
