@@ -1472,11 +1472,33 @@ pub fn lower_module(module: &tpt_wasm_ir::IrModule) -> Result<Vec<BaselineFuncti
 }
 
 /// The linear memory a lowered module executes against.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BaselineMemory {
+    /// The allocation: at least `len` bytes. Bytes past `len` are zero and in no use until a grow
+    /// brings them into use, which is what lets a memory with a small maximum be reserved up front.
     data: Vec<u8>,
+    /// The size in bytes, which is the memory's size.
+    len: usize,
     max_pages: Option<u64>,
+    /// The engine's memory limit, in pages, which a grow may not pass as well as the declared maximum.
+    limit_pages: Option<u64>,
 }
+
+/// Two memories are equal when their sizes, maximums and contents agree, whatever their allocations.
+impl PartialEq for BaselineMemory {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.max_pages == other.max_pages
+            && self.limit_pages == other.limit_pages
+            && self.data[..self.len] == other.data[..other.len]
+    }
+}
+
+impl Eq for BaselineMemory {}
+
+/// The largest declared maximum, in pages, that a memory reserves in full so that native code can grow
+/// it in place: 16 MiB. A memory with a larger maximum, or none, is never grown by native code.
+pub const MAX_RESERVED_PAGES: u64 = 256;
 
 /// One 64 KiB page.
 const PAGE_SIZE: usize = 65_536;
@@ -1485,7 +1507,7 @@ const MAX_PAGES: u64 = 65_536;
 
 impl GuestMemory for BaselineMemory {
     fn size(&self) -> u64 {
-        self.data.len() as u64
+        self.len as u64
     }
 
     fn read(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
@@ -1499,7 +1521,7 @@ impl GuestMemory for BaselineMemory {
         let Some(end) = start.checked_add(bytes.len()) else {
             return false;
         };
-        match self.data.get_mut(start..end) {
+        match self.data[..self.len].get_mut(start..end) {
             Some(target) => {
                 target.copy_from_slice(bytes);
                 true
@@ -1519,13 +1541,52 @@ impl BaselineMemory {
             .map_err(|_| CodegenError::UnsupportedMemory("page count"))?;
         Ok(Self {
             data: vec![0; bytes],
+            len: bytes,
             max_pages,
+            limit_pages: None,
         })
+    }
+
+    /// Bound growth by the engine's memory limit, in pages, as well as the declared maximum.
+    pub fn set_memory_limit(&mut self, max_pages: u64) {
+        self.limit_pages = Some(max_pages);
     }
 
     /// Current size in pages.
     pub fn pages(&self) -> u32 {
-        u32::try_from(self.data.len() / PAGE_SIZE).unwrap_or(u32::MAX)
+        u32::try_from(self.len / PAGE_SIZE).unwrap_or(u32::MAX)
+    }
+
+    /// Allocate the whole declared maximum up front, when it is at most [`MAX_RESERVED_PAGES`], so that
+    /// native code can grow the memory in place. The memory's size and contents do not change.
+    pub fn reserve_for_growth(&mut self) {
+        if let Some(declared) = self.max_pages.filter(|max| *max <= MAX_RESERVED_PAGES) {
+            let max = self
+                .limit_pages
+                .map_or(declared, |limit| limit.min(declared));
+            let bytes = max as usize * PAGE_SIZE;
+            if self.data.len() < bytes {
+                self.data.resize(bytes, 0);
+            }
+        }
+    }
+
+    /// The size in bytes, which is the memory's size.
+    pub fn len_bytes(&self) -> usize {
+        self.len
+    }
+
+    /// Set the size in bytes, after native code has grown the memory in place. Refused when the size is
+    /// past the allocation, which native code never reaches, since it checks against the allocation.
+    pub fn set_len_bytes(&mut self, len: usize) -> bool {
+        if len > self.data.len() || !len.is_multiple_of(PAGE_SIZE) {
+            return false;
+        }
+        if len > self.len {
+            self.data[self.len..len].fill(0);
+        }
+        self.len = len;
+        true
     }
 
     /// The declared maximum page count, or `None` when the module set none.
@@ -1535,10 +1596,11 @@ impl BaselineMemory {
     pub fn bytes_at(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
         let start = usize::try_from(offset).ok()?;
         let end = start.checked_add(length)?;
-        self.data.get(start..end).map(<[u8]>::to_vec)
+        self.data[..self.len].get(start..end).map(<[u8]>::to_vec)
     }
 
-    /// The whole memory, for a native tier that reads and writes it directly.
+    /// The allocation, for a native tier that reads and writes it directly. Its length is at least the
+    /// memory's size, and native code checks each access against the size it is given, not this length.
     ///
     /// Only the engine calls this, and only while it holds the memory's lock, so the
     /// slice cannot outlive the call that asked for it.
@@ -1553,7 +1615,7 @@ impl BaselineMemory {
     /// Read `width` bytes little-endian, trapping if the access is out of bounds.
     fn read(&self, address: u64, width: u64) -> Result<u64, Trap> {
         let end = address.checked_add(width).ok_or(Trap::MemoryOutOfBounds)?;
-        if end > self.data.len() as u64 {
+        if end > self.len as u64 {
             return Err(Trap::MemoryOutOfBounds);
         }
         let start = address as usize;
@@ -1567,7 +1629,7 @@ impl BaselineMemory {
     /// Write the low `width` bytes of `bits`, trapping if out of bounds.
     fn write(&mut self, address: u64, width: u64, bits: u64) -> Result<(), Trap> {
         let end = address.checked_add(width).ok_or(Trap::MemoryOutOfBounds)?;
-        if end > self.data.len() as u64 {
+        if end > self.len as u64 {
             return Err(Trap::MemoryOutOfBounds);
         }
         let start = address as usize;
@@ -1589,6 +1651,11 @@ impl BaselineMemory {
                 return -1;
             }
         }
+        if let Some(limit) = self.limit_pages {
+            if requested > limit {
+                return -1;
+            }
+        }
         if requested > MAX_PAGES {
             return -1;
         }
@@ -1596,7 +1663,11 @@ impl BaselineMemory {
             Ok(bytes) => bytes,
             Err(_) => return -1,
         };
-        self.data.resize(bytes, 0);
+        if self.data.len() < bytes {
+            self.data.resize(bytes, 0);
+        }
+        self.data[self.len..bytes].fill(0);
+        self.len = bytes;
         previous as i32
     }
 }
@@ -1839,7 +1910,7 @@ fn apply_segments(
     for segment in segments {
         let start = segment.offset as usize;
         let end = start + segment.bytes.len();
-        if end > memory.data.len() {
+        if end > memory.len {
             return Err(CodegenError::UnsupportedMemory(
                 "data segment does not fit the memory",
             ));
@@ -1965,6 +2036,17 @@ impl BaselineModule {
     /// memory it has not been given yet.
     pub fn memory_handle(&self) -> Option<SharedMemory> {
         self.memory.clone()
+    }
+
+    /// Bound how many pages the module's own memory may grow to, by the engine's memory limit. A grow
+    /// past it fails, as it does on the interpreter. An imported memory keeps its exporter's limit.
+    pub fn set_max_memory_pages(&mut self, max_memory_pages: u64) -> &mut Self {
+        if let Some(handle) = self.memory.as_ref() {
+            if let Ok(mut memory) = handle.lock() {
+                memory.set_memory_limit(max_memory_pages);
+            }
+        }
+        self
     }
 
     /// Call the function a Wasm function index names, whether that is one of

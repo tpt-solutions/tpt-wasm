@@ -62,6 +62,7 @@ const TABLE_TYPES_OFFSET: u32 = std::mem::offset_of!(Context, table_types) as u3
 const TABLE_LEN_OFFSET: u32 = std::mem::offset_of!(Context, table_len) as u32;
 const GLOBALS_OFFSET: u32 = std::mem::offset_of!(Context, globals) as u32;
 const GLOBALS_LENGTH_OFFSET: u32 = std::mem::offset_of!(Context, globals_len) as u32;
+const MEMORY_CAPACITY_OFFSET: u32 = std::mem::offset_of!(Context, memory_capacity) as u32;
 /// The `lo` condition: unsigned less than, the test that keeps a call within the depth limit.
 const LO: u32 = 3;
 
@@ -878,6 +879,31 @@ fn int_rotate(
     emitter.push(str_x(R9, SP, destination));
 }
 
+/// `result = memory.grow(delta)` in place. The new size is the old size plus `delta` pages; it fails,
+/// with -1, when it is past the reservation, which is the memory's maximum. A success stores the new
+/// size in the context, where the caller reads it back, and returns the old size in pages.
+fn memory_grow(result: ValueId, delta: ValueId, frame: &mut Frame, emitter: &mut Emitter) {
+    let delta_slot = frame.slot(delta);
+    let destination = frame.slot(result);
+    emitter.push(ldr_x(R12, SP, frame.context)); // the context
+    emitter.push(ldr_x(R13, R12, MEMORY_LENGTH_OFFSET)); // the old size in bytes
+    emitter.push(ldr_w(R9, SP, delta_slot)); // the pages to add, zero-extended
+    emitter.push(0xD340_0000 | (48 << 16) | (47 << 10) | (R9 << 5) | R9); // lsl x9, x9, #16
+    emitter.push(alu(true, ADD, R9, R9, R13)); // x9 = the new size
+    emitter.push(ldr_x(R11, R12, MEMORY_CAPACITY_OFFSET));
+    emitter.push(cmp(true, R9, R11)); // the new size against the reservation
+    let fail = emitter.new_label();
+    emitter.branch(b_cond(HI), Target::Label(fail), Fixup::Branch19);
+    emitter.push(str_x(R9, R12, MEMORY_LENGTH_OFFSET)); // the new size
+    emitter.push(lsr_immediate(R10, R13, 16)); // the old size in pages
+    let done = emitter.new_label();
+    emitter.branch(B, Target::Label(done), Fixup::Branch26);
+    emitter.bind(fail);
+    emit_constant(u64::MAX, R10, emitter); // -1
+    emitter.bind(done);
+    emitter.push(str_x(R10, SP, destination));
+}
+
 fn emit_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
@@ -1085,6 +1111,14 @@ fn emit_instruction(
             left,
             right,
         } => int_rotate(true, false, *result, *left, *right, frame, emitter),
+        IrInstr::MemoryGrow { result, delta } => {
+            if !frame.env.memory_grow {
+                return Err(JitError::Unsupported(
+                    "a memory.grow of a memory that is not reserved".into(),
+                ));
+            }
+            memory_grow(*result, *delta, frame, emitter)
+        }
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
         IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),

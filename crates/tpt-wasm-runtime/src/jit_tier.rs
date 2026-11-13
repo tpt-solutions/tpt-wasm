@@ -22,6 +22,18 @@ use tpt_wasm_types::ValueType;
 use crate::native_cache::NativeCache;
 use crate::RuntimeError;
 
+/// The linear memory of a native call: its bytes, and its size in bytes, which a grow updates.
+#[cfg(feature = "jit")]
+pub(crate) use tpt_wasm_jit::LinearMemory;
+
+/// Without the feature no native call runs, so the view exists only to type the same calls.
+#[cfg(not(feature = "jit"))]
+#[allow(dead_code)]
+pub(crate) struct LinearMemory<'a> {
+    pub(crate) bytes: &'a mut [u8],
+    pub(crate) len: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct JitTier {
     #[cfg(feature = "jit")]
@@ -81,7 +93,10 @@ impl JitTier {
         table_private: bool,
         cache: Option<(&NativeCache, &str)>,
     ) -> Self {
-        let Some((cache, key)) = cache.filter(|_| ir.globals.is_empty()) else {
+        // An artifact records neither globals nor a grown memory, so such a module is compiled each time.
+        let Some((cache, key)) =
+            cache.filter(|_| ir.globals.is_empty() && !tpt_wasm_jit::module_uses_memory_grow(ir))
+        else {
             return Self::compile(ir, max_call_depth, table_private);
         };
         if let Some(module) = cache.load(key, ir.functions.len(), max_call_depth) {
@@ -191,7 +206,7 @@ impl JitTier {
         &self,
         index: usize,
         args: &[Value],
-        memory: Option<&mut [u8]>,
+        memory: Option<&mut LinearMemory>,
         globals: &mut [u64],
     ) -> Result<Vec<Value>, RuntimeError> {
         let module = self
@@ -224,7 +239,7 @@ impl JitTier {
             });
         }
         let raw = module
-            .call_with_globals(index, &slots, memory, globals)
+            .call_with_memory(index, &slots, memory, globals)
             .map_err(|error| match error {
                 tpt_wasm_jit::JitError::Trap(trap) => RuntimeError::Trap(trap),
                 _ => RuntimeError::UnsupportedFeature("a native function that could not run"),
@@ -245,13 +260,27 @@ impl JitTier {
         Ok(vec![value])
     }
 
+    /// Whether compiled code grows the memory, so the memory must be reserved before a call.
+    #[cfg(feature = "jit")]
+    pub(crate) fn memory_grows(&self) -> bool {
+        self.module
+            .as_ref()
+            .is_some_and(|module| module.memory_grows())
+    }
+
+    /// Without the feature no function grows memory.
+    #[cfg(not(feature = "jit"))]
+    pub(crate) fn memory_grows(&self) -> bool {
+        false
+    }
+
     /// Without the feature no function has native code, so this is never reached.
     #[cfg(not(feature = "jit"))]
     pub(crate) fn run(
         &self,
         _index: usize,
         _args: &[Value],
-        _memory: Option<&mut [u8]>,
+        _memory: Option<&mut LinearMemory>,
         _globals: &mut [u64],
     ) -> Result<Vec<Value>, RuntimeError> {
         Err(RuntimeError::UnsupportedFeature("the jit feature"))

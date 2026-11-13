@@ -440,12 +440,14 @@ fn a_caller_of_a_refused_function_is_not_compiled() {
     let memory_grow = vec![0x41, 0x01, 0x40, 0x00, 0x0B]; // i32.const 1; memory.grow; end
     let calls_refused = vec![0x10, 0x00, 0x0B];
     let seven = vec![0x41, 0x07, 0x0B];
-    let module = module(
+    let mut module = module(
         vec![0, 0, 0],
         vec![memory_grow, calls_refused, seven],
         vec![ValueType::I32; 3],
         true,
     );
+    // A memory with no maximum is never reserved, so growing it is refused.
+    module.memories[0].memory_type.limits.max = None;
     let code = compiled(&module, 1_000);
     assert!(!code.is_compiled(0), "memory.grow is refused");
     assert!(

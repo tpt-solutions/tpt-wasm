@@ -119,6 +119,9 @@ pub(crate) struct Context {
     /// The number of globals the caller provided. Compiled code checks an index against it before
     /// it touches `globals`.
     pub(crate) globals_len: u64,
+    /// The bytes the memory may grow to in place: the length of its reservation. Compiled growth past
+    /// it fails, as a grow past the memory's maximum does.
+    pub(crate) memory_capacity: u64,
 }
 
 impl Context {
@@ -136,6 +139,7 @@ impl Context {
             table_len: 0,
             globals: std::ptr::null_mut(),
             globals_len: 0,
+            memory_capacity: 0,
         }
     }
 }
@@ -157,6 +161,9 @@ pub(crate) struct CallEnv {
     pub(crate) indirect: bool,
     /// Whether the code may read and write globals: the caller provides them as an array.
     pub(crate) globals: bool,
+    /// Whether `memory.grow` may be compiled: the module's memory has a maximum that the runtime
+    /// reserves in full (see [`MAX_RESERVED_PAGES`]).
+    pub(crate) memory_grow: bool,
 }
 
 /// The result of a call in the IR: its one result, or none for a call to a function that returns nothing.
@@ -585,7 +592,41 @@ pub struct CompiledModule {
     indirect: bool,
     /// Whether the module has globals. Its functions need them supplied, through `call_with_globals`.
     globals: bool,
+    /// Whether compiled code grows the memory, so the memory must be reserved and called with
+    /// `call_with_memory`.
+    memory_grows: bool,
     max_call_depth: u64,
+}
+
+/// The linear memory of a call: its bytes, which may be longer than the memory's size, and the size in
+/// bytes. A call that grows the memory in place updates `len`, which the caller must keep.
+pub struct LinearMemory<'a> {
+    /// The allocation. Compiled code reads and writes only up to `len`, and grows into the rest.
+    pub bytes: &'a mut [u8],
+    /// The size in bytes.
+    pub len: u64,
+}
+
+/// The largest memory maximum, in pages, that compiled code may grow in place.
+pub use tpt_wasm_codegen::MAX_RESERVED_PAGES;
+
+/// Whether `module`'s memory has a maximum small enough for compiled code to grow it in place.
+pub fn memory_reservable(module: &IrModule) -> bool {
+    module
+        .memory
+        .as_ref()
+        .and_then(|memory| memory.max_pages)
+        .is_some_and(|max| max <= MAX_RESERVED_PAGES)
+}
+
+/// Whether any function of `module` executes `memory.grow`.
+pub fn module_uses_memory_grow(module: &IrModule) -> bool {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instrs)
+        .any(|instr| matches!(instr, IrInstr::MemoryGrow { .. }))
 }
 
 /// One compiled function in the form an artifact stores: its signature and its machine code.
@@ -722,6 +763,7 @@ impl CompiledModule {
             table_functions: table_functions.into_boxed_slice(),
             indirect: parts.indirect,
             globals: false,
+            memory_grows: false,
             max_call_depth: parts.max_call_depth,
         })
     }
@@ -754,7 +796,16 @@ impl CompiledModule {
                 "a module with globals; use call_with_globals".into(),
             ));
         }
-        self.call_inner(index, args, memory, &mut [])
+        if self.memory_grows {
+            return Err(JitError::Unsupported(
+                "a module whose memory compiled code grows; use call_with_memory".into(),
+            ));
+        }
+        let mut memory = memory.map(|bytes| {
+            let len = bytes.len() as u64;
+            LinearMemory { bytes, len }
+        });
+        self.call_inner(index, args, memory.as_mut(), &mut [])
     }
 
     /// As [`call`](Self::call), with `globals` as the module's globals by index, as raw 8-byte values:
@@ -768,14 +819,43 @@ impl CompiledModule {
         memory: Option<&mut [u8]>,
         globals: &mut [u64],
     ) -> Result<u64, JitError> {
+        if self.memory_grows {
+            return Err(JitError::Unsupported(
+                "a module whose memory compiled code grows; use call_with_memory".into(),
+            ));
+        }
+        let mut memory = memory.map(|bytes| {
+            let len = bytes.len() as u64;
+            LinearMemory { bytes, len }
+        });
+        self.call_inner(index, args, memory.as_mut(), globals)
+    }
+
+    /// As [`call_with_globals`](Self::call_with_globals), with the memory given as a [`LinearMemory`],
+    /// whose `len` is the memory's size and which a call that grows the memory updates. The bytes may be
+    /// longer than the size: compiled code grows into them, and so the memory's reservation is the most it
+    /// can grow to.
+    pub fn call_with_memory(
+        &self,
+        index: usize,
+        args: &[i64],
+        memory: Option<&mut LinearMemory>,
+        globals: &mut [u64],
+    ) -> Result<u64, JitError> {
         self.call_inner(index, args, memory, globals)
+    }
+
+    /// Whether compiled code of this module grows its memory, so the caller must reserve the memory's
+    /// maximum and use [`call_with_memory`](Self::call_with_memory).
+    pub fn memory_grows(&self) -> bool {
+        self.memory_grows
     }
 
     fn call_inner(
         &self,
         index: usize,
         args: &[i64],
-        memory: Option<&mut [u8]>,
+        memory: Option<&mut LinearMemory>,
         globals: &mut [u64],
     ) -> Result<u64, JitError> {
         let function = self
@@ -789,12 +869,13 @@ impl CompiledModule {
                 actual: args.len(),
             });
         }
-        let (memory, memory_len) = match memory {
-            Some(memory) => (memory.as_mut_ptr(), memory.len() as u64),
-            None => (std::ptr::null_mut(), 0),
+        let mut memory = memory;
+        let (base, memory_len, capacity) = match memory.as_deref_mut() {
+            Some(view) => (view.bytes.as_mut_ptr(), view.len, view.bytes.len() as u64),
+            None => (std::ptr::null_mut(), 0, 0),
         };
         let mut context = Context {
-            memory,
+            memory: base,
             memory_len,
             status: 0,
             functions: self.entries.as_ptr(),
@@ -806,8 +887,13 @@ impl CompiledModule {
             table_len: self.table_types.len() as u64,
             globals: globals.as_mut_ptr(),
             globals_len: globals.len() as u64,
+            memory_capacity: capacity,
         };
         let bits = function.code.call(args.as_ptr(), &mut context);
+        // A grow in the code updated the size in the context, so the caller sees it, trap or not.
+        if let Some(memory) = memory {
+            memory.len = context.memory_len;
+        }
         finish(bits, context.status)
     }
 }
@@ -862,10 +948,12 @@ pub fn compile_module(
         .collect();
     // An indirect call is compiled only when no other instance can write the table, and every
     // slot it can select is a function compiled in this module.
+    let memory_grow_env = memory_reservable(module);
     let env_for = |callable: &[bool]| CallEnv {
         callable: callable.to_vec(),
         type_ids: type_ids.clone(),
         globals: !module.globals.is_empty(),
+        memory_grow: memory_grow_env,
         indirect: table.is_some()
             && table_private
             && slots.iter().all(|slot| match slot {
@@ -940,6 +1028,7 @@ pub fn compile_module(
             table_functions: Box::new([]),
             indirect: false,
             globals: !module.globals.is_empty(),
+            memory_grows: false,
             max_call_depth,
         };
     }
@@ -969,6 +1058,7 @@ pub fn compile_module(
         table_functions: table_functions.into_boxed_slice(),
         indirect: env_for(&callable).indirect,
         globals: !module.globals.is_empty(),
+        memory_grows: memory_grow_env && module_uses_memory_grow(module),
         max_call_depth,
     }
 }

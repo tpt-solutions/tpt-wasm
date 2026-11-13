@@ -1516,6 +1516,9 @@ fn instantiate_module(
         // which is a resource-limit divergence rather than a difference in
         // execution: the embedder asked for a bound and only got it on one backend.
         module.set_max_execution_steps(context.limits.max_execution_steps);
+        // The memory limit is the same kind of bound: a grow past it fails here as it does on Micro,
+        // rather than growing on this backend only.
+        module.set_max_memory_pages(context.limits.max_memory_pages);
         // A compiled module holds a shared handle to its memory rather than owning
         // one, so that an instance importing another's memory reaches the same
         // bytes. A module that defines its memory publishes the handle under the
@@ -1746,9 +1749,29 @@ impl Instance {
         let mut bits = self.jit.global_bits(&globals)?;
         let result = match handle {
             Some(handle) => match handle.lock() {
-                Ok(mut memory) => self
-                    .jit
-                    .run(index, args, Some(memory.bytes_mut()), &mut bits),
+                Ok(mut memory) => {
+                    // Compiled code grows memory in place, so the memory is reserved to its maximum
+                    // first. Its size goes into the call and comes back out, since the call may change it.
+                    if self.jit.memory_grows() {
+                        memory.reserve_for_growth();
+                    }
+                    let size = memory.len_bytes() as u64;
+                    let (result, size) = {
+                        let mut view = jit_tier::LinearMemory {
+                            bytes: memory.bytes_mut(),
+                            len: size,
+                        };
+                        let result = self.jit.run(index, args, Some(&mut view), &mut bits);
+                        (result, view.len)
+                    };
+                    if memory.set_len_bytes(size as usize) {
+                        result
+                    } else {
+                        Err(RuntimeError::UnsupportedFeature(
+                            "a native grow past the memory's reservation",
+                        ))
+                    }
+                }
                 Err(_) => Err(RuntimeError::UnsupportedFeature(
                     "a memory whose lock was poisoned",
                 )),

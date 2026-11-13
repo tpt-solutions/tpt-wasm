@@ -89,6 +89,7 @@ const TABLE_TYPES_OFFSET: u8 = std::mem::offset_of!(Context, table_types) as u8;
 const TABLE_LEN_OFFSET: u8 = std::mem::offset_of!(Context, table_len) as u8;
 const GLOBALS_OFFSET: u8 = std::mem::offset_of!(Context, globals) as u8;
 const GLOBALS_LENGTH_OFFSET: u8 = std::mem::offset_of!(Context, globals_len) as u8;
+const MEMORY_CAPACITY_OFFSET: u8 = std::mem::offset_of!(Context, memory_capacity) as u8;
 
 /// Two-operand opcodes with `rax` as the destination and a memory source.
 const OP_ADD: &[u8] = &[0x03];
@@ -1531,6 +1532,39 @@ fn int_rotate(
     emitter.store64(EAX, destination);
 }
 
+/// `result = memory.grow(delta)` in place. The new size is the old size plus `delta` pages; it fails,
+/// with -1, when it is past the reservation, which is the memory's maximum. A success stores the new
+/// size in the context, where the caller reads it back, and returns the old size in pages.
+fn memory_grow(result: ValueId, delta: ValueId, frame: &mut Frame, emitter: &mut Emitter) {
+    let delta_slot = frame.slot(delta);
+    let destination = frame.slot(result);
+    emitter.memory_wide(&[0x8B], EDX, frame.context); // mov rdx, [context]
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x8B, 0x42, MEMORY_LENGTH_OFFSET]); // mov rax, [rdx + length]
+    emitter.load32(ECX, delta_slot); // rcx = the pages to add, zero-extended
+    emitter.bytes.extend_from_slice(&[0x48, 0xC1, 0xE1, 0x10]); // shl rcx, 16
+    emitter.bytes.extend_from_slice(&[0x48, 0x01, 0xC1]); // add rcx, rax: the new size
+                                                          // cmp rcx, [rdx + capacity]; ja fail: the new size is past the reservation.
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x3B, 0x4A, MEMORY_CAPACITY_OFFSET]);
+    let fail = emitter.new_label();
+    emitter.jump(&[0x0F, 0x87], Target::Label(fail));
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x89, 0x4A, MEMORY_LENGTH_OFFSET]); // mov [rdx + length], rcx
+    emitter.bytes.extend_from_slice(&[0x48, 0xC1, 0xE8, 0x10]); // shr rax, 16: the old size in pages
+    let done = emitter.new_label();
+    emitter.jump(&[0xE9], Target::Label(done));
+    emitter.bind(fail);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rax, -1
+    emitter.bind(done);
+    emitter.store64(EAX, destination);
+}
+
 fn emit_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
@@ -1646,6 +1680,14 @@ fn emit_instruction(
             left,
             right,
         } => int_rotate(true, false, *result, *left, *right, frame, emitter),
+        IrInstr::MemoryGrow { result, delta } => {
+            if !frame.env.memory_grow {
+                return Err(JitError::Unsupported(
+                    "a memory.grow of a memory that is not reserved".into(),
+                ));
+            }
+            memory_grow(*result, *delta, frame, emitter)
+        }
         IrInstr::Drop { .. } => {}
         IrInstr::Call {
             function,
