@@ -19,8 +19,8 @@ use tpt_wasm_format::{
 use tpt_wasm_jit::{compile_module, HostCalls, LinearMemory};
 use tpt_wasm_runtime::{Config, Engine, EngineMode, HostFunction, RuntimeError};
 use tpt_wasm_types::{
-    FunctionType, Limits, MemoryType, RefType, ResourceLimits, ResultType, TableType, Value,
-    ValueType,
+    FunctionType, GuestMemory, Limits, MemoryType, RefType, ResourceLimits, ResultType, TableType,
+    Trap, Value, ValueType,
 };
 
 /// The call-depth limit both engines enforce. Small, so recursion through the table reaches it.
@@ -458,7 +458,23 @@ fn build(bytes: &mut Bytes<'_>) -> Module {
     }
 }
 
-/// The host function on Micro, the golden side of the host call.
+/// The answer the host gives for `x`, and whether it refuses `x`. Both host implementations use these, so the
+/// Micro side and the native side compute the same thing.
+fn host_answer(x: i32) -> i32 {
+    x.wrapping_mul(7).wrapping_add(3)
+}
+
+fn host_refuses(x: i32) -> bool {
+    x.rem_euclid(13) == 0
+}
+
+/// Where the host stores its answer: a word inside the page, so the store always fits.
+fn host_address(x: i32) -> usize {
+    (x as u32 as usize) & 0xFFF0
+}
+
+/// The host function on Micro, the golden side of the host call. It stores its answer into the module's memory,
+/// and refuses some arguments.
 struct GoldenHost;
 
 impl HostFunction for GoldenHost {
@@ -470,14 +486,30 @@ impl HostFunction for GoldenHost {
     }
 
     fn call(&self, args: &[Value]) -> Result<Vec<Value>, String> {
-        match args {
-            [Value::I32(value)] => Ok(vec![Value::I32(value.wrapping_mul(7).wrapping_add(3))]),
-            _ => Err("h takes one i32".into()),
+        self.call_with_memory(None, args)
+    }
+
+    fn call_with_memory(
+        &self,
+        memory: Option<&mut dyn GuestMemory>,
+        args: &[Value],
+    ) -> Result<Vec<Value>, String> {
+        let [Value::I32(value)] = args else {
+            return Err("h takes one i32".into());
+        };
+        if host_refuses(*value) {
+            return Err("h refused its argument".into());
         }
+        let answer = host_answer(*value);
+        if let Some(memory) = memory {
+            memory.write(host_address(*value) as u64, &answer.to_le_bytes());
+        }
+        Ok(vec![Value::I32(answer)])
     }
 }
 
-/// The same host function, as compiled code reaches it: its argument and result are words.
+/// The same host, as compiled code reaches it: its argument and result are words, and its memory is the bytes
+/// the call was given.
 struct NativeHost;
 
 impl HostCalls for NativeHost {
@@ -490,11 +522,28 @@ impl HostCalls for NativeHost {
         _import: u32,
         args: &[i64],
         results: &mut [i64],
-        _memory: Option<&mut [u8]>,
+        memory: Option<&mut [u8]>,
     ) -> bool {
-        results[0] = i64::from((args[0] as i32).wrapping_mul(7).wrapping_add(3));
+        let value = args[0] as i32;
+        if host_refuses(value) {
+            return false;
+        }
+        let answer = host_answer(value);
+        if let Some(bytes) = memory {
+            let address = host_address(value);
+            bytes[address..address + 4].copy_from_slice(&answer.to_le_bytes());
+        }
+        results[0] = i64::from(answer);
         true
     }
+}
+
+/// What a call to a generated function can end in: a trap, or a host failure. The Micro side reports a host
+/// failure as an error of the host, and the compiled side as a failed host call; both are the same outcome.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Trap(Trap),
+    HostFailure,
 }
 
 /// The module instantiated on Micro, the golden engine, with the same call-depth limit.
@@ -568,8 +617,9 @@ fuzz_target!(|data: &[u8]| {
                 [value] => Ok(value.clone()),
                 other => panic!("expected one result, got {other:?}"),
             },
-            Err(RuntimeError::Trap(trap)) => Err(trap),
-            Err(other) => panic!("Micro failed in a way that is not a trap: {other:?}"),
+            Err(RuntimeError::Trap(trap)) => Err(Outcome::Trap(trap)),
+            Err(RuntimeError::HostFunction { .. }) => Err(Outcome::HostFailure),
+            Err(other) => panic!("Micro failed in a way that is not a trap or a host failure: {other:?}"),
         };
 
         let slots: Vec<i64> = args.iter().map(|(_, bits)| *bits as i64).collect();
@@ -580,8 +630,11 @@ fuzz_target!(|data: &[u8]| {
             };
             match native.call_with_host(index, &slots, Some(&mut view), &mut [], Some(&mut NativeHost)) {
                 Ok(bits) => Ok(to_value(result_kind, bits)),
-                Err(tpt_wasm_jit::JitError::Trap(trap)) => Err(trap),
-                Err(error) => panic!("the compiled code failed without a trap: {error}"),
+                Err(tpt_wasm_jit::JitError::Trap(trap)) => Err(Outcome::Trap(trap)),
+                Err(tpt_wasm_jit::JitError::Unsupported(message)) if message == "a host call failed" => {
+                    Err(Outcome::HostFailure)
+                }
+                Err(error) => panic!("the compiled code failed without a trap or a host failure: {error}"),
             }
         };
 
