@@ -483,7 +483,7 @@ const NATIVE_CALL_STACK_BUDGET: usize = 512 * 1024;
 
 /// Whether `function` contains a call, direct or indirect, and so needs the call table and the
 /// depth check.
-fn makes_calls(function: &IrFunction) -> bool {
+pub(crate) fn makes_calls(function: &IrFunction) -> bool {
     function
         .blocks
         .iter()

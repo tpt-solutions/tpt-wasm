@@ -25,7 +25,7 @@ mod verify;
 /// in a later block; without a pre-pass, the backend accepts only the block order
 /// the lowering happened to produce, which is a constraint on layout rather than
 /// on semantics.
-pub use verify::instruction_results;
+pub use verify::{instruction_operands, instruction_results, terminator_operands};
 
 pub use lower::{const_expr_i32, lower_module, LoweringError};
 pub use verify::{

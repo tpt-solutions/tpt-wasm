@@ -619,13 +619,13 @@ fn verify_dominance(
     // block's parameters are declared even if the block is never entered, and
     // leaving them undefined would make an otherwise valid function look like
     // it reads an uninitialized value.
-    for block_index in 0..function.blocks.len() {
-        for id in &function.blocks[block_index].params {
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        for id in &block.params {
             if def_block.insert(*id, block_index).is_some() {
                 return Err(VerificationError::RedefinedValue(*id));
             }
         }
-        for instruction in &function.blocks[block_index].instrs {
+        for instruction in &block.instrs {
             for result in instruction_results(instruction) {
                 if def_block.insert(result, block_index).is_some() {
                     return Err(VerificationError::RedefinedValue(result));
@@ -746,7 +746,9 @@ fn verify_branch_types(
 }
 
 /// Values a terminator reads.
-fn terminator_operands(terminator: &super::Terminator) -> Vec<ValueId> {
+/// The values a terminator reads: its returned values, its branch values, or its condition and both sets of
+/// branch values.
+pub fn terminator_operands(terminator: &super::Terminator) -> Vec<ValueId> {
     match terminator {
         super::Terminator::Return(values) => values.clone(),
         super::Terminator::Branch { values, .. } => values.clone(),
@@ -826,7 +828,9 @@ fn verify_terminator(
 /// The dataflow instructions each have a distinct operand set and are listed
 /// explicitly; the numeric instructions all share a `left`/`right` or single
 /// `value` shape and are matched by pattern.
-fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
+/// The values an instruction reads, in the order it reads them. An encoder that needs to know every use of a
+/// value uses this, so that no read is missed.
+pub fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
     use super::IrInstr::*;
     match instruction {
         // Constants read nothing.

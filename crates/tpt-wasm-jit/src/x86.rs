@@ -20,16 +20,17 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
-    BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
-    IntConversion, IntUnary, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
-    Terminator, ValueId,
+    instruction_operands, instruction_results, terminator_operands, BasicBlock, BlockId,
+    FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison, IntConversion,
+    IntUnary, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend, Terminator,
+    ValueId,
 };
 use tpt_wasm_types::ValueType;
 
 use crate::{
-    call_result, CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
-    STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE,
-    STATUS_TABLE_OUT_OF_BOUNDS, STATUS_UNREACHABLE,
+    call_result, makes_calls, CallEnv, Context, JitError, STATUS_CALL_DEPTH,
+    STATUS_GLOBAL_OUT_OF_BOUNDS, STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION,
+    STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS, STATUS_UNREACHABLE,
 };
 
 /// The calling convention whose argument registers the code reads.
@@ -128,6 +129,8 @@ struct Frame {
     abi: Abi,
     /// Bytes reserved below the slots for a callee's shadow space. Set when the function calls.
     shadow: i32,
+    /// The registers of the values that live in one, in a function that makes no call.
+    registers: HashMap<ValueId, u8>,
     /// Whether the host has SSE4.1, which the rounding functions need.
     sse41: bool,
 }
@@ -147,6 +150,7 @@ impl Frame {
             abi,
             shadow: 0,
             sse41,
+            registers: HashMap::new(),
         }
     }
 
@@ -414,6 +418,9 @@ pub(crate) fn encode(
         .collect();
 
     let mut frame = Frame::new(function, abi, env, sse41);
+    if !makes_calls(function) {
+        frame.registers = allocate_registers(function);
+    }
     let mut emitter = Emitter::new();
 
     // The two pointers arrive in argument registers. They are kept in slots, because the code
@@ -1565,21 +1572,320 @@ fn memory_grow(result: ValueId, delta: ValueId, frame: &mut Frame, emitter: &mut
     emitter.store64(EAX, destination);
 }
 
-fn emit_instruction(
+/// The registers that hold values in a function that makes no call: r9, r10 and r11. They are
+/// caller-saved on both conventions, and the encoder never uses them, so a leaf function can keep values
+/// in them between instructions.
+const VALUE_REGISTERS: [u8; 3] = [9, 10, 11];
+
+/// Whether an instruction reads and writes its values through [`load_value`] and [`store_value`], so
+/// that each value may be in a register or a slot. The rest read and write slots only.
+fn is_register_instruction(instruction: &IrInstr) -> bool {
+    matches!(
+        instruction,
+        IrInstr::ConstI32 { .. }
+            | IrInstr::ConstI64 { .. }
+            | IrInstr::LocalGet { .. }
+            | IrInstr::LocalSet { .. }
+            | IrInstr::I32Add { .. }
+            | IrInstr::I32Sub { .. }
+            | IrInstr::I32Mul { .. }
+            | IrInstr::I32And { .. }
+            | IrInstr::I32Or { .. }
+            | IrInstr::I32Xor { .. }
+            | IrInstr::I64Add { .. }
+            | IrInstr::I64Sub { .. }
+            | IrInstr::I64Mul { .. }
+            | IrInstr::I64And { .. }
+            | IrInstr::I64Or { .. }
+            | IrInstr::I64Xor { .. }
+    )
+}
+
+/// The registers for the values of a function that makes no call. A value is given a register when a
+/// register instruction defines it and only register instructions in the same block read it, after its
+/// definition. Such a value lives only between its definition and its last read, so the registers are
+/// assigned in one pass per block, and a value that finds no free register stays in its slot.
+fn allocate_registers(function: &IrFunction) -> HashMap<ValueId, u8> {
+    // The (block, index) of the instruction that defines each value a register instruction defines.
+    let mut definitions: HashMap<ValueId, (usize, usize)> = HashMap::new();
+    // Every read of a value: (block, index, whether the reader is a register instruction). A terminator
+    // reads at index `usize::MAX`, which is not a register instruction, so a terminator read rules the
+    // value out.
+    let mut reads: HashMap<ValueId, Vec<(usize, usize, bool)>> = HashMap::new();
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        for (index, instruction) in block.instrs.iter().enumerate() {
+            let register = is_register_instruction(instruction);
+            if register {
+                for result in instruction_results(instruction) {
+                    definitions.insert(result, (block_index, index));
+                }
+            }
+            for operand in instruction_operands(instruction) {
+                reads
+                    .entry(operand)
+                    .or_default()
+                    .push((block_index, index, register));
+            }
+        }
+        for operand in terminator_operands(&block.terminator) {
+            reads
+                .entry(operand)
+                .or_default()
+                .push((block_index, usize::MAX, false));
+        }
+    }
+    // The live interval (definition, last read) of each value that qualifies, per block.
+    let mut intervals: Vec<Vec<(usize, usize, ValueId)>> = vec![Vec::new(); function.blocks.len()];
+    for (value, (block, definition)) in &definitions {
+        let Some(uses) = reads.get(value) else {
+            continue;
+        };
+        let mut last_read = None;
+        let qualifies = uses.iter().all(|(reader_block, index, register)| {
+            let inside = *register && *reader_block == *block && *index > *definition;
+            if inside {
+                last_read = Some(last_read.map_or(*index, |last: usize| last.max(*index)));
+            }
+            inside
+        });
+        if let (true, Some(last)) = (qualifies, last_read) {
+            intervals[*block].push((*definition, last, *value));
+        }
+    }
+    let mut registers = HashMap::new();
+    for block in &mut intervals {
+        // Sorting by definition makes the assignment, and so the code, the same on every run.
+        block.sort_by_key(|(definition, _, _)| *definition);
+        // Registers held by values still live, with the index of their last read.
+        let mut held: Vec<(usize, u8)> = Vec::new();
+        for &(definition, last, value) in block.iter() {
+            // A register whose value is last read at this definition is still needed by it, so only
+            // registers last read before the definition are free.
+            held.retain(|(last_read, _)| *last_read >= definition);
+            let free = VALUE_REGISTERS.iter().copied().find(|register| {
+                held.iter()
+                    .all(|(_, held_register)| held_register != register)
+            });
+            if let Some(register) = free {
+                held.push((last, register));
+                registers.insert(value, register);
+            }
+        }
+    }
+    registers
+}
+
+/// The register a value lives in, if it has one.
+impl Frame {
+    fn register(&self, value: ValueId) -> Option<u8> {
+        self.registers.get(&value).copied()
+    }
+}
+
+/// An instruction in a REX-prefixed register form: `prefix? opcode modrm(reg, rm)`. The REX prefix is
+/// needed for a 64-bit operation, or when either register is one of r8 to r15.
+fn emit_register_form(emitter: &mut Emitter, wide: bool, opcode: &[u8], reg: u8, rm: u8) {
+    let rex = 0x40
+        | if wide { 0x08 } else { 0 }
+        | if reg >= 8 { 0x04 } else { 0 }
+        | if rm >= 8 { 0x01 } else { 0 };
+    if rex != 0x40 {
+        emitter.bytes.push(rex);
+    }
+    emitter.bytes.extend_from_slice(opcode);
+    emitter.bytes.push(0xC0 | ((reg & 7) << 3) | (rm & 7));
+}
+
+/// Load a value into `into`, from its register or its slot. `wide` loads 64 bits, else 32.
+fn load_value(frame: &mut Frame, value: ValueId, wide: bool, into: u8, emitter: &mut Emitter) {
+    match frame.register(value) {
+        Some(register) => emit_register_form(emitter, wide, &[0x89], register, into), // mov into, register
+        None => {
+            let slot = frame.slot(value);
+            if wide {
+                emitter.load64(into, slot);
+            } else {
+                emitter.load32(into, slot);
+            }
+        }
+    }
+}
+
+/// Store `from` into a value's register or slot. `wide` stores 64 bits, else 32.
+fn store_value(frame: &mut Frame, value: ValueId, wide: bool, from: u8, emitter: &mut Emitter) {
+    match frame.register(value) {
+        Some(register) => emit_register_form(emitter, wide, &[0x89], from, register), // mov register, from
+        None => {
+            let slot = frame.slot(value);
+            if wide {
+                emitter.store64(from, slot);
+            } else {
+                emitter.store32(from, slot);
+            }
+        }
+    }
+}
+
+/// `result = left op right` with `opcode` in its `r, r/m` form, on 32 or 64 bits.
+fn int_binary(
+    wide: bool,
+    opcode: &[u8],
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    load_value(frame, left, wide, EAX, emitter);
+    match frame.register(right) {
+        Some(register) => emit_register_form(emitter, wide, opcode, EAX, register),
+        None => {
+            let slot = frame.slot(right);
+            if wide {
+                emitter.memory_wide(opcode, EAX, slot);
+            } else {
+                emitter.memory(opcode, EAX, slot);
+            }
+        }
+    }
+    store_value(frame, result, wide, EAX, emitter);
+}
+
+/// Emit an instruction of [`is_register_instruction`].
+fn emit_register_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
     emitter: &mut Emitter,
 ) -> Result<(), JitError> {
     match instruction {
-        IrInstr::ConstI32 { result, value } => {
-            let slot = frame.slot(*result);
-            emitter.store_immediate32(slot, *value);
+        IrInstr::ConstI32 { result, value } => match frame.register(*result) {
+            Some(register) => {
+                if register >= 8 {
+                    emitter.bytes.push(0x41);
+                }
+                emitter.bytes.push(0xB8 | (register & 7)); // mov r32, imm32
+                emitter.bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            None => {
+                let slot = frame.slot(*result);
+                emitter.store_immediate32(slot, *value);
+            }
+        },
+        IrInstr::ConstI64 { result, value } => match frame.register(*result) {
+            Some(register) => {
+                emitter
+                    .bytes
+                    .push(0x48 | if register >= 8 { 0x01 } else { 0 });
+                emitter.bytes.push(0xB8 | (register & 7)); // movabs r64, imm64
+                emitter.bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            None => {
+                let slot = frame.slot(*result);
+                emitter.movabs(EAX, *value);
+                emitter.store64(EAX, slot);
+            }
+        },
+        IrInstr::LocalGet { result, local } => {
+            let source = frame.slot(*local);
+            match frame.register(*result) {
+                Some(register) => emitter.memory_with(true, &[0x8B], register, source),
+                None => {
+                    let destination = frame.slot(*result);
+                    emitter.load64(EAX, source);
+                    emitter.store64(EAX, destination);
+                }
+            }
         }
-        IrInstr::ConstI64 { result, value } => {
-            let slot = frame.slot(*result);
-            emitter.movabs(EAX, *value);
-            emitter.store64(EAX, slot);
+        IrInstr::LocalSet { local, value } => {
+            let destination = frame.slot(*local);
+            match frame.register(*value) {
+                Some(register) => emitter.memory_with(true, &[0x89], register, destination),
+                None => {
+                    let source = frame.slot(*value);
+                    emitter.load64(EAX, source);
+                    emitter.store64(EAX, destination);
+                }
+            }
         }
+        IrInstr::I32Add {
+            result,
+            left,
+            right,
+        } => int_binary(false, OP_ADD, *result, *left, *right, frame, emitter),
+        IrInstr::I32Sub {
+            result,
+            left,
+            right,
+        } => int_binary(false, OP_SUB, *result, *left, *right, frame, emitter),
+        IrInstr::I32Mul {
+            result,
+            left,
+            right,
+        } => int_binary(false, OP_IMUL, *result, *left, *right, frame, emitter),
+        IrInstr::I32And {
+            result,
+            left,
+            right,
+        } => int_binary(false, OP_AND, *result, *left, *right, frame, emitter),
+        IrInstr::I32Or {
+            result,
+            left,
+            right,
+        } => int_binary(false, OP_OR, *result, *left, *right, frame, emitter),
+        IrInstr::I32Xor {
+            result,
+            left,
+            right,
+        } => int_binary(false, OP_XOR, *result, *left, *right, frame, emitter),
+        IrInstr::I64Add {
+            result,
+            left,
+            right,
+        } => int_binary(true, OP_ADD, *result, *left, *right, frame, emitter),
+        IrInstr::I64Sub {
+            result,
+            left,
+            right,
+        } => int_binary(true, OP_SUB, *result, *left, *right, frame, emitter),
+        IrInstr::I64Mul {
+            result,
+            left,
+            right,
+        } => int_binary(true, OP_IMUL, *result, *left, *right, frame, emitter),
+        IrInstr::I64And {
+            result,
+            left,
+            right,
+        } => int_binary(true, OP_AND, *result, *left, *right, frame, emitter),
+        IrInstr::I64Or {
+            result,
+            left,
+            right,
+        } => int_binary(true, OP_OR, *result, *left, *right, frame, emitter),
+        IrInstr::I64Xor {
+            result,
+            left,
+            right,
+        } => int_binary(true, OP_XOR, *result, *left, *right, frame, emitter),
+        other => {
+            return Err(JitError::Unsupported(format!(
+                "the {} instruction in a register",
+                instruction_name(other)
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn emit_instruction(
+    instruction: &IrInstr,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    if is_register_instruction(instruction) {
+        return emit_register_instruction(instruction, frame, emitter);
+    }
+    match instruction {
         IrInstr::F32Min {
             result,
             left,
@@ -1779,18 +2085,6 @@ fn emit_instruction(
             value,
             operation,
         } => float_unary(true, *result, *value, *operation, frame, emitter)?,
-        IrInstr::LocalGet { result, local } => {
-            let source = frame.slot(*local);
-            let destination = frame.slot(*result);
-            emitter.load64(EAX, source);
-            emitter.store64(EAX, destination);
-        }
-        IrInstr::LocalSet { local, value } => {
-            let source = frame.slot(*value);
-            let destination = frame.slot(*local);
-            emitter.load64(EAX, source);
-            emitter.store64(EAX, destination);
-        }
         IrInstr::LocalTee {
             result,
             local,
@@ -1803,66 +2097,6 @@ fn emit_instruction(
             emitter.store64(EAX, local_slot);
             emitter.store64(EAX, result_slot);
         }
-        IrInstr::I32Add {
-            result,
-            left,
-            right,
-        } => binary32(OP_ADD, *result, *left, *right, frame, emitter),
-        IrInstr::I32Sub {
-            result,
-            left,
-            right,
-        } => binary32(OP_SUB, *result, *left, *right, frame, emitter),
-        IrInstr::I32Mul {
-            result,
-            left,
-            right,
-        } => binary32(OP_IMUL, *result, *left, *right, frame, emitter),
-        IrInstr::I32And {
-            result,
-            left,
-            right,
-        } => binary32(OP_AND, *result, *left, *right, frame, emitter),
-        IrInstr::I32Or {
-            result,
-            left,
-            right,
-        } => binary32(OP_OR, *result, *left, *right, frame, emitter),
-        IrInstr::I32Xor {
-            result,
-            left,
-            right,
-        } => binary32(OP_XOR, *result, *left, *right, frame, emitter),
-        IrInstr::I64Add {
-            result,
-            left,
-            right,
-        } => binary64(OP_ADD, *result, *left, *right, frame, emitter),
-        IrInstr::I64Sub {
-            result,
-            left,
-            right,
-        } => binary64(OP_SUB, *result, *left, *right, frame, emitter),
-        IrInstr::I64Mul {
-            result,
-            left,
-            right,
-        } => binary64(OP_IMUL, *result, *left, *right, frame, emitter),
-        IrInstr::I64And {
-            result,
-            left,
-            right,
-        } => binary64(OP_AND, *result, *left, *right, frame, emitter),
-        IrInstr::I64Or {
-            result,
-            left,
-            right,
-        } => binary64(OP_OR, *result, *left, *right, frame, emitter),
-        IrInstr::I64Xor {
-            result,
-            left,
-            right,
-        } => binary64(OP_XOR, *result, *left, *right, frame, emitter),
         IrInstr::I32Shl {
             result,
             left,
@@ -2126,40 +2360,6 @@ fn emit_instruction(
     Ok(())
 }
 
-/// `result = left op right` on 32-bit values.
-fn binary32(
-    opcode: &[u8],
-    result: ValueId,
-    left: ValueId,
-    right: ValueId,
-    frame: &mut Frame,
-    emitter: &mut Emitter,
-) {
-    let left = frame.slot(left);
-    let right = frame.slot(right);
-    let destination = frame.slot(result);
-    emitter.load32(EAX, left);
-    emitter.memory(opcode, EAX, right);
-    emitter.store32(EAX, destination);
-}
-
-/// `result = left op right` on 64-bit values.
-fn binary64(
-    opcode: &[u8],
-    result: ValueId,
-    left: ValueId,
-    right: ValueId,
-    frame: &mut Frame,
-    emitter: &mut Emitter,
-) {
-    let left = frame.slot(left);
-    let right = frame.slot(right);
-    let destination = frame.slot(result);
-    emitter.load64(EAX, left);
-    emitter.memory_wide(opcode, EAX, right);
-    emitter.store64(EAX, destination);
-}
-
 /// `result = left << right` (or a right shift, by `extension`): the count goes in `cl`.
 fn shift(
     wide: bool,
@@ -2380,6 +2580,82 @@ mod tests {
             "without SSE4.1 the rounding function is refused, not approximated"
         );
         assert!(encode(&function, Abi::SysV, &CallEnv::default(), true).is_ok());
+    }
+
+    #[test]
+    fn a_chain_inside_one_block_takes_registers_except_a_terminator_read() {
+        // v0 and v1 are read only by v2's definition, and v2 only by v3's, all in one block. v3 is
+        // returned, so the terminator reads it and it stays in its slot.
+        let instrs = vec![
+            IrInstr::ConstI32 {
+                result: ValueId(0),
+                value: 1,
+            },
+            IrInstr::ConstI32 {
+                result: ValueId(1),
+                value: 2,
+            },
+            IrInstr::I32Add {
+                result: ValueId(2),
+                left: ValueId(0),
+                right: ValueId(1),
+            },
+            IrInstr::I32Add {
+                result: ValueId(3),
+                left: ValueId(2),
+                right: ValueId(2),
+            },
+        ];
+        let values = (0..4).map(i32_value).collect();
+        let function = one_block(instrs, ValueId(3), values);
+        let registers = allocate_registers(&function);
+        assert!(registers.contains_key(&ValueId(0)));
+        assert!(registers.contains_key(&ValueId(1)));
+        assert!(registers.contains_key(&ValueId(2)));
+        assert!(
+            !registers.contains_key(&ValueId(3)),
+            "a value the terminator returns is read outside the register instructions"
+        );
+    }
+
+    #[test]
+    fn a_value_read_in_another_block_takes_no_register() {
+        // v0 is defined in block 0 and read in block 1, so it must be in its slot.
+        let function = IrFunction {
+            function_type: FunctionType {
+                params: ResultType(Vec::new()),
+                results: ResultType(vec![ValueType::I32]),
+            },
+            params: Vec::new(),
+            locals: Vec::new(),
+            values: (0..2).map(i32_value).collect(),
+            entry: BlockId(0),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    params: Vec::new(),
+                    instrs: vec![IrInstr::ConstI32 {
+                        result: ValueId(0),
+                        value: 5,
+                    }],
+                    terminator: Terminator::Branch {
+                        target: BlockId(1),
+                        values: Vec::new(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    params: Vec::new(),
+                    instrs: vec![IrInstr::I32Add {
+                        result: ValueId(1),
+                        left: ValueId(0),
+                        right: ValueId(0),
+                    }],
+                    terminator: Terminator::Return(vec![ValueId(1)]),
+                },
+            ],
+        };
+        assert!(allocate_registers(&function).is_empty());
     }
 
     #[test]
