@@ -84,8 +84,8 @@ impl JitTier {
 
     /// As `compile`, but the module is loaded from the native cache when the cache holds a trusted
     /// entry for it, and is stored there after a compile. A store that fails means only that the next
-    /// instantiation compiles the module again. A module with globals is not cached: an artifact
-    /// records no global count, so a loaded one could not be checked against its globals.
+    /// instantiation compiles the module again. The artifact records whether the module has globals and
+    /// whether its code grows memory, so a loaded module is called the same way a compiled one is.
     #[cfg(all(feature = "jit", any(unix, windows)))]
     pub(crate) fn compile_cached(
         ir: &IrModule,
@@ -93,10 +93,7 @@ impl JitTier {
         table_private: bool,
         cache: Option<(&NativeCache, &str)>,
     ) -> Self {
-        // An artifact records neither globals nor a grown memory, so such a module is compiled each time.
-        let Some((cache, key)) =
-            cache.filter(|_| ir.globals.is_empty() && !tpt_wasm_jit::module_uses_memory_grow(ir))
-        else {
+        let Some((cache, key)) = cache else {
             return Self::compile(ir, max_call_depth, table_private);
         };
         if let Some(module) = cache.load(key, ir.functions.len(), max_call_depth) {

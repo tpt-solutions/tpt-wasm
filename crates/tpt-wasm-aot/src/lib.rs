@@ -51,7 +51,18 @@ use tpt_wasm_types::ValueType;
 /// The magic bytes of a single-function artifact, ending with the format version.
 const MAGIC: [u8; 8] = *b"TPTAOT\0\x02";
 /// The magic bytes of a module artifact: the same family, with its own version.
-const MODULE_MAGIC: [u8; 8] = *b"TPTAOT\0\x03";
+const MODULE_MAGIC: [u8; 8] = *b"TPTAOT\0\x04";
+/// A one-byte flag in a module artifact: `0` or `1`, and anything else is refused.
+fn flag_byte(byte: u8, what: &str) -> Result<bool, AotError> {
+    match byte {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(AotError::Malformed(format!(
+            "{what} of {other}, which is neither 0 nor 1"
+        ))),
+    }
+}
+
 /// The function index a null table slot holds in a module artifact.
 const NO_FUNCTION: u32 = u32::MAX;
 
@@ -363,6 +374,8 @@ impl ModuleArtifact {
         out.extend_from_slice(self.target.as_bytes());
         out.extend_from_slice(&self.parts.max_call_depth.to_le_bytes());
         out.push(u8::from(self.parts.indirect));
+        out.push(u8::from(self.parts.globals));
+        out.push(u8::from(self.parts.memory_grows));
         out.extend_from_slice(&(self.parts.functions.len() as u32).to_le_bytes());
         for function in &self.parts.functions {
             match function {
@@ -413,15 +426,9 @@ impl ModuleArtifact {
             .map_err(|_| AotError::Malformed("the target name is not UTF-8".into()))?
             .to_owned();
         let max_call_depth = cursor.u64()?;
-        let indirect = match cursor.byte()? {
-            0 => false,
-            1 => true,
-            other => {
-                return Err(AotError::Malformed(format!(
-                    "an indirect flag of {other}, which is neither 0 nor 1"
-                )))
-            }
-        };
+        let indirect = flag_byte(cursor.byte()?, "an indirect flag")?;
+        let globals = flag_byte(cursor.byte()?, "a globals flag")?;
+        let memory_grows = flag_byte(cursor.byte()?, "a memory-growth flag")?;
         // Each function takes at least one byte, so a count larger than the rest of the bytes
         // cannot be honest. Checking it first keeps a hostile count from reserving memory.
         let function_count = cursor.count(1)?;
@@ -491,6 +498,8 @@ impl ModuleArtifact {
                 table,
                 indirect,
                 max_call_depth,
+                globals,
+                memory_grows,
             },
         })
     }

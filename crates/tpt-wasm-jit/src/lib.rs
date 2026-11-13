@@ -661,6 +661,11 @@ pub struct ModuleParts {
     pub indirect: bool,
     /// The call-depth limit the calls were compiled against.
     pub max_call_depth: u64,
+    /// Whether the module has globals, which the caller provides as an array.
+    pub globals: bool,
+    /// Whether compiled code grows the memory, so the caller reserves it and passes it as a
+    /// [`LinearMemory`].
+    pub memory_grows: bool,
 }
 
 impl CompiledModule {
@@ -689,6 +694,8 @@ impl CompiledModule {
                 .collect(),
             indirect: self.indirect,
             max_call_depth: self.max_call_depth,
+            globals: self.globals,
+            memory_grows: self.memory_grows,
         }
     }
 
@@ -703,6 +710,7 @@ impl CompiledModule {
         if !HOST_CAN_RUN_CODE {
             return Err(JitError::UnsupportedTarget);
         }
+        let (globals, memory_grows) = (parts.globals, parts.memory_grows);
         let count = parts.functions.len();
         let mut functions: Vec<Option<CompiledFunction>> = Vec::with_capacity(count);
         let mut entries = vec![0usize; count];
@@ -762,8 +770,8 @@ impl CompiledModule {
             table_types: table_types.into_boxed_slice(),
             table_functions: table_functions.into_boxed_slice(),
             indirect: parts.indirect,
-            globals: false,
-            memory_grows: false,
+            globals,
+            memory_grows,
             max_call_depth: parts.max_call_depth,
         })
     }
