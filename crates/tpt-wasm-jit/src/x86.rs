@@ -90,6 +90,7 @@ const TABLE_TYPES_OFFSET: u8 = std::mem::offset_of!(Context, table_types) as u8;
 const TABLE_LEN_OFFSET: u8 = std::mem::offset_of!(Context, table_len) as u8;
 const GLOBALS_OFFSET: u8 = std::mem::offset_of!(Context, globals) as u8;
 const GLOBALS_LENGTH_OFFSET: u8 = std::mem::offset_of!(Context, globals_len) as u8;
+const HOST_CALL_OFFSET: u8 = std::mem::offset_of!(Context, host_call) as u8;
 const MEMORY_CAPACITY_OFFSET: u8 = std::mem::offset_of!(Context, memory_capacity) as u8;
 
 /// Two-operand opcodes with `rax` as the destination and a memory source.
@@ -1302,6 +1303,61 @@ fn reinterpret_into(
 /// past the limit traps. A trap in the callee leaves its status in the context and returns zero,
 /// so this function checks the status after the call and returns zero too, before it stores
 /// anything. The return value is the callee's result register.
+/// The registers a host call passes its four words in, in the host's argument order: the context, the import,
+/// the argument block, and the result block.
+fn host_call_registers(abi: Abi) -> [u8; 4] {
+    match abi {
+        Abi::SysV => [7, 6, 2, 1],  // rdi, rsi, rdx, rcx
+        Abi::Win64 => [1, 2, 8, 9], // rcx, rdx, r8, r9
+    }
+}
+
+/// `results = host import(arguments)`: the arguments go to a block of the frame, the host is called through the
+/// context, and the results are read from a block the host fills. A failed host call leaves a status in the context,
+/// and the function returns with it, as a trapping callee's status is returned.
+fn emit_host_call(
+    import: u32,
+    arguments: &[ValueId],
+    results: &[ValueId],
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    let arguments_block = frame.block(arguments.len().max(1));
+    let results_block = frame.block(results.len().max(1));
+    store_arguments(arguments, arguments_block, frame, emitter);
+    let [context_register, import_register, arguments_register, results_register] =
+        host_call_registers(frame.abi);
+    emitter.memory_wide(&[0x8D], arguments_register, arguments_block); // lea args, [rbp + block]
+    emitter.memory_wide(&[0x8D], results_register, results_block); // lea results, [rbp + block]
+    if import_register >= 8 {
+        emitter.bytes.push(0x41);
+    }
+    emitter.bytes.push(0xB8 | (import_register & 7)); // mov import, imm32
+    emitter.bytes.extend_from_slice(&import.to_le_bytes());
+    emitter.memory_wide(&[0x8B], EAX, frame.context); // mov rax, [context]
+    emit_register_form(emitter, true, &[0x89], EAX, context_register); // mov context, rax
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x8B, 0x40, HOST_CALL_OFFSET]); // mov rax, [rax + host_call]
+    emitter.bytes.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                                                    // mov rcx, [context]; cmp qword [rcx + status], 0; je ok; xor eax, eax; leave; ret; ok:
+    emitter.memory_wide(&[0x8B], ECX, frame.context);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x83, 0x79, STATUS_OFFSET, 0x00]);
+    emitter.bytes.extend_from_slice(&[0x74, 0x04]);
+    emitter.bytes.extend_from_slice(&[0x31, 0xC0]);
+    emitter.epilogue();
+    for (index, result) in results.iter().enumerate() {
+        let destination = frame.slot(*result);
+        emitter.load64(EAX, results_block + 8 * index as i32);
+        emitter.store64(EAX, destination);
+    }
+    // The host's words are passed in the shadow space of a Windows call, which the frame must hold.
+    frame.shadow = 32;
+    Ok(())
+}
+
 fn emit_call(
     function: u32,
     arguments: &[ValueId],
@@ -2043,6 +2099,11 @@ fn emit_instruction(
             arguments,
             results,
         } => emit_call(*function, arguments, results, frame, emitter)?,
+        IrInstr::CallHost {
+            import,
+            arguments,
+            results,
+        } => emit_host_call(*import, arguments, results, frame, emitter)?,
         IrInstr::CallIndirect {
             type_index,
             table,

@@ -1747,6 +1747,14 @@ impl Instance {
         // after it, whatever the call returns, so a trap leaves them as the code left them.
         let globals = self.baseline.as_ref()?.globals_handles();
         let mut bits = self.jit.global_bits(&globals)?;
+        // The host calls go to the module's imports and boundary, which the native code reaches through this view.
+        let module = self.baseline.as_mut()?;
+        let (imports, host) = module.host_view();
+        let mut native_host = jit_tier::NativeHost {
+            imports,
+            host,
+            failure: None,
+        };
         let result = match handle {
             Some(handle) => match handle.lock() {
                 Ok(mut memory) => {
@@ -1761,7 +1769,9 @@ impl Instance {
                             bytes: memory.bytes_mut(),
                             len: size,
                         };
-                        let result = self.jit.run(index, args, Some(&mut view), &mut bits);
+                        let result =
+                            self.jit
+                                .run(index, args, Some(&mut view), &mut bits, &mut native_host);
                         (result, view.len)
                     };
                     if memory.set_len_bytes(size as usize) {
@@ -1776,7 +1786,13 @@ impl Instance {
                     "a memory whose lock was poisoned",
                 )),
             },
-            None => self.jit.run(index, args, None, &mut bits),
+            None => self.jit.run(index, args, None, &mut bits, &mut native_host),
+        };
+        // A host failure is the call's failure, reported as the baseline reports it. The native code only saw
+        // that a host call failed.
+        let result = match native_host.failure.take() {
+            Some(error) => Err(baseline_error(error)),
+            None => result,
         };
         let stored = self.jit.store_global_bits(&globals, &bits);
         let result = match (result, stored) {

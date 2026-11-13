@@ -54,6 +54,7 @@
 #![deny(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::fmt;
 
 use tpt_wasm_ir::{
@@ -91,6 +92,9 @@ pub(crate) const STATUS_INVALID_CONVERSION: u32 = 8;
 pub(crate) const STATUS_GLOBAL_OUT_OF_BOUNDS: u32 = 9;
 /// The status for the `unreachable` instruction, which traps.
 pub(crate) const STATUS_UNREACHABLE: u32 = 10;
+/// The status for a host call that failed. The host has recorded the failure itself, so the caller reports it
+/// from there.
+pub(crate) const STATUS_HOST_FAILED: u32 = 11;
 
 /// What a compiled function reads and writes besides its arguments.
 ///
@@ -126,6 +130,10 @@ pub(crate) struct Context {
     /// The bytes the memory may grow to in place: the length of its reservation. Compiled growth past
     /// it fails, as a grow past the memory's maximum does.
     pub(crate) memory_capacity: u64,
+    /// The address of [`host_trampoline`], which compiled code calls for an import.
+    pub(crate) host_call: usize,
+    /// The host calls this call may make: a `*mut &mut dyn HostCalls`, or null when it has none.
+    pub(crate) host: *mut c_void,
 }
 
 impl Context {
@@ -144,6 +152,8 @@ impl Context {
             globals: std::ptr::null_mut(),
             globals_len: 0,
             memory_capacity: 0,
+            host_call: 0,
+            host: std::ptr::null_mut(),
         }
     }
 }
@@ -381,6 +391,7 @@ fn finish(bits: u64, status: u64) -> Result<u64, JitError> {
         STATUS_INDIRECT_TYPE_MISMATCH => Err(JitError::Trap(Trap::IndirectCallTypeMismatch)),
         STATUS_INVALID_CONVERSION => Err(JitError::Trap(Trap::InvalidConversion)),
         STATUS_UNREACHABLE => Err(JitError::Trap(Trap::Unreachable)),
+        STATUS_HOST_FAILED => Err(JitError::Unsupported("a host call failed".into())),
         STATUS_GLOBAL_OUT_OF_BOUNDS => Err(JitError::Unsupported(
             "a global the call did not provide".into(),
         )),
@@ -680,7 +691,7 @@ pub(crate) fn makes_calls(function: &IrFunction) -> bool {
         .any(|instruction| {
             matches!(
                 instruction,
-                IrInstr::Call { .. } | IrInstr::CallIndirect { .. }
+                IrInstr::Call { .. } | IrInstr::CallIndirect { .. } | IrInstr::CallHost { .. }
             )
         })
 }
@@ -722,6 +733,10 @@ fn frame_estimate(function: &IrFunction) -> usize {
             IrInstr::Call { arguments, .. } | IrInstr::CallIndirect { arguments, .. } => {
                 arguments.len().max(1)
             }
+            // A host call has an argument block and a result block.
+            IrInstr::CallHost {
+                arguments, results, ..
+            } => arguments.len().max(1) + results.len().max(1),
             _ => 0,
         })
         .sum();
@@ -785,6 +800,62 @@ pub struct CompiledModule {
     /// `call_with_memory`.
     memory_grows: bool,
     max_call_depth: u64,
+}
+
+/// The host side of the calls compiled code makes to imports. Each argument and result is one `i64` word, as
+/// the import's declared types say: an `i32` in the low four bytes, a float as its bits.
+pub trait HostCalls {
+    /// The number of arguments and results of import `import`.
+    fn arity(&self, import: u32) -> (usize, usize);
+
+    /// Call import `import` with `args`, writing its results to `results`. `memory` is the module's memory,
+    /// when it has one. Returns `false` when the call failed, after the host has recorded the failure.
+    fn call(
+        &mut self,
+        import: u32,
+        args: &[i64],
+        results: &mut [i64],
+        memory: Option<&mut [u8]>,
+    ) -> bool;
+}
+
+/// The function compiled code calls for an import. It runs the host call through the context's host, and reports
+/// a failure by setting the context's status, which the code checks before it goes on.
+///
+/// A panic in the host is caught here, because it must not unwind through the compiled frames; it is reported as a
+/// failed call.
+#[allow(unsafe_code)]
+unsafe extern "C" fn host_trampoline(
+    context: *mut Context,
+    import: u32,
+    args: *const i64,
+    results: *mut i64,
+) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: compiled code passes the context it was run with, and its own blocks of the import's arity for
+        // `args` and `results`. The host pointer is null or the `&mut &mut dyn HostCalls` that `call_inner` stored,
+        // which lives for the whole call. The memory pointer and length describe the bytes the call was given.
+        let context = unsafe { &mut *context };
+        if context.host.is_null() {
+            return false;
+        }
+        let host = unsafe { &mut *(context.host as *mut &mut dyn HostCalls) };
+        let (parameters, returns) = host.arity(import);
+        let arguments = unsafe { std::slice::from_raw_parts(args, parameters) };
+        let returned = unsafe { std::slice::from_raw_parts_mut(results, returns) };
+        let memory = if context.memory.is_null() {
+            None
+        } else {
+            Some(unsafe {
+                std::slice::from_raw_parts_mut(context.memory, context.memory_len as usize)
+            })
+        };
+        host.call(import, arguments, returned, memory)
+    }));
+    if !matches!(outcome, Ok(true)) {
+        // SAFETY: the context is the one compiled code was given, and it is live for the call.
+        unsafe { (*context).status = u64::from(STATUS_HOST_FAILED) };
+    }
 }
 
 /// The linear memory of a call: its bytes, which may be longer than the memory's size, and the size in
@@ -1002,7 +1073,7 @@ impl CompiledModule {
             let len = bytes.len() as u64;
             LinearMemory { bytes, len }
         });
-        self.call_inner(index, args, memory.as_mut(), &mut [])
+        self.call_inner(index, args, memory.as_mut(), &mut [], None)
     }
 
     /// As [`call`](Self::call), with `globals` as the module's globals by index, as raw 8-byte values:
@@ -1025,7 +1096,7 @@ impl CompiledModule {
             let len = bytes.len() as u64;
             LinearMemory { bytes, len }
         });
-        self.call_inner(index, args, memory.as_mut(), globals)
+        self.call_inner(index, args, memory.as_mut(), globals, None)
     }
 
     /// As [`call_with_globals`](Self::call_with_globals), with the memory given as a [`LinearMemory`],
@@ -1039,7 +1110,20 @@ impl CompiledModule {
         memory: Option<&mut LinearMemory>,
         globals: &mut [u64],
     ) -> Result<u64, JitError> {
-        self.call_inner(index, args, memory, globals)
+        self.call_inner(index, args, memory, globals, None)
+    }
+
+    /// As [`call_with_memory`](Self::call_with_memory), with `host` as the host the code's calls to imports go
+    /// through. Without a host, a call to an import fails.
+    pub fn call_with_host(
+        &self,
+        index: usize,
+        args: &[i64],
+        memory: Option<&mut LinearMemory>,
+        globals: &mut [u64],
+        host: Option<&mut dyn HostCalls>,
+    ) -> Result<u64, JitError> {
+        self.call_inner(index, args, memory, globals, host)
     }
 
     /// Whether compiled code of this module grows its memory, so the caller must reserve the memory's
@@ -1054,6 +1138,7 @@ impl CompiledModule {
         args: &[i64],
         memory: Option<&mut LinearMemory>,
         globals: &mut [u64],
+        host: Option<&mut dyn HostCalls>,
     ) -> Result<u64, JitError> {
         let function = self
             .functions
@@ -1067,6 +1152,11 @@ impl CompiledModule {
             });
         }
         let mut memory = memory;
+        let mut host = host;
+        let host_pointer = match host.as_mut() {
+            Some(host) => (host as *mut &mut dyn HostCalls).cast::<c_void>(),
+            None => std::ptr::null_mut(),
+        };
         let (base, memory_len, capacity) = match memory.as_deref_mut() {
             Some(view) => (view.bytes.as_mut_ptr(), view.len, view.bytes.len() as u64),
             None => (std::ptr::null_mut(), 0, 0),
@@ -1085,6 +1175,8 @@ impl CompiledModule {
             globals: globals.as_mut_ptr(),
             globals_len: globals.len() as u64,
             memory_capacity: capacity,
+            host_call: host_trampoline as *const () as usize,
+            host: host_pointer,
         };
         let bits = function.code.call(args.as_ptr(), &mut context);
         // A grow in the code updated the size in the context, so the caller sees it, trap or not.

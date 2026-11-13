@@ -1899,6 +1899,57 @@ pub trait HostBoundary {
     ) -> Result<Vec<Value>, HostCallFailure>;
 }
 
+/// Invoke import `import` through the host boundary, with its arguments, and check what the host returns
+/// against the import's declared signature.
+///
+/// The baseline's `CallHost` and a native tier's host call both come here, so a host call has one
+/// implementation. The host is outside the verified module, so its return is not trusted: a return of the
+/// wrong arity or types is a host failure, and so is a call with no boundary installed.
+pub fn invoke_import(
+    imports: &[tpt_wasm_ir::IrImport],
+    host: Option<&mut dyn HostBoundary>,
+    memory: Option<&mut dyn GuestMemory>,
+    import: u32,
+    args: Vec<Value>,
+) -> Result<Vec<Value>, BaselineError> {
+    let declaration = imports
+        .get(import as usize)
+        .ok_or_else(|| Trap::HostFailure("baseline host import is out of range".into()))?;
+    let qualified = format!("{}::{}", declaration.module, declaration.name);
+    // No boundary means the embedder granted no host capability, so the call is refused rather than
+    // resolved by guesswork. That is a host refusal rather than the module trapping.
+    let host = host.ok_or_else(|| {
+        BaselineError::Host(HostCallFailure {
+            name: qualified.clone(),
+            message: "no host boundary was installed".into(),
+        })
+    })?;
+    let returned = host.call(&declaration.module, &declaration.name, memory, args)?;
+    let expected_results = &declaration.function_type.results.0;
+    if returned.len() != expected_results.len() {
+        return Err(BaselineError::Host(HostCallFailure {
+            name: qualified,
+            message: format!(
+                "host returned {} results, the import declares {}",
+                returned.len(),
+                expected_results.len()
+            ),
+        }));
+    }
+    for (value, expected) in returned.iter().zip(expected_results) {
+        check_value_type(value, *expected).map_err(|trap| {
+            BaselineError::Host(HostCallFailure {
+                name: qualified.clone(),
+                message: Trap::HostFailure(format!(
+                    "host returned the wrong type for a result: {trap}"
+                ))
+                .to_string(),
+            })
+        })?;
+    }
+    Ok(returned)
+}
+
 /// Write a module's active data segments into a memory, in module order.
 ///
 /// Order is the point: a later segment overwrites an earlier one at the same
@@ -2008,6 +2059,16 @@ impl BaselineModule {
     ///
     /// Without one, a `CallHost` traps rather than reaching outside the module,
     /// so a compiled module cannot acquire a host capability by accident.
+    /// The imports and the host boundary together, for a native tier that calls host functions itself. They
+    /// are fields of different parts of the module, so both can be borrowed at once.
+    pub fn host_view(&mut self) -> (&[tpt_wasm_ir::IrImport], Option<&mut dyn HostBoundary>) {
+        let host = self
+            .host
+            .as_deref_mut()
+            .map(|host| host as &mut dyn HostBoundary);
+        (&self.imports, host)
+    }
+
     pub fn set_host(&mut self, host: impl HostBoundary + 'static) -> &mut Self {
         self.host = Some(Box::new(host));
         self
@@ -2890,56 +2951,24 @@ fn exec_op(
             arguments,
             results,
         } => {
-            let declaration = state
-                .imports
-                .get(*import as usize)
-                .ok_or_else(|| Trap::HostFailure("baseline host import is out of range".into()))?;
-            let qualified = format!("{}::{}", declaration.module, declaration.name);
-            // No boundary means the embedder granted no host
-            // capability, so the call is refused rather than
-            // resolved by guesswork. That is a host refusal rather
-            // than the module trapping, so it is reported as one.
             let memory = state
                 .memory
                 .as_deref_mut()
                 .map(|memory| memory as &mut dyn GuestMemory);
-            let host = state.host.as_deref_mut().ok_or_else(|| {
-                BaselineError::Host(HostCallFailure {
-                    name: qualified.clone(),
-                    message: "no host boundary was installed".into(),
-                })
-            })?;
             let mut call_args = Vec::with_capacity(arguments.len());
             for slot in arguments {
                 call_args.push(read_slot(slots, *slot)?);
             }
-            let returned = host.call(&declaration.module, &declaration.name, memory, call_args)?;
-            // The import's declared result arity and types are
-            // re-checked here: the host is outside the verified
-            // module, so its return is not trusted. A host that
-            // breaks its declared signature is reported as a host
-            // failure, matching how the interpreter reports one.
-            if returned.len() != results.len() {
-                return Err(BaselineError::Host(HostCallFailure {
-                    name: qualified.clone(),
-                    message: format!(
-                        "host returned {} results, the import declares {}",
-                        returned.len(),
-                        results.len()
-                    ),
-                }));
-            }
-            for (position, expected) in declaration.function_type.results.0.iter().enumerate() {
-                check_value_type(&returned[position], *expected).map_err(|trap| {
-                    BaselineError::Host(HostCallFailure {
-                        name: qualified.clone(),
-                        message: Trap::HostFailure(format!(
-                            "host returned the wrong type for a result: {trap}"
-                        ))
-                        .to_string(),
-                    })
-                })?;
-            }
+            let returned = invoke_import(
+                state.imports,
+                state
+                    .host
+                    .as_deref_mut()
+                    .map(|host| host as &mut dyn HostBoundary),
+                memory,
+                *import,
+                call_args,
+            )?;
             for (slot, value) in results.iter().copied().zip(returned) {
                 slots[slot as usize] = Some(value);
             }

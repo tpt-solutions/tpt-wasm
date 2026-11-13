@@ -13,11 +13,11 @@
 //! no execution steps, which is why the engine turns this tier off when a step limit, profiling or
 //! debugging is in effect.
 
-use tpt_wasm_codegen::SharedGlobal;
-use tpt_wasm_ir::IrModule;
-use tpt_wasm_types::Value;
+use tpt_wasm_codegen::{HostBoundary, SharedGlobal};
+use tpt_wasm_ir::{IrImport, IrModule};
 #[cfg(feature = "jit")]
 use tpt_wasm_types::ValueType;
+use tpt_wasm_types::{GuestMemory, Value};
 
 use crate::native_cache::NativeCache;
 use crate::RuntimeError;
@@ -205,6 +205,7 @@ impl JitTier {
         args: &[Value],
         memory: Option<&mut LinearMemory>,
         globals: &mut [u64],
+        host: &mut NativeHost<'_>,
     ) -> Result<Vec<Value>, RuntimeError> {
         let module = self
             .module
@@ -236,7 +237,13 @@ impl JitTier {
             });
         }
         let raw = module
-            .call_with_memory(index, &slots, memory, globals)
+            .call_with_host(
+                index,
+                &slots,
+                memory,
+                globals,
+                Some(host as &mut dyn tpt_wasm_jit::HostCalls),
+            )
             .map_err(|error| match error {
                 tpt_wasm_jit::JitError::Trap(trap) => RuntimeError::Trap(trap),
                 _ => RuntimeError::UnsupportedFeature("a native function that could not run"),
@@ -279,8 +286,132 @@ impl JitTier {
         _args: &[Value],
         _memory: Option<&mut LinearMemory>,
         _globals: &mut [u64],
+        _host: &mut NativeHost<'_>,
     ) -> Result<Vec<Value>, RuntimeError> {
         Err(RuntimeError::UnsupportedFeature("the jit feature"))
+    }
+}
+
+/// The host calls of a native call: the module's imports, and its host boundary. A call goes through the same
+/// `invoke_import` the baseline uses, so a host call has one implementation, and a failure is kept whole so the
+/// call can report it as the baseline reports it.
+pub(crate) struct NativeHost<'a> {
+    pub(crate) imports: &'a [IrImport],
+    pub(crate) host: Option<&'a mut dyn HostBoundary>,
+    /// The first failure a host call reported. The native code only sees that a call failed, so the failure
+    /// itself is taken from here.
+    pub(crate) failure: Option<tpt_wasm_codegen::BaselineError>,
+}
+
+#[cfg(feature = "jit")]
+impl tpt_wasm_jit::HostCalls for NativeHost<'_> {
+    fn arity(&self, import: u32) -> (usize, usize) {
+        self.imports
+            .get(import as usize)
+            .map_or((0, 0), |declaration| {
+                (
+                    declaration.function_type.params.0.len(),
+                    declaration.function_type.results.0.len(),
+                )
+            })
+    }
+
+    fn call(
+        &mut self,
+        import: u32,
+        args: &[i64],
+        results: &mut [i64],
+        memory: Option<&mut [u8]>,
+    ) -> bool {
+        let Some(declaration) = self.imports.get(import as usize) else {
+            return false;
+        };
+        let values: Vec<Value> = args
+            .iter()
+            .zip(&declaration.function_type.params.0)
+            .map(|(word, value_type)| word_value(*word, *value_type))
+            .collect();
+        let mut view = memory.map(NativeMemory);
+        let memory: Option<&mut dyn GuestMemory> = match view.as_mut() {
+            Some(view) => Some(view),
+            None => None,
+        };
+        match tpt_wasm_codegen::invoke_import(
+            self.imports,
+            self.host
+                .as_deref_mut()
+                .map(|host| host as &mut dyn HostBoundary),
+            memory,
+            import,
+            values,
+        ) {
+            Ok(returned) => {
+                for (slot, value) in results.iter_mut().zip(&returned) {
+                    *slot = value_word(value);
+                }
+                true
+            }
+            Err(error) => {
+                self.failure.get_or_insert(error);
+                false
+            }
+        }
+    }
+}
+
+/// The module's memory as a host sees it: the bytes a native call was given, up to the size it is at.
+#[cfg(feature = "jit")]
+struct NativeMemory<'a>(&'a mut [u8]);
+
+#[cfg(feature = "jit")]
+impl GuestMemory for NativeMemory<'_> {
+    fn size(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn read(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(usize::try_from(length).ok()?)?;
+        self.0.get(start..end).map(<[u8]>::to_vec)
+    }
+
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> bool {
+        let Ok(start) = usize::try_from(offset) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(bytes.len()) else {
+            return false;
+        };
+        match self.0.get_mut(start..end) {
+            Some(target) => {
+                target.copy_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// A host argument from its word, as its declared type says.
+#[cfg(feature = "jit")]
+fn word_value(word: i64, value_type: ValueType) -> Value {
+    match value_type {
+        ValueType::I32 => Value::I32(word as i32),
+        ValueType::I64 => Value::I64(word),
+        ValueType::F32 => Value::F32(word as u32),
+        _ => Value::F64(word as u64),
+    }
+}
+
+/// A host result as its word.
+#[cfg(feature = "jit")]
+fn value_word(value: &Value) -> i64 {
+    match value {
+        Value::I32(value) => i64::from(*value),
+        Value::I64(value) => *value,
+        Value::F32(bits) => i64::from(*bits),
+        Value::F64(bits) => *bits as i64,
+        _ => 0,
     }
 }
 
