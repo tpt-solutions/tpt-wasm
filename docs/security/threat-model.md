@@ -123,4 +123,4 @@ risks, and the engine modes do not change until the same differential tests cove
 - **Miri.** `tpt-wasm-codegen` did not finish within the Miri time limit, and `tpt-wasm-opt`
   was not clean within it earlier. Those crates have no Miri result yet. Miri cannot run the
   JIT's generated code, so the JIT's encoder tests are its only Miri-checkable part.
-- **Fuzzing duration.** The fuzzing above is 5-minute runs. Longer campaigns have not been run.
+- **Fuzzing duration.** The fuzzing above is mostly 5-minute runs. The module fuzzer, which now generates host calls, refusals and memory writes, ran twice for eight minutes each under WSL (41,365 and 41,320 inputs, different seeds) with no divergence. Longer campaigns of the other targets have not been run.
