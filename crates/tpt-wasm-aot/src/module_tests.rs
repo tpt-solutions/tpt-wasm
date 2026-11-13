@@ -202,7 +202,7 @@ fn a_float_function_keeps_its_types_through_the_artifact() {
     let ir = lowered(module);
     let artifact = compile_artifact(&ir.functions[0]).expect("compiles");
     assert_eq!(artifact.params(), &[ValueType::F64]);
-    assert_eq!(artifact.result(), ValueType::F64);
+    assert_eq!(artifact.result(), Some(ValueType::F64));
     let restored = Artifact::from_bytes(&artifact.to_bytes()).expect("reads back");
     assert_eq!(restored, artifact);
     let loaded = restored.load().expect("loads on this host");

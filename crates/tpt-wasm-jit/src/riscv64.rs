@@ -27,9 +27,9 @@ use tpt_wasm_ir::{
 
 use crate::x86::{check_supported, instruction_name, terminator_name};
 use crate::{
-    CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
+    call_result, CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
     STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE,
-    STATUS_TABLE_OUT_OF_BOUNDS,
+    STATUS_TABLE_OUT_OF_BOUNDS, STATUS_UNREACHABLE,
 };
 
 /// Register numbers.
@@ -444,6 +444,15 @@ fn emit_terminator(
             epilogue(emitter);
             Ok(Vec::new())
         }
+        Terminator::Return(values) if values.is_empty() => {
+            emitter.push(addi(A0, ZERO, 0)); // a function with no result returns zero
+            epilogue(emitter);
+            Ok(Vec::new())
+        }
+        Terminator::Unreachable => {
+            trap(frame, STATUS_UNREACHABLE, emitter);
+            Ok(Vec::new())
+        }
         Terminator::Return(values) => Err(JitError::Unsupported(format!(
             "a return of {} values",
             values.len()
@@ -570,11 +579,7 @@ fn emit_call(
             "a call to a function that is not compiled".into(),
         ));
     }
-    let [result] = results else {
-        return Err(JitError::Unsupported(
-            "a call with other than one result".into(),
-        ));
-    };
+    let result = call_result(results)?;
     let block = frame.block(arguments.len().max(1));
     if block >= 2048 {
         return Err(JitError::Unsupported(
@@ -582,7 +587,10 @@ fn emit_call(
         ));
     }
     store_arguments(arguments, block, frame, emitter);
-    let destination = frame.slot(*result);
+    let destination = match result {
+        Some(result) => frame.slot(result),
+        None => frame.temporary(),
+    };
     enter_callee(frame, emitter);
     // a0 = the argument block; a1 = the context; t0 = the callee's entry, the table at
     // `functions` plus eight bytes per function, loaded through `jalr`.
@@ -618,11 +626,7 @@ fn emit_call_indirect(
         .get(type_index as usize)
         .copied()
         .ok_or_else(|| JitError::Unsupported("an indirect call to an unknown type".into()))?;
-    let [result] = results else {
-        return Err(JitError::Unsupported(
-            "a call with other than one result".into(),
-        ));
-    };
+    let result = call_result(results)?;
     let block = frame.block(arguments.len().max(1));
     if block >= 2048 {
         return Err(JitError::Unsupported(
@@ -631,7 +635,10 @@ fn emit_call_indirect(
     }
     store_arguments(arguments, block, frame, emitter);
     let operand_slot = frame.slot(operand);
-    let destination = frame.slot(*result);
+    let destination = match result {
+        Some(result) => frame.slot(result),
+        None => frame.temporary(),
+    };
     let entry = frame.temporary();
 
     // t0 = the index, zero-extended from its i32 slot (lwu); t2 = the context.

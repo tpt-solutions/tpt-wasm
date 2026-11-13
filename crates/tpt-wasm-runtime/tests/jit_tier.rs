@@ -108,8 +108,8 @@ fn only_the_functions_the_compiler_accepts_run_natively() {
     assert!(instance.runs_natively("add"));
     assert!(instance.runs_natively("div"));
     assert!(instance.runs_natively("load"));
-    // No result, so refused and left on the baseline.
-    assert!(!instance.runs_natively("store"));
+    // A store returns nothing; functions with no result compile too.
+    assert!(instance.runs_natively("store"));
     assert!(!instance.runs_natively("no_such_export"));
 }
 

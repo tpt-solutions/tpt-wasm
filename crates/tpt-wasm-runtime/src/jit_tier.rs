@@ -28,7 +28,7 @@ pub(crate) struct JitTier {
     module: Option<tpt_wasm_jit::CompiledModule>,
     /// The parameter types and result type of every function, by index, for checking arguments.
     #[cfg(feature = "jit")]
-    signatures: Vec<(Vec<ValueType>, ValueType)>,
+    signatures: Vec<(Vec<ValueType>, Option<ValueType>)>,
     /// The type and mutability of every global, by index, for moving its value in and out.
     #[cfg(feature = "jit")]
     globals: Vec<(ValueType, bool)>,
@@ -54,13 +54,7 @@ impl JitTier {
             .iter()
             .map(|function| {
                 let params = function.function_type.params.0.clone();
-                let result = function
-                    .function_type
-                    .results
-                    .0
-                    .first()
-                    .copied()
-                    .unwrap_or(ValueType::I32);
+                let result = function.function_type.results.0.first().copied();
                 (params, result)
             })
             .collect();
@@ -235,11 +229,13 @@ impl JitTier {
                 tpt_wasm_jit::JitError::Trap(trap) => RuntimeError::Trap(trap),
                 _ => RuntimeError::UnsupportedFeature("a native function that could not run"),
             })?;
+        // A function with no result returns nothing, whatever its compiled code left in the register.
         let value = match result {
-            ValueType::I32 => Value::I32(raw as u32 as i32),
-            ValueType::I64 => Value::I64(raw as i64),
-            ValueType::F32 => Value::F32(raw as u32),
-            ValueType::F64 => Value::F64(raw),
+            None => return Ok(Vec::new()),
+            Some(ValueType::I32) => Value::I32(raw as u32 as i32),
+            Some(ValueType::I64) => Value::I64(raw as i64),
+            Some(ValueType::F32) => Value::F32(raw as u32),
+            Some(ValueType::F64) => Value::F64(raw),
             _ => {
                 return Err(RuntimeError::UnsupportedFeature(
                     "a reference result from a native function",

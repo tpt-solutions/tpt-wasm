@@ -28,7 +28,7 @@
 //! | target length | 1 | length of the target name |
 //! | target | n | [`tpt_wasm_jit::target_id`] of the generating host |
 //! | parameters | 1 + n | the number of parameters, then one kind byte each: `0` for `i32`, `1` for `i64`, `2` for `f32`, `3` for `f64` |
-//! | result | 1 | the result kind, with the same encoding |
+//! | result | 1 | the result kind, with the same encoding, or `4` for a function that returns nothing |
 //! | code length | 4 | length of the machine code |
 //! | code | m | the machine code |
 //! | checksum | 8 | FNV-1a 64 over every byte before it |
@@ -104,7 +104,7 @@ impl std::error::Error for AotError {}
 pub struct Artifact {
     target: String,
     params: Vec<ValueType>,
-    result: ValueType,
+    result: Option<ValueType>,
     code: Vec<u8>,
 }
 
@@ -131,6 +131,23 @@ fn kind_from_byte(byte: u8) -> Result<ValueType, AotError> {
         other => Err(AotError::Malformed(format!(
             "an unknown value kind {other}"
         ))),
+    }
+}
+
+/// The one-byte encoding of a result: a scalar type as `kind_byte` does, or `4` for a function that returns
+/// nothing. The byte `4` is not a scalar kind, so an older reader refuses such an artifact.
+fn result_byte(result: Option<ValueType>) -> u8 {
+    match result {
+        None => 4,
+        Some(value_type) => kind_byte(value_type),
+    }
+}
+
+/// The result a header byte names: `None` for `4`, otherwise a scalar type.
+fn result_from_byte(byte: u8) -> Result<Option<ValueType>, AotError> {
+    match byte {
+        4 => Ok(None),
+        other => kind_from_byte(other).map(Some),
     }
 }
 
@@ -163,8 +180,8 @@ impl Artifact {
         &self.params
     }
 
-    /// The result type.
-    pub fn result(&self) -> ValueType {
+    /// The result type, or `None` for a function that returns nothing.
+    pub fn result(&self) -> Option<ValueType> {
         self.result
     }
 
@@ -182,7 +199,7 @@ impl Artifact {
         out.extend_from_slice(self.target.as_bytes());
         out.push(self.params.len() as u8);
         out.extend(self.params.iter().map(|value_type| kind_byte(*value_type)));
-        out.push(kind_byte(self.result));
+        out.push(result_byte(self.result));
         out.extend_from_slice(&(self.code.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.code);
         let checksum = fnv1a(&out);
@@ -216,7 +233,7 @@ impl Artifact {
             .iter()
             .map(|byte| kind_from_byte(*byte))
             .collect::<Result<Vec<_>, _>>()?;
-        let result = kind_from_byte(cursor.byte()?)?;
+        let result = result_from_byte(cursor.byte()?)?;
         let code_length =
             u32::from_le_bytes(cursor.take(4)?.try_into().expect("four bytes")) as usize;
         let code = cursor.take(code_length)?.to_vec();
@@ -359,7 +376,7 @@ impl ModuleArtifact {
                             .iter()
                             .map(|value_type| kind_byte(*value_type)),
                     );
-                    out.push(kind_byte(function.result));
+                    out.push(result_byte(function.result));
                     out.extend_from_slice(&(function.code.len() as u32).to_le_bytes());
                     out.extend_from_slice(&function.code);
                 }
@@ -419,7 +436,7 @@ impl ModuleArtifact {
                         .iter()
                         .map(|byte| kind_from_byte(*byte))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let result = kind_from_byte(cursor.byte()?)?;
+                    let result = result_from_byte(cursor.byte()?)?;
                     let code_length = cursor.u32()? as usize;
                     let code = cursor.take(code_length)?.to_vec();
                     functions.push(Some(FunctionParts {
@@ -561,7 +578,7 @@ mod tests {
         Artifact {
             target: target.to_owned(),
             params: vec![tpt_wasm_types::ValueType::I32; 2],
-            result: tpt_wasm_types::ValueType::I32,
+            result: Some(tpt_wasm_types::ValueType::I32),
             code,
         }
     }

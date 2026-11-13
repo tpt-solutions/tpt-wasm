@@ -85,6 +85,8 @@ pub(crate) const STATUS_INVALID_CONVERSION: u32 = 8;
 /// The status for a global access past the end of the globals the caller provided. The code checks
 /// this itself, so a module called without its globals traps instead of reading past them.
 pub(crate) const STATUS_GLOBAL_OUT_OF_BOUNDS: u32 = 9;
+/// The status for the `unreachable` instruction, which traps.
+pub(crate) const STATUS_UNREACHABLE: u32 = 10;
 
 /// What a compiled function reads and writes besides its arguments.
 ///
@@ -157,6 +159,19 @@ pub(crate) struct CallEnv {
     pub(crate) globals: bool,
 }
 
+/// The result of a call in the IR: its one result, or none for a call to a function that returns nothing.
+pub(crate) fn call_result(
+    results: &[tpt_wasm_ir::ValueId],
+) -> Result<Option<tpt_wasm_ir::ValueId>, JitError> {
+    match results {
+        [] => Ok(None),
+        [result] => Ok(Some(*result)),
+        _ => Err(JitError::Unsupported(
+            "a call with more than one result".into(),
+        )),
+    }
+}
+
 /// The result of a call, given the return value and the status the code left in the context.
 fn finish(bits: u64, status: u64) -> Result<u64, JitError> {
     match status as u32 {
@@ -169,6 +184,7 @@ fn finish(bits: u64, status: u64) -> Result<u64, JitError> {
         STATUS_NULL_REFERENCE => Err(JitError::Trap(Trap::NullReference)),
         STATUS_INDIRECT_TYPE_MISMATCH => Err(JitError::Trap(Trap::IndirectCallTypeMismatch)),
         STATUS_INVALID_CONVERSION => Err(JitError::Trap(Trap::InvalidConversion)),
+        STATUS_UNREACHABLE => Err(JitError::Trap(Trap::Unreachable)),
         STATUS_GLOBAL_OUT_OF_BOUNDS => Err(JitError::Unsupported(
             "a global the call did not provide".into(),
         )),
@@ -213,7 +229,7 @@ impl std::error::Error for JitError {}
 /// A function compiled to machine code, ready to call.
 pub struct CompiledFunction {
     params: Vec<ValueType>,
-    result: ValueType,
+    result: Option<ValueType>,
     code: exec::ExecutableCode,
 }
 
@@ -287,7 +303,7 @@ impl CompiledFunction {
     }
 
     fn require_result(&self, expected: ValueType) -> Result<(), JitError> {
-        if self.result != expected {
+        if self.result != Some(expected) {
             return Err(JitError::Unsupported(format!(
                 "the function returns {:?}, not {expected:?}",
                 self.result
@@ -324,8 +340,8 @@ impl CompiledFunction {
         &self.params
     }
 
-    /// The result type.
-    pub fn result(&self) -> ValueType {
+    /// The result type, or `None` for a function that returns nothing.
+    pub fn result(&self) -> Option<ValueType> {
         self.result
     }
 
@@ -338,7 +354,7 @@ impl CompiledFunction {
     pub fn from_machine_code(
         code: &[u8],
         params: Vec<ValueType>,
-        result: ValueType,
+        result: Option<ValueType>,
     ) -> Result<Self, JitError> {
         Ok(Self {
             params,
@@ -437,13 +453,7 @@ fn encode_for_host(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, JitE
 /// crate documentation.
 pub fn compile(function: &IrFunction) -> Result<CompiledFunction, JitError> {
     let params = function.function_type.params.0.clone();
-    let result = function
-        .function_type
-        .results
-        .0
-        .first()
-        .copied()
-        .ok_or_else(|| JitError::Unsupported("a function with no result".into()))?;
+    let result = function.function_type.results.0.first().copied();
     // Encoding is pure and runs everywhere, so a function outside the subset is refused the same
     // way on every target. Only installing the code needs the target. With no callable functions,
     // a call in this function is refused: a call needs the module it belongs to.
@@ -557,8 +567,8 @@ pub struct CompiledModule {
 pub struct FunctionParts {
     /// The parameter types, in order.
     pub params: Vec<ValueType>,
-    /// The result type.
-    pub result: ValueType,
+    /// The result type, or `None` for a function that returns nothing.
+    pub result: Option<ValueType>,
     /// The machine code, which is installed exactly as it is. See [`CompiledModule::from_parts`].
     pub code: Vec<u8>,
 }
@@ -889,13 +899,7 @@ pub fn compile_module(
                 entries[index] = code.address();
                 compiled.push(Some(CompiledFunction {
                     params: function.function_type.params.0.clone(),
-                    result: function
-                        .function_type
-                        .results
-                        .0
-                        .first()
-                        .copied()
-                        .unwrap_or(ValueType::I32),
+                    result: function.function_type.results.0.first().copied(),
                     code,
                 }));
             }

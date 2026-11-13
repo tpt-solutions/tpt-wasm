@@ -25,9 +25,9 @@ use tpt_wasm_types::ValueType;
 
 use crate::x86::{check_supported, instruction_name, terminator_name};
 use crate::{
-    CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
+    call_result, CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
     STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE,
-    STATUS_TABLE_OUT_OF_BOUNDS,
+    STATUS_TABLE_OUT_OF_BOUNDS, STATUS_UNREACHABLE,
 };
 
 /// Scratch registers. `9` holds the first operand, `10` the second, `11` a temporary, and `12`
@@ -493,6 +493,15 @@ fn emit_terminator(
             epilogue(emitter);
             Ok(Vec::new())
         }
+        Terminator::Return(values) if values.is_empty() => {
+            emitter.push(movz_w(0, 0)); // a function with no result returns zero
+            epilogue(emitter);
+            Ok(Vec::new())
+        }
+        Terminator::Unreachable => {
+            trap(frame, STATUS_UNREACHABLE, emitter);
+            Ok(Vec::new())
+        }
         Terminator::Return(values) => Err(JitError::Unsupported(format!(
             "a return of {} values",
             values.len()
@@ -627,11 +636,7 @@ fn emit_call(
             "a call to a function that is not compiled".into(),
         ));
     }
-    let [result] = results else {
-        return Err(JitError::Unsupported(
-            "a call with other than one result".into(),
-        ));
-    };
+    let result = call_result(results)?;
     // The table entry is loaded with an unsigned 12-bit offset, scaled by eight.
     let entry = 8 * function;
     if entry > 4095 * 8 {
@@ -641,7 +646,10 @@ fn emit_call(
     }
     let block = frame.block(arguments.len().max(1));
     store_arguments(arguments, block, frame, emitter);
-    let destination = frame.slot(*result);
+    let destination = match result {
+        Some(result) => frame.slot(result),
+        None => frame.temporary(),
+    };
     enter_callee(frame, emitter);
     // x0 = the argument block; x1 = the context; x12 = the callee's entry.
     emitter.push(add_x_imm(0, SP, block));
@@ -674,15 +682,14 @@ fn emit_call_indirect(
         .get(type_index as usize)
         .copied()
         .ok_or_else(|| JitError::Unsupported("an indirect call to an unknown type".into()))?;
-    let [result] = results else {
-        return Err(JitError::Unsupported(
-            "a call with other than one result".into(),
-        ));
-    };
+    let result = call_result(results)?;
     let block = frame.block(arguments.len().max(1));
     store_arguments(arguments, block, frame, emitter);
     let operand_slot = frame.slot(operand);
-    let destination = frame.slot(*result);
+    let destination = match result {
+        Some(result) => frame.slot(result),
+        None => frame.temporary(),
+    };
     let entry = frame.temporary();
     let context = frame.context;
 

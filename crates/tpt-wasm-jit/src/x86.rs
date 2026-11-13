@@ -27,9 +27,9 @@ use tpt_wasm_ir::{
 use tpt_wasm_types::ValueType;
 
 use crate::{
-    CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
+    call_result, CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
     STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE,
-    STATUS_TABLE_OUT_OF_BOUNDS,
+    STATUS_TABLE_OUT_OF_BOUNDS, STATUS_UNREACHABLE,
 };
 
 /// The calling convention whose argument registers the code reads.
@@ -490,6 +490,16 @@ fn emit_terminator(
             emitter.epilogue();
             Ok(Vec::new())
         }
+        Terminator::Return(values) if values.is_empty() => {
+            // A function with no result returns zero, which its caller ignores.
+            emitter.bytes.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+            emitter.epilogue();
+            Ok(Vec::new())
+        }
+        Terminator::Unreachable => {
+            emitter.trap(frame, STATUS_UNREACHABLE);
+            Ok(Vec::new())
+        }
         Terminator::Return(values) => Err(JitError::Unsupported(format!(
             "a return of {} values",
             values.len()
@@ -580,9 +590,9 @@ pub(crate) fn check_supported(function: &IrFunction) -> Result<(), JitError> {
     if function.blocks.is_empty() {
         return Err(JitError::Unsupported("a function with no blocks".into()));
     }
-    if function.function_type.results.0.len() != 1 {
+    if function.function_type.results.0.len() > 1 {
         return Err(JitError::Unsupported(
-            "a function that does not return exactly one value".into(),
+            "a function that returns more than one value".into(),
         ));
     }
     for value_type in function
@@ -1214,14 +1224,13 @@ fn emit_call(
             "a call to a function that is not compiled".into(),
         ));
     }
-    let [result] = results else {
-        return Err(JitError::Unsupported(
-            "a call with other than one result".into(),
-        ));
-    };
+    let result = call_result(results)?;
     let block = frame.block(arguments.len().max(1));
     store_arguments(arguments, block, frame, emitter);
-    let destination = frame.slot(*result);
+    let destination = match result {
+        Some(result) => frame.slot(result),
+        None => frame.temporary(),
+    };
     enter_callee(frame, emitter)?;
     set_call_registers(block, frame, emitter);
     // mov rax, [rax + functions]; call [rax + 8 * function]
@@ -1262,15 +1271,14 @@ fn emit_call_indirect(
         .copied()
         .and_then(|id| i32::try_from(id).ok())
         .ok_or_else(|| JitError::Unsupported("an indirect call to an unknown type".into()))?;
-    let [result] = results else {
-        return Err(JitError::Unsupported(
-            "a call with other than one result".into(),
-        ));
-    };
+    let result = call_result(results)?;
     let block = frame.block(arguments.len().max(1));
     store_arguments(arguments, block, frame, emitter);
     let operand_slot = frame.slot(operand);
-    let destination = frame.slot(*result);
+    let destination = match result {
+        Some(result) => frame.slot(result),
+        None => frame.temporary(),
+    };
     let entry = frame.temporary();
     let context = frame.context;
 
