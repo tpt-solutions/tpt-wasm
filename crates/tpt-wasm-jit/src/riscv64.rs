@@ -27,9 +27,10 @@ use tpt_wasm_ir::{
 
 use crate::x86::{check_supported, instruction_name, terminator_name};
 use crate::{
-    call_result, CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
-    STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE,
-    STATUS_TABLE_OUT_OF_BOUNDS, STATUS_UNREACHABLE,
+    allocate_registers, call_result, is_register_instruction, makes_calls, CallEnv, Context,
+    JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS, STATUS_INDIRECT_TYPE_MISMATCH,
+    STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
+    STATUS_UNREACHABLE,
 };
 
 /// Register numbers.
@@ -88,6 +89,8 @@ struct Frame {
     context: u32,
     /// What the function's calls may name, and the table they may index.
     env: CallEnv,
+    /// The registers of the values that live in one, in a function that makes no call.
+    registers: HashMap<ValueId, u8>,
 }
 
 impl Frame {
@@ -97,6 +100,7 @@ impl Frame {
             used: 0,
             context: 0,
             env: env.clone(),
+            registers: HashMap::new(),
         }
     }
 
@@ -367,6 +371,9 @@ pub(crate) fn encode(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, Ji
         .collect();
 
     let mut frame = Frame::new(env);
+    if !makes_calls(function) {
+        frame.registers = allocate_registers(function, &VALUE_REGISTERS);
+    }
     let mut emitter = Emitter::new();
 
     // The two pointers arrive in a0 and a1 and are kept in slots, because the code below uses the
@@ -865,11 +872,280 @@ fn memory_grow(result: ValueId, delta: ValueId, frame: &mut Frame, emitter: &mut
     emitter.push(store(3, T0, SP, destination as i32));
 }
 
+/// The registers that hold values in a function that makes no call: a2 to a7 (x12 to x17). The encoder uses
+/// t0 to t4 and a0 and a1, and a leaf function never calls out, so these are free for the whole function.
+const VALUE_REGISTERS: [u8; 6] = [12, 13, 14, 15, 16, 17];
+
+impl Frame {
+    /// The register a value lives in, if it has one.
+    fn register(&self, value: ValueId) -> Option<u32> {
+        self.registers.get(&value).copied().map(u32::from)
+    }
+}
+
+/// The register holding `value`: its own register, or `scratch` after a load from its slot.
+fn operand_register(frame: &mut Frame, value: ValueId, scratch: u32, emitter: &mut Emitter) -> u32 {
+    match frame.register(value) {
+        Some(register) => register,
+        None => {
+            let slot = frame.slot(value);
+            emitter.push(load(3, scratch, SP, slot as i32));
+            scratch
+        }
+    }
+}
+
+/// The register a result is computed into: its own register, or t0 for a result stored to its slot.
+fn result_register(frame: &Frame, value: ValueId) -> u32 {
+    frame.register(value).unwrap_or(T0)
+}
+
+/// Store a result computed into t0 to its slot, when the result has no register.
+fn finish_result(frame: &mut Frame, value: ValueId, emitter: &mut Emitter) {
+    if frame.register(value).is_none() {
+        let slot = frame.slot(value);
+        emitter.push(store(3, T0, SP, slot as i32));
+    }
+}
+
+/// The operations the register path computes.
+#[derive(Clone, Copy)]
+enum RegisterOp {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Xor,
+}
+
+/// The instruction word of `op` on `rs1` and `rs2`, into `rd`, on 32 or 64 bits. The 32-bit forms of add,
+/// subtract and multiply are the OP-32 encodings, and and, or and xor are the same words on both widths.
+fn register_word(wide: bool, kind: RegisterOp, rd: u32, rs1: u32, rs2: u32) -> u32 {
+    match (wide, kind) {
+        (false, RegisterOp::Add) => op_w(0x00, 0, rd, rs1, rs2),
+        (false, RegisterOp::Sub) => op_w(0x20, 0, rd, rs1, rs2),
+        (false, RegisterOp::Mul) => op_w(0x01, 0, rd, rs1, rs2),
+        (true, RegisterOp::Add) => op(0x00, 0, rd, rs1, rs2),
+        (true, RegisterOp::Sub) => op(0x20, 0, rd, rs1, rs2),
+        (true, RegisterOp::Mul) => op(0x01, 0, rd, rs1, rs2),
+        (_, RegisterOp::And) => op(0x00, 7, rd, rs1, rs2),
+        (_, RegisterOp::Or) => op(0x00, 6, rd, rs1, rs2),
+        (_, RegisterOp::Xor) => op(0x00, 4, rd, rs1, rs2),
+    }
+}
+
+/// `result = left op right` on 32 or 64 bits, through the register or slot of each value.
+fn register_binary(
+    wide: bool,
+    op: RegisterOp,
+    result: ValueId,
+    left: ValueId,
+    right: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let left = operand_register(frame, left, T0, emitter);
+    let right = operand_register(frame, right, T1, emitter);
+    let destination = result_register(frame, result);
+    emitter.push(register_word(wide, op, destination, left, right));
+    finish_result(frame, result, emitter);
+}
+
+/// Emit an instruction of [`is_register_instruction`].
+fn emit_register_instruction(
+    instruction: &IrInstr,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    match instruction {
+        IrInstr::ConstI32 { result, value } => {
+            let destination = result_register(frame, *result);
+            load_constant32(destination, *value, emitter);
+            finish_result(frame, *result, emitter);
+        }
+        IrInstr::ConstI64 { result, value } => {
+            let destination = result_register(frame, *result);
+            load_constant64(destination, *value, emitter);
+            finish_result(frame, *result, emitter);
+        }
+        IrInstr::LocalGet { result, local } => {
+            let source = frame.slot(*local);
+            let destination = result_register(frame, *result);
+            emitter.push(load(3, destination, SP, source as i32));
+            finish_result(frame, *result, emitter);
+        }
+        IrInstr::LocalSet { local, value } => {
+            let register = operand_register(frame, *value, T0, emitter);
+            let destination = frame.slot(*local);
+            emitter.push(store(3, register, SP, destination as i32));
+        }
+        IrInstr::I32Add {
+            result,
+            left,
+            right,
+        } => register_binary(
+            false,
+            RegisterOp::Add,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32Sub {
+            result,
+            left,
+            right,
+        } => register_binary(
+            false,
+            RegisterOp::Sub,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32Mul {
+            result,
+            left,
+            right,
+        } => register_binary(
+            false,
+            RegisterOp::Mul,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64Add {
+            result,
+            left,
+            right,
+        } => register_binary(
+            true,
+            RegisterOp::Add,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64Sub {
+            result,
+            left,
+            right,
+        } => register_binary(
+            true,
+            RegisterOp::Sub,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64Mul {
+            result,
+            left,
+            right,
+        } => register_binary(
+            true,
+            RegisterOp::Mul,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32And {
+            result,
+            left,
+            right,
+        } => register_binary(
+            false,
+            RegisterOp::And,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32Or {
+            result,
+            left,
+            right,
+        } => register_binary(
+            false,
+            RegisterOp::Or,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I32Xor {
+            result,
+            left,
+            right,
+        } => register_binary(
+            false,
+            RegisterOp::Xor,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64And {
+            result,
+            left,
+            right,
+        } => register_binary(
+            true,
+            RegisterOp::And,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        IrInstr::I64Or {
+            result,
+            left,
+            right,
+        } => register_binary(true, RegisterOp::Or, *result, *left, *right, frame, emitter),
+        IrInstr::I64Xor {
+            result,
+            left,
+            right,
+        } => register_binary(
+            true,
+            RegisterOp::Xor,
+            *result,
+            *left,
+            *right,
+            frame,
+            emitter,
+        ),
+        other => {
+            return Err(JitError::Unsupported(format!(
+                "the {} instruction in a register",
+                instruction_name(other)
+            )))
+        }
+    }
+    Ok(())
+}
+
 fn emit_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
     emitter: &mut Emitter,
 ) -> Result<(), JitError> {
+    if is_register_instruction(instruction) {
+        return emit_register_instruction(instruction, frame, emitter);
+    }
     match instruction {
         IrInstr::ConstI32 { result, value } => {
             let slot = frame.slot(*result);
