@@ -20,17 +20,17 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
-    instruction_operands, instruction_results, terminator_operands, BasicBlock, BlockId,
-    FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison, IntConversion,
-    IntUnary, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend, Terminator,
-    ValueId,
+    BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
+    IntConversion, IntUnary, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
+    Terminator, ValueId,
 };
 use tpt_wasm_types::ValueType;
 
 use crate::{
-    call_result, makes_calls, CallEnv, Context, JitError, STATUS_CALL_DEPTH,
-    STATUS_GLOBAL_OUT_OF_BOUNDS, STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION,
-    STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS, STATUS_UNREACHABLE,
+    allocate_registers, call_result, is_register_instruction, makes_calls, CallEnv, Context,
+    JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS, STATUS_INDIRECT_TYPE_MISMATCH,
+    STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
+    STATUS_UNREACHABLE,
 };
 
 /// The calling convention whose argument registers the code reads.
@@ -419,7 +419,7 @@ pub(crate) fn encode(
 
     let mut frame = Frame::new(function, abi, env, sse41);
     if !makes_calls(function) {
-        frame.registers = allocate_registers(function);
+        frame.registers = allocate_registers(function, &VALUE_REGISTERS);
     }
     let mut emitter = Emitter::new();
 
@@ -1577,104 +1577,6 @@ fn memory_grow(result: ValueId, delta: ValueId, frame: &mut Frame, emitter: &mut
 /// in them between instructions.
 const VALUE_REGISTERS: [u8; 3] = [9, 10, 11];
 
-/// Whether an instruction reads and writes its values through [`load_value`] and [`store_value`], so
-/// that each value may be in a register or a slot. The rest read and write slots only.
-fn is_register_instruction(instruction: &IrInstr) -> bool {
-    matches!(
-        instruction,
-        IrInstr::ConstI32 { .. }
-            | IrInstr::ConstI64 { .. }
-            | IrInstr::LocalGet { .. }
-            | IrInstr::LocalSet { .. }
-            | IrInstr::I32Add { .. }
-            | IrInstr::I32Sub { .. }
-            | IrInstr::I32Mul { .. }
-            | IrInstr::I32And { .. }
-            | IrInstr::I32Or { .. }
-            | IrInstr::I32Xor { .. }
-            | IrInstr::I64Add { .. }
-            | IrInstr::I64Sub { .. }
-            | IrInstr::I64Mul { .. }
-            | IrInstr::I64And { .. }
-            | IrInstr::I64Or { .. }
-            | IrInstr::I64Xor { .. }
-    )
-}
-
-/// The registers for the values of a function that makes no call. A value is given a register when a
-/// register instruction defines it and only register instructions in the same block read it, after its
-/// definition. Such a value lives only between its definition and its last read, so the registers are
-/// assigned in one pass per block, and a value that finds no free register stays in its slot.
-fn allocate_registers(function: &IrFunction) -> HashMap<ValueId, u8> {
-    // The (block, index) of the instruction that defines each value a register instruction defines.
-    let mut definitions: HashMap<ValueId, (usize, usize)> = HashMap::new();
-    // Every read of a value: (block, index, whether the reader is a register instruction). A terminator
-    // reads at index `usize::MAX`, which is not a register instruction, so a terminator read rules the
-    // value out.
-    let mut reads: HashMap<ValueId, Vec<(usize, usize, bool)>> = HashMap::new();
-    for (block_index, block) in function.blocks.iter().enumerate() {
-        for (index, instruction) in block.instrs.iter().enumerate() {
-            let register = is_register_instruction(instruction);
-            if register {
-                for result in instruction_results(instruction) {
-                    definitions.insert(result, (block_index, index));
-                }
-            }
-            for operand in instruction_operands(instruction) {
-                reads
-                    .entry(operand)
-                    .or_default()
-                    .push((block_index, index, register));
-            }
-        }
-        for operand in terminator_operands(&block.terminator) {
-            reads
-                .entry(operand)
-                .or_default()
-                .push((block_index, usize::MAX, false));
-        }
-    }
-    // The live interval (definition, last read) of each value that qualifies, per block.
-    let mut intervals: Vec<Vec<(usize, usize, ValueId)>> = vec![Vec::new(); function.blocks.len()];
-    for (value, (block, definition)) in &definitions {
-        let Some(uses) = reads.get(value) else {
-            continue;
-        };
-        let mut last_read = None;
-        let qualifies = uses.iter().all(|(reader_block, index, register)| {
-            let inside = *register && *reader_block == *block && *index > *definition;
-            if inside {
-                last_read = Some(last_read.map_or(*index, |last: usize| last.max(*index)));
-            }
-            inside
-        });
-        if let (true, Some(last)) = (qualifies, last_read) {
-            intervals[*block].push((*definition, last, *value));
-        }
-    }
-    let mut registers = HashMap::new();
-    for block in &mut intervals {
-        // Sorting by definition makes the assignment, and so the code, the same on every run.
-        block.sort_by_key(|(definition, _, _)| *definition);
-        // Registers held by values still live, with the index of their last read.
-        let mut held: Vec<(usize, u8)> = Vec::new();
-        for &(definition, last, value) in block.iter() {
-            // A register whose value is last read at this definition is still needed by it, so only
-            // registers last read before the definition are free.
-            held.retain(|(last_read, _)| *last_read >= definition);
-            let free = VALUE_REGISTERS.iter().copied().find(|register| {
-                held.iter()
-                    .all(|(_, held_register)| held_register != register)
-            });
-            if let Some(register) = free {
-                held.push((last, register));
-                registers.insert(value, register);
-            }
-        }
-    }
-    registers
-}
-
 /// The register a value lives in, if it has one.
 impl Frame {
     fn register(&self, value: ValueId) -> Option<u8> {
@@ -2608,7 +2510,7 @@ mod tests {
         ];
         let values = (0..4).map(i32_value).collect();
         let function = one_block(instrs, ValueId(3), values);
-        let registers = allocate_registers(&function);
+        let registers = allocate_registers(&function, &VALUE_REGISTERS);
         assert!(registers.contains_key(&ValueId(0)));
         assert!(registers.contains_key(&ValueId(1)));
         assert!(registers.contains_key(&ValueId(2)));
@@ -2655,7 +2557,7 @@ mod tests {
                 },
             ],
         };
-        assert!(allocate_registers(&function).is_empty());
+        assert!(allocate_registers(&function, &VALUE_REGISTERS).is_empty());
     }
 
     #[test]
