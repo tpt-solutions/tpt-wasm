@@ -8,9 +8,12 @@
 //!
 //! A native function may call other native functions of its module. It reads and writes linear
 //! memory through the baseline's own memory, under that memory's lock, so the two tiers observe
-//! one memory. It charges no execution steps, which is why the engine turns this tier off when a
-//! step limit, profiling or debugging is in effect.
+//! one memory. Its globals are copied out of the baseline's handles before the call and written back
+//! after it, including after a trap, so the two tiers observe one set of globals as well. It charges
+//! no execution steps, which is why the engine turns this tier off when a step limit, profiling or
+//! debugging is in effect.
 
+use tpt_wasm_codegen::SharedGlobal;
 use tpt_wasm_ir::IrModule;
 use tpt_wasm_types::Value;
 #[cfg(feature = "jit")]
@@ -26,6 +29,9 @@ pub(crate) struct JitTier {
     /// The parameter types and result type of every function, by index, for checking arguments.
     #[cfg(feature = "jit")]
     signatures: Vec<(Vec<ValueType>, ValueType)>,
+    /// The type and mutability of every global, by index, for moving its value in and out.
+    #[cfg(feature = "jit")]
+    globals: Vec<(ValueType, bool)>,
 }
 
 impl JitTier {
@@ -58,15 +64,22 @@ impl JitTier {
                 (params, result)
             })
             .collect();
+        let globals = ir
+            .globals
+            .iter()
+            .map(|global| (global.value_type, global.mutable))
+            .collect();
         Self {
             module: Some(module),
             signatures,
+            globals,
         }
     }
 
     /// As `compile`, but the module is loaded from the native cache when the cache holds a trusted
     /// entry for it, and is stored there after a compile. A store that fails means only that the next
-    /// instantiation compiles the module again.
+    /// instantiation compiles the module again. A module with globals is not cached: an artifact
+    /// records no global count, so a loaded one could not be checked against its globals.
     #[cfg(all(feature = "jit", any(unix, windows)))]
     pub(crate) fn compile_cached(
         ir: &IrModule,
@@ -74,7 +87,7 @@ impl JitTier {
         table_private: bool,
         cache: Option<(&NativeCache, &str)>,
     ) -> Self {
-        let Some((cache, key)) = cache else {
+        let Some((cache, key)) = cache.filter(|_| ir.globals.is_empty()) else {
             return Self::compile(ir, max_call_depth, table_private);
         };
         if let Some(module) = cache.load(key, ir.functions.len(), max_call_depth) {
@@ -117,13 +130,75 @@ impl JitTier {
         }
     }
 
-    /// Run the native function at `index` on `args`, with `memory` as linear memory.
+    /// The value of every global as raw bits, read from the baseline's handles, for the native code
+    /// to read and write. A global whose type the native code does not handle is left at zero and is
+    /// never read by it. `None` when a handle is missing or cannot be read, so the caller runs the
+    /// function on the baseline instead.
+    #[cfg(feature = "jit")]
+    pub(crate) fn global_bits(&self, handles: &[Option<SharedGlobal>]) -> Option<Vec<u64>> {
+        self.globals
+            .iter()
+            .enumerate()
+            .map(|(index, (value_type, _))| {
+                if !is_scalar(*value_type) {
+                    return Some(0);
+                }
+                let handle = handles.get(index)?.as_ref()?;
+                let value = handle.lock().ok()?;
+                let bits = value_bits(&value)?;
+                (value_type_of(&value) == Some(*value_type)).then_some(bits)
+            })
+            .collect()
+    }
+
+    /// Without the feature no function has native code, so no globals are moved.
+    #[cfg(not(feature = "jit"))]
+    pub(crate) fn global_bits(&self, _handles: &[Option<SharedGlobal>]) -> Option<Vec<u64>> {
+        Some(Vec::new())
+    }
+
+    /// Write the native code's globals back to the baseline's handles. Only mutable globals can have
+    /// changed, so only those are written.
+    #[cfg(feature = "jit")]
+    pub(crate) fn store_global_bits(
+        &self,
+        handles: &[Option<SharedGlobal>],
+        bits: &[u64],
+    ) -> Result<(), RuntimeError> {
+        for (index, (value_type, mutable)) in self.globals.iter().enumerate() {
+            if !*mutable || !is_scalar(*value_type) {
+                continue;
+            }
+            let handle = handles.get(index).and_then(Option::as_ref).ok_or(
+                RuntimeError::UnsupportedFeature("a global without a handle"),
+            )?;
+            let mut value = handle.lock().map_err(|_| {
+                RuntimeError::UnsupportedFeature("a global whose lock was poisoned")
+            })?;
+            *value = bits_value(*value_type, bits[index]);
+        }
+        Ok(())
+    }
+
+    /// Without the feature no globals are moved.
+    #[cfg(not(feature = "jit"))]
+    pub(crate) fn store_global_bits(
+        &self,
+        _handles: &[Option<SharedGlobal>],
+        _bits: &[u64],
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Run the native function at `index` on `args`, with `memory` as linear memory and `globals`
+    /// as the module's globals by index, as raw bits (see [`Self::global_bits`]).
     #[cfg(feature = "jit")]
     pub(crate) fn run(
         &self,
         index: usize,
         args: &[Value],
         memory: Option<&mut [u8]>,
+        globals: &mut [u64],
     ) -> Result<Vec<Value>, RuntimeError> {
         let module = self
             .module
@@ -155,7 +230,7 @@ impl JitTier {
             });
         }
         let raw = module
-            .call(index, &slots, memory)
+            .call_with_globals(index, &slots, memory, globals)
             .map_err(|error| match error {
                 tpt_wasm_jit::JitError::Trap(trap) => RuntimeError::Trap(trap),
                 _ => RuntimeError::UnsupportedFeature("a native function that could not run"),
@@ -181,7 +256,52 @@ impl JitTier {
         _index: usize,
         _args: &[Value],
         _memory: Option<&mut [u8]>,
+        _globals: &mut [u64],
     ) -> Result<Vec<Value>, RuntimeError> {
         Err(RuntimeError::UnsupportedFeature("the jit feature"))
+    }
+}
+
+/// Whether a global of this type is one the native code reads and writes.
+#[cfg(feature = "jit")]
+fn is_scalar(value_type: ValueType) -> bool {
+    matches!(
+        value_type,
+        ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
+    )
+}
+
+/// The raw bits of a scalar value: an `i32` in the low four bytes, a float as its bits.
+#[cfg(feature = "jit")]
+fn value_bits(value: &Value) -> Option<u64> {
+    match value {
+        Value::I32(value) => Some(u64::from(*value as u32)),
+        Value::I64(value) => Some(*value as u64),
+        Value::F32(bits) => Some(u64::from(*bits)),
+        Value::F64(bits) => Some(*bits),
+        _ => None,
+    }
+}
+
+/// The type of a scalar value, or `None` for a reference.
+#[cfg(feature = "jit")]
+fn value_type_of(value: &Value) -> Option<ValueType> {
+    match value {
+        Value::I32(_) => Some(ValueType::I32),
+        Value::I64(_) => Some(ValueType::I64),
+        Value::F32(_) => Some(ValueType::F32),
+        Value::F64(_) => Some(ValueType::F64),
+        _ => None,
+    }
+}
+
+/// The value of a scalar global of `value_type` from its raw bits.
+#[cfg(feature = "jit")]
+fn bits_value(value_type: ValueType, bits: u64) -> Value {
+    match value_type {
+        ValueType::I32 => Value::I32(bits as u32 as i32),
+        ValueType::I64 => Value::I64(bits as i64),
+        ValueType::F32 => Value::F32(bits as u32),
+        _ => Value::F64(bits),
     }
 }

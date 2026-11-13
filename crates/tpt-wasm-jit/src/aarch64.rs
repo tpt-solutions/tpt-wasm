@@ -25,8 +25,9 @@ use tpt_wasm_types::ValueType;
 
 use crate::x86::{check_supported, instruction_name, terminator_name};
 use crate::{
-    CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_INDIRECT_TYPE_MISMATCH,
-    STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
+    CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
+    STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE,
+    STATUS_TABLE_OUT_OF_BOUNDS,
 };
 
 /// Scratch registers. `9` holds the first operand, `10` the second, `11` a temporary, and `12`
@@ -43,6 +44,8 @@ const SP: u32 = 31;
 const EQ: u32 = 0;
 const NE: u32 = 1;
 const LS: u32 = 9;
+/// The `hi` condition: unsigned greater than.
+const HI: u32 = 8;
 
 /// The largest frame the encoder emits.
 const MAX_FRAME: u32 = 4096;
@@ -57,6 +60,8 @@ const DEPTH_LIMIT_OFFSET: u32 = std::mem::offset_of!(Context, depth_limit) as u3
 const TABLE_ENTRIES_OFFSET: u32 = std::mem::offset_of!(Context, table_entries) as u32;
 const TABLE_TYPES_OFFSET: u32 = std::mem::offset_of!(Context, table_types) as u32;
 const TABLE_LEN_OFFSET: u32 = std::mem::offset_of!(Context, table_len) as u32;
+const GLOBALS_OFFSET: u32 = std::mem::offset_of!(Context, globals) as u32;
+const GLOBALS_LENGTH_OFFSET: u32 = std::mem::offset_of!(Context, globals_len) as u32;
 /// The `lo` condition: unsigned less than, the test that keeps a call within the depth limit.
 const LO: u32 = 3;
 
@@ -932,6 +937,18 @@ fn emit_instruction(
             emitter.push(0xD340_FC00 | (16 << 16) | (9 << 5) | 9); // lsr x9, x9, #16
             emitter.push(str_x(R9, SP, destination));
         }
+        IrInstr::GlobalGet { result, global } => {
+            let destination = frame.slot(*result);
+            globals_element(*global, frame, emitter)?;
+            emitter.push(ldr_x(R9, R12, 0));
+            emitter.push(str_x(R9, SP, destination));
+        }
+        IrInstr::GlobalSet { global, value } => {
+            let source = frame.slot(*value);
+            globals_element(*global, frame, emitter)?;
+            emitter.push(ldr_x(R9, SP, source));
+            emitter.push(str_x(R9, R12, 0));
+        }
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
         IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),
@@ -1685,6 +1702,37 @@ fn float_unary_arm(
 
 fn ldr_x_sign_word(rt: u32, rn: u32, imm: u32) -> u32 {
     0xB980_0000 | ((imm / 4) << 10) | (rn << 5) | rt
+}
+
+/// Check that global `index` is inside the globals the caller provided, then leave the address of the
+/// global's value in `x12`. An index past the end traps, so code called without its globals cannot
+/// read past them.
+fn globals_element(index: u32, frame: &Frame, emitter: &mut Emitter) -> Result<(), JitError> {
+    if !frame.env.globals {
+        return Err(JitError::Unsupported(
+            "a global access without a globals array".into(),
+        ));
+    }
+    if index >= 1 << 28 {
+        return Err(JitError::Unsupported(
+            "a global index past the encodable range".into(),
+        ));
+    }
+    let offset = index * 8;
+    emitter.push(ldr_x(R12, SP, frame.context)); // the context
+    emitter.push(ldr_x(R13, R12, GLOBALS_LENGTH_OFFSET));
+    emitter.push(movz_x(R11, index & 0xFFFF, 0));
+    emitter.push(movk_x(R11, index >> 16, 1));
+    emitter.push(cmp(true, R13, R11)); // length - index
+    let inside = emitter.new_label();
+    emitter.branch(b_cond(HI), Target::Label(inside), Fixup::Branch19);
+    trap(frame, STATUS_GLOBAL_OUT_OF_BOUNDS, emitter);
+    emitter.bind(inside);
+    emitter.push(ldr_x(R12, R12, GLOBALS_OFFSET)); // the globals' base
+    emitter.push(movz_x(R10, offset & 0xFFFF, 0));
+    emitter.push(movk_x(R10, offset >> 16, 1));
+    emitter.push(add_x(R12, R12, R10)); // the global's address
+    Ok(())
 }
 
 /// Copy a value's slot to another, eight bytes at a time.

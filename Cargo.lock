@@ -217,6 +217,7 @@ name = "tpt-wasm-jit"
 version = "0.1.0"
 dependencies = [
  "tpt-wasm-codegen",
+ "tpt-wasm-decode",
  "tpt-wasm-format",
  "tpt-wasm-ir",
  "tpt-wasm-opt",

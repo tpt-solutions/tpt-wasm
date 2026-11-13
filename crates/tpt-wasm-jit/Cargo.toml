@@ -18,6 +18,7 @@ tpt-wasm-opt.workspace = true
 tpt-wasm-codegen.workspace = true
 
 [dev-dependencies]
+tpt-wasm-decode.workspace = true
 tpt-wasm-format.workspace = true
 tpt-wasm-runtime.workspace = true
 tpt-wasm-validate.workspace = true

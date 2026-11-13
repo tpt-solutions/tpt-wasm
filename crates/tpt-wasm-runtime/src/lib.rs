@@ -1740,14 +1740,25 @@ impl Instance {
         // while the native function holds it, and the native function sees every store the
         // baseline made before the call.
         let handle = self.baseline.as_ref()?.memory_handle();
+        // The globals are copied out of the baseline's handles before the call and written back
+        // after it, whatever the call returns, so a trap leaves them as the code left them.
+        let globals = self.baseline.as_ref()?.globals_handles();
+        let mut bits = self.jit.global_bits(&globals)?;
         let result = match handle {
             Some(handle) => match handle.lock() {
-                Ok(mut memory) => self.jit.run(index, args, Some(memory.bytes_mut())),
+                Ok(mut memory) => self
+                    .jit
+                    .run(index, args, Some(memory.bytes_mut()), &mut bits),
                 Err(_) => Err(RuntimeError::UnsupportedFeature(
                     "a memory whose lock was poisoned",
                 )),
             },
-            None => self.jit.run(index, args, None),
+            None => self.jit.run(index, args, None, &mut bits),
+        };
+        let stored = self.jit.store_global_bits(&globals, &bits);
+        let result = match (result, stored) {
+            (Ok(values), Ok(())) => Ok(values),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         };
         // Native code charges no steps, keeps no profile, makes no host calls, and cannot
         // grow memory, so the counters a call reports are all zero.

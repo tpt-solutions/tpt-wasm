@@ -82,12 +82,16 @@ pub(crate) const STATUS_NULL_REFERENCE: u32 = 6;
 pub(crate) const STATUS_INDIRECT_TYPE_MISMATCH: u32 = 7;
 /// The status for a float-to-integer truncation of a NaN, an infinity, or a value out of range.
 pub(crate) const STATUS_INVALID_CONVERSION: u32 = 8;
+/// The status for a global access past the end of the globals the caller provided. The code checks
+/// this itself, so a module called without its globals traps instead of reading past them.
+pub(crate) const STATUS_GLOBAL_OUT_OF_BOUNDS: u32 = 9;
 
 /// What a compiled function reads and writes besides its arguments.
 ///
 /// The layout is part of the calling convention, and the generated code reads and writes it at
 /// fixed offsets: the memory base at 0, the memory length at 8, the trap status at 16, the call
-/// table at 24, the active-frame count at 32, and its limit at 40.
+/// table at 24, the active-frame count at 32, its limit at 40, the table's entries, types and length
+/// at 48, 56 and 64, and the globals and their length at 72 and 80.
 #[repr(C)]
 pub(crate) struct Context {
     pub(crate) memory: *mut u8,
@@ -107,6 +111,12 @@ pub(crate) struct Context {
     pub(crate) table_types: *const u64,
     /// The number of slots in the table.
     pub(crate) table_len: u64,
+    /// The module's globals, by index, as raw 8-byte values: an `i32` in the low four bytes, a float
+    /// as its bits. Null when the caller gave none.
+    pub(crate) globals: *mut u64,
+    /// The number of globals the caller provided. Compiled code checks an index against it before
+    /// it touches `globals`.
+    pub(crate) globals_len: u64,
 }
 
 impl Context {
@@ -122,6 +132,8 @@ impl Context {
             table_entries: std::ptr::null(),
             table_types: std::ptr::null(),
             table_len: 0,
+            globals: std::ptr::null_mut(),
+            globals_len: 0,
         }
     }
 }
@@ -141,6 +153,8 @@ pub(crate) struct CallEnv {
     /// Whether an indirect call may be compiled: the module's table is private to it, and every
     /// slot names a callable function or is null.
     pub(crate) indirect: bool,
+    /// Whether the code may read and write globals: the caller provides them as an array.
+    pub(crate) globals: bool,
 }
 
 /// The result of a call, given the return value and the status the code left in the context.
@@ -155,6 +169,9 @@ fn finish(bits: u64, status: u64) -> Result<u64, JitError> {
         STATUS_NULL_REFERENCE => Err(JitError::Trap(Trap::NullReference)),
         STATUS_INDIRECT_TYPE_MISMATCH => Err(JitError::Trap(Trap::IndirectCallTypeMismatch)),
         STATUS_INVALID_CONVERSION => Err(JitError::Trap(Trap::InvalidConversion)),
+        STATUS_GLOBAL_OUT_OF_BOUNDS => Err(JitError::Unsupported(
+            "a global the call did not provide".into(),
+        )),
         other => Err(JitError::Unsupported(format!("an unknown status {other}"))),
     }
 }
@@ -530,6 +547,8 @@ pub struct CompiledModule {
     table_functions: Box<[Option<u32>]>,
     /// Whether the module's indirect calls are compiled, which fixes what the table must hold.
     indirect: bool,
+    /// Whether the module has globals. Its functions need them supplied, through `call_with_globals`.
+    globals: bool,
     max_call_depth: u64,
 }
 
@@ -666,6 +685,7 @@ impl CompiledModule {
             table_types: table_types.into_boxed_slice(),
             table_functions: table_functions.into_boxed_slice(),
             indirect: parts.indirect,
+            globals: false,
             max_call_depth: parts.max_call_depth,
         })
     }
@@ -693,6 +713,35 @@ impl CompiledModule {
         args: &[i64],
         memory: Option<&mut [u8]>,
     ) -> Result<u64, JitError> {
+        if self.globals {
+            return Err(JitError::Unsupported(
+                "a module with globals; use call_with_globals".into(),
+            ));
+        }
+        self.call_inner(index, args, memory, &mut [])
+    }
+
+    /// As [`call`](Self::call), with `globals` as the module's globals by index, as raw 8-byte values:
+    /// an `i32` in the low four bytes, a float as its bits. The code reads a global when it reads it
+    /// and writes it when it sets it, so after the call `globals` holds what the call left, including
+    /// after a trap.
+    pub fn call_with_globals(
+        &self,
+        index: usize,
+        args: &[i64],
+        memory: Option<&mut [u8]>,
+        globals: &mut [u64],
+    ) -> Result<u64, JitError> {
+        self.call_inner(index, args, memory, globals)
+    }
+
+    fn call_inner(
+        &self,
+        index: usize,
+        args: &[i64],
+        memory: Option<&mut [u8]>,
+        globals: &mut [u64],
+    ) -> Result<u64, JitError> {
         let function = self
             .functions
             .get(index)
@@ -719,6 +768,8 @@ impl CompiledModule {
             table_entries: self.table_entries.as_ptr(),
             table_types: self.table_types.as_ptr(),
             table_len: self.table_types.len() as u64,
+            globals: globals.as_mut_ptr(),
+            globals_len: globals.len() as u64,
         };
         let bits = function.code.call(args.as_ptr(), &mut context);
         finish(bits, context.status)
@@ -778,6 +829,7 @@ pub fn compile_module(
     let env_for = |callable: &[bool]| CallEnv {
         callable: callable.to_vec(),
         type_ids: type_ids.clone(),
+        globals: !module.globals.is_empty(),
         indirect: table.is_some()
             && table_private
             && slots.iter().all(|slot| match slot {
@@ -861,6 +913,7 @@ pub fn compile_module(
             table_types: Box::new([]),
             table_functions: Box::new([]),
             indirect: false,
+            globals: !module.globals.is_empty(),
             max_call_depth,
         };
     }
@@ -889,6 +942,7 @@ pub fn compile_module(
         table_types: table_types.into_boxed_slice(),
         table_functions: table_functions.into_boxed_slice(),
         indirect: env_for(&callable).indirect,
+        globals: !module.globals.is_empty(),
         max_call_depth,
     }
 }

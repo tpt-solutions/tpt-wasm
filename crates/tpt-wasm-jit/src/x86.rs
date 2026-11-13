@@ -27,8 +27,9 @@ use tpt_wasm_ir::{
 use tpt_wasm_types::ValueType;
 
 use crate::{
-    CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_INDIRECT_TYPE_MISMATCH,
-    STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
+    CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
+    STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE,
+    STATUS_TABLE_OUT_OF_BOUNDS,
 };
 
 /// The calling convention whose argument registers the code reads.
@@ -86,6 +87,8 @@ const DEPTH_LIMIT_OFFSET: u8 = std::mem::offset_of!(Context, depth_limit) as u8;
 const TABLE_ENTRIES_OFFSET: u8 = std::mem::offset_of!(Context, table_entries) as u8;
 const TABLE_TYPES_OFFSET: u8 = std::mem::offset_of!(Context, table_types) as u8;
 const TABLE_LEN_OFFSET: u8 = std::mem::offset_of!(Context, table_len) as u8;
+const GLOBALS_OFFSET: u8 = std::mem::offset_of!(Context, globals) as u8;
+const GLOBALS_LENGTH_OFFSET: u8 = std::mem::offset_of!(Context, globals_len) as u8;
 
 /// Two-operand opcodes with `rax` as the destination and a memory source.
 const OP_ADD: &[u8] = &[0x03];
@@ -1375,6 +1378,40 @@ fn guard_trap(frame: &Frame, jump: u8, status: u32, emitter: &mut Emitter) -> Re
     Ok(())
 }
 
+/// Check that global `index` is inside the globals the caller provided, then leave the array's base in
+/// `rax`. Returns the byte offset of the global within it, for `[rax + offset]`. An index past the end
+/// traps, so code called without its globals cannot read past them.
+fn globals_base_into_rax(
+    index: u32,
+    frame: &Frame,
+    emitter: &mut Emitter,
+) -> Result<i32, JitError> {
+    if !frame.env.globals {
+        return Err(JitError::Unsupported(
+            "a global access without a globals array".into(),
+        ));
+    }
+    let index = i32::try_from(index)
+        .map_err(|_| JitError::Unsupported("a global index past the encodable range".into()))?;
+    let offset = index
+        .checked_mul(8)
+        .ok_or_else(|| JitError::Unsupported("a global index past the encodable range".into()))?;
+    emitter.memory_wide(&[0x8B], EDX, frame.context); // mov rdx, [context]
+                                                      // cmp qword [rdx + globals_len], index; ja inside; trap
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x81, 0x7A, GLOBALS_LENGTH_OFFSET]);
+    emitter.bytes.extend_from_slice(&index.to_le_bytes());
+    let inside = emitter.new_label();
+    emitter.jump(&[0x0F, 0x87], Target::Label(inside));
+    emitter.trap(frame, STATUS_GLOBAL_OUT_OF_BOUNDS);
+    emitter.bind(inside);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x8B, 0x42, GLOBALS_OFFSET]); // mov rax, [rdx + globals]
+    Ok(offset)
+}
+
 fn emit_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
@@ -1445,6 +1482,20 @@ fn emit_instruction(
                 .extend_from_slice(&[0x48, 0x8B, 0x40, MEMORY_LENGTH_OFFSET]); // mov rax, [rax + len]
             emitter.bytes.extend_from_slice(&[0x48, 0xC1, 0xE8, 0x10]); // shr rax, 16
             emitter.store64(EAX, destination);
+        }
+        IrInstr::GlobalGet { result, global } => {
+            let destination = frame.slot(*result);
+            let offset = globals_base_into_rax(*global, frame, emitter)?;
+            emitter.bytes.extend_from_slice(&[0x48, 0x8B, 0x80]); // mov rax, [rax + offset]
+            emitter.bytes.extend_from_slice(&offset.to_le_bytes());
+            emitter.store64(EAX, destination);
+        }
+        IrInstr::GlobalSet { global, value } => {
+            let source = frame.slot(*value);
+            let offset = globals_base_into_rax(*global, frame, emitter)?;
+            emitter.memory_wide(&[0x8B], ECX, source); // mov rcx, [value]
+            emitter.bytes.extend_from_slice(&[0x48, 0x89, 0x88]); // mov [rax + offset], rcx
+            emitter.bytes.extend_from_slice(&offset.to_le_bytes());
         }
         IrInstr::Drop { .. } => {}
         IrInstr::Call {
