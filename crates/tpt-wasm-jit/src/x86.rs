@@ -2739,6 +2739,105 @@ mod tests {
         .is_empty());
     }
 
+    /// Count how many times `pattern` occurs in `code`.
+    fn count_occurrences(code: &[u8], pattern: &[u8]) -> usize {
+        code.windows(pattern.len())
+            .filter(|window| *window == pattern)
+            .count()
+    }
+
+    #[test]
+    fn a_leaf_function_saves_and_restores_each_callee_saved_register_it_uses() {
+        // Six values are live together, and the four caller-saved value registers hold only four of them,
+        // so the allocator must give two to callee-saved registers: rbx and r12.
+        let instrs = vec![
+            IrInstr::ConstI32 {
+                result: ValueId(0),
+                value: 1,
+            },
+            IrInstr::ConstI32 {
+                result: ValueId(1),
+                value: 2,
+            },
+            IrInstr::ConstI32 {
+                result: ValueId(2),
+                value: 3,
+            },
+            IrInstr::ConstI32 {
+                result: ValueId(3),
+                value: 4,
+            },
+            IrInstr::ConstI32 {
+                result: ValueId(4),
+                value: 5,
+            },
+            IrInstr::ConstI32 {
+                result: ValueId(5),
+                value: 6,
+            },
+            IrInstr::I32Add {
+                result: ValueId(6),
+                left: ValueId(0),
+                right: ValueId(1),
+            },
+            IrInstr::I32Add {
+                result: ValueId(7),
+                left: ValueId(2),
+                right: ValueId(3),
+            },
+            IrInstr::I32Add {
+                result: ValueId(8),
+                left: ValueId(4),
+                right: ValueId(5),
+            },
+            IrInstr::I32Add {
+                result: ValueId(9),
+                left: ValueId(6),
+                right: ValueId(7),
+            },
+            IrInstr::I32Add {
+                result: ValueId(10),
+                left: ValueId(9),
+                right: ValueId(8),
+            },
+        ];
+        let values = (0..11).map(i32_value).collect();
+        let function = one_block(instrs, ValueId(10), values);
+        let code = encode(&function, Abi::SysV, &CallEnv::default(), false).expect("compiles");
+        // mov [rbp + disp32], rbx; mov rbx, [rbp + disp32]; and the same for r12 with REX.R set.
+        let save_rbx = [0x48, 0x89, 0x9D];
+        let restore_rbx = [0x48, 0x8B, 0x9D];
+        let save_r12 = [0x4C, 0x89, 0xA5];
+        let restore_r12 = [0x4C, 0x8B, 0xA5];
+        assert_eq!(
+            count_occurrences(&code, &save_rbx),
+            1,
+            "rbx is saved on entry"
+        );
+        assert_eq!(
+            count_occurrences(&code, &restore_rbx),
+            1,
+            "rbx is restored on return"
+        );
+        assert_eq!(
+            count_occurrences(&code, &save_r12),
+            1,
+            "r12 is saved on entry"
+        );
+        assert_eq!(
+            count_occurrences(&code, &restore_r12),
+            1,
+            "r12 is restored on return"
+        );
+        // The restores come before the return, at the end of the code.
+        let ret = code.len() - 2;
+        assert_eq!(&code[ret..], &[0xC9, 0xC3], "the code ends with leave; ret");
+        assert!(
+            code[..ret].windows(3).any(|window| window == restore_r12),
+            "r12 is restored before the return"
+        );
+    }
+
     #[test]
     fn a_constant_return_has_the_expected_encoding() {
         let function = one_block(
