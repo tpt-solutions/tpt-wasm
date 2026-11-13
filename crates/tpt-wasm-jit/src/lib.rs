@@ -491,6 +491,32 @@ fn makes_calls(function: &IrFunction) -> bool {
 
 /// An upper bound on the native stack one activation of `function` takes: a slot for each value,
 /// the words a call reserves for its arguments, and a fixed header and shadow space.
+/// The largest [`frame_estimate`] of any function a call chain from `start` can enter: `start` itself
+/// and every function reached through direct calls. A function that makes an indirect call may enter
+/// any function of the module, since the table is not read here, so it reaches them all.
+fn largest_reachable_frame(functions: &[IrFunction], start: usize) -> usize {
+    let mut seen = vec![false; functions.len()];
+    let mut pending = vec![start];
+    let mut largest = 0;
+    while let Some(index) = pending.pop() {
+        if index >= functions.len() || std::mem::replace(&mut seen[index], true) {
+            continue;
+        }
+        let function = &functions[index];
+        largest = largest.max(frame_estimate(function));
+        for instr in function.blocks.iter().flat_map(|block| &block.instrs) {
+            match instr {
+                IrInstr::Call {
+                    function: callee, ..
+                } => pending.push(*callee as usize),
+                IrInstr::CallIndirect { .. } => pending.extend(0..functions.len()),
+                _ => {}
+            }
+        }
+    }
+    largest
+}
+
 fn frame_estimate(function: &IrFunction) -> usize {
     let argument_words: usize = function
         .blocks
@@ -848,22 +874,18 @@ pub fn compile_module(
             }),
     };
     // Nested calls use the native stack, a frame per active call, so a chain of them is as deep as
-    // the call-depth limit. When the deepest such chain could outgrow the stack budget, the
-    // functions that call are left out, and the baseline runs them. A leaf adds one frame, so the
-    // leaves stay compiled.
-    let largest_caller = functions
-        .iter()
-        .filter(|function| makes_calls(function))
-        .map(frame_estimate)
-        .max()
-        .unwrap_or(0);
-    let largest_frame = functions.iter().map(frame_estimate).max().unwrap_or(0);
-    let chain = (max_call_depth as usize)
-        .saturating_mul(largest_caller)
-        .saturating_add(largest_frame);
-    if chain > NATIVE_CALL_STACK_BUDGET {
-        for (index, function) in functions.iter().enumerate() {
-            if makes_calls(function) {
+    // the call-depth limit. A chain that starts at a function enters only the functions it reaches,
+    // so the bound for a caller is the depth times the largest frame it reaches. A caller whose bound
+    // outgrows the stack budget is left out, and the baseline runs it. A leaf adds one frame, so the
+    // leaves stay compiled. The bound is per caller, so one large function does not hold back the
+    // callers that never reach it.
+    for (index, function) in functions.iter().enumerate() {
+        if makes_calls(function) {
+            let reach = largest_reachable_frame(functions, index);
+            let bound = (max_call_depth as usize)
+                .saturating_mul(reach)
+                .saturating_add(reach);
+            if bound > NATIVE_CALL_STACK_BUDGET {
                 callable[index] = false;
             }
         }

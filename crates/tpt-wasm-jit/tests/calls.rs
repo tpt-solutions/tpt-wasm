@@ -406,6 +406,35 @@ fn a_deep_caller_with_a_large_frame_is_left_to_the_baseline() {
     )
 ))]
 #[test]
+fn a_large_caller_does_not_hold_back_a_small_caller_that_never_reaches_it() {
+    // f0 is the large caller: it pushes two hundred constants and calls the leaf f2. f1 is a small
+    // caller of the same leaf. The stack bound is per caller, so only f0 is left to the baseline.
+    let mut large = Vec::new();
+    for _ in 0..200 {
+        large.extend([0x41, 0x01, 0x1A]); // i32.const 1; drop
+    }
+    large.extend([0x10, 0x02, 0x0B]); // call 2; end
+    let small = vec![0x10, 0x02, 0x0B]; // call 2; end
+    let leaf = vec![0x41, 0x03, 0x0B];
+    let module = module(
+        vec![0, 0, 0],
+        vec![large, small, leaf],
+        vec![ValueType::I32; 3],
+        false,
+    );
+    let compiled = compiled(&module, 1_000);
+    assert!(
+        !compiled.is_compiled(0),
+        "the large caller is left to the baseline"
+    );
+    assert!(
+        compiled.is_compiled(1),
+        "the small caller is compiled, since it reaches only the leaf"
+    );
+    assert_eq!(native(&compiled, 1, &[]), Ok(3));
+}
+
+#[test]
 fn a_caller_of_a_refused_function_is_not_compiled() {
     // f0() = memory.grow, which the compiler refuses; f1() = f0(); f2() = 7.
     let memory_grow = vec![0x41, 0x01, 0x40, 0x00, 0x0B]; // i32.const 1; memory.grow; end
