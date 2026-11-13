@@ -13,11 +13,11 @@
 
 use libfuzzer_sys::fuzz_target;
 use tpt_wasm_format::{
-    ConstExpr, Element, ElementInit, ElementMode, Export, ExportDesc, Function, Memory, Module,
-    Table,
+    ConstExpr, Element, ElementInit, ElementMode, Export, ExportDesc, Function, Import, ImportDesc,
+    Memory, Module, Table,
 };
-use tpt_wasm_jit::compile_module;
-use tpt_wasm_runtime::{Config, Engine, EngineMode, RuntimeError};
+use tpt_wasm_jit::{compile_module, HostCalls, LinearMemory};
+use tpt_wasm_runtime::{Config, Engine, EngineMode, HostFunction, RuntimeError};
 use tpt_wasm_types::{
     FunctionType, Limits, MemoryType, RefType, ResourceLimits, ResultType, TableType, Value,
     ValueType,
@@ -26,6 +26,8 @@ use tpt_wasm_types::{
 /// The call-depth limit both engines enforce. Small, so recursion through the table reaches it.
 const MAX_CALL_DEPTH: usize = 8;
 const PAGE: usize = 65_536;
+/// The imports the module declares, `env.h`, which come before its defined functions in the index space.
+const IMPORTS: u32 = 1;
 
 /// Reads choices from the fuzzer's bytes. Past the end it returns zero, so every input describes
 /// some module.
@@ -153,7 +155,7 @@ impl Generator<'_, '_> {
         if depth == 0 {
             return self.leaf(kind, params);
         }
-        let choice = self.bytes.byte() % 14;
+        let choice = self.bytes.byte() % 15;
         match (kind, choice) {
             (_, 0 | 1) => self.leaf(kind, params),
             (Kind::I32, 2 | 3) => {
@@ -247,6 +249,13 @@ impl Generator<'_, '_> {
                 // memory.size: the memory's length in pages, which is fixed during a call.
                 vec![0x3F, 0x00]
             }
+            (Kind::I32, 14) => {
+                // A call to the host import, which computes `x * 7 + 3` on its argument.
+                let mut out = self.expression(Kind::I32, depth - 1, params);
+                out.push(0x10); // call
+                out.extend(uleb(0));
+                out
+            }
             (_, 6) => self.call(kind, depth, params),
             (Kind::I32, 7) => self.indirect_call(depth, params),
             (_, 8) => {
@@ -313,7 +322,7 @@ impl Generator<'_, '_> {
             out.extend(self.expression(*parameter, depth - 1, params));
         }
         out.push(0x10); // call
-        out.extend(uleb(target as u32));
+        out.extend(uleb(target as u32 + IMPORTS));
         out
     }
 
@@ -374,7 +383,7 @@ fn build(bytes: &mut Bytes<'_>) -> Module {
         table.push(if choice == count {
             None
         } else {
-            Some(choice as u32)
+            Some(choice as u32 + IMPORTS)
         });
     }
 
@@ -397,7 +406,7 @@ fn build(bytes: &mut Bytes<'_>) -> Module {
                 .map(|slot| match slot {
                     Some(index) => {
                         let mut expression = vec![0xD2];
-                        expression.extend(uleb(*index));
+                        expression.extend(uleb(*index + IMPORTS));
                         expression.push(0x0B);
                         ConstExpr(expression)
                     }
@@ -409,7 +418,7 @@ fn build(bytes: &mut Bytes<'_>) -> Module {
     let mut exports: Vec<Export> = (0..count)
         .map(|index| Export {
             name: format!("f{index}"),
-            desc: ExportDesc::Function(index as u32),
+            desc: ExportDesc::Function(index as u32 + IMPORTS),
         })
         .collect();
     exports.push(Export {
@@ -418,6 +427,11 @@ fn build(bytes: &mut Bytes<'_>) -> Module {
     });
     Module {
         types,
+        imports: vec![Import {
+            module: "env".into(),
+            name: "h".into(),
+            desc: ImportDesc::Function(1),
+        }],
         functions,
         tables: vec![Table {
             table_type: TableType {
@@ -444,9 +458,48 @@ fn build(bytes: &mut Bytes<'_>) -> Module {
     }
 }
 
+/// The host function on Micro, the golden side of the host call.
+struct GoldenHost;
+
+impl HostFunction for GoldenHost {
+    fn function_type(&self) -> FunctionType {
+        FunctionType {
+            params: ResultType(vec![ValueType::I32]),
+            results: ResultType(vec![ValueType::I32]),
+        }
+    }
+
+    fn call(&self, args: &[Value]) -> Result<Vec<Value>, String> {
+        match args {
+            [Value::I32(value)] => Ok(vec![Value::I32(value.wrapping_mul(7).wrapping_add(3))]),
+            _ => Err("h takes one i32".into()),
+        }
+    }
+}
+
+/// The same host function, as compiled code reaches it: its argument and result are words.
+struct NativeHost;
+
+impl HostCalls for NativeHost {
+    fn arity(&self, _import: u32) -> (usize, usize) {
+        (1, 1)
+    }
+
+    fn call(
+        &mut self,
+        _import: u32,
+        args: &[i64],
+        results: &mut [i64],
+        _memory: Option<&mut [u8]>,
+    ) -> bool {
+        results[0] = i64::from((args[0] as i32).wrapping_mul(7).wrapping_add(3));
+        true
+    }
+}
+
 /// The module instantiated on Micro, the golden engine, with the same call-depth limit.
 fn micro_instance(module: &Module) -> tpt_wasm_runtime::Instance {
-    let engine = Engine::new(Config {
+    let mut engine = Engine::new(Config {
         engine_mode: EngineMode::Micro,
         limits: ResourceLimits {
             max_call_depth: MAX_CALL_DEPTH,
@@ -455,6 +508,7 @@ fn micro_instance(module: &Module) -> tpt_wasm_runtime::Instance {
         ..Config::default()
     })
     .expect("accepted");
+    engine.linker_mut().define_function("env", "h", GoldenHost);
     engine.instantiate(module.clone()).expect("instantiates")
 }
 
@@ -519,10 +573,16 @@ fuzz_target!(|data: &[u8]| {
         };
 
         let slots: Vec<i64> = args.iter().map(|(_, bits)| *bits as i64).collect();
-        let actual = match native.call(index, &slots, Some(&mut memory)) {
-            Ok(bits) => Ok(to_value(result_kind, bits)),
-            Err(tpt_wasm_jit::JitError::Trap(trap)) => Err(trap),
-            Err(error) => panic!("the compiled code failed without a trap: {error}"),
+        let actual = {
+            let mut view = LinearMemory {
+                bytes: &mut memory,
+                len: PAGE as u64,
+            };
+            match native.call_with_host(index, &slots, Some(&mut view), &mut [], Some(&mut NativeHost)) {
+                Ok(bits) => Ok(to_value(result_kind, bits)),
+                Err(tpt_wasm_jit::JitError::Trap(trap)) => Err(trap),
+                Err(error) => panic!("the compiled code failed without a trap: {error}"),
+            }
         };
 
         // Exact, bit for bit, as the deterministic mode of Micro is.
