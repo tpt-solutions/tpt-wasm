@@ -53,7 +53,7 @@
 
 #![deny(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use tpt_wasm_ir::{
@@ -266,6 +266,40 @@ pub(crate) fn allocate_registers(function: &IrFunction, pool: &[u8]) -> HashMap<
         }
     }
     registers
+}
+
+/// The registers for the locals and parameters of a function that makes no call, drawn from `pool`. The
+/// most used locals take up to `locals` registers, so that values within a block keep the rest. Ties go to the lower value id, so the choice is the same on every run.
+pub(crate) fn allocate_local_registers(
+    function: &IrFunction,
+    pool: &[u8],
+    locals: usize,
+) -> HashMap<ValueId, u8> {
+    let mut uses: HashMap<ValueId, usize> = HashMap::new();
+    for instruction in function.blocks.iter().flat_map(|block| &block.instrs) {
+        if let IrInstr::LocalGet { local, .. }
+        | IrInstr::LocalSet { local, .. }
+        | IrInstr::LocalTee { local, .. } = instruction
+        {
+            *uses.entry(*local).or_default() += 1;
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut candidates: Vec<(usize, u32, ValueId)> = function
+        .params
+        .iter()
+        .chain(&function.locals)
+        .filter(|value| seen.insert(**value))
+        .filter_map(|value| uses.get(value).map(|count| (*count, value.0, *value)))
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let capacity = locals.min(pool.len());
+    candidates
+        .into_iter()
+        .take(capacity)
+        .zip(pool.iter().copied())
+        .map(|((_, _, value), register)| (value, register))
+        .collect()
 }
 
 /// The result of a call in the IR: its one result, or none for a call to a function that returns nothing.

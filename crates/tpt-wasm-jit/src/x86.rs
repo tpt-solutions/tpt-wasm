@@ -27,10 +27,10 @@ use tpt_wasm_ir::{
 use tpt_wasm_types::ValueType;
 
 use crate::{
-    allocate_registers, call_result, is_register_instruction, makes_calls, CallEnv, Context,
-    JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS, STATUS_INDIRECT_TYPE_MISMATCH,
-    STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE, STATUS_TABLE_OUT_OF_BOUNDS,
-    STATUS_UNREACHABLE,
+    allocate_local_registers, allocate_registers, call_result, is_register_instruction,
+    makes_calls, CallEnv, Context, JitError, STATUS_CALL_DEPTH, STATUS_GLOBAL_OUT_OF_BOUNDS,
+    STATUS_INDIRECT_TYPE_MISMATCH, STATUS_INVALID_CONVERSION, STATUS_NULL_REFERENCE,
+    STATUS_TABLE_OUT_OF_BOUNDS, STATUS_UNREACHABLE,
 };
 
 /// The calling convention whose argument registers the code reads.
@@ -208,6 +208,9 @@ struct Emitter {
     bytes: Vec<u8>,
     labels: Vec<Option<usize>>,
     fixups: Vec<(usize, Target)>,
+    /// The callee-saved registers the function uses, each with the slot its value was saved to. Every
+    /// return restores them.
+    restores: Vec<(u8, i32)>,
 }
 
 impl Emitter {
@@ -216,6 +219,7 @@ impl Emitter {
             bytes: Vec::new(),
             labels: Vec::new(),
             fixups: Vec::new(),
+            restores: Vec::new(),
         }
     }
 
@@ -398,6 +402,9 @@ impl Emitter {
 
     /// `leave; ret`.
     fn epilogue(&mut self) {
+        for (register, slot) in self.restores.clone() {
+            self.memory_with(true, &[0x8B], register, slot); // mov register, [slot]
+        }
         self.bytes.push(0xC9);
         self.bytes.push(0xC3);
     }
@@ -419,9 +426,32 @@ pub(crate) fn encode(
 
     let mut frame = Frame::new(function, abi, env, sse41);
     if !makes_calls(function) {
-        frame.registers = allocate_registers(function, &VALUE_REGISTERS);
+        let locals = allocate_local_registers(function, &VALUE_REGISTERS, 6);
+        let remaining: Vec<u8> = VALUE_REGISTERS
+            .iter()
+            .copied()
+            .filter(|register| !locals.values().any(|taken| taken == register))
+            .collect();
+        frame.registers = locals;
+        frame
+            .registers
+            .extend(allocate_registers(function, &remaining));
     }
     let mut emitter = Emitter::new();
+    // Save each callee-saved register the function uses, in order, before the body runs.
+    let mut saved: Vec<u8> = frame
+        .registers
+        .values()
+        .copied()
+        .filter(|register| CALLEE_SAVED.contains(register))
+        .collect();
+    saved.sort_unstable();
+    saved.dedup();
+    for register in saved {
+        let slot = frame.temporary();
+        emitter.memory_with(true, &[0x89], register, slot); // mov [slot], register
+        emitter.restores.push((register, slot));
+    }
 
     // The two pointers arrive in argument registers. They are kept in slots, because the code
     // below uses every scratch register. Each argument is an 8-byte slot in the arguments array.
@@ -436,15 +466,27 @@ pub(crate) fn encode(
         emitter
             .bytes
             .extend_from_slice(&(8 * index as i32).to_le_bytes());
-        let slot = frame.slot(*parameter);
-        emitter.store64(EAX, slot);
+        match frame.register(*parameter) {
+            Some(register) => emit_register_form(&mut emitter, true, &[0x89], EAX, register),
+            None => {
+                let slot = frame.slot(*parameter);
+                emitter.store64(EAX, slot);
+            }
+        }
     }
     // A declared local starts at zero, as Wasm requires; parameters are already set.
     let parameters: HashSet<ValueId> = function.params.iter().copied().collect();
     for local in &function.locals {
         if !parameters.contains(local) {
-            let slot = frame.slot(*local);
-            emitter.zero64(slot);
+            match frame.register(*local) {
+                Some(register) => {
+                    emit_register_form(&mut emitter, true, &[0x31], register, register)
+                }
+                None => {
+                    let slot = frame.slot(*local);
+                    emitter.zero64(slot);
+                }
+            }
         }
     }
 
@@ -1575,7 +1617,11 @@ fn memory_grow(result: ValueId, delta: ValueId, frame: &mut Frame, emitter: &mut
 /// The registers that hold values in a function that makes no call: r9, r10 and r11. They are
 /// caller-saved on both conventions, and the encoder never uses them, so a leaf function can keep values
 /// in them between instructions.
-const VALUE_REGISTERS: [u8; 3] = [9, 10, 11];
+const VALUE_REGISTERS: [u8; 9] = [8, 9, 10, 11, 3, 12, 13, 14, 15];
+
+/// The callee-saved registers among the value registers: rbx and r12 to r15. A leaf function that uses one
+/// saves it on entry and restores it on every return, so the caller sees it unchanged.
+const CALLEE_SAVED: [u8; 5] = [3, 12, 13, 14, 15];
 
 /// The register a value lives in, if it has one.
 impl Frame {
@@ -1653,6 +1699,32 @@ fn int_binary(
     store_value(frame, result, wide, EAX, emitter);
 }
 
+/// Copy a value to another through the register or slot each has. Two registers take one move, a register and
+/// a slot take one memory move, and two slots go through `eax`.
+fn copy_value(from: ValueId, to: ValueId, frame: &mut Frame, emitter: &mut Emitter) {
+    match (frame.register(from), frame.register(to)) {
+        (Some(source), Some(destination)) => {
+            if source != destination {
+                emit_register_form(emitter, true, &[0x89], source, destination);
+            }
+        }
+        (Some(source), None) => {
+            let slot = frame.slot(to);
+            emitter.memory_with(true, &[0x89], source, slot);
+        }
+        (None, Some(destination)) => {
+            let slot = frame.slot(from);
+            emitter.memory_with(true, &[0x8B], destination, slot);
+        }
+        (None, None) => {
+            let source = frame.slot(from);
+            let destination = frame.slot(to);
+            emitter.load64(EAX, source);
+            emitter.store64(EAX, destination);
+        }
+    }
+}
+
 /// Emit an instruction of [`is_register_instruction`].
 fn emit_register_instruction(
     instruction: &IrInstr,
@@ -1687,28 +1759,8 @@ fn emit_register_instruction(
                 emitter.store64(EAX, slot);
             }
         },
-        IrInstr::LocalGet { result, local } => {
-            let source = frame.slot(*local);
-            match frame.register(*result) {
-                Some(register) => emitter.memory_with(true, &[0x8B], register, source),
-                None => {
-                    let destination = frame.slot(*result);
-                    emitter.load64(EAX, source);
-                    emitter.store64(EAX, destination);
-                }
-            }
-        }
-        IrInstr::LocalSet { local, value } => {
-            let destination = frame.slot(*local);
-            match frame.register(*value) {
-                Some(register) => emitter.memory_with(true, &[0x89], register, destination),
-                None => {
-                    let source = frame.slot(*value);
-                    emitter.load64(EAX, source);
-                    emitter.store64(EAX, destination);
-                }
-            }
-        }
+        IrInstr::LocalGet { result, local } => copy_value(*local, *result, frame, emitter),
+        IrInstr::LocalSet { local, value } => copy_value(*value, *local, frame, emitter),
         IrInstr::I32Add {
             result,
             left,
@@ -1992,12 +2044,8 @@ fn emit_instruction(
             local,
             value,
         } => {
-            let source = frame.slot(*value);
-            let local_slot = frame.slot(*local);
-            let result_slot = frame.slot(*result);
-            emitter.load64(EAX, source);
-            emitter.store64(EAX, local_slot);
-            emitter.store64(EAX, result_slot);
+            copy_value(*value, *local, frame, emitter);
+            copy_value(*value, *result, frame, emitter);
         }
         IrInstr::I32Shl {
             result,
@@ -2236,20 +2284,18 @@ fn emit_instruction(
             operation,
             bounds: _,
         } => {
-            // The value is loaded into r8 and the store takes its low bits. An eight-byte store
+            // The value is loaded into rcx and the store takes its low bits, so r8 stays free for values. An eight-byte store
             // uses the wide forms; the narrower ones store the low 8, 16, or 32 bits.
             let (width, access, wide): (u32, &[u8], bool) = match operation {
-                MemoryStore::I32 | MemoryStore::F32 => (4, &[0x44, 0x89, 0x04, 0x02], false),
-                MemoryStore::I32_8 | MemoryStore::I64_8 => (1, &[0x44, 0x88, 0x04, 0x02], false),
-                MemoryStore::I32_16 | MemoryStore::I64_16 => {
-                    (2, &[0x66, 0x44, 0x89, 0x04, 0x02], false)
-                }
-                MemoryStore::I64 | MemoryStore::F64 => (8, &[0x4C, 0x89, 0x04, 0x02], true),
-                MemoryStore::I64_32 => (4, &[0x44, 0x89, 0x04, 0x02], false),
+                MemoryStore::I32 | MemoryStore::F32 => (4, &[0x89, 0x0C, 0x02], false),
+                MemoryStore::I32_8 | MemoryStore::I64_8 => (1, &[0x88, 0x0C, 0x02], false),
+                MemoryStore::I32_16 | MemoryStore::I64_16 => (2, &[0x66, 0x89, 0x0C, 0x02], false),
+                MemoryStore::I64 | MemoryStore::F64 => (8, &[0x48, 0x89, 0x0C, 0x02], true),
+                MemoryStore::I64_32 => (4, &[0x89, 0x0C, 0x02], false),
             };
             emit_address(*address, *offset, width, frame, emitter);
             let source = frame.slot(*value);
-            emitter.memory_with(wide, &[0x8B], 8, source); // mov r8(d), [value]
+            emitter.memory_with(wide, &[0x8B], ECX, source); // mov rcx(d), [value]
             emitter.bytes.extend_from_slice(access);
         }
         other => {
