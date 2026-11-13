@@ -132,20 +132,14 @@ fn a_native_host_call_agrees_with_micro_and_the_baseline() {
 }
 
 #[test]
-fn a_native_function_that_makes_host_calls_runs_natively_on_x86_64() {
+fn a_native_function_that_makes_host_calls_runs_natively() {
     let (_engine, instance) = instance(
         EngineMode::Jit,
         AddOne {
             calls: Arc::new(AtomicUsize::new(0)),
         },
     );
-    #[cfg(target_arch = "x86_64")]
     assert!(instance.runs_natively("f"), "f runs as machine code");
-    #[cfg(not(target_arch = "x86_64"))]
-    assert!(
-        !instance.runs_natively("f"),
-        "host calls are compiled on x86-64 only"
-    );
 }
 
 #[test]
@@ -262,11 +256,8 @@ fn a_host_call_writes_memory_that_the_native_code_then_reads() {
     for mode in [EngineMode::Baseline, EngineMode::Jit] {
         let (results, natively) = run(mode);
         assert_eq!(results, golden, "{mode:?} sees the host's write");
-        #[cfg(target_arch = "x86_64")]
         if mode == EngineMode::Jit {
             assert!(natively, "g runs as machine code");
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = natively;
     }
 }

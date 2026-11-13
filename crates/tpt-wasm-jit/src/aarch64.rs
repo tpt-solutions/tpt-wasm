@@ -55,6 +55,7 @@ const MAX_FRAME: u32 = 4096;
 const MEMORY_BASE_OFFSET: u32 = std::mem::offset_of!(Context, memory) as u32;
 const MEMORY_LENGTH_OFFSET: u32 = std::mem::offset_of!(Context, memory_len) as u32;
 const STATUS_OFFSET: u32 = std::mem::offset_of!(Context, status) as u32;
+const HOST_CALL_OFFSET: u32 = std::mem::offset_of!(Context, host_call) as u32;
 const FUNCTIONS_OFFSET: u32 = std::mem::offset_of!(Context, functions) as u32;
 const DEPTH_OFFSET: u32 = std::mem::offset_of!(Context, depth) as u32;
 const DEPTH_LIMIT_OFFSET: u32 = std::mem::offset_of!(Context, depth_limit) as u32;
@@ -633,6 +634,47 @@ fn blr(rn: u32) -> u32 {
 /// context is passed in `x1`. The call counts a frame against the depth limit first, and a call
 /// past the limit traps. A trap in the callee leaves its status in the context and returns zero,
 /// so the status is checked after the call, and a non-zero status returns zero from here too.
+/// `results = host import(arguments)`: the arguments go to a block of the frame, the host is called through the
+/// context with the context, the import, the argument block and the result block in x0 to x3, and the results are
+/// read from a block the host fills. A failed host call leaves a status in the context, and the function returns
+/// with it.
+fn emit_host_call(
+    import: u32,
+    arguments: &[ValueId],
+    results: &[ValueId],
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    let arguments_block = frame.block(arguments.len().max(1));
+    let results_block = frame.block(results.len().max(1));
+    store_arguments(arguments, arguments_block, frame, emitter);
+    emitter.push(ldr_x(R9, SP, frame.context)); // x9 = the context
+    emitter.push(mov_x(0, R9)); // x0 = the context
+    emitter.push(movz_w(1, import & 0xFFFF)); // x1 = the import
+    if import >> 16 != 0 {
+        emitter.push(movk_w_high(1, import >> 16));
+    }
+    emitter.push(add_x_imm(2, SP, arguments_block)); // x2 = the argument block
+    emitter.push(add_x_imm(3, SP, results_block)); // x3 = the result block
+    emitter.push(ldr_x(R12, R9, HOST_CALL_OFFSET));
+    emitter.push(blr(R12));
+    // The context is reloaded, since the call may have used x9. A status left behind returns with zero.
+    emitter.push(ldr_x(R9, SP, frame.context));
+    emitter.push(ldr_x(R10, R9, STATUS_OFFSET));
+    let propagate = emitter.words.len();
+    emitter.push(0); // cbz past the return below, patched below
+    emitter.push(movz_w(0, 0));
+    epilogue(emitter);
+    let skip = (emitter.words.len() - propagate) as u32;
+    emitter.words[propagate] = cbz(true, R10) | (skip << 5);
+    for (index, result) in results.iter().enumerate() {
+        let destination = frame.slot(*result);
+        emitter.push(ldr_x(R9, SP, results_block + 8 * index as u32));
+        emitter.push(str_x(R9, SP, destination));
+    }
+    Ok(())
+}
+
 fn emit_call(
     function: u32,
     arguments: &[ValueId],
@@ -1181,6 +1223,11 @@ fn emit_instruction(
             value,
             operation,
         } => float_unary_arm(true, *result, *value, *operation, frame, emitter)?,
+        IrInstr::CallHost {
+            import,
+            arguments,
+            results,
+        } => emit_host_call(*import, arguments, results, frame, emitter)?,
         IrInstr::Call {
             function,
             arguments,

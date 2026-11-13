@@ -44,6 +44,8 @@ const T3: u32 = 28;
 const T4: u32 = 29;
 const A0: u32 = 10;
 const A1: u32 = 11;
+const A2: u32 = 12;
+const A3: u32 = 13;
 /// The return address, which a call writes and the prologue saves.
 const RA: u32 = 1;
 const FUNCTIONS_OFFSET: i32 = std::mem::offset_of!(Context, functions) as i32;
@@ -65,6 +67,7 @@ const MAX_OFFSET: u32 = (1 << 31) - 4096;
 const MEMORY_BASE_OFFSET: i32 = std::mem::offset_of!(Context, memory) as i32;
 const MEMORY_LENGTH_OFFSET: i32 = std::mem::offset_of!(Context, memory_len) as i32;
 const STATUS_OFFSET: i32 = std::mem::offset_of!(Context, status) as i32;
+const HOST_CALL_OFFSET: i32 = std::mem::offset_of!(Context, host_call) as i32;
 
 /// A place a jump can go: a block of the function, or a label inside the emitted code.
 #[derive(Clone, Copy, Debug)]
@@ -576,6 +579,47 @@ fn copy_into_parameters(
 /// context is passed in `a1`. The call counts a frame against the depth limit first, and a call
 /// past the limit traps. A trap in the callee leaves its status in the context and returns zero,
 /// so the status is checked after the call, and a non-zero status returns zero from here too.
+/// `results = host import(arguments)`: the arguments go to a block of the frame, the host is called through the
+/// context with the context, the import, the argument block and the result block in a0 to a3, and the results are
+/// read from a block the host fills. A failed host call leaves a status in the context, and the function returns
+/// with it.
+fn emit_host_call(
+    import: u32,
+    arguments: &[ValueId],
+    results: &[ValueId],
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) -> Result<(), JitError> {
+    let arguments_block = frame.block(arguments.len().max(1));
+    let results_block = frame.block(results.len().max(1));
+    if arguments_block >= 2048 || results_block >= 2048 {
+        return Err(JitError::Unsupported(
+            "a host call block beyond the reach of a 12-bit offset".into(),
+        ));
+    }
+    store_arguments(arguments, arguments_block, frame, emitter);
+    emitter.push(load(3, A0, SP, frame.context as i32)); // a0 = the context
+    load_constant32(A1, import as i32, emitter); // a1 = the import
+    emitter.push(addi(A2, SP, arguments_block as i32)); // a2 = the argument block
+    emitter.push(addi(A3, SP, results_block as i32)); // a3 = the result block
+    emitter.push(load(3, T0, A0, HOST_CALL_OFFSET)); // t0 = the host call
+    emitter.push(i_type(0, T0, 0, RA, 0x67)); // jalr ra, 0(t0)
+                                              // A status left behind returns with zero, as a callee's status does.
+    emitter.push(load(3, T0, SP, frame.context as i32));
+    emitter.push(load(3, T0, T0, STATUS_OFFSET));
+    let ok = emitter.new_label();
+    emitter.branch(branch(0, T0, ZERO), Target::Label(ok), Fixup::Branch13); // beq t0, zero, ok
+    emitter.push(addi(A0, ZERO, 0));
+    epilogue(emitter);
+    emitter.bind(ok);
+    for (index, result) in results.iter().enumerate() {
+        let destination = frame.slot(*result);
+        emitter.push(load(3, T0, SP, (results_block + 8 * index as u32) as i32));
+        emitter.push(store(3, T0, SP, destination as i32));
+    }
+    Ok(())
+}
+
 fn emit_call(
     function: u32,
     arguments: &[ValueId],
@@ -1230,6 +1274,11 @@ fn emit_instruction(
             value,
             operation,
         } => float_unary_arm(true, *result, *value, *operation, frame, emitter)?,
+        IrInstr::CallHost {
+            import,
+            arguments,
+            results,
+        } => emit_host_call(*import, arguments, results, frame, emitter)?,
         IrInstr::Call {
             function,
             arguments,
