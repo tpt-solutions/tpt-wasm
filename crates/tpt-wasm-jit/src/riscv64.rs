@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
     BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
-    IntConversion, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
+    IntConversion, IntUnary, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
     Terminator, ValueId,
 };
 
@@ -724,6 +724,121 @@ fn guard_trap(frame: &Frame, funct3: u32, rs1: u32, rs2: u32, status: u32, emitt
     emitter.words[at] = branch(funct3, rs1, rs2) | b_immediate(distance);
 }
 
+/// The number of set bits in `t0`, on 64 bits, by the divide-and-add sequence. Clobbers `t1` and `t2`.
+/// A zero-extended 32-bit value has the same count, so it serves both widths.
+fn popcount_t0(emitter: &mut Emitter) {
+    // x -= (x >> 1) & 0x5555...
+    emitter.push(srli(T1, T0, 1));
+    load_constant64(T2, 0x5555_5555_5555_5555, emitter);
+    emitter.push(op(0x00, 7, T1, T1, T2)); // and t1, t1, t2
+    emitter.push(op(0x20, 0, T0, T0, T1)); // sub t0, t0, t1
+                                           // x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+    load_constant64(T2, 0x3333_3333_3333_3333, emitter);
+    emitter.push(op(0x00, 7, T1, T0, T2));
+    emitter.push(srli(T0, T0, 2));
+    emitter.push(op(0x00, 7, T0, T0, T2));
+    emitter.push(op(0x00, 0, T0, T0, T1)); // add t0, t0, t1
+                                           // x = (x + (x >> 4)) & 0x0F0F...
+    emitter.push(srli(T1, T0, 4));
+    emitter.push(op(0x00, 0, T0, T0, T1));
+    load_constant64(T2, 0x0F0F_0F0F_0F0F_0F0F, emitter);
+    emitter.push(op(0x00, 7, T0, T0, T2));
+    // x * 0x0101... >> 56: the byte sums collect in the top byte.
+    load_constant64(T2, 0x0101_0101_0101_0101, emitter);
+    emitter.push(op(0x01, 0, T0, T0, T2)); // mul t0, t0, t2
+    emitter.push(srli(T0, T0, 56));
+}
+
+/// `result = clz(value)`, `ctz(value)` or `popcnt(value)` on 32 or 64 bits, from shifts, masks and
+/// the popcount above, since the base instruction set has no count instructions.
+///
+/// `clz` smears the top set bit down through every lower bit, so the count of zeros is the width
+/// less the count of ones. `ctz` isolates the lowest set bit, `x & -x`, and counts the ones below it;
+/// a zero input gives all ones, which a 32-bit count masks to 32.
+fn int_unary(
+    wide: bool,
+    operation: IntUnary,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    emitter.push(load(3, T0, SP, source as i32));
+    if !wide {
+        // The slot holds the value sign-extended or with garbage above bit 31: keep the low word.
+        emitter.push(slli(T0, T0, 32));
+        emitter.push(srli(T0, T0, 32));
+    }
+    let bits = if wide { 64 } else { 32 };
+    match operation {
+        IntUnary::Clz => {
+            let shifts: &[u32] = if wide {
+                &[1, 2, 4, 8, 16, 32]
+            } else {
+                &[1, 2, 4, 8, 16]
+            };
+            for shift in shifts {
+                emitter.push(srli(T1, T0, *shift));
+                emitter.push(op(0x00, 6, T0, T0, T1)); // or t0, t0, t1
+            }
+            popcount_t0(emitter);
+            // result = bits - ones
+            load_constant32(T1, bits, emitter);
+            emitter.push(op(0x20, 0, T0, T1, T0)); // sub t0, t1, t0
+        }
+        IntUnary::Ctz => {
+            emitter.push(op(0x20, 0, T1, ZERO, T0)); // sub t1, zero, t0: -x
+            emitter.push(op(0x00, 7, T0, T0, T1)); // and t0, t0, t1: the lowest set bit
+            emitter.push(addi(T0, T0, -1)); // the bits below it
+            if !wide {
+                emitter.push(slli(T0, T0, 32));
+                emitter.push(srli(T0, T0, 32));
+            }
+            popcount_t0(emitter);
+        }
+        IntUnary::Popcnt => popcount_t0(emitter),
+    }
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
+/// `result = left rotl count` or `left rotr count` on 32 or 64 bits. The shifts take the count modulo
+/// the width, so a rotate left by `n` is a shift left by `n` or'd with a shift right by `-n`.
+fn int_rotate(
+    wide: bool,
+    rotate_left: bool,
+    result: ValueId,
+    value: ValueId,
+    count: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let amount = frame.slot(count);
+    let destination = frame.slot(result);
+    emitter.push(load(3, T0, SP, source as i32));
+    emitter.push(load(3, T1, SP, amount as i32));
+    emitter.push(op(0x20, 0, T3, ZERO, T1)); // sub t3, zero, t1: -count
+                                             // Left shifts use funct3 1 and right shifts funct3 5; the 32-bit forms are on OP-32.
+    let shift = |funct3: u32, rd: u32, rs1: u32, rs2: u32| {
+        if wide {
+            op(0x00, funct3, rd, rs1, rs2)
+        } else {
+            op_w(0x00, funct3, rd, rs1, rs2)
+        }
+    };
+    if rotate_left {
+        emitter.push(shift(1, T2, T0, T1)); // sll t2, t0, count
+        emitter.push(shift(5, T4, T0, T3)); // srl t4, t0, -count
+    } else {
+        emitter.push(shift(5, T4, T0, T1)); // srl t4, t0, count
+        emitter.push(shift(1, T2, T0, T3)); // sll t2, t0, -count
+    }
+    emitter.push(op(0x00, 6, T0, T2, T4)); // or t0, t2, t4
+    emitter.push(store(3, T0, SP, destination as i32));
+}
+
 fn emit_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
@@ -895,6 +1010,36 @@ fn emit_instruction(
             emitter.push(load(3, T0, SP, source as i32));
             emitter.push(store(3, T0, T3, 0));
         }
+        IrInstr::I32Unary {
+            result,
+            value,
+            operation,
+        } => int_unary(false, *operation, *result, *value, frame, emitter),
+        IrInstr::I64Unary {
+            result,
+            value,
+            operation,
+        } => int_unary(true, *operation, *result, *value, frame, emitter),
+        IrInstr::I32Rotl {
+            result,
+            left,
+            right,
+        } => int_rotate(false, true, *result, *left, *right, frame, emitter),
+        IrInstr::I32Rotr {
+            result,
+            left,
+            right,
+        } => int_rotate(false, false, *result, *left, *right, frame, emitter),
+        IrInstr::I64Rotl {
+            result,
+            left,
+            right,
+        } => int_rotate(true, true, *result, *left, *right, frame, emitter),
+        IrInstr::I64Rotr {
+            result,
+            left,
+            right,
+        } => int_rotate(true, false, *result, *left, *right, frame, emitter),
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
         IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),

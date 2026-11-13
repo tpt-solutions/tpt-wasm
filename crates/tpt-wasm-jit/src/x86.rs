@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
     BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
-    IntConversion, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
+    IntConversion, IntUnary, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
     Terminator, ValueId,
 };
 use tpt_wasm_types::ValueType;
@@ -1420,6 +1420,117 @@ fn globals_base_into_rax(
     Ok(offset)
 }
 
+/// `result = clz(value)`, `ctz(value)` or `popcnt(value)` on 32 or 64 bits.
+///
+/// `bsr` and `bsf` leave their destination undefined for a zero input, so a zero input is given the
+/// width's count by a conditional move on the zero flag. `popcnt` is computed in software, since the
+/// instruction needs a CPU feature the target identity does not record.
+fn int_unary(
+    wide: bool,
+    operation: IntUnary,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    let bits: i32 = if wide { 64 } else { 32 };
+    if wide {
+        emitter.load64(ECX, source);
+    } else {
+        emitter.load32(ECX, source);
+    }
+    match operation {
+        IntUnary::Clz => {
+            // rdx = -1; rax = bsr(rcx), or -1 for zero; rcx = (bits - 1) - rax; rax = rcx.
+            emitter
+                .bytes
+                .extend_from_slice(&[0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rdx, -1
+            emitter.bytes.extend_from_slice(&[0x48, 0x0F, 0xBD, 0xC1]); // bsr rax, rcx
+            emitter.bytes.extend_from_slice(&[0x48, 0x0F, 0x44, 0xC2]); // cmovz rax, rdx
+            emitter.bytes.extend_from_slice(&[0x48, 0xC7, 0xC1]); // mov rcx, bits - 1
+            emitter.bytes.extend_from_slice(&(bits - 1).to_le_bytes());
+            emitter.bytes.extend_from_slice(&[0x48, 0x29, 0xC1]); // sub rcx, rax
+            emitter.bytes.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+        }
+        IntUnary::Ctz => {
+            emitter.bytes.extend_from_slice(&[0x48, 0xC7, 0xC2]); // mov rdx, bits
+            emitter.bytes.extend_from_slice(&bits.to_le_bytes());
+            emitter.bytes.extend_from_slice(&[0x48, 0x0F, 0xBC, 0xC1]); // bsf rax, rcx
+            emitter.bytes.extend_from_slice(&[0x48, 0x0F, 0x44, 0xC2]); // cmovz rax, rdx
+        }
+        IntUnary::Popcnt => {
+            emitter.bytes.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+            popcount_rax(emitter);
+        }
+    }
+    emitter.store64(EAX, destination);
+}
+
+/// The number of set bits in `rax`, the standard divide-and-add sequence on 64 bits. A 32-bit input
+/// is zero-extended, so its count is the same. Clobbers `rcx` and `rdx`.
+fn popcount_rax(emitter: &mut Emitter) {
+    // x -= (x >> 1) & 0x5555...
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x89, 0xC1, 0x48, 0xD1, 0xE9]); // mov rcx, rax; shr rcx, 1
+    emitter.movabs(EDX, 0x5555_5555_5555_5555);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x21, 0xD1, 0x48, 0x29, 0xC8]); // and rcx, rdx; sub rax, rcx
+                                                                   // x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+    emitter.movabs(EDX, 0x3333_3333_3333_3333);
+    emitter.bytes.extend_from_slice(&[
+        0x48, 0x89, 0xC1, // mov rcx, rax
+        0x48, 0x21, 0xD1, // and rcx, rdx
+        0x48, 0xC1, 0xE8, 0x02, // shr rax, 2
+        0x48, 0x21, 0xD0, // and rax, rdx
+        0x48, 0x01, 0xC8, // add rax, rcx
+    ]);
+    // x = (x + (x >> 4)) & 0x0F0F...
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x89, 0xC1, 0x48, 0xC1, 0xE9, 0x04, 0x48, 0x01, 0xC8]);
+    emitter.movabs(EDX, 0x0F0F_0F0F_0F0F_0F0F);
+    emitter.bytes.extend_from_slice(&[0x48, 0x21, 0xD0]); // and rax, rdx
+                                                          // x * 0x0101... >> 56: the byte sums collect in the top byte.
+    emitter.movabs(EDX, 0x0101_0101_0101_0101);
+    emitter
+        .bytes
+        .extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC2, 0x48, 0xC1, 0xE8, 0x38]); // imul rax, rdx; shr rax, 56
+}
+
+/// `result = left rotl count` or `left rotr count` on 32 or 64 bits. `rol` and `ror` take the count
+/// modulo the width, as WebAssembly does.
+fn int_rotate(
+    wide: bool,
+    rotate_left: bool,
+    result: ValueId,
+    value: ValueId,
+    count: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let count = frame.slot(count);
+    let destination = frame.slot(result);
+    if wide {
+        emitter.load64(EAX, source);
+    } else {
+        emitter.load32(EAX, source);
+    }
+    emitter.load32(ECX, count);
+    // d3 /0 is rol and d3 /1 is ror, both by cl.
+    if wide {
+        emitter.bytes.push(0x48);
+    }
+    emitter
+        .bytes
+        .extend_from_slice(&[0xD3, if rotate_left { 0xC0 } else { 0xC8 }]);
+    emitter.store64(EAX, destination);
+}
+
 fn emit_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
@@ -1505,6 +1616,36 @@ fn emit_instruction(
             emitter.bytes.extend_from_slice(&[0x48, 0x89, 0x88]); // mov [rax + offset], rcx
             emitter.bytes.extend_from_slice(&offset.to_le_bytes());
         }
+        IrInstr::I32Unary {
+            result,
+            value,
+            operation,
+        } => int_unary(false, *operation, *result, *value, frame, emitter),
+        IrInstr::I64Unary {
+            result,
+            value,
+            operation,
+        } => int_unary(true, *operation, *result, *value, frame, emitter),
+        IrInstr::I32Rotl {
+            result,
+            left,
+            right,
+        } => int_rotate(false, true, *result, *left, *right, frame, emitter),
+        IrInstr::I32Rotr {
+            result,
+            left,
+            right,
+        } => int_rotate(false, false, *result, *left, *right, frame, emitter),
+        IrInstr::I64Rotl {
+            result,
+            left,
+            right,
+        } => int_rotate(true, true, *result, *left, *right, frame, emitter),
+        IrInstr::I64Rotr {
+            result,
+            left,
+            right,
+        } => int_rotate(true, false, *result, *left, *right, frame, emitter),
         IrInstr::Drop { .. } => {}
         IrInstr::Call {
             function,

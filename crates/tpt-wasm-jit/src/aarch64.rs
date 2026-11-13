@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use tpt_wasm_ir::{
     BasicBlock, BlockId, FloatComparison, FloatConversion, FloatTrunc, FloatUnary, IntComparison,
-    IntConversion, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
+    IntConversion, IntUnary, IrFunction, IrInstr, MemoryLoad, MemoryStore, Reinterpret, SignExtend,
     Terminator, ValueId,
 };
 use tpt_wasm_types::ValueType;
@@ -779,6 +779,105 @@ fn indexed_scaled(base: u32, rt: u32, rn: u32, rm: u32) -> u32 {
     base | 0x1000 | (rm << 16) | (rn << 5) | rt
 }
 
+/// `clz` of `rn` into `rd`, on 32 or 64 bits.
+fn count_leading_zeros(wide: bool, rd: u32, rn: u32) -> u32 {
+    let base = if wide { 0xDAC0_1000 } else { 0x5AC0_1000 };
+    base | (rn << 5) | rd
+}
+
+/// A logical shift right by an immediate, on 64 bits: `lsr rd, rn, #shift`.
+fn lsr_immediate(rd: u32, rn: u32, shift: u32) -> u32 {
+    0xD340_FC00 | (shift << 16) | (rn << 5) | rd
+}
+
+/// `rorv rd, rn, rm`: a rotate right by a register, which takes the count modulo the width.
+fn rotate_right(wide: bool, rd: u32, rn: u32, rm: u32) -> u32 {
+    let base = if wide { 0x9AC0_2C00 } else { 0x1AC0_2C00 };
+    base | (rm << 16) | (rn << 5) | rd
+}
+
+/// `result = clz(value)`, `ctz(value)` or `popcnt(value)` on 32 or 64 bits.
+///
+/// `clz` is an instruction, and `ctz` is a bit reversal followed by `clz`. `popcnt` is computed in
+/// software, as on the other targets. It works on 64 bits throughout, and a 32-bit value is loaded
+/// zero-extended, so its count is the same.
+fn int_unary(
+    wide: bool,
+    operation: IntUnary,
+    result: ValueId,
+    value: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let destination = frame.slot(result);
+    if wide {
+        emitter.push(ldr_x(R9, SP, source));
+    } else {
+        emitter.push(ldr_w(R9, SP, source)); // zero-extends into x9
+    }
+    match operation {
+        IntUnary::Clz => emitter.push(count_leading_zeros(wide, R9, R9)),
+        IntUnary::Ctz => {
+            // rbit reverses the bits, so the trailing zeros become leading ones.
+            let base = if wide { 0xDAC0_0000 } else { 0x5AC0_0000 };
+            emitter.push(base | (R9 << 5) | R9);
+            emitter.push(count_leading_zeros(wide, R9, R9));
+        }
+        IntUnary::Popcnt => {
+            // x -= (x >> 1) & 0x5555...
+            emitter.push(lsr_immediate(R10, R9, 1));
+            emit_constant(0x5555_5555_5555_5555, R11, emitter);
+            emitter.push(alu(true, AND, R10, R10, R11));
+            emitter.push(alu(true, SUB, R9, R9, R10));
+            // x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+            emit_constant(0x3333_3333_3333_3333, R11, emitter);
+            emitter.push(alu(true, AND, R10, R9, R11));
+            emitter.push(lsr_immediate(R9, R9, 2));
+            emitter.push(alu(true, AND, R9, R9, R11));
+            emitter.push(alu(true, ADD, R9, R9, R10));
+            // x = (x + (x >> 4)) & 0x0F0F...
+            emitter.push(lsr_immediate(R10, R9, 4));
+            emitter.push(alu(true, ADD, R9, R9, R10));
+            emit_constant(0x0F0F_0F0F_0F0F_0F0F, R11, emitter);
+            emitter.push(alu(true, AND, R9, R9, R11));
+            // x * 0x0101... >> 56: the byte sums collect in the top byte.
+            emit_constant(0x0101_0101_0101_0101, R11, emitter);
+            emitter.push(mul(true, R9, R9, R11));
+            emitter.push(lsr_immediate(R9, R9, 56));
+        }
+    }
+    emitter.push(str_x(R9, SP, destination));
+}
+
+/// `result = left rotl count` or `left rotr count` on 32 or 64 bits. A rotate left is a rotate right
+/// by the negated count, which `rorv` takes modulo the width.
+fn int_rotate(
+    wide: bool,
+    rotate_left: bool,
+    result: ValueId,
+    value: ValueId,
+    count: ValueId,
+    frame: &mut Frame,
+    emitter: &mut Emitter,
+) {
+    let source = frame.slot(value);
+    let count = frame.slot(count);
+    let destination = frame.slot(result);
+    if wide {
+        emitter.push(ldr_x(R9, SP, source));
+    } else {
+        emitter.push(ldr_w(R9, SP, source));
+    }
+    emitter.push(ldr_w(R10, SP, count));
+    if rotate_left {
+        // r10 = 0 - count, with register 31 as the zero register.
+        emitter.push(alu(wide, SUB, R10, 31, R10));
+    }
+    emitter.push(rotate_right(wide, R9, R9, R10));
+    emitter.push(str_x(R9, SP, destination));
+}
+
 fn emit_instruction(
     instruction: &IrInstr,
     frame: &mut Frame,
@@ -956,6 +1055,36 @@ fn emit_instruction(
             emitter.push(ldr_x(R9, SP, source));
             emitter.push(str_x(R9, R12, 0));
         }
+        IrInstr::I32Unary {
+            result,
+            value,
+            operation,
+        } => int_unary(false, *operation, *result, *value, frame, emitter),
+        IrInstr::I64Unary {
+            result,
+            value,
+            operation,
+        } => int_unary(true, *operation, *result, *value, frame, emitter),
+        IrInstr::I32Rotl {
+            result,
+            left,
+            right,
+        } => int_rotate(false, true, *result, *left, *right, frame, emitter),
+        IrInstr::I32Rotr {
+            result,
+            left,
+            right,
+        } => int_rotate(false, false, *result, *left, *right, frame, emitter),
+        IrInstr::I64Rotl {
+            result,
+            left,
+            right,
+        } => int_rotate(true, true, *result, *left, *right, frame, emitter),
+        IrInstr::I64Rotr {
+            result,
+            left,
+            right,
+        } => int_rotate(true, false, *result, *left, *right, frame, emitter),
         IrInstr::Drop { .. } => {}
         IrInstr::LocalGet { result, local } => copy(*local, *result, frame, emitter),
         IrInstr::LocalSet { local, value } => copy(*value, *local, frame, emitter),
