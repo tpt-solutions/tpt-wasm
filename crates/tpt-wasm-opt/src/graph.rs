@@ -38,7 +38,9 @@ use std::collections::{HashMap, HashSet};
 
 use tpt_wasm_ir::{BlockId, IrFunction, IrInstr, IrModule, Terminator, ValueId};
 
-use crate::analysis::{map_operands, map_terminator_operands, Cfg};
+use crate::analysis::{
+    map_operands, map_terminator_operands, terminator_used_values, used_values, Cfg,
+};
 use crate::PassOutcome;
 
 /// Simplify the control-flow graph of every function.
@@ -510,7 +512,36 @@ fn mergeable_target(
     if values.len() != function.blocks[to].params.len() {
         return None;
     }
+    // The merge substitutes the target's parameters only inside the target's own body
+    // and terminator. A read of one of them anywhere else would be left naming a value
+    // nothing binds any more, so such a target is not merged.
+    if read_outside_block(function, to, &function.blocks[to].params) {
+        return None;
+    }
     Some(to)
+}
+
+/// Whether any block other than `block` reads one of `values`.
+///
+/// Block parameters are only in scope inside the block that declares them *and* the
+/// blocks that block dominates, and the lowering does produce reads from those later
+/// blocks: a `block` result that is consumed after a following `if` is one. Merging
+/// such a block would strand those reads.
+fn read_outside_block(function: &IrFunction, block: usize, values: &[ValueId]) -> bool {
+    if values.is_empty() {
+        return false;
+    }
+    let wanted: HashSet<ValueId> = values.iter().copied().collect();
+    function.blocks.iter().enumerate().any(|(index, other)| {
+        index != block
+            && (other
+                .instrs
+                .iter()
+                .any(|instruction| used_values(instruction).iter().any(|v| wanted.contains(v)))
+                || terminator_used_values(&other.terminator)
+                    .iter()
+                    .any(|v| wanted.contains(v)))
+    })
 }
 
 /// Perform one merge: append the target's body to its predecessor.
