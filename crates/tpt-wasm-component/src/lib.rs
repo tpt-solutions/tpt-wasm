@@ -86,6 +86,7 @@ const TYPE_OPTION: u8 = 0x6b;
 const TYPE_ENUM: u8 = 0x6d;
 const TYPE_FLAGS: u8 = 0x6e;
 const TYPE_TUPLE: u8 = 0x6f;
+const TYPE_RESULT: u8 = 0x6a;
 /// The canon tag of a lift, and of a lower.
 const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
@@ -338,6 +339,8 @@ pub enum ComponentType {
     Flags(u32),
     /// A tuple of scalars, by the index of its definition in the type table.
     Tuple(u32),
+    /// A result, by the index of its definition in the component's type table.
+    Result(u32),
 }
 
 /// One field of a record type.
@@ -364,6 +367,11 @@ pub enum ComponentTypeDef {
     Enum(Vec<String>),
     /// A tuple of scalars, in order.
     Tuple(Vec<Scalar>),
+    /// A result: the payload types of its ok and error cases, each optional.
+    Result {
+        ok: Option<Scalar>,
+        err: Option<Scalar>,
+    },
     /// A set of flags: its labels, at most 32, each a bit.
     Flags(Vec<String>),
 }
@@ -403,6 +411,8 @@ pub enum ComponentValue {
     Enum(String),
     /// A tuple: its values, in order.
     Tuple(Vec<ComponentValue>),
+    /// A result: its ok or error case, and the case's payload if it has one.
+    Result(Result<Option<Box<ComponentValue>>, Option<Box<ComponentValue>>>),
     /// A set of flags: the labels that are set.
     Flags(Vec<String>),
 }
@@ -429,7 +439,8 @@ impl ComponentValue {
             | ComponentValue::Option(_)
             | ComponentValue::Enum(_)
             | ComponentValue::Flags(_)
-            | ComponentValue::Tuple(_) => None,
+            | ComponentValue::Tuple(_)
+            | ComponentValue::Result(_) => None,
         }
     }
 }
@@ -952,7 +963,8 @@ impl Component {
             | ComponentTypeDef::Option(_)
             | ComponentTypeDef::Enum(_)
             | ComponentTypeDef::Flags(_)
-            | ComponentTypeDef::Tuple(_) => None,
+            | ComponentTypeDef::Tuple(_)
+            | ComponentTypeDef::Result { .. } => None,
         }
     }
 
@@ -978,15 +990,20 @@ impl Component {
                 ComponentType::Option(_) => Err(format!("the import {name} takes an option")),
                 ComponentType::Enum(_) => Err(format!("the import {name} takes an enum")),
                 ComponentType::Flags(_) => Err(format!("the import {name} takes flags")),
-                ComponentType::Tuple(_) => Err(format!("the import {name} takes a tuple")),
+                ComponentType::Tuple(_) | ComponentType::Result(_) => {
+                    Err(format!("the import {name} takes a tuple"))
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         let result = match declared.result {
             None => None,
             Some(ComponentType::Scalar(scalar)) => Some(scalar),
-            Some(ComponentType::Enum(_) | ComponentType::Flags(_) | ComponentType::Tuple(_)) => {
-                return Err(format!("the import {name} returns an enum"))
-            }
+            Some(
+                ComponentType::Enum(_)
+                | ComponentType::Flags(_)
+                | ComponentType::Tuple(_)
+                | ComponentType::Result(_),
+            ) => return Err(format!("the import {name} returns an enum")),
             Some(ComponentType::List(_)) => {
                 return Err(format!("the import {name} returns a list"))
             }
@@ -1059,6 +1076,18 @@ fn flat_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> Vec<ValueType> {
             let mut flat = vec![ValueType::I32];
             if let Some(ComponentTypeDef::Option(payload)) = types.get(*index as usize) {
                 flat.extend(payload.flat_params());
+            }
+            flat
+        }
+        // A result is its discriminant, then the flat value of its payload. Decoding refuses
+        // payloads whose flat types differ, and a scalar payload is one value, so either case's
+        // payload gives the same shape.
+        ComponentType::Result(index) => {
+            let mut flat = vec![ValueType::I32];
+            if let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) {
+                if let Some(payload) = ok.or(*err) {
+                    flat.extend(payload.flat_params());
+                }
             }
             flat
         }
@@ -1472,6 +1501,47 @@ impl ComponentInstance {
                 }
                 Ok(())
             }
+            ComponentValue::Result(outcome) => {
+                let ComponentType::Result(index) = ty else {
+                    return Err("a result argument is not a result type".to_owned());
+                };
+                let (ok_type, err_type) = match self.types.get(*index as usize) {
+                    Some(ComponentTypeDef::Result { ok, err }) => (*ok, *err),
+                    _ => return Err("the result is not defined".to_owned()),
+                };
+                let (discriminant, case_type, payload) = match outcome {
+                    Ok(payload) => (0, ok_type, payload.as_deref()),
+                    Err(payload) => (1, err_type, payload.as_deref()),
+                };
+                // The payload's flat value is one value, shared by both cases; a case without a
+                // payload gets zero in its place, as the canonical ABI does.
+                let mismatch = || "a result payload does not match its case".to_owned();
+                let value = match (case_type, payload) {
+                    (None, None) => None,
+                    (Some(scalar), Some(value)) => {
+                        if value.scalar() != Some(scalar) {
+                            return Err(mismatch());
+                        }
+                        Some(
+                            lower_scalar(value)
+                                .ok_or_else(|| "a result payload did not lower".to_owned())?,
+                        )
+                    }
+                    _ => return Err(mismatch()),
+                };
+                // The shared payload slot holds the case's value, or zero for a case without one.
+                let slot = ok_type.or(err_type).map(|scalar| scalar.flat_params());
+                out.push(Value::I32(discriminant));
+                match (slot.as_deref(), value) {
+                    (Some([_]), Some(value)) => out.push(value),
+                    (Some([flat]), None) => out.push(zero_value(*flat)),
+                    (Some(_), _) => {
+                        return Err("a result payload has no single flat value".to_owned())
+                    }
+                    (None, _) => {}
+                }
+                Ok(())
+            }
             ComponentValue::List(items) => {
                 let ComponentType::List(index) = ty else {
                     return Err("a list argument is not a list type".to_owned());
@@ -1599,6 +1669,21 @@ impl ComponentInstance {
         }
         match (ty, core_results) {
             (ComponentType::Scalar(scalar), [value]) => lift(value.clone(), *scalar),
+            // A result with no payloads is its discriminant alone, so it is a direct value.
+            (ComponentType::Result(index), [Value::I32(discriminant)]) => {
+                let Some(ComponentTypeDef::Result { ok, err }) = self.types.get(*index as usize)
+                else {
+                    return Err("the result's result type is not defined".to_owned());
+                };
+                if ok.is_some() || err.is_some() {
+                    return Err("a result with payloads is returned through memory".to_owned());
+                }
+                match discriminant {
+                    0 => Ok(ComponentValue::Result(Ok(None))),
+                    1 => Ok(ComponentValue::Result(Err(None))),
+                    _ => Err("a result's discriminant is neither 0 nor 1".to_owned()),
+                }
+            }
             (ComponentType::Tuple(index), values) => {
                 let Some(ComponentTypeDef::Tuple(scalars)) = self.types.get(*index as usize) else {
                     return Err("the result's tuple is not defined".to_owned());
@@ -1744,6 +1829,37 @@ impl ComponentInstance {
                     }
                     _ => Err("an option's discriminant is neither 0 nor 1".to_owned()),
                 }
+            }
+            ComponentType::Result(index) => {
+                let Some(ComponentTypeDef::Result { ok, err }) = self.types.get(*index as usize)
+                else {
+                    return Err("the result is not defined".to_owned());
+                };
+                let (ok, err) = (*ok, *err);
+                // The discriminant is one byte, and the payload follows at its aligned offset.
+                let discriminant = self
+                    .read_core_memory(instance, memory, u64::from(pointer), 1)
+                    .map_err(|error| error.to_string())?[0];
+                let case_type = match discriminant {
+                    0 => ok,
+                    1 => err,
+                    _ => return Err("a result's discriminant is neither 0 nor 1".to_owned()),
+                };
+                let payload = match case_type {
+                    None => None,
+                    Some(scalar) => {
+                        let (_, align) = scalar.size_and_align();
+                        let offset = u64::from(pointer) + align_to(1, align) as u64;
+                        Some(Box::new(
+                            self.load_scalar(instance, memory, offset, scalar)?,
+                        ))
+                    }
+                };
+                Ok(ComponentValue::Result(if discriminant == 0 {
+                    Ok(payload)
+                } else {
+                    Err(payload)
+                }))
             }
             ComponentType::List(index) => {
                 let Some(ComponentTypeDef::List(element)) = self.types.get(*index as usize) else {
@@ -1952,6 +2068,20 @@ fn value_matches(value: &ComponentValue, ty: &ComponentType, types: &[ComponentT
             };
             items.iter().all(|item| item.scalar() == Some(*element))
         }
+        (ComponentValue::Result(outcome), ComponentType::Result(index)) => {
+            let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) else {
+                return false;
+            };
+            let (payload, case) = match outcome {
+                Ok(payload) => (payload, ok),
+                Err(payload) => (payload, err),
+            };
+            match (payload, case) {
+                (None, None) => true,
+                (Some(value), Some(scalar)) => value.scalar() == Some(*scalar),
+                _ => false,
+            }
+        }
         (value, ComponentType::Scalar(scalar)) => value.scalar() == Some(*scalar),
         _ => false,
     }
@@ -1995,7 +2125,8 @@ fn lower_scalar(value: &ComponentValue) -> Option<Value> {
         | ComponentValue::Option(_)
         | ComponentValue::Enum(_)
         | ComponentValue::Flags(_)
-        | ComponentValue::Tuple(_) => None,
+        | ComponentValue::Tuple(_)
+        | ComponentValue::Result(_) => None,
     }
 }
 
@@ -2227,6 +2358,7 @@ fn value_type(
         Some(ComponentTypeDef::Enum(_)) => Ok(ComponentType::Enum(index)),
         Some(ComponentTypeDef::Flags(_)) => Ok(ComponentType::Flags(index)),
         Some(ComponentTypeDef::Tuple(_)) => Ok(ComponentType::Tuple(index)),
+        Some(ComponentTypeDef::Result { .. }) => Ok(ComponentType::Result(index)),
         Some(ComponentTypeDef::Func(_)) => Err(ComponentError::UnsupportedType {
             what: "a function type used as a value",
             offset: at,
@@ -2287,7 +2419,8 @@ fn decode_types(
                         ComponentType::Option(_)
                         | ComponentType::Enum(_)
                         | ComponentType::Flags(_)
-                        | ComponentType::Tuple(_) => {
+                        | ComponentType::Tuple(_)
+                        | ComponentType::Result(_) => {
                             return Err(ComponentError::UnsupportedType {
                                 what: "an option or an enum in a record",
                                 offset: at_field,
@@ -2324,7 +2457,8 @@ fn decode_types(
                     | ComponentType::Option(_)
                     | ComponentType::Enum(_)
                     | ComponentType::Flags(_)
-                    | ComponentType::Tuple(_) => {
+                    | ComponentType::Tuple(_)
+                    | ComponentType::Result(_) => {
                         return Err(ComponentError::UnsupportedType {
                             what: "an option of a record, list, or option",
                             offset: payload_at,
@@ -2391,6 +2525,46 @@ fn decode_types(
                 }
                 types.push(ComponentTypeDef::Enum(labels));
             }
+            TYPE_RESULT => {
+                // Each case is `0x00` for no payload, or `0x01` and a value type.
+                let mut cases = [None, None];
+                for case in &mut cases {
+                    let at_case = reader.position();
+                    match reader.byte()? {
+                        0x00 => {}
+                        0x01 => {
+                            let at_payload = reader.position();
+                            *case = Some(match value_type(reader, types)? {
+                                ComponentType::Scalar(Scalar::String) => {
+                                    return Err(ComponentError::UnsupportedType {
+                                        what: "a string in a result",
+                                        offset: at_payload,
+                                    })
+                                }
+                                ComponentType::Scalar(scalar) => scalar,
+                                _ => {
+                                    return Err(ComponentError::UnsupportedType {
+                                        what: "a compound type in a result",
+                                        offset: at_payload,
+                                    })
+                                }
+                            });
+                        }
+                        _ => return Err(ComponentError::Malformed { offset: at_case }),
+                    }
+                }
+                let [ok, err] = cases;
+                // Both payloads must share one flat type, or the canonical ABI would join them.
+                if let (Some(ok_flat), Some(err_flat)) = (ok, err) {
+                    if ok_flat.flat_params() != err_flat.flat_params() {
+                        return Err(ComponentError::UnsupportedType {
+                            what: "a result whose payloads have different flat types",
+                            offset: at,
+                        });
+                    }
+                }
+                types.push(ComponentTypeDef::Result { ok, err });
+            }
             TYPE_LIST => {
                 let element_at = reader.position();
                 let element = match value_type(reader, types)? {
@@ -2406,7 +2580,8 @@ fn decode_types(
                     | ComponentType::Option(_)
                     | ComponentType::Enum(_)
                     | ComponentType::Flags(_)
-                    | ComponentType::Tuple(_) => {
+                    | ComponentType::Tuple(_)
+                    | ComponentType::Result(_) => {
                         return Err(ComponentError::UnsupportedType {
                             what: "a list of records, lists, or options",
                             offset: element_at,
@@ -2468,6 +2643,7 @@ fn decode_imports(
                     | ComponentType::Enum(_)
                     | ComponentType::Flags(_)
                     | ComponentType::Tuple(_)
+                    | ComponentType::Result(_)
             )
         });
         if has_record {
@@ -2548,6 +2724,7 @@ fn decode_canon(
                                     | ComponentType::Enum(_)
                                     | ComponentType::Flags(_)
                                     | ComponentType::Tuple(_)
+                                    | ComponentType::Result(_)
                             )
                     }) {
                         return Err(ComponentError::UnsupportedCanon {

@@ -1289,8 +1289,7 @@ fn no_truncation_or_corruption_of_a_component_panics() {
         enum_component(),
         flags_component(),
         tuple_component(),
-        flags_component(),
-        tuple_component(),
+        result_component(),
     ];
     let mut decoded = 0usize;
     let mut instantiated = 0usize;
@@ -2358,5 +2357,279 @@ fn an_empty_tuple_is_malformed_and_a_string_in_a_tuple_is_refused() {
             what: "a string in a tuple",
             ..
         })
+    ));
+}
+
+/// A core module with a memory, and four functions. `ok` and `err` return a pointer to a result
+/// of `result<u32, u32>` laid out in memory, and `none` returns the discriminant of a result with
+/// no payloads. `take` returns the payload of the result passed as its two flat values.
+fn result_module() -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    // Two types: [] -> [i32], and [i32, i32] -> [i32].
+    bytes.extend(section(
+        1,
+        &[2, 0x60, 0, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 1, 0x7f],
+    ));
+    bytes.extend(section(3, &[4, 0, 0, 0, 1]));
+    bytes.extend(section(5, &[1, 0x00, 1]));
+    bytes.extend(section(
+        7,
+        &[
+            5, 2, b'o', b'k', 0, 0, 3, b'e', b'r', b'r', 0, 1, 4, b'n', b'o', b'n', b'e', 0, 2, 4,
+            b't', b'a', b'k', b'e', 0, 3, 6, b'm', b'e', b'm', b'o', b'r', b'y', 2, 0,
+        ],
+    ));
+    bytes.extend(section(
+        10,
+        &[
+            4, 4, 0, 0x41, 16, 0x0b, 4, 0, 0x41, 24, 0x0b, 4, 0, 0x41, 1, 0x0b, 4, 0, 0x20, 1, 0x0b,
+        ],
+    ));
+    // At 16, an ok with 42: discriminant 0, the payload at offset 4. At 24, an err with 7.
+    bytes.extend(section(
+        11,
+        &[
+            1, 0, 0x41, 16, 0x0b, 16, 0, 0, 0, 0, 42, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0,
+        ],
+    ));
+    bytes
+}
+
+/// A component over `result_module`, with the types `result<u32, u32>`, a function returning it,
+/// a payload-free result, and `take`, a function from `result<u32, u32>` to `u32`.
+fn result_component() -> Vec<u8> {
+    let types = section(
+        SECTION_TYPE,
+        &[
+            5,
+            TYPE_RESULT,
+            1,
+            VALTYPE_U32,
+            1,
+            VALTYPE_U32,
+            TYPE_FUNC,
+            0,
+            0x00,
+            0,
+            TYPE_RESULT,
+            0,
+            0,
+            TYPE_FUNC,
+            0,
+            0x00,
+            2,
+            TYPE_FUNC,
+            1,
+            1,
+            b'x',
+            0x00,
+            0x00,
+            VALTYPE_U32,
+        ],
+    );
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            5, 0, 0, 1, 0, 2, b'o', b'k', 0, 0, 1, 0, 3, b'e', b'r', b'r', 0, 0, 1, 0, 4, b'n',
+            b'o', b'n', b'e', 0, 0, 1, 0, 4, b't', b'a', b'k', b'e', 0, 2, 1, 0, 6, b'm', b'e',
+            b'm', b'o', b'r', b'y',
+        ],
+    );
+    let canon = section(
+        SECTION_CANON,
+        &[
+            4,
+            CANON_LIFT,
+            SORT_FUNC,
+            0,
+            1,
+            OPTION_MEMORY,
+            0,
+            1,
+            CANON_LIFT,
+            SORT_FUNC,
+            1,
+            1,
+            OPTION_MEMORY,
+            0,
+            1,
+            CANON_LIFT,
+            SORT_FUNC,
+            2,
+            0,
+            3,
+            CANON_LIFT,
+            SORT_FUNC,
+            3,
+            0,
+            4,
+        ],
+    );
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            4,
+            0x00,
+            2,
+            b'o',
+            b'k',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+            0x00,
+            3,
+            b'e',
+            b'r',
+            b'r',
+            COMPONENT_SORT_FUNC,
+            1,
+            0x00,
+            0x00,
+            4,
+            b'n',
+            b'o',
+            b'n',
+            b'e',
+            COMPONENT_SORT_FUNC,
+            2,
+            0x00,
+            0x00,
+            4,
+            b't',
+            b'a',
+            b'k',
+            b'e',
+            COMPONENT_SORT_FUNC,
+            3,
+            0x00,
+        ],
+    );
+    let mut bytes = with(&module_section(&result_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+#[test]
+fn a_result_with_payloads_is_read_back_from_memory() {
+    let mut instance = Component::decode(&result_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("ok", Vec::new()),
+        Ok(vec![ComponentValue::Result(Ok(Some(Box::new(
+            ComponentValue::U32(42)
+        ))))])
+    );
+    assert_eq!(
+        instance.call_export("err", Vec::new()),
+        Ok(vec![ComponentValue::Result(Err(Some(Box::new(
+            ComponentValue::U32(7)
+        ))))])
+    );
+}
+
+#[test]
+fn a_payload_free_result_is_a_direct_discriminant() {
+    let mut instance = Component::decode(&result_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    // The module returns 1, the discriminant of the error case, which has no payload.
+    assert_eq!(
+        instance.call_export("none", Vec::new()),
+        Ok(vec![ComponentValue::Result(Err(None))])
+    );
+}
+
+#[test]
+fn a_result_argument_passes_its_discriminant_and_payload() {
+    let mut instance = Component::decode(&result_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export(
+            "take",
+            vec![ComponentValue::Result(Ok(Some(Box::new(
+                ComponentValue::U32(5)
+            ))))]
+        ),
+        Ok(vec![ComponentValue::U32(5)])
+    );
+    assert_eq!(
+        instance.call_export(
+            "take",
+            vec![ComponentValue::Result(Err(Some(Box::new(
+                ComponentValue::U32(9)
+            ))))]
+        ),
+        Ok(vec![ComponentValue::U32(9)])
+    );
+    // A case without its payload, or a payload of another type, is refused before the call.
+    assert!(matches!(
+        instance.call_export("take", vec![ComponentValue::Result(Ok(None))]),
+        Err(ComponentError::ArgumentMismatch { .. })
+    ));
+    assert!(matches!(
+        instance.call_export(
+            "take",
+            vec![ComponentValue::Result(Ok(Some(Box::new(
+                ComponentValue::S32(1)
+            ))))]
+        ),
+        Err(ComponentError::ArgumentMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_result_with_a_string_or_a_compound_payload_is_refused() {
+    assert!(matches!(
+        Component::decode(&with(&section(
+            SECTION_TYPE,
+            &[1, TYPE_RESULT, 1, VALTYPE_STRING, 0]
+        ))),
+        Err(ComponentError::UnsupportedType {
+            what: "a string in a result",
+            ..
+        })
+    ));
+    // Type 0 is a list, so the result's payload is a compound type.
+    assert!(matches!(
+        Component::decode(&with(&section(
+            SECTION_TYPE,
+            &[2, TYPE_LIST, VALTYPE_U8, TYPE_RESULT, 1, 0x00, 0]
+        ))),
+        Err(ComponentError::UnsupportedType {
+            what: "a compound type in a result",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_result_whose_payloads_differ_in_flat_type_is_refused() {
+    assert!(matches!(
+        Component::decode(&with(&section(
+            SECTION_TYPE,
+            &[1, TYPE_RESULT, 1, VALTYPE_U32, 1, VALTYPE_F32]
+        ))),
+        Err(ComponentError::UnsupportedType {
+            what: "a result whose payloads have different flat types",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_result_case_with_an_unknown_tag_is_malformed() {
+    assert!(matches!(
+        Component::decode(&with(&section(SECTION_TYPE, &[1, TYPE_RESULT, 2]))),
+        Err(ComponentError::Malformed { .. })
     ));
 }

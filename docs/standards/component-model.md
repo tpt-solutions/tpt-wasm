@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and the remaining compound value types (variants, results, tuples, flags) are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing, variants, and results whose payloads differ in flat type are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -121,8 +121,18 @@ flattens to its values in order, lays out in memory as a record does, and a tupl
 passed directly or read back through memory by the same rules. A tuple must hold at least one
 value, and a value may not be a string or another compound type.
 
+Results (`0x6a`) of scalars are supported for lifted exports, as a parameter or a result. A result is
+`result<T, E>` where each payload is optional. A result with a payload flattens to a discriminant and
+the payload's flat value, so it is always returned through memory: a one-byte discriminant at offset 0,
+then the payload at its alignment. A result with no payloads flattens to its discriminant alone, so it
+is passed directly. A parameter passes its case's value, with zero in the other case's place. A case
+without its value, or with a value of another type, is refused before the call, and a discriminant other
+than 0 or 1 is a call error. A payload that is a string or a compound type is refused, and so is a pair
+of payloads whose flat types differ, since the canonical ABI would join them with conversions that are
+not implemented here.
+
 Refused, each by name and offset, until its own decoder exists: value types beyond the ones
-supported (variants, results, resources, and
+supported (variants, resources, and
 the rest), extern types on exports, and exports of any sort other than function. Exports of
 imported functions are refused too.
 
@@ -167,7 +177,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 a separate stage, which will map each parsed function onto the same capability id.
 
 Not done: strings and records in lowered imports, UTF-16 and Latin-1 encodings, `post-return`,
-records passed indirectly, variants, results, and parsing WIT to
+records passed indirectly, variants, results whose payloads differ in flat type, and parsing WIT to
 derive the capability ids.
 
 ## Design constraint
