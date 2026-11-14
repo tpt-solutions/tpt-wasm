@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope and the core-instance section, and the alias section for core functions, and instantiates core instances with imports bound to earlier instances or to inline exports; the type and import checks and the WIT mapping are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; and lifts exported functions over scalar types. The import checks and the WIT mapping are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -61,8 +61,24 @@ names, through `Linker::define_export`, and a call into it runs that function in
 instance that defines it. Each name is checked at instantiation, so a missing export is an
 error then, not at the first call.
 
-Not done: the component's type and import checks, canonical lifting and lowering, and the
-WIT mapping to capabilities.
+Canonical lifting, on the recommendation, covers the scalar subset only: `s32`, `u32`,
+`s64`, `u64`, `f32`, and `f64`. Each flattens to one core value of the same width, and the
+conversion is a reinterpretation of the bits, so no value changes. A canon lift (`0x00 0x00`)
+names a core function and a component function type, and takes no canonical options. A
+component function's flattened type (one core parameter per scalar, and at most one core
+result) must equal the core function's type, which is read from the nested module's bytes
+at instantiation, so a mismatch fails there and not at the first call. An export names a
+component function (`0x01`) with no extern type; each export is then callable with
+`ComponentInstance::call_export`, which checks the argument count and types and lifts the
+result.
+
+Refused, each by name and offset, until its own decoder exists: canon lower (`0x01 0x00`),
+canonical options (strings, memory, and realloc, which need the lifting of linear memory),
+the other value types (`bool`, the small integers, `char`, `string`, records, lists, and
+the rest), extern types on exports, and exports of any sort other than function.
+
+Not done: the component's import checks, canon lower, the value types and options above, and
+the WIT mapping to capabilities.
 
 ## Design constraint
 

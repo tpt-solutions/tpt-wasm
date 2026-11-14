@@ -2,20 +2,22 @@
 // Copyright (c) 2026 TPT Solutions
 
 #![forbid(unsafe_code)]
-//! The Component Model envelope, its aliases, and its core instances.
+//! The Component Model envelope, its types, aliases, core instances, and lifted exports.
 //!
 //! A component is a binary with the Core Wasm magic, the version `0x0d` and the layer
 //! `0x01`, so it cannot be mistaken for a core module, whose layer is zero. After the
 //! preamble comes a sequence of sections: each is an id byte, a `u32` size, and the
 //! contents. This crate reads that framing, collects the core modules a component nests,
-//! decodes the alias section (id 6) and the core-instance section (id 2), and runs the
-//! instances on a runtime `Engine`. Every other section, and every form it does not
-//! implement, is refused rather than skipped.
+//! decodes the type (7), canon (8), alias (6), core-instance (2) and export (11) sections,
+//! and runs the instances on a runtime `Engine`. A component's exported functions are
+//! lifted from core functions over scalar types. Every other section, and every form it
+//! does not implement, is refused rather than skipped.
 
 use std::fmt;
 
+use tpt_wasm_format::{ExportDesc, ImportDesc};
 use tpt_wasm_runtime::{Engine, Instance, Linker};
-use tpt_wasm_types::Value;
+use tpt_wasm_types::{FunctionType, ResultType, Value, ValueType};
 
 /// The component preamble: the magic, then version `0x0d` and layer `0x01`.
 pub const PREAMBLE: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
@@ -28,6 +30,12 @@ const SECTION_CORE_MODULE: u8 = 1;
 const SECTION_CORE_INSTANCE: u8 = 2;
 /// The section id of aliases.
 const SECTION_ALIAS: u8 = 6;
+/// The section id of component types.
+const SECTION_TYPE: u8 = 7;
+/// The section id of canonical functions.
+const SECTION_CANON: u8 = 8;
+/// The section id of exports.
+const SECTION_EXPORT: u8 = 11;
 
 /// The core-instance expression tag that instantiates a module.
 const INSTANTIATE: u8 = 0x00;
@@ -35,12 +43,27 @@ const INSTANTIATE: u8 = 0x00;
 const INLINE_EXPORTS: u8 = 0x01;
 /// The sort wrapper that marks a core sort in an alias.
 const SORT_CORE_WRAPPER: u8 = 0x00;
-/// The core sort of a function.
-const SORT_CORE_FUNC: u8 = 0x00;
+/// The core sort of a function, and the sort of a function in a sort index.
+const SORT_FUNC: u8 = 0x00;
 /// The sort byte of a core instance, which an instance argument names.
 const SORT_CORE_INSTANCE: u8 = 0x12;
 /// The alias tag that takes an export of a core instance.
 const ALIAS_CORE_EXPORT: u8 = 0x01;
+/// The component sort of a function in an export.
+const COMPONENT_SORT_FUNC: u8 = 0x01;
+
+/// The component type tag of a function type.
+const TYPE_FUNC: u8 = 0x40;
+/// The canon tag of a lift, and of a lower.
+const CANON_LIFT: u8 = 0x00;
+const CANON_LOWER: u8 = 0x01;
+/// The value type bytes this crate lifts.
+const VALTYPE_S64: u8 = 0x78;
+const VALTYPE_U64: u8 = 0x77;
+const VALTYPE_F32: u8 = 0x76;
+const VALTYPE_F64: u8 = 0x75;
+const VALTYPE_S32: u8 = 0x7a;
+const VALTYPE_U32: u8 = 0x79;
 
 /// Why a component was refused or could not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +81,12 @@ pub enum ComponentError {
     UnsupportedInstance { what: &'static str, offset: usize },
     /// An alias form this crate does not implement yet.
     UnsupportedAlias { what: &'static str, offset: usize },
+    /// A type this crate does not implement yet.
+    UnsupportedType { what: &'static str, offset: usize },
+    /// A canonical function form this crate does not implement yet.
+    UnsupportedCanon { what: &'static str, offset: usize },
+    /// An export form this crate does not implement yet.
+    UnsupportedExport { what: &'static str, offset: usize },
     /// A tag or index that the grammar does not allow here, or a name that is not UTF-8.
     Malformed { offset: usize },
     /// A core instance names a module the component does not nest.
@@ -66,8 +95,18 @@ pub enum ComponentError {
     NoSuchInstance { instance: usize },
     /// A reference names a core function that no alias defines before it.
     NoSuchFunction { function: u32 },
+    /// A reference names a component type that is not declared before it.
+    NoSuchType { index: u32 },
+    /// A reference names a component function that no canon defines before it.
+    NoSuchComponentFunction { function: u32 },
+    /// No export has this name.
+    NoSuchExport { name: String },
     /// A core instance could not be created, with the runtime's reason.
     Instantiate { instance: usize, message: String },
+    /// A lifted function's core type does not match its component type.
+    LiftMismatch { export: String, message: String },
+    /// A call's arguments do not match the export's type.
+    ArgumentMismatch { export: String, message: String },
     /// A call into a core instance failed, with the runtime's reason.
     Call { instance: usize, message: String },
 }
@@ -85,10 +124,11 @@ impl fmt::Display for ComponentError {
             ComponentError::UnsupportedSection { id, offset } => {
                 write!(f, "section id {id} at byte {offset} is not supported yet")
             }
-            ComponentError::UnsupportedInstance { what, offset } => {
-                write!(f, "{what} at byte {offset} is not supported yet")
-            }
-            ComponentError::UnsupportedAlias { what, offset } => {
+            ComponentError::UnsupportedInstance { what, offset }
+            | ComponentError::UnsupportedAlias { what, offset }
+            | ComponentError::UnsupportedType { what, offset }
+            | ComponentError::UnsupportedCanon { what, offset }
+            | ComponentError::UnsupportedExport { what, offset } => {
                 write!(f, "{what} at byte {offset} is not supported yet")
             }
             ComponentError::Malformed { offset } => write!(f, "malformed entry at byte {offset}"),
@@ -110,8 +150,30 @@ impl fmt::Display for ComponentError {
                     "there is no core function {function} defined before this use"
                 )
             }
+            ComponentError::NoSuchType { index } => {
+                write!(
+                    f,
+                    "there is no component type {index} declared before this use"
+                )
+            }
+            ComponentError::NoSuchComponentFunction { function } => {
+                write!(
+                    f,
+                    "there is no component function {function} defined before this use"
+                )
+            }
+            ComponentError::NoSuchExport { name } => write!(f, "there is no export named {name}"),
             ComponentError::Instantiate { instance, message } => {
                 write!(f, "core instance {instance} did not instantiate: {message}")
+            }
+            ComponentError::LiftMismatch { export, message } => {
+                write!(
+                    f,
+                    "export {export} does not match its component type: {message}"
+                )
+            }
+            ComponentError::ArgumentMismatch { export, message } => {
+                write!(f, "a call to {export} does not match its type: {message}")
             }
             ComponentError::Call { instance, message } => {
                 write!(f, "a call into core instance {instance} failed: {message}")
@@ -122,19 +184,79 @@ impl fmt::Display for ComponentError {
 
 impl std::error::Error for ComponentError {}
 
-/// One core instance a component declares.
+/// A scalar component type: one core value, reinterpreted at the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scalar {
+    S32,
+    U32,
+    S64,
+    U64,
+    F32,
+    F64,
+}
+
+impl Scalar {
+    /// The core value type this scalar lowers to.
+    fn flat(self) -> ValueType {
+        match self {
+            Scalar::S32 | Scalar::U32 => ValueType::I32,
+            Scalar::S64 | Scalar::U64 => ValueType::I64,
+            Scalar::F32 => ValueType::F32,
+            Scalar::F64 => ValueType::F64,
+        }
+    }
+}
+
+/// A value of a scalar component type, as the caller sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ComponentValue {
+    S32(i32),
+    U32(u32),
+    S64(i64),
+    U64(u64),
+    F32(f32),
+    F64(f64),
+}
+
+impl ComponentValue {
+    /// The scalar type of this value.
+    pub fn scalar(self) -> Scalar {
+        match self {
+            ComponentValue::S32(_) => Scalar::S32,
+            ComponentValue::U32(_) => Scalar::U32,
+            ComponentValue::S64(_) => Scalar::S64,
+            ComponentValue::U64(_) => Scalar::U64,
+            ComponentValue::F32(_) => Scalar::F32,
+            ComponentValue::F64(_) => Scalar::F64,
+        }
+    }
+}
+
+/// A component function type: scalar parameters and at most one scalar result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CoreInstance {
-    /// Instantiate the nested core module with index `module`. Each argument binds one of
-    /// the module's import modules to an earlier core instance.
-    Instantiate {
-        module: u32,
-        arguments: Vec<InstanceArgument>,
-    },
-    /// A core instance that exists only to group functions: each export is one function of
-    /// the core function index space. Nothing runs for it; calling one of its exports runs
-    /// the function it names.
-    FromExports { exports: Vec<InlineExport> },
+pub struct ComponentFuncType {
+    /// The parameter types, in order.
+    pub params: Vec<Scalar>,
+    /// The result type, if the function returns one.
+    pub result: Option<Scalar>,
+}
+
+/// A component function: a core function lifted to a component type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentFunction {
+    /// The index of the core function, in the core function index space.
+    pub core_function: u32,
+    /// The index of the component function type.
+    pub ty: u32,
+}
+
+/// One export of the component: a name for a component function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentExport {
+    /// The export name.
+    pub name: String,
+    /// The index of the component function, in the component function index space.
+    pub function: u32,
 }
 
 /// One instance argument: every import of the instantiated module under `name` resolves to
@@ -156,6 +278,21 @@ pub struct InlineExport {
     pub function: u32,
 }
 
+/// One core instance a component declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreInstance {
+    /// Instantiate the nested core module with index `module`. Each argument binds one of
+    /// the module's import modules to an earlier core instance.
+    Instantiate {
+        module: u32,
+        arguments: Vec<InstanceArgument>,
+    },
+    /// A core instance that exists only to group functions: each export is one function of
+    /// the core function index space. Nothing runs for it; calling one of its exports runs
+    /// the function it names.
+    FromExports { exports: Vec<InlineExport> },
+}
+
 /// One entry of the core function index space: an export of a core instance, named by an
 /// alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,13 +303,15 @@ pub struct CoreFunction {
     pub export: String,
 }
 
-/// A decoded component envelope: the core modules it nests, the core functions its aliases
-/// define, and the core instances it declares, in the order they appear.
+/// A decoded component envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Component {
     core_modules: Vec<Vec<u8>>,
     core_functions: Vec<CoreFunction>,
     core_instances: Vec<CoreInstance>,
+    types: Vec<ComponentFuncType>,
+    functions: Vec<ComponentFunction>,
+    exports: Vec<ComponentExport>,
 }
 
 impl Component {
@@ -206,6 +345,16 @@ impl Component {
                     &component.core_functions,
                     &mut component.core_instances,
                 )?,
+                SECTION_TYPE => decode_types(&mut section, &mut component.types)?,
+                SECTION_CANON => decode_canon(
+                    &mut section,
+                    &component.core_functions,
+                    &component.types,
+                    &mut component.functions,
+                )?,
+                SECTION_EXPORT => {
+                    decode_exports(&mut section, &component.functions, &mut component.exports)?
+                }
                 other => {
                     return Err(ComponentError::UnsupportedSection {
                         id: other,
@@ -213,8 +362,8 @@ impl Component {
                     })
                 }
             }
-            // The aliases and instances must fill their sections exactly.
-            if matches!(id, SECTION_ALIAS | SECTION_CORE_INSTANCE) && !section.at_end() {
+            // Every section with contents must fill its size exactly.
+            if id != SECTION_CUSTOM && id != SECTION_CORE_MODULE && !section.at_end() {
                 return Err(ComponentError::Malformed {
                     offset: section.position(),
                 });
@@ -246,8 +395,24 @@ impl Component {
         &self.core_instances
     }
 
-    /// Instantiate each core instance, in order, on `engine`. A component with no core
-    /// instances runs nothing.
+    /// The component function types, in index order.
+    pub fn component_types(&self) -> &[ComponentFuncType] {
+        &self.types
+    }
+
+    /// The component functions, in index order.
+    pub fn component_functions(&self) -> &[ComponentFunction] {
+        &self.functions
+    }
+
+    /// The component's exports, in the order they appear.
+    pub fn component_exports(&self) -> &[ComponentExport] {
+        &self.exports
+    }
+
+    /// Instantiate each core instance, in order, on `engine`, then check that every
+    /// component function's core type matches its component type, and record the exports.
+    /// A component with no instances runs nothing.
     pub fn instantiate(&self, engine: &Engine) -> Result<ComponentInstance, ComponentError> {
         let mut slots: Vec<Slot> = Vec::with_capacity(self.core_instances.len());
         for (index, instance) in self.core_instances.iter().enumerate() {
@@ -308,8 +473,99 @@ impl Component {
             };
             slots.push(slot);
         }
-        Ok(ComponentInstance { slots })
+
+        // Each lifted function's core type must be the flattening of its component type.
+        for function in &self.functions {
+            let core = &self.core_functions[function.core_function as usize];
+            let ty = &self.types[function.ty as usize];
+            let expected = flat_signature(ty);
+            let Some(CoreInstance::Instantiate { module, .. }) =
+                self.core_instances.get(core.instance as usize)
+            else {
+                return Err(ComponentError::LiftMismatch {
+                    export: core.export.clone(),
+                    message: "the function comes from an inline-exports instance".to_owned(),
+                });
+            };
+            let actual = core_signature(&self.core_modules[*module as usize], &core.export)
+                .map_err(|message| ComponentError::LiftMismatch {
+                    export: core.export.clone(),
+                    message,
+                })?;
+            if actual != expected {
+                return Err(ComponentError::LiftMismatch {
+                    export: core.export.clone(),
+                    message: format!(
+                        "the core function has type {actual:?}, but the component type needs {expected:?}"
+                    ),
+                });
+            }
+        }
+
+        let exports = self
+            .exports
+            .iter()
+            .map(|export| {
+                let function = &self.functions[export.function as usize];
+                let ty = &self.types[function.ty as usize];
+                let core = &self.core_functions[function.core_function as usize];
+                LiftedExport {
+                    name: export.name.clone(),
+                    params: ty.params.clone(),
+                    result: ty.result,
+                    core_instance: core.instance as usize,
+                    core_export: core.export.clone(),
+                }
+            })
+            .collect();
+        Ok(ComponentInstance { slots, exports })
     }
+}
+
+/// The core signature a component function of type `ty` flattens to.
+fn flat_signature(ty: &ComponentFuncType) -> FunctionType {
+    FunctionType {
+        params: ResultType(ty.params.iter().map(|scalar| scalar.flat()).collect()),
+        results: ResultType(ty.result.map(Scalar::flat).into_iter().collect()),
+    }
+}
+
+/// The type of the core function exported as `export` by a module, read from its bytes.
+fn core_signature(bytes: &[u8], export: &str) -> Result<FunctionType, String> {
+    let module = tpt_wasm_decode::decode(bytes)
+        .map_err(|error| format!("the module does not decode: {error:?}"))?;
+    let desc = module
+        .exports
+        .iter()
+        .find(|candidate| candidate.name == export)
+        .map(|candidate| candidate.desc)
+        .ok_or_else(|| format!("the module does not export {export}"))?;
+    let ExportDesc::Function(index) = desc else {
+        return Err(format!("the module's {export} is not a function"));
+    };
+    let imported: Vec<u32> = module
+        .imports
+        .iter()
+        .filter_map(|import| match import.desc {
+            ImportDesc::Function(ty) => Some(ty),
+            _ => None,
+        })
+        .collect();
+    let type_index = match (index as usize).checked_sub(imported.len()) {
+        None => imported[index as usize],
+        Some(defined) => {
+            module
+                .functions
+                .get(defined)
+                .ok_or_else(|| format!("the module has no function {index}"))?
+                .type_index
+        }
+    };
+    module
+        .types
+        .get(type_index as usize)
+        .cloned()
+        .ok_or_else(|| format!("the module has no type {type_index}"))
 }
 
 /// One core instance as it exists at run time.
@@ -327,6 +583,16 @@ struct BoundExport {
     name: String,
     source: usize,
     export: String,
+}
+
+/// An exported component function, ready to call.
+#[derive(Debug)]
+struct LiftedExport {
+    name: String,
+    params: Vec<Scalar>,
+    result: Option<Scalar>,
+    core_instance: usize,
+    core_export: String,
 }
 
 /// Bind the import module `module` to the core instance at `instance`: a runtime instance
@@ -353,16 +619,82 @@ fn bind(linker: &mut Linker, module: &str, slots: &[Slot], instance: usize) -> R
     }
 }
 
-/// The core instances of a running component, in the order the component declares them.
+/// The core instances of a running component, and its lifted exports.
 #[derive(Debug)]
 pub struct ComponentInstance {
     slots: Vec<Slot>,
+    exports: Vec<LiftedExport>,
 }
 
 impl ComponentInstance {
     /// How many core instances the component has.
     pub fn core_instance_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// The names of the component's exports, in the order they appear.
+    pub fn export_names(&self) -> Vec<&str> {
+        self.exports
+            .iter()
+            .map(|export| export.name.as_str())
+            .collect()
+    }
+
+    /// Call an exported component function with scalar arguments. The arguments must match
+    /// the export's parameter types in number and in type, and the result is lifted back to
+    /// the export's result type.
+    pub fn call_export(
+        &mut self,
+        name: &str,
+        arguments: Vec<ComponentValue>,
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        let export = self
+            .exports
+            .iter()
+            .find(|export| export.name == name)
+            .ok_or_else(|| ComponentError::NoSuchExport {
+                name: name.to_owned(),
+            })?;
+        let instance = export.core_instance;
+        let core_export = export.core_export.clone();
+        let params = export.params.clone();
+        let result = export.result;
+        if arguments.len() != params.len() {
+            return Err(ComponentError::ArgumentMismatch {
+                export: name.to_owned(),
+                message: format!(
+                    "it takes {} arguments, and {} were given",
+                    params.len(),
+                    arguments.len()
+                ),
+            });
+        }
+        let mut core_arguments = Vec::with_capacity(arguments.len());
+        for (position, (expected, argument)) in params.iter().zip(&arguments).enumerate() {
+            if argument.scalar() != *expected {
+                return Err(ComponentError::ArgumentMismatch {
+                    export: name.to_owned(),
+                    message: format!(
+                        "argument {position} is {:?}, but {:?} is expected",
+                        argument.scalar(),
+                        expected
+                    ),
+                });
+            }
+            core_arguments.push(lower(*argument));
+        }
+        let core_results = self.call_core(instance, &core_export, core_arguments)?;
+        match (result, core_results.as_slice()) {
+            (None, []) => Ok(Vec::new()),
+            (Some(scalar), [value]) => lift(value.clone(), scalar)
+                .map(|value| vec![value])
+                .map_err(|message| ComponentError::Call { instance, message }),
+            _ => Err(ComponentError::Call {
+                instance,
+                message: "the core function returned a different number of results than its type"
+                    .to_owned(),
+            }),
+        }
     }
 
     /// Call an export of core instance `instance`. For an inline-exports instance, the call
@@ -405,6 +737,33 @@ impl ComponentInstance {
     }
 }
 
+/// The core value a scalar lowers to. Signed and unsigned values share their bits.
+fn lower(value: ComponentValue) -> Value {
+    match value {
+        ComponentValue::S32(value) => Value::I32(value),
+        ComponentValue::U32(value) => Value::I32(value as i32),
+        ComponentValue::S64(value) => Value::I64(value),
+        ComponentValue::U64(value) => Value::I64(value as i64),
+        ComponentValue::F32(value) => Value::F32(value.to_bits()),
+        ComponentValue::F64(value) => Value::F64(value.to_bits()),
+    }
+}
+
+/// The scalar a core value lifts to, when the core value has the scalar's type.
+fn lift(value: Value, scalar: Scalar) -> Result<ComponentValue, String> {
+    match (scalar, value) {
+        (Scalar::S32, Value::I32(value)) => Ok(ComponentValue::S32(value)),
+        (Scalar::U32, Value::I32(value)) => Ok(ComponentValue::U32(value as u32)),
+        (Scalar::S64, Value::I64(value)) => Ok(ComponentValue::S64(value)),
+        (Scalar::U64, Value::I64(value)) => Ok(ComponentValue::U64(value as u64)),
+        (Scalar::F32, Value::F32(bits)) => Ok(ComponentValue::F32(f32::from_bits(bits))),
+        (Scalar::F64, Value::F64(bits)) => Ok(ComponentValue::F64(f64::from_bits(bits))),
+        (scalar, value) => Err(format!(
+            "a core value {value:?} does not lift to {scalar:?}"
+        )),
+    }
+}
+
 /// Decode an alias section's contents: a count, then each alias. Only an export of a core
 /// instance that is a module instance defines a core function, so the other forms are refused.
 fn decode_aliases(
@@ -421,7 +780,7 @@ fn decode_aliases(
                 offset: at,
             });
         }
-        if reader.byte()? != SORT_CORE_FUNC {
+        if reader.byte()? != SORT_FUNC {
             return Err(ComponentError::UnsupportedAlias {
                 what: "alias of a core sort other than function",
                 offset: at,
@@ -492,7 +851,7 @@ fn decode_instances(
                 for _ in 0..export_count {
                     let name = reader.name()?;
                     let sort_at = reader.position();
-                    if reader.byte()? != SORT_CORE_FUNC {
+                    if reader.byte()? != SORT_FUNC {
                         return Err(ComponentError::UnsupportedInstance {
                             what: "inline export of a sort other than function",
                             offset: sort_at,
@@ -511,6 +870,154 @@ fn decode_instances(
             }
             _ => return Err(ComponentError::Malformed { offset: at }),
         }
+    }
+    Ok(())
+}
+
+/// Decode a scalar value type byte, refusing every other type.
+fn scalar(byte: u8, offset: usize) -> Result<Scalar, ComponentError> {
+    match byte {
+        VALTYPE_S32 => Ok(Scalar::S32),
+        VALTYPE_U32 => Ok(Scalar::U32),
+        VALTYPE_S64 => Ok(Scalar::S64),
+        VALTYPE_U64 => Ok(Scalar::U64),
+        VALTYPE_F32 => Ok(Scalar::F32),
+        VALTYPE_F64 => Ok(Scalar::F64),
+        _ => Err(ComponentError::UnsupportedType {
+            what: "a value type other than s32, u32, s64, u64, f32, or f64",
+            offset,
+        }),
+    }
+}
+
+/// Decode a type section's contents: a count, then each function type. A function type is
+/// its tag, a labelled parameter list, and a result: `0x00` and a value type, or `0x01 0x00`
+/// for none.
+fn decode_types(
+    reader: &mut Reader<'_>,
+    types: &mut Vec<ComponentFuncType>,
+) -> Result<(), ComponentError> {
+    let count = reader.u32()?;
+    for _ in 0..count {
+        let at = reader.position();
+        if reader.byte()? != TYPE_FUNC {
+            return Err(ComponentError::UnsupportedType {
+                what: "a type other than a function type",
+                offset: at,
+            });
+        }
+        let parameter_count = reader.u32()?;
+        let mut params = Vec::new();
+        for _ in 0..parameter_count {
+            let _label = reader.name()?;
+            let at_type = reader.position();
+            params.push(scalar(reader.byte()?, at_type)?);
+        }
+        let at_result = reader.position();
+        let result = match reader.byte()? {
+            0x00 => Some(scalar(reader.byte()?, reader.position() - 1)?),
+            0x01 => {
+                if reader.byte()? != 0x00 {
+                    return Err(ComponentError::Malformed { offset: at_result });
+                }
+                None
+            }
+            _ => return Err(ComponentError::Malformed { offset: at_result }),
+        };
+        types.push(ComponentFuncType { params, result });
+    }
+    Ok(())
+}
+
+/// Decode a canon section's contents: a count, then each canonical function. Only lifts of
+/// core functions with no options are supported.
+fn decode_canon(
+    reader: &mut Reader<'_>,
+    core_functions: &[CoreFunction],
+    types: &[ComponentFuncType],
+    functions: &mut Vec<ComponentFunction>,
+) -> Result<(), ComponentError> {
+    let count = reader.u32()?;
+    for _ in 0..count {
+        let at = reader.position();
+        let form = reader.byte()?;
+        if form == CANON_LOWER {
+            return Err(ComponentError::UnsupportedCanon {
+                what: "canon lower",
+                offset: at,
+            });
+        }
+        if form != CANON_LIFT || reader.byte()? != SORT_FUNC {
+            return Err(ComponentError::Malformed { offset: at });
+        }
+        let core_function = reader.u32()?;
+        if core_function as usize >= core_functions.len() {
+            return Err(ComponentError::NoSuchFunction {
+                function: core_function,
+            });
+        }
+        if reader.u32()? != 0 {
+            return Err(ComponentError::UnsupportedCanon {
+                what: "canonical options",
+                offset: at,
+            });
+        }
+        let ty = reader.u32()?;
+        if ty as usize >= types.len() {
+            return Err(ComponentError::NoSuchType { index: ty });
+        }
+        functions.push(ComponentFunction { core_function, ty });
+    }
+    Ok(())
+}
+
+/// Decode an export section's contents: a count, then each export of a component function
+/// with no extern type.
+fn decode_exports(
+    reader: &mut Reader<'_>,
+    functions: &[ComponentFunction],
+    exports: &mut Vec<ComponentExport>,
+) -> Result<(), ComponentError> {
+    let count = reader.u32()?;
+    for _ in 0..count {
+        let at = reader.position();
+        match reader.byte()? {
+            0x00 | 0x01 => {}
+            0x02 => {
+                return Err(ComponentError::UnsupportedExport {
+                    what: "export with attributes",
+                    offset: at,
+                })
+            }
+            _ => return Err(ComponentError::Malformed { offset: at }),
+        }
+        let name = reader.name()?;
+        let sort_at = reader.position();
+        if reader.byte()? != COMPONENT_SORT_FUNC {
+            return Err(ComponentError::UnsupportedExport {
+                what: "export of a sort other than function",
+                offset: sort_at,
+            });
+        }
+        let function = reader.u32()?;
+        if function as usize >= functions.len() {
+            return Err(ComponentError::NoSuchComponentFunction { function });
+        }
+        let flag_at = reader.position();
+        match reader.byte()? {
+            0x00 => {}
+            0x01 => {
+                return Err(ComponentError::UnsupportedExport {
+                    what: "export with an extern type",
+                    offset: flag_at,
+                })
+            }
+            _ => return Err(ComponentError::Malformed { offset: flag_at }),
+        }
+        if exports.iter().any(|export| export.name == name) {
+            return Err(ComponentError::Malformed { offset: at });
+        }
+        exports.push(ComponentExport { name, function });
     }
     Ok(())
 }
@@ -551,7 +1058,7 @@ impl<'a> Reader<'a> {
         Ok(byte)
     }
 
-    /// A core name: a `u32` length, then that many bytes of UTF-8.
+    /// A name: a `u32` length, then that many bytes of UTF-8.
     fn name(&mut self) -> Result<String, ComponentError> {
         let start = self.position;
         let length = self.u32()? as usize;
@@ -614,6 +1121,34 @@ mod tests {
         0x0a, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x0b, // code: call 0, end
     ];
 
+    /// A component type `() -> s32`.
+    const TYPE_NO_ARGUMENTS_S32: [u8; 7] = [SECTION_TYPE, 5, 1, TYPE_FUNC, 0, 0, VALTYPE_S32];
+    /// A component type `() -> u32`.
+    const TYPE_NO_ARGUMENTS_U32: [u8; 7] = [SECTION_TYPE, 5, 1, TYPE_FUNC, 0, 0, VALTYPE_U32];
+    /// A component type `() -> s64`, which does not match the i32 the module returns.
+    const TYPE_NO_ARGUMENTS_S64: [u8; 7] = [SECTION_TYPE, 5, 1, TYPE_FUNC, 0, 0, VALTYPE_S64];
+    /// A component type `() -> ()`, which does not match the module's result.
+    const TYPE_NO_RESULT: [u8; 7] = [SECTION_TYPE, 5, 1, TYPE_FUNC, 0, 1, 0];
+    /// The canon that lifts core function 0 with no options, using type 0.
+    const CANON_LIFT_ANSWER: [u8; 8] = [SECTION_CANON, 6, 1, CANON_LIFT, SORT_FUNC, 0, 0, 0];
+    /// The export of component function 0 as `answer`.
+    const EXPORT_ANSWER: [u8; 14] = [
+        SECTION_EXPORT,
+        12,
+        1,
+        0x00,
+        6,
+        b'a',
+        b'n',
+        b's',
+        b'w',
+        b'e',
+        b'r',
+        COMPONENT_SORT_FUNC,
+        0,
+        0x00,
+    ];
+
     fn with(sections: &[u8]) -> Vec<u8> {
         let mut bytes = PREAMBLE.to_vec();
         bytes.extend_from_slice(sections);
@@ -638,7 +1173,7 @@ mod tests {
             12,
             1,
             SORT_CORE_WRAPPER,
-            SORT_CORE_FUNC,
+            SORT_FUNC,
             ALIAS_CORE_EXPORT,
             0,
             6,
@@ -666,9 +1201,25 @@ mod tests {
             b'w',
             b'e',
             b'r',
-            SORT_CORE_FUNC,
+            SORT_FUNC,
             0,
         ]
+    }
+
+    /// A component that lifts `answer` of the answer module, with the given type, canon, and
+    /// export sections.
+    fn answer_component(types: &[u8], canon: &[u8], export: &[u8]) -> Vec<u8> {
+        let mut bytes = with(&module_section(&ANSWER_MODULE));
+        bytes.extend(instantiate_module_zero());
+        bytes.extend(alias_answer());
+        bytes.extend_from_slice(types);
+        bytes.extend_from_slice(canon);
+        bytes.extend_from_slice(export);
+        bytes
+    }
+
+    fn engine() -> Engine {
+        Engine::new(tpt_wasm_runtime::Config::default()).expect("engine")
     }
 
     #[test]
@@ -677,6 +1228,8 @@ mod tests {
         assert!(component.core_modules().is_empty());
         assert!(component.core_instances().is_empty());
         assert!(component.core_functions().is_empty());
+        assert!(component.component_types().is_empty());
+        assert!(component.component_exports().is_empty());
     }
 
     #[test]
@@ -837,19 +1390,14 @@ mod tests {
     fn an_inline_export_of_a_missing_function_is_refused() {
         let mut bytes = with(&module_section(&ANSWER_MODULE));
         bytes.extend(instantiate_module_zero());
-        bytes.extend(inline_answer_naming(3));
+        let mut section = inline_answer();
+        let last = section.len() - 1;
+        section[last] = 3;
+        bytes.extend(section);
         assert_eq!(
             Component::decode(&bytes),
             Err(ComponentError::NoSuchFunction { function: 3 })
         );
-    }
-
-    /// An inline-exports instance exporting `answer` as the function with index `function`.
-    fn inline_answer_naming(function: u8) -> Vec<u8> {
-        let mut section = inline_answer();
-        let last = section.len() - 1;
-        section[last] = function;
-        section
     }
 
     #[test]
@@ -859,8 +1407,7 @@ mod tests {
         bytes.extend(alias_answer());
         bytes.extend(inline_answer());
         let component = Component::decode(&bytes).expect("decodes");
-        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
-        let mut instance = component.instantiate(&engine).expect("instantiates");
+        let mut instance = component.instantiate(&engine()).expect("instantiates");
         assert_eq!(instance.core_instance_count(), 2);
         assert_eq!(
             instance.call_core(1, "answer", Vec::new()),
@@ -899,8 +1446,7 @@ mod tests {
             1,
         ]);
         let component = Component::decode(&bytes).expect("decodes");
-        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
-        let mut instance = component.instantiate(&engine).expect("instantiates");
+        let mut instance = component.instantiate(&engine()).expect("instantiates");
         assert_eq!(
             instance.call_core(2, "relay", Vec::new()),
             Ok(vec![Value::I32(42)])
@@ -917,7 +1463,7 @@ mod tests {
             13,
             1,
             SORT_CORE_WRAPPER,
-            SORT_CORE_FUNC,
+            SORT_FUNC,
             ALIAS_CORE_EXPORT,
             0,
             7,
@@ -931,9 +1477,8 @@ mod tests {
         ]);
         bytes.extend(inline_answer());
         let component = Component::decode(&bytes).expect("decodes");
-        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
         let error = component
-            .instantiate(&engine)
+            .instantiate(&engine())
             .expect_err("the export is missing");
         assert!(matches!(
             error,
@@ -985,9 +1530,8 @@ mod tests {
         let mut bytes = with(&module_section(&RELAY_MODULE));
         bytes.extend(instantiate_module_zero());
         let component = Component::decode(&bytes).expect("decodes");
-        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
         let error = component
-            .instantiate(&engine)
+            .instantiate(&engine())
             .expect_err("the import is missing");
         assert!(matches!(
             error,
@@ -1000,8 +1544,7 @@ mod tests {
         let mut bytes = with(&module_section(&ANSWER_MODULE));
         bytes.extend(instantiate_module_zero());
         let component = Component::decode(&bytes).expect("decodes");
-        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
-        let mut instance = component.instantiate(&engine).expect("instantiates");
+        let mut instance = component.instantiate(&engine()).expect("instantiates");
         assert_eq!(instance.core_instance_count(), 1);
         assert_eq!(
             instance.call_core(0, "answer", Vec::new()),
@@ -1016,8 +1559,185 @@ mod tests {
     #[test]
     fn a_component_with_no_instances_instantiates_to_nothing() {
         let component = Component::decode(&with(&module_section(&EMPTY_MODULE))).expect("decodes");
-        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
-        let instance = component.instantiate(&engine).expect("instantiates");
+        let instance = component.instantiate(&engine()).expect("instantiates");
         assert_eq!(instance.core_instance_count(), 0);
+        assert!(instance.export_names().is_empty());
+    }
+
+    #[test]
+    fn a_lifted_export_returns_a_typed_value() {
+        let bytes = answer_component(&TYPE_NO_ARGUMENTS_S32, &CANON_LIFT_ANSWER, &EXPORT_ANSWER);
+        let component = Component::decode(&bytes).expect("decodes");
+        assert_eq!(component.component_exports()[0].name, "answer");
+        let mut instance = component.instantiate(&engine()).expect("instantiates");
+        assert_eq!(instance.export_names(), ["answer"]);
+        assert_eq!(
+            instance.call_export("answer", Vec::new()),
+            Ok(vec![ComponentValue::S32(42)])
+        );
+    }
+
+    #[test]
+    fn the_same_bits_lift_to_the_declared_signedness() {
+        let bytes = answer_component(&TYPE_NO_ARGUMENTS_U32, &CANON_LIFT_ANSWER, &EXPORT_ANSWER);
+        let mut instance = Component::decode(&bytes)
+            .expect("decodes")
+            .instantiate(&engine())
+            .expect("instantiates");
+        assert_eq!(
+            instance.call_export("answer", Vec::new()),
+            Ok(vec![ComponentValue::U32(42)])
+        );
+    }
+
+    #[test]
+    fn a_result_of_the_wrong_core_type_is_a_lift_mismatch() {
+        let bytes = answer_component(&TYPE_NO_ARGUMENTS_S64, &CANON_LIFT_ANSWER, &EXPORT_ANSWER);
+        let error = Component::decode(&bytes)
+            .expect("decodes")
+            .instantiate(&engine())
+            .expect_err("i64 is not i32");
+        assert!(matches!(
+            error,
+            ComponentError::LiftMismatch { ref export, .. } if export == "answer"
+        ));
+    }
+
+    #[test]
+    fn a_missing_result_is_a_lift_mismatch() {
+        let bytes = answer_component(&TYPE_NO_RESULT, &CANON_LIFT_ANSWER, &EXPORT_ANSWER);
+        let error = Component::decode(&bytes)
+            .expect("decodes")
+            .instantiate(&engine())
+            .expect_err("the module returns a value");
+        assert!(matches!(error, ComponentError::LiftMismatch { .. }));
+    }
+
+    #[test]
+    fn calls_check_the_argument_count_and_the_export_name() {
+        let bytes = answer_component(&TYPE_NO_ARGUMENTS_S32, &CANON_LIFT_ANSWER, &EXPORT_ANSWER);
+        let mut instance = Component::decode(&bytes)
+            .expect("decodes")
+            .instantiate(&engine())
+            .expect("instantiates");
+        assert!(matches!(
+            instance.call_export("answer", vec![ComponentValue::S32(1)]),
+            Err(ComponentError::ArgumentMismatch { .. })
+        ));
+        assert!(matches!(
+            instance.call_export("missing", Vec::new()),
+            Err(ComponentError::NoSuchExport { .. })
+        ));
+    }
+
+    #[test]
+    fn canon_options_and_canon_lower_are_refused() {
+        let with_options = [SECTION_CANON, 5, 1, CANON_LIFT, SORT_FUNC, 0, 1];
+        assert!(matches!(
+            Component::decode(&answer_component(
+                &TYPE_NO_ARGUMENTS_S32,
+                &with_options,
+                &[]
+            )),
+            Err(ComponentError::UnsupportedCanon {
+                what: "canonical options",
+                ..
+            })
+        ));
+        let lower = [SECTION_CANON, 4, 1, CANON_LOWER, SORT_FUNC, 0];
+        assert!(matches!(
+            Component::decode(&answer_component(&TYPE_NO_ARGUMENTS_S32, &lower, &[])),
+            Err(ComponentError::UnsupportedCanon {
+                what: "canon lower",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_type_outside_the_scalar_subset_is_refused() {
+        // A bool result, which this crate does not lift yet.
+        let bool_result = [SECTION_TYPE, 5, 1, TYPE_FUNC, 0, 0, 0x7f];
+        assert!(matches!(
+            Component::decode(&answer_component(&bool_result, &CANON_LIFT_ANSWER, &[])),
+            Err(ComponentError::UnsupportedType { .. })
+        ));
+    }
+
+    #[test]
+    fn an_export_of_another_sort_or_a_missing_function_is_refused() {
+        let value_sort = [
+            SECTION_EXPORT,
+            12,
+            1,
+            0x00,
+            6,
+            b'a',
+            b'n',
+            b's',
+            b'w',
+            b'e',
+            b'r',
+            0x02,
+            0,
+            0x00,
+        ];
+        assert!(matches!(
+            Component::decode(&answer_component(
+                &TYPE_NO_ARGUMENTS_S32,
+                &CANON_LIFT_ANSWER,
+                &value_sort
+            )),
+            Err(ComponentError::UnsupportedExport { .. })
+        ));
+        let missing_function = [
+            SECTION_EXPORT,
+            12,
+            1,
+            0x00,
+            6,
+            b'a',
+            b'n',
+            b's',
+            b'w',
+            b'e',
+            b'r',
+            COMPONENT_SORT_FUNC,
+            5,
+            0x00,
+        ];
+        assert_eq!(
+            Component::decode(&answer_component(
+                &TYPE_NO_ARGUMENTS_S32,
+                &CANON_LIFT_ANSWER,
+                &missing_function
+            )),
+            Err(ComponentError::NoSuchComponentFunction { function: 5 })
+        );
+    }
+
+    #[test]
+    fn scalars_lower_and_lift_by_their_bits() {
+        assert_eq!(lower(ComponentValue::U32(u32::MAX)), Value::I32(-1));
+        assert_eq!(
+            lift(Value::I32(-1), Scalar::U32),
+            Ok(ComponentValue::U32(u32::MAX))
+        );
+        assert_eq!(
+            lift(Value::I32(-1), Scalar::S32),
+            Ok(ComponentValue::S32(-1))
+        );
+        // A NaN with a payload keeps its bits through the round trip.
+        let nan = f32::from_bits(0x7fc0_1234);
+        let lowered = lower(ComponentValue::F32(nan));
+        assert_eq!(lowered, Value::F32(0x7fc0_1234));
+        assert_eq!(
+            lift(lowered, Scalar::F32).map(|value| match value {
+                ComponentValue::F32(value) => value.to_bits(),
+                _ => 0,
+            }),
+            Ok(0x7fc0_1234)
+        );
+        assert!(lift(Value::I64(1), Scalar::S32).is_err());
     }
 }

@@ -12,5 +12,7 @@ keywords = ["webassembly", "wasm", "component-model"]
 categories = ["wasm"]
 
 [dependencies]
+tpt-wasm-decode.workspace = true
+tpt-wasm-format.workspace = true
 tpt-wasm-runtime.workspace = true
 tpt-wasm-types.workspace = true
