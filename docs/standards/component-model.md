@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types and UTF-8 strings; and takes imported functions from the embedder, lowering them so core code can call them. The WIT mapping and the remaining value types are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`) and UTF-8 strings; and takes imported functions from the embedder, lowering them so core code can call them. The WIT mapping and the compound value types are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -83,11 +83,16 @@ no type to check; the call still checks the number and kinds of its arguments an
 Lowering a function the component defines, and lifting a lowered function, are refused,
 because they would need a component to call back into itself.
 
-Refused, each by name and offset, until its own decoder exists: canonical options (strings,
-memory, and realloc, which need the lifting of linear memory), the other value types
-(`bool`, the small integers, `char`, `string`, records, lists, and the rest), extern types on
-exports, and exports of any sort other than function. Exports of imported functions are
-refused too.
+Refused, each by name and offset, until its own decoder exists: value types beyond the ones
+supported (records, lists, variants, options, results, tuples, enums, flags, resources, and
+the rest), extern types on exports, and exports of any sort other than function. Exports of
+imported functions are refused too.
+
+The scalar types `bool`, `s8`, `u8`, `s16`, `u16`, and `char` each flatten to one `i32`. A
+`bool` lifts to true for any non-zero value. The small integers keep the low bits of the core
+value, and the signed ones sign-extend them. A `char` lifts only when it is a Unicode scalar
+value, so a surrogate or a value above `0x10FFFF` is a call error, the canonical ABI's trap.
+These rules were checked against the same mirror as the strings.
 
 The decoder and the instantiation path take untrusted bytes, so a test truncates every
 fixture at every length and corrupts each byte in four ways. Each variant that decodes is
@@ -110,9 +115,9 @@ Refused, each by name and offset: a string in a lowered import (the host call wo
 caller's memory), more than 16 flat parameters, a memory or `realloc` from another instance,
 any other canonical option, and a string without the options it needs.
 
-Not done: strings in lowered imports, UTF-16 and Latin-1 encodings, `post-return`, the other
-value types (`bool`, the small integers, `char`, records, lists), the component's import type
-checks against the embedder's functions, and the WIT mapping to capabilities.
+Not done: strings in lowered imports, UTF-16 and Latin-1 encodings, `post-return`, records,
+lists, and the other compound types, the component's import type checks against the embedder's
+functions, and the WIT mapping to capabilities.
 
 ## Design constraint
 

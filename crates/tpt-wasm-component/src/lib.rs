@@ -89,6 +89,12 @@ const VALTYPE_U64: u8 = 0x77;
 const VALTYPE_F32: u8 = 0x76;
 const VALTYPE_F64: u8 = 0x75;
 const VALTYPE_STRING: u8 = 0x73;
+const VALTYPE_CHAR: u8 = 0x74;
+const VALTYPE_U16: u8 = 0x7b;
+const VALTYPE_S16: u8 = 0x7c;
+const VALTYPE_U8: u8 = 0x7d;
+const VALTYPE_S8: u8 = 0x7e;
+const VALTYPE_BOOL: u8 = 0x7f;
 
 /// Why a component was refused or could not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +243,14 @@ pub enum Scalar {
     F64,
     /// A UTF-8 string, passed as a pointer and a length into linear memory.
     String,
+    /// A boolean, one `i32`: zero is false, and any other value is true.
+    Bool,
+    S8,
+    U8,
+    S16,
+    U16,
+    /// A Unicode scalar value, one `i32`, which must not be a surrogate or above `0x10FFFF`.
+    Char,
 }
 
 impl Scalar {
@@ -244,7 +258,15 @@ impl Scalar {
     /// takes one, and its length a second.
     fn single(self) -> ValueType {
         match self {
-            Scalar::S32 | Scalar::U32 | Scalar::String => ValueType::I32,
+            Scalar::S32
+            | Scalar::U32
+            | Scalar::String
+            | Scalar::Bool
+            | Scalar::S8
+            | Scalar::U8
+            | Scalar::S16
+            | Scalar::U16
+            | Scalar::Char => ValueType::I32,
             Scalar::S64 | Scalar::U64 => ValueType::I64,
             Scalar::F32 => ValueType::F32,
             Scalar::F64 => ValueType::F64,
@@ -276,6 +298,12 @@ pub enum ComponentValue {
     F32(f32),
     F64(f64),
     String(String),
+    Bool(bool),
+    S8(i8),
+    U8(u8),
+    S16(i16),
+    U16(u16),
+    Char(char),
 }
 
 impl ComponentValue {
@@ -289,6 +317,12 @@ impl ComponentValue {
             ComponentValue::F32(_) => Scalar::F32,
             ComponentValue::F64(_) => Scalar::F64,
             ComponentValue::String(_) => Scalar::String,
+            ComponentValue::Bool(_) => Scalar::Bool,
+            ComponentValue::S8(_) => Scalar::S8,
+            ComponentValue::U8(_) => Scalar::U8,
+            ComponentValue::S16(_) => Scalar::S16,
+            ComponentValue::U16(_) => Scalar::U16,
+            ComponentValue::Char(_) => Scalar::Char,
         }
     }
 }
@@ -1224,6 +1258,12 @@ fn lower_scalar(value: &ComponentValue) -> Option<Value> {
         ComponentValue::F32(value) => Some(Value::F32(value.to_bits())),
         ComponentValue::F64(value) => Some(Value::F64(value.to_bits())),
         ComponentValue::String(_) => None,
+        ComponentValue::Bool(value) => Some(Value::I32(i32::from(*value))),
+        ComponentValue::S8(value) => Some(Value::I32(i32::from(*value))),
+        ComponentValue::U8(value) => Some(Value::I32(i32::from(*value))),
+        ComponentValue::S16(value) => Some(Value::I32(i32::from(*value))),
+        ComponentValue::U16(value) => Some(Value::I32(i32::from(*value))),
+        ComponentValue::Char(value) => Some(Value::I32(*value as u32 as i32)),
     }
 }
 
@@ -1237,6 +1277,16 @@ fn lift(value: Value, scalar: Scalar) -> Result<ComponentValue, String> {
         (Scalar::U64, Value::I64(value)) => Ok(ComponentValue::U64(value as u64)),
         (Scalar::F32, Value::F32(bits)) => Ok(ComponentValue::F32(f32::from_bits(bits))),
         (Scalar::F64, Value::F64(bits)) => Ok(ComponentValue::F64(f64::from_bits(bits))),
+        // A small integer keeps the low bits of the core value, and a signed one sign-extends
+        // them, as the canonical ABI's lift does. A boolean is true for any non-zero value.
+        (Scalar::Bool, Value::I32(value)) => Ok(ComponentValue::Bool(value != 0)),
+        (Scalar::S8, Value::I32(value)) => Ok(ComponentValue::S8(value as i8)),
+        (Scalar::U8, Value::I32(value)) => Ok(ComponentValue::U8(value as u8)),
+        (Scalar::S16, Value::I32(value)) => Ok(ComponentValue::S16(value as i16)),
+        (Scalar::U16, Value::I32(value)) => Ok(ComponentValue::U16(value as u16)),
+        (Scalar::Char, Value::I32(value)) => char::from_u32(value as u32)
+            .map(ComponentValue::Char)
+            .ok_or_else(|| format!("{value:#x} is not a Unicode scalar value")),
         (scalar, value) => Err(format!(
             "a core value {value:?} does not lift to {scalar:?}"
         )),
@@ -1370,8 +1420,14 @@ fn scalar(byte: u8, offset: usize) -> Result<Scalar, ComponentError> {
         VALTYPE_F32 => Ok(Scalar::F32),
         VALTYPE_F64 => Ok(Scalar::F64),
         VALTYPE_STRING => Ok(Scalar::String),
+        VALTYPE_BOOL => Ok(Scalar::Bool),
+        VALTYPE_S8 => Ok(Scalar::S8),
+        VALTYPE_U8 => Ok(Scalar::U8),
+        VALTYPE_S16 => Ok(Scalar::S16),
+        VALTYPE_U16 => Ok(Scalar::U16),
+        VALTYPE_CHAR => Ok(Scalar::Char),
         _ => Err(ComponentError::UnsupportedType {
-            what: "a value type other than s32, u32, s64, u64, f32, f64, or string",
+            what: "a value type this crate does not support",
             offset,
         }),
     }
@@ -2582,8 +2638,8 @@ mod tests {
 
     #[test]
     fn a_type_outside_the_supported_set_is_refused() {
-        // A bool result, which this crate does not support yet.
-        let bool_result = [SECTION_TYPE, 5, 1, TYPE_FUNC, 0, 0, 0x7f];
+        // error-context, a primitive type this crate does not support yet.
+        let bool_result = [SECTION_TYPE, 5, 1, TYPE_FUNC, 0, 0, 0x64];
         assert!(matches!(
             Component::decode(&answer_component(&bool_result, &CANON_LIFT_ANSWER, &[])),
             Err(ComponentError::UnsupportedType { .. })
@@ -2831,6 +2887,101 @@ mod tests {
             instance.call_export("len", vec![ComponentValue::S32(5)]),
             Err(ComponentError::ArgumentMismatch { .. })
         ));
+    }
+
+    /// A component whose `answer` returns `valtype`, lifted from the answer module's 42.
+    fn answer_returning(valtype: u8) -> Vec<u8> {
+        answer_component(
+            &[SECTION_TYPE, 5, 1, TYPE_FUNC, 0, 0, valtype],
+            &CANON_LIFT_ANSWER,
+            &EXPORT_ANSWER,
+        )
+    }
+
+    #[test]
+    fn the_small_and_boolean_types_lift_from_their_core_value() {
+        assert_eq!(
+            lift(Value::I32(2), Scalar::Bool),
+            Ok(ComponentValue::Bool(true))
+        );
+        assert_eq!(
+            lift(Value::I32(0), Scalar::Bool),
+            Ok(ComponentValue::Bool(false))
+        );
+        // The unsigned types keep the low bits; the signed ones sign-extend them.
+        assert_eq!(
+            lift(Value::I32(0x1ff), Scalar::U8),
+            Ok(ComponentValue::U8(0xff))
+        );
+        assert_eq!(
+            lift(Value::I32(0xff), Scalar::S8),
+            Ok(ComponentValue::S8(-1))
+        );
+        assert_eq!(
+            lift(Value::I32(0x8000), Scalar::S16),
+            Ok(ComponentValue::S16(i16::MIN))
+        );
+        assert_eq!(
+            lift(Value::I32(0x1_ffff), Scalar::U16),
+            Ok(ComponentValue::U16(0xffff))
+        );
+        assert_eq!(
+            lift(Value::I32(42), Scalar::Char),
+            Ok(ComponentValue::Char('*'))
+        );
+    }
+
+    #[test]
+    fn a_character_that_is_not_a_scalar_value_traps() {
+        assert!(lift(Value::I32(0xD800), Scalar::Char).is_err());
+        assert!(lift(Value::I32(0xDFFF), Scalar::Char).is_err());
+        assert!(lift(Value::I32(0x11_0000), Scalar::Char).is_err());
+        assert!(lift(Value::I32(-1), Scalar::Char).is_err());
+    }
+
+    #[test]
+    fn the_small_and_boolean_types_lower_to_one_i32() {
+        assert_eq!(
+            lower_scalar(&ComponentValue::Bool(true)),
+            Some(Value::I32(1))
+        );
+        assert_eq!(lower_scalar(&ComponentValue::S8(-1)), Some(Value::I32(-1)));
+        assert_eq!(
+            lower_scalar(&ComponentValue::U8(255)),
+            Some(Value::I32(255))
+        );
+        assert_eq!(lower_scalar(&ComponentValue::S16(-2)), Some(Value::I32(-2)));
+        assert_eq!(
+            lower_scalar(&ComponentValue::U16(65535)),
+            Some(Value::I32(65535))
+        );
+        assert_eq!(
+            lower_scalar(&ComponentValue::Char('A')),
+            Some(Value::I32(65))
+        );
+    }
+
+    #[test]
+    fn exports_return_the_small_and_boolean_types() {
+        let cases = [
+            (VALTYPE_BOOL, ComponentValue::Bool(true)),
+            (VALTYPE_U8, ComponentValue::U8(42)),
+            (VALTYPE_S8, ComponentValue::S8(42)),
+            (VALTYPE_U16, ComponentValue::U16(42)),
+            (VALTYPE_S16, ComponentValue::S16(42)),
+            (VALTYPE_CHAR, ComponentValue::Char('*')),
+        ];
+        for (valtype, expected) in cases {
+            let mut instance = Component::decode(&answer_returning(valtype))
+                .expect("decodes")
+                .instantiate(&engine())
+                .expect("instantiates");
+            assert_eq!(
+                instance.call_export("answer", Vec::new()),
+                Ok(vec![expected]),
+                "valtype {valtype:#x}"
+            );
+        }
     }
 
     /// Every truncation and every single-byte corruption of the fixtures is decoded, and every
