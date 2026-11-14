@@ -177,6 +177,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tpt-wasm-component"
+version = "0.1.0"
+
+[[package]]
 name = "tpt-wasm-decode"
 version = "0.1.0"
 dependencies = [
