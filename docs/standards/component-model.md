@@ -100,8 +100,14 @@ its pointer and its length, as a string is: a parameter is copied into the calle
 read from the pointer the function returns, which needs the memory option. A list of strings or
 records, a list in a record, a list in an import, and a list in a lowered import are refused.
 
+Options (`0x6b`) of a scalar are supported for lifted exports. An option flattens to a
+discriminant and the payload's flat values, so it is a direct parameter. As a result it is always
+returned through memory, and is read back with the discriminant as one byte and the payload at
+its alignment; a discriminant other than 0 or 1 is a call error. An option of a string, a record,
+a list, or an option is refused.
+
 Refused, each by name and offset, until its own decoder exists: value types beyond the ones
-supported (variants, options, results, tuples, enums, flags, resources, and
+supported (variants, results, tuples, enums, flags, resources, and
 the rest), extern types on exports, and exports of any sort other than function. Exports of
 imported functions are refused too.
 
@@ -146,7 +152,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 a separate stage, which will map each parsed function onto the same capability id.
 
 Not done: strings and records in lowered imports, UTF-16 and Latin-1 encodings, `post-return`,
-records passed indirectly, variants, options, results, tuples, enums, flags, and parsing WIT to
+records passed indirectly, variants, results, tuples, enums, flags, and parsing WIT to
 derive the capability ids.
 
 ## Design constraint

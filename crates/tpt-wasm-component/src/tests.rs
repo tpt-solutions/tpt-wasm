@@ -1285,6 +1285,7 @@ fn no_truncation_or_corruption_of_a_component_panics() {
         string_component(&complete_len_canon()),
         record_component(&complete_rec_canon()),
         list_component(&complete_count_canon()),
+        option_component(),
     ];
     let mut decoded = 0usize;
     let mut instantiated = 0usize;
@@ -1802,6 +1803,181 @@ fn a_list_parameter_without_realloc_is_refused() {
         Component::decode(&list_component(&memory_only)),
         Err(ComponentError::UnsupportedCanon {
             what: "a string or list parameter without a realloc option",
+            ..
+        })
+    ));
+}
+
+/// A core module with memory and two functions over an option of `u32`: `has(disc, payload)`
+/// returns the discriminant, and `opt() -> i32` returns the address of an option holding 7, in the
+/// canonical layout (a discriminant byte, then the payload at its alignment).
+fn option_module() -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bytes.extend(section(
+        1,
+        &[2, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 1, 0x7f],
+    ));
+    bytes.extend(section(3, &[2, 0, 1]));
+    bytes.extend(section(5, &[1, 0x00, 1]));
+    bytes.extend(section(
+        7,
+        &[
+            3, 6, b'm', b'e', b'm', b'o', b'r', b'y', 2, 0, 3, b'h', b'a', b's', 0, 0, 3, b'o',
+            b'p', b't', 0, 1,
+        ],
+    ));
+    bytes.extend(section(
+        10,
+        &[2, 4, 0, 0x20, 0, 0x0b, 5, 0, 0x41, 0x80, 0x10, 0x0b],
+    ));
+    // The option at 2048: discriminant 1, three bytes of padding, then the payload 7.
+    bytes.extend(section(
+        11,
+        &[1, 0x00, 0x41, 0x80, 0x10, 0x0b, 8, 1, 0, 0, 0, 7, 0, 0, 0],
+    ));
+    bytes
+}
+
+/// A component over `option_module`: `has` takes an `option<u32>` and returns `u32`, and `opt`
+/// returns an `option<u32>`.
+fn option_component() -> Vec<u8> {
+    let types = section(
+        SECTION_TYPE,
+        &[
+            3,
+            TYPE_OPTION,
+            VALTYPE_U32,
+            TYPE_FUNC,
+            1,
+            1,
+            b'o',
+            0x00,
+            0x00,
+            VALTYPE_U32,
+            TYPE_FUNC,
+            0,
+            0x00,
+            0x00,
+        ],
+    );
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            3, 0, 0, 1, 0, 3, b'h', b'a', b's', 0, 0, 1, 0, 3, b'o', b'p', b't', 0, 2, 1, 0, 6,
+            b'm', b'e', b'm', b'o', b'r', b'y',
+        ],
+    );
+    // `has` needs no memory: its option is passed directly. `opt` returns through memory.
+    let canon = section(
+        SECTION_CANON,
+        &[
+            2,
+            CANON_LIFT,
+            SORT_FUNC,
+            0,
+            0,
+            1,
+            CANON_LIFT,
+            SORT_FUNC,
+            1,
+            1,
+            OPTION_MEMORY,
+            0,
+            2,
+        ],
+    );
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            2,
+            0x00,
+            3,
+            b'h',
+            b'a',
+            b's',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+            0x00,
+            3,
+            b'o',
+            b'p',
+            b't',
+            COMPONENT_SORT_FUNC,
+            1,
+            0x00,
+        ],
+    );
+    let mut bytes = with(&module_section(&option_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+#[test]
+fn an_option_argument_passes_its_discriminant_and_payload() {
+    let mut instance = Component::decode(&option_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    // The module returns the discriminant: 1 for some, 0 for none.
+    assert_eq!(
+        instance.call_export(
+            "has",
+            vec![ComponentValue::Option(Some(Box::new(ComponentValue::U32(
+                7
+            ))))]
+        ),
+        Ok(vec![ComponentValue::U32(1)])
+    );
+    assert_eq!(
+        instance.call_export("has", vec![ComponentValue::Option(None)]),
+        Ok(vec![ComponentValue::U32(0)])
+    );
+}
+
+#[test]
+fn an_option_result_is_read_back_from_memory() {
+    let mut instance = Component::decode(&option_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("opt", Vec::new()),
+        Ok(vec![ComponentValue::Option(Some(Box::new(
+            ComponentValue::U32(7)
+        )))])
+    );
+}
+
+#[test]
+fn an_option_payload_of_another_type_is_refused() {
+    let mut instance = Component::decode(&option_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert!(matches!(
+        instance.call_export(
+            "has",
+            vec![ComponentValue::Option(Some(Box::new(ComponentValue::U8(
+                1
+            ))))]
+        ),
+        Err(ComponentError::ArgumentMismatch { .. })
+    ));
+}
+
+#[test]
+fn an_option_of_a_string_is_refused() {
+    let bytes = with(&section(SECTION_TYPE, &[1, TYPE_OPTION, VALTYPE_STRING]));
+    assert!(matches!(
+        Component::decode(&bytes),
+        Err(ComponentError::UnsupportedType {
+            what: "an option of a string",
             ..
         })
     ));

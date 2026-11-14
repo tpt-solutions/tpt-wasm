@@ -82,6 +82,7 @@ const EXTERN_FUNC: u8 = 0x01;
 const TYPE_FUNC: u8 = 0x40;
 const TYPE_RECORD: u8 = 0x72;
 const TYPE_LIST: u8 = 0x70;
+const TYPE_OPTION: u8 = 0x6b;
 /// The canon tag of a lift, and of a lower.
 const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
@@ -326,6 +327,8 @@ pub enum ComponentType {
     Record(u32),
     /// A list of scalars, by the index of its definition in the component's type table.
     List(u32),
+    /// An option of a scalar, by the index of its definition in the component's type table.
+    Option(u32),
 }
 
 /// One field of a record type.
@@ -346,6 +349,8 @@ pub enum ComponentTypeDef {
     Record(Vec<RecordField>),
     /// A list type, whose elements are of one scalar type.
     List(Scalar),
+    /// An option type, whose payload is of one scalar type.
+    Option(Scalar),
 }
 
 /// A component function type: parameter types and at most one result type.
@@ -377,10 +382,12 @@ pub enum ComponentValue {
     Record(Vec<(String, ComponentValue)>),
     /// A list of scalars, whose elements all have the list's element type.
     List(Vec<ComponentValue>),
+    /// An option: `None`, or the payload.
+    Option(Option<Box<ComponentValue>>),
 }
 
 impl ComponentValue {
-    /// The scalar type of this value, or `None` for a record.
+    /// The scalar type of this value, or `None` for a compound value.
     pub fn scalar(&self) -> Option<Scalar> {
         match self {
             ComponentValue::S32(_) => Some(Scalar::S32),
@@ -396,7 +403,7 @@ impl ComponentValue {
             ComponentValue::S16(_) => Some(Scalar::S16),
             ComponentValue::U16(_) => Some(Scalar::U16),
             ComponentValue::Char(_) => Some(Scalar::Char),
-            ComponentValue::Record(_) | ComponentValue::List(_) => None,
+            ComponentValue::Record(_) | ComponentValue::List(_) | ComponentValue::Option(_) => None,
         }
     }
 }
@@ -914,7 +921,9 @@ impl Component {
     fn func_type(&self, index: u32) -> Option<&ComponentFuncType> {
         match self.types.get(index as usize)? {
             ComponentTypeDef::Func(func) => Some(func),
-            ComponentTypeDef::Record(_) | ComponentTypeDef::List(_) => None,
+            ComponentTypeDef::Record(_)
+            | ComponentTypeDef::List(_)
+            | ComponentTypeDef::Option(_) => None,
         }
     }
 
@@ -937,6 +946,7 @@ impl Component {
                 ComponentType::Scalar(scalar) => Ok(*scalar),
                 ComponentType::Record(_) => Err(format!("the import {name} takes a record")),
                 ComponentType::List(_) => Err(format!("the import {name} takes a list")),
+                ComponentType::Option(_) => Err(format!("the import {name} takes an option")),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let result = match declared.result {
@@ -944,6 +954,9 @@ impl Component {
             Some(ComponentType::Scalar(scalar)) => Some(scalar),
             Some(ComponentType::List(_)) => {
                 return Err(format!("the import {name} returns a list"))
+            }
+            Some(ComponentType::Option(_)) => {
+                return Err(format!("the import {name} returns an option"))
             }
             Some(ComponentType::Record(_)) => {
                 return Err(format!("the import {name} returns a record"))
@@ -997,6 +1010,14 @@ fn flat_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> Vec<ValueType> {
         },
         // A list is its pointer and its length, as a string is.
         ComponentType::List(_) => vec![ValueType::I32, ValueType::I32],
+        // An option is its discriminant, then its payload's flat values.
+        ComponentType::Option(index) => {
+            let mut flat = vec![ValueType::I32];
+            if let Some(ComponentTypeDef::Option(payload)) = types.get(*index as usize) {
+                flat.extend(payload.flat_params());
+            }
+            flat
+        }
     }
 }
 
@@ -1324,6 +1345,33 @@ impl ComponentInstance {
         out: &mut Vec<Value>,
     ) -> Result<(), String> {
         match argument {
+            ComponentValue::Option(payload) => {
+                let ComponentType::Option(index) = ty else {
+                    return Err("an option argument is not an option type".to_owned());
+                };
+                let payload_type = match self.types.get(*index as usize) {
+                    Some(ComponentTypeDef::Option(payload_type)) => *payload_type,
+                    _ => return Err("the option is not defined".to_owned()),
+                };
+                match payload {
+                    None => {
+                        // The discriminant is 0, and the payload is zero, as the canonical ABI gives it.
+                        out.push(Value::I32(0));
+                        out.extend(payload_type.flat_params().into_iter().map(zero_value));
+                    }
+                    Some(value) => {
+                        if value.scalar() != Some(payload_type) {
+                            return Err("an option payload does not match its type".to_owned());
+                        }
+                        out.push(Value::I32(1));
+                        out.push(
+                            lower_scalar(value)
+                                .ok_or_else(|| "an option payload did not lower".to_owned())?,
+                        );
+                    }
+                }
+                Ok(())
+            }
             ComponentValue::List(items) => {
                 let ComponentType::List(index) = ty else {
                     return Err("a list argument is not a list type".to_owned());
@@ -1501,6 +1549,32 @@ impl ComponentInstance {
             ComponentType::Scalar(scalar) => {
                 self.load_scalar(instance, memory, u64::from(pointer), *scalar)
             }
+            ComponentType::Option(index) => {
+                let Some(ComponentTypeDef::Option(payload)) = self.types.get(*index as usize)
+                else {
+                    return Err("the option is not defined".to_owned());
+                };
+                let payload = *payload;
+                // The discriminant is one byte; the payload follows at its aligned offset.
+                let discriminant = self
+                    .read_core_memory(instance, memory, u64::from(pointer), 1)
+                    .map_err(|error| error.to_string())?[0];
+                let (_, payload_align) = payload.size_and_align();
+                let payload_offset = align_to(1, payload_align) as u64;
+                match discriminant {
+                    0 => Ok(ComponentValue::Option(None)),
+                    1 => {
+                        let value = self.load_scalar(
+                            instance,
+                            memory,
+                            u64::from(pointer) + payload_offset,
+                            payload,
+                        )?;
+                        Ok(ComponentValue::Option(Some(Box::new(value))))
+                    }
+                    _ => Err("an option's discriminant is neither 0 nor 1".to_owned()),
+                }
+            }
             ComponentType::List(index) => {
                 let Some(ComponentTypeDef::List(element)) = self.types.get(*index as usize) else {
                     return Err("the list is not defined".to_owned());
@@ -1670,6 +1744,15 @@ fn value_matches(value: &ComponentValue, ty: &ComponentType, types: &[ComponentT
                     *name == field.name && value.scalar() == Some(field.ty)
                 })
         }
+        (ComponentValue::Option(payload), ComponentType::Option(index)) => {
+            let Some(ComponentTypeDef::Option(element)) = types.get(*index as usize) else {
+                return false;
+            };
+            match payload {
+                None => true,
+                Some(value) => value.scalar() == Some(*element),
+            }
+        }
         (ComponentValue::List(items), ComponentType::List(index)) => {
             let Some(ComponentTypeDef::List(element)) = types.get(*index as usize) else {
                 return false;
@@ -1713,7 +1796,20 @@ fn lower_scalar(value: &ComponentValue) -> Option<Value> {
         ComponentValue::S16(value) => Some(Value::I32(i32::from(*value))),
         ComponentValue::U16(value) => Some(Value::I32(i32::from(*value))),
         ComponentValue::Char(value) => Some(Value::I32(*value as u32 as i32)),
-        ComponentValue::String(_) | ComponentValue::Record(_) | ComponentValue::List(_) => None,
+        ComponentValue::String(_)
+        | ComponentValue::Record(_)
+        | ComponentValue::List(_)
+        | ComponentValue::Option(_) => None,
+    }
+}
+
+/// The zero core value of a flat type: what an option's payload is when the option is `None`.
+fn zero_value(ty: ValueType) -> Value {
+    match ty {
+        ValueType::I64 => Value::I64(0),
+        ValueType::F32 => Value::F32(0),
+        ValueType::F64 => Value::F64(0),
+        _ => Value::I32(0),
     }
 }
 
@@ -1921,6 +2017,7 @@ fn value_type(
     match types.get(index as usize) {
         Some(ComponentTypeDef::Record(_)) => Ok(ComponentType::Record(index)),
         Some(ComponentTypeDef::List(_)) => Ok(ComponentType::List(index)),
+        Some(ComponentTypeDef::Option(_)) => Ok(ComponentType::Option(index)),
         Some(ComponentTypeDef::Func(_)) => Err(ComponentError::UnsupportedType {
             what: "a function type used as a value",
             offset: at,
@@ -1978,6 +2075,12 @@ fn decode_types(
                             })
                         }
                         ComponentType::Scalar(ty) => fields.push(RecordField { name, ty }),
+                        ComponentType::Option(_) => {
+                            return Err(ComponentError::UnsupportedType {
+                                what: "an option in a record",
+                                offset: at_field,
+                            })
+                        }
                         ComponentType::List(_) => {
                             return Err(ComponentError::UnsupportedType {
                                 what: "a list in a record",
@@ -1994,6 +2097,27 @@ fn decode_types(
                 }
                 types.push(ComponentTypeDef::Record(fields));
             }
+            TYPE_OPTION => {
+                let payload_at = reader.position();
+                let payload = match value_type(reader, types)? {
+                    ComponentType::Scalar(Scalar::String) => {
+                        return Err(ComponentError::UnsupportedType {
+                            what: "an option of a string",
+                            offset: payload_at,
+                        })
+                    }
+                    ComponentType::Scalar(scalar) => scalar,
+                    ComponentType::Record(_)
+                    | ComponentType::List(_)
+                    | ComponentType::Option(_) => {
+                        return Err(ComponentError::UnsupportedType {
+                            what: "an option of a record, list, or option",
+                            offset: payload_at,
+                        })
+                    }
+                };
+                types.push(ComponentTypeDef::Option(payload));
+            }
             TYPE_LIST => {
                 let element_at = reader.position();
                 let element = match value_type(reader, types)? {
@@ -2004,9 +2128,11 @@ fn decode_types(
                         })
                     }
                     ComponentType::Scalar(scalar) => scalar,
-                    ComponentType::Record(_) | ComponentType::List(_) => {
+                    ComponentType::Record(_)
+                    | ComponentType::List(_)
+                    | ComponentType::Option(_) => {
                         return Err(ComponentError::UnsupportedType {
-                            what: "a list of records or lists",
+                            what: "a list of records, lists, or options",
                             offset: element_at,
                         })
                     }
@@ -2057,11 +2183,12 @@ fn decode_imports(
         let Some(ComponentTypeDef::Func(func)) = types.get(ty as usize) else {
             return Err(ComponentError::NoSuchType { index: ty });
         };
-        let has_record = func
-            .params
-            .iter()
-            .chain(func.result.iter())
-            .any(|ty| matches!(ty, ComponentType::Record(_) | ComponentType::List(_)));
+        let has_record = func.params.iter().chain(func.result.iter()).any(|ty| {
+            matches!(
+                ty,
+                ComponentType::Record(_) | ComponentType::List(_) | ComponentType::Option(_)
+            )
+        });
         if has_record {
             return Err(ComponentError::UnsupportedImport {
                 what: "import with a record or list in its type",
@@ -2131,7 +2258,9 @@ fn decode_canon(
                         return Err(ComponentError::NoSuchType { index: *ty });
                     };
                     if func.params.iter().chain(func.result.iter()).any(|ty| {
-                        holds_string(ty) || holds_list(ty) || matches!(ty, ComponentType::Record(_))
+                        holds_string(ty)
+                            || holds_list(ty)
+                            || matches!(ty, ComponentType::Record(_) | ComponentType::Option(_))
                     }) {
                         return Err(ComponentError::UnsupportedCanon {
                             what: "lowering a function with strings, lists, or records",
