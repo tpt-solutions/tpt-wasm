@@ -7031,6 +7031,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "runs many generated programs through the baseline and Micro; over half an hour under Miri, and covered natively"
+    )]
     fn baseline_matches_micro_over_generated_programs() {
         // Enough programs to reach combinations the hand-written fixtures do
         // not, while staying fast enough for ordinary `cargo test`.
