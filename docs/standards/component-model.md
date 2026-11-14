@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; and lifts exported functions over scalar types. The import checks and the WIT mapping are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types; and takes imported functions from the embedder, lowering them so core code can call them. The WIT mapping and the options and value types beyond scalars are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -72,13 +72,25 @@ component function (`0x01`) with no extern type; each export is then callable wi
 `ComponentInstance::call_export`, which checks the argument count and types and lifts the
 result.
 
-Refused, each by name and offset, until its own decoder exists: canon lower (`0x01 0x00`),
-canonical options (strings, memory, and realloc, which need the lifting of linear memory),
-the other value types (`bool`, the small integers, `char`, `string`, records, lists, and
-the rest), extern types on exports, and exports of any sort other than function.
+Imports (section 10, `0x00` name and `0x01` function type) are functions the embedder supplies
+by name through `Imports`. A component that imports a name the embedder did not supply
+fails with `MissingImport` before anything runs. Canon lower (`0x01 0x00`) turns an import into
+a core function. That core function reaches a core module through an inline-exports instance,
+and binding it as an import registers the embedder's function as a host function, so the
+core module calls the embedder's closure with lifted arguments and lowers the results. The
+closure's type is not checked against the import's declared type, since a Rust closure has
+no type to check; the call still checks the number and kinds of its arguments and results.
+Lowering a function the component defines, and lifting a lowered function, are refused,
+because they would need a component to call back into itself.
 
-Not done: the component's import checks, canon lower, the value types and options above, and
-the WIT mapping to capabilities.
+Refused, each by name and offset, until its own decoder exists: canonical options (strings,
+memory, and realloc, which need the lifting of linear memory), the other value types
+(`bool`, the small integers, `char`, `string`, records, lists, and the rest), extern types on
+exports, and exports of any sort other than function. Exports of imported functions are
+refused too.
+
+Not done: canonical options, the other value types, the component's import type checks
+against the embedder's functions, and the WIT mapping to capabilities.
 
 ## Design constraint
 

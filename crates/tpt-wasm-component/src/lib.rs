@@ -2,21 +2,28 @@
 // Copyright (c) 2026 TPT Solutions
 
 #![forbid(unsafe_code)]
-//! The Component Model envelope, its types, aliases, core instances, and lifted exports.
+//! The Component Model envelope: types, imports, canonical functions, aliases, core
+//! instances, and exports.
 //!
 //! A component is a binary with the Core Wasm magic, the version `0x0d` and the layer
 //! `0x01`, so it cannot be mistaken for a core module, whose layer is zero. After the
 //! preamble comes a sequence of sections: each is an id byte, a `u32` size, and the
 //! contents. This crate reads that framing, collects the core modules a component nests,
-//! decodes the type (7), canon (8), alias (6), core-instance (2) and export (11) sections,
-//! and runs the instances on a runtime `Engine`. A component's exported functions are
-//! lifted from core functions over scalar types. Every other section, and every form it
-//! does not implement, is refused rather than skipped.
+//! decodes the type (7), import (10), canon (8), alias (6), core-instance (2) and export (11)
+//! sections, and runs the instances on a runtime `Engine`.
+//!
+//! The values that cross the boundary are scalars: `s32`, `u32`, `s64`, `u64`, `f32`, and
+//! `f64`. A component function is either an import the embedder supplies, or a core function
+//! lifted to a component type. An import can be lowered to a core function, which a core
+//! module calls back into the embedder through. Every other section, and every form the
+//! crate does not implement, is refused by name and offset rather than skipped.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use tpt_wasm_format::{ExportDesc, ImportDesc};
-use tpt_wasm_runtime::{Engine, Instance, Linker};
+use tpt_wasm_runtime::{Engine, HostFunction, Instance, Linker};
 use tpt_wasm_types::{FunctionType, ResultType, Value, ValueType};
 
 /// The component preamble: the magic, then version `0x0d` and layer `0x01`.
@@ -34,6 +41,8 @@ const SECTION_ALIAS: u8 = 6;
 const SECTION_TYPE: u8 = 7;
 /// The section id of canonical functions.
 const SECTION_CANON: u8 = 8;
+/// The section id of imports.
+const SECTION_IMPORT: u8 = 10;
 /// The section id of exports.
 const SECTION_EXPORT: u8 = 11;
 
@@ -51,19 +60,21 @@ const SORT_CORE_INSTANCE: u8 = 0x12;
 const ALIAS_CORE_EXPORT: u8 = 0x01;
 /// The component sort of a function in an export.
 const COMPONENT_SORT_FUNC: u8 = 0x01;
+/// The extern type tag of a function, in an import.
+const EXTERN_FUNC: u8 = 0x01;
 
 /// The component type tag of a function type.
 const TYPE_FUNC: u8 = 0x40;
 /// The canon tag of a lift, and of a lower.
 const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
-/// The value type bytes this crate lifts.
+/// The value type bytes this crate supports.
+const VALTYPE_S32: u8 = 0x7a;
+const VALTYPE_U32: u8 = 0x79;
 const VALTYPE_S64: u8 = 0x78;
 const VALTYPE_U64: u8 = 0x77;
 const VALTYPE_F32: u8 = 0x76;
 const VALTYPE_F64: u8 = 0x75;
-const VALTYPE_S32: u8 = 0x7a;
-const VALTYPE_U32: u8 = 0x79;
 
 /// Why a component was refused or could not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +94,8 @@ pub enum ComponentError {
     UnsupportedAlias { what: &'static str, offset: usize },
     /// A type this crate does not implement yet.
     UnsupportedType { what: &'static str, offset: usize },
+    /// An import form this crate does not implement yet.
+    UnsupportedImport { what: &'static str, offset: usize },
     /// A canonical function form this crate does not implement yet.
     UnsupportedCanon { what: &'static str, offset: usize },
     /// An export form this crate does not implement yet.
@@ -93,21 +106,23 @@ pub enum ComponentError {
     NoSuchModule { module: u32 },
     /// A reference names a core instance that is not declared before it.
     NoSuchInstance { instance: usize },
-    /// A reference names a core function that no alias defines before it.
+    /// A reference names a core function that is not defined before it.
     NoSuchFunction { function: u32 },
     /// A reference names a component type that is not declared before it.
     NoSuchType { index: u32 },
-    /// A reference names a component function that no canon defines before it.
+    /// A reference names a component function that is not defined before it.
     NoSuchComponentFunction { function: u32 },
     /// No export has this name.
     NoSuchExport { name: String },
+    /// The component imports a function the embedder did not supply.
+    MissingImport { name: String },
     /// A core instance could not be created, with the runtime's reason.
     Instantiate { instance: usize, message: String },
     /// A lifted function's core type does not match its component type.
     LiftMismatch { export: String, message: String },
     /// A call's arguments do not match the export's type.
     ArgumentMismatch { export: String, message: String },
-    /// A call into a core instance failed, with the runtime's reason.
+    /// A call into a core instance, or into an embedder function, failed.
     Call { instance: usize, message: String },
 }
 
@@ -127,6 +142,7 @@ impl fmt::Display for ComponentError {
             ComponentError::UnsupportedInstance { what, offset }
             | ComponentError::UnsupportedAlias { what, offset }
             | ComponentError::UnsupportedType { what, offset }
+            | ComponentError::UnsupportedImport { what, offset }
             | ComponentError::UnsupportedCanon { what, offset }
             | ComponentError::UnsupportedExport { what, offset } => {
                 write!(f, "{what} at byte {offset} is not supported yet")
@@ -163,6 +179,9 @@ impl fmt::Display for ComponentError {
                 )
             }
             ComponentError::NoSuchExport { name } => write!(f, "there is no export named {name}"),
+            ComponentError::MissingImport { name } => {
+                write!(f, "the component imports {name}, which was not supplied")
+            }
             ComponentError::Instantiate { instance, message } => {
                 write!(f, "core instance {instance} did not instantiate: {message}")
             }
@@ -241,13 +260,22 @@ pub struct ComponentFuncType {
     pub result: Option<Scalar>,
 }
 
-/// A component function: a core function lifted to a component type.
+/// A component function: one entry of the component function index space.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ComponentFunction {
-    /// The index of the core function, in the core function index space.
-    pub core_function: u32,
-    /// The index of the component function type.
-    pub ty: u32,
+pub enum ComponentFunction {
+    /// A function the embedder supplies, under this name, of the type with index `ty`.
+    Import { name: String, ty: u32 },
+    /// A core function lifted to the type with index `ty`.
+    Lift { core_function: u32, ty: u32 },
+}
+
+/// One entry of the core function index space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreFunction {
+    /// An export of a core instance, named by an alias.
+    Alias { instance: u32, export: String },
+    /// A component import, lowered so that core code can call it.
+    Lowered { function: u32 },
 }
 
 /// One export of the component: a name for a component function.
@@ -293,14 +321,31 @@ pub enum CoreInstance {
     FromExports { exports: Vec<InlineExport> },
 }
 
-/// One entry of the core function index space: an export of a core instance, named by an
-/// alias.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoreFunction {
-    /// The index of the core instance that exports the function.
-    pub instance: u32,
-    /// The name of the export.
-    pub export: String,
+/// The embedder's implementation of a component import: scalar values in, scalar values out.
+pub type ComponentFn =
+    Arc<dyn Fn(&[ComponentValue]) -> Result<Vec<ComponentValue>, String> + Send + Sync>;
+
+/// The functions an embedder supplies for a component's imports, by name.
+#[derive(Default)]
+pub struct Imports {
+    functions: BTreeMap<String, ComponentFn>,
+}
+
+impl Imports {
+    /// No imports.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Supply the import `name`. The function receives the arguments and returns the results,
+    /// or an error that stops the call that reached it.
+    pub fn define_function<F>(&mut self, name: impl Into<String>, function: F) -> &mut Self
+    where
+        F: Fn(&[ComponentValue]) -> Result<Vec<ComponentValue>, String> + Send + Sync + 'static,
+    {
+        self.functions.insert(name.into(), Arc::new(function));
+        self
+    }
 }
 
 /// A decoded component envelope.
@@ -346,9 +391,12 @@ impl Component {
                     &mut component.core_instances,
                 )?,
                 SECTION_TYPE => decode_types(&mut section, &mut component.types)?,
+                SECTION_IMPORT => {
+                    decode_imports(&mut section, &component.types, &mut component.functions)?
+                }
                 SECTION_CANON => decode_canon(
                     &mut section,
-                    &component.core_functions,
+                    &mut component.core_functions,
                     &component.types,
                     &mut component.functions,
                 )?,
@@ -385,7 +433,7 @@ impl Component {
         &self.core_modules
     }
 
-    /// The core functions the component's aliases define, in index order.
+    /// The core functions, in index order.
     pub fn core_functions(&self) -> &[CoreFunction] {
         &self.core_functions
     }
@@ -410,10 +458,27 @@ impl Component {
         &self.exports
     }
 
-    /// Instantiate each core instance, in order, on `engine`, then check that every
-    /// component function's core type matches its component type, and record the exports.
-    /// A component with no instances runs nothing.
+    /// Instantiate a component that has no imports. See [`Component::instantiate_with`].
     pub fn instantiate(&self, engine: &Engine) -> Result<ComponentInstance, ComponentError> {
+        self.instantiate_with(engine, &Imports::new())
+    }
+
+    /// Instantiate each core instance, in order, on `engine`, with the embedder's `imports`.
+    /// Every import must be supplied. Each lifted function's core type is then checked against
+    /// its component type, and the exports are recorded.
+    pub fn instantiate_with(
+        &self,
+        engine: &Engine,
+        imports: &Imports,
+    ) -> Result<ComponentInstance, ComponentError> {
+        for function in &self.functions {
+            if let ComponentFunction::Import { name, .. } = function {
+                if !imports.functions.contains_key(name) {
+                    return Err(ComponentError::MissingImport { name: name.clone() });
+                }
+            }
+        }
+
         let mut slots: Vec<Slot> = Vec::with_capacity(self.core_instances.len());
         for (index, instance) in self.core_instances.iter().enumerate() {
             let slot = match instance {
@@ -447,25 +512,43 @@ impl Component {
                 CoreInstance::FromExports { exports } => {
                     let mut bound = Vec::with_capacity(exports.len());
                     for export in exports {
-                        let function = &self.core_functions[export.function as usize];
-                        let Slot::Runtime(source) = &slots[function.instance as usize] else {
-                            return Err(ComponentError::Instantiate {
-                                instance: index,
-                                message: "an alias names an inline-exports instance".to_owned(),
-                            });
-                        };
-                        // Check now that the export exists, so a missing one is an error here
-                        // and not at the first call.
-                        source.get_function(&function.export).map_err(|error| {
-                            ComponentError::Instantiate {
-                                instance: index,
-                                message: error.to_string(),
+                        let target = match &self.core_functions[export.function as usize] {
+                            CoreFunction::Alias {
+                                instance: source,
+                                export: source_export,
+                            } => {
+                                let Slot::Runtime(runtime) = &slots[*source as usize] else {
+                                    return Err(ComponentError::Instantiate {
+                                        instance: index,
+                                        message: "an alias names an inline-exports instance"
+                                            .to_owned(),
+                                    });
+                                };
+                                // Check now that the export exists, so a missing one is an
+                                // error here and not at the first call.
+                                runtime.get_function(source_export).map_err(|error| {
+                                    ComponentError::Instantiate {
+                                        instance: index,
+                                        message: error.to_string(),
+                                    }
+                                })?;
+                                Target::Alias {
+                                    source: *source as usize,
+                                    export: source_export.clone(),
+                                }
                             }
-                        })?;
+                            CoreFunction::Lowered { function } => {
+                                Target::Host(self.lowered(*function, imports).map_err(
+                                    |message| ComponentError::Instantiate {
+                                        instance: index,
+                                        message,
+                                    },
+                                )?)
+                            }
+                        };
                         bound.push(BoundExport {
                             name: export.name.clone(),
-                            source: function.instance as usize,
-                            export: function.export.clone(),
+                            target,
                         });
                     }
                     Slot::Exports(bound)
@@ -476,25 +559,35 @@ impl Component {
 
         // Each lifted function's core type must be the flattening of its component type.
         for function in &self.functions {
-            let core = &self.core_functions[function.core_function as usize];
-            let ty = &self.types[function.ty as usize];
-            let expected = flat_signature(ty);
+            let ComponentFunction::Lift { core_function, ty } = function else {
+                continue;
+            };
+            let CoreFunction::Alias { instance, export } =
+                &self.core_functions[*core_function as usize]
+            else {
+                return Err(ComponentError::Instantiate {
+                    instance: 0,
+                    message: "a lift names a lowered function".to_owned(),
+                });
+            };
+            let expected = flat_signature(&self.types[*ty as usize]);
             let Some(CoreInstance::Instantiate { module, .. }) =
-                self.core_instances.get(core.instance as usize)
+                self.core_instances.get(*instance as usize)
             else {
                 return Err(ComponentError::LiftMismatch {
-                    export: core.export.clone(),
+                    export: export.clone(),
                     message: "the function comes from an inline-exports instance".to_owned(),
                 });
             };
-            let actual = core_signature(&self.core_modules[*module as usize], &core.export)
-                .map_err(|message| ComponentError::LiftMismatch {
-                    export: core.export.clone(),
+            let actual = core_signature(&self.core_modules[*module as usize], export).map_err(
+                |message| ComponentError::LiftMismatch {
+                    export: export.clone(),
                     message,
-                })?;
+                },
+            )?;
             if actual != expected {
                 return Err(ComponentError::LiftMismatch {
-                    export: core.export.clone(),
+                    export: export.clone(),
                     message: format!(
                         "the core function has type {actual:?}, but the component type needs {expected:?}"
                     ),
@@ -502,23 +595,53 @@ impl Component {
             }
         }
 
-        let exports = self
-            .exports
-            .iter()
-            .map(|export| {
-                let function = &self.functions[export.function as usize];
-                let ty = &self.types[function.ty as usize];
-                let core = &self.core_functions[function.core_function as usize];
-                LiftedExport {
-                    name: export.name.clone(),
-                    params: ty.params.clone(),
-                    result: ty.result,
-                    core_instance: core.instance as usize,
-                    core_export: core.export.clone(),
-                }
-            })
-            .collect();
+        let mut exports = Vec::with_capacity(self.exports.len());
+        for export in &self.exports {
+            let ComponentFunction::Lift { core_function, ty } =
+                &self.functions[export.function as usize]
+            else {
+                return Err(ComponentError::NoSuchComponentFunction {
+                    function: export.function,
+                });
+            };
+            let CoreFunction::Alias {
+                instance,
+                export: core_export,
+            } = &self.core_functions[*core_function as usize]
+            else {
+                return Err(ComponentError::NoSuchFunction {
+                    function: *core_function,
+                });
+            };
+            let ty = &self.types[*ty as usize];
+            exports.push(LiftedExport {
+                name: export.name.clone(),
+                params: ty.params.clone(),
+                result: ty.result,
+                core_instance: *instance as usize,
+                core_export: core_export.clone(),
+            });
+        }
         Ok(ComponentInstance { slots, exports })
+    }
+
+    /// The host function a lowered import is, given the embedder's implementation.
+    fn lowered(&self, function: u32, imports: &Imports) -> Result<LoweredHost, String> {
+        let ComponentFunction::Import { name, ty } = &self.functions[function as usize] else {
+            return Err("a lowered function is not an import".to_owned());
+        };
+        let closure = imports
+            .functions
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("the import {name} was not supplied"))?;
+        let ty = &self.types[*ty as usize];
+        Ok(LoweredHost {
+            name: name.clone(),
+            closure,
+            params: ty.params.clone(),
+            result: ty.result,
+        })
     }
 }
 
@@ -568,21 +691,84 @@ fn core_signature(bytes: &[u8], export: &str) -> Result<FunctionType, String> {
         .ok_or_else(|| format!("the module has no type {type_index}"))
 }
 
+/// What an inline export of a core instance runs.
+#[derive(Debug, Clone)]
+enum Target {
+    /// A function of an instance that was created on the engine.
+    Alias { source: usize, export: String },
+    /// An embedder function, lowered to a core function.
+    Host(LoweredHost),
+}
+
 /// One core instance as it exists at run time.
 #[derive(Debug)]
 enum Slot {
     /// An instance created on the engine. Boxed, so the variants stay close in size.
     Runtime(Box<Instance>),
-    /// An inline-exports instance: each export names a function of a runtime instance.
+    /// An inline-exports instance: each export names what runs for it.
     Exports(Vec<BoundExport>),
 }
 
-/// One export of an inline-exports instance, resolved to the instance that runs it.
-#[derive(Debug)]
+/// One export of an inline-exports instance.
+#[derive(Debug, Clone)]
 struct BoundExport {
     name: String,
-    source: usize,
-    export: String,
+    target: Target,
+}
+
+/// An embedder function, as a core function: its arguments are lifted and its results lowered.
+#[derive(Clone)]
+struct LoweredHost {
+    name: String,
+    closure: ComponentFn,
+    params: Vec<Scalar>,
+    result: Option<Scalar>,
+}
+
+impl fmt::Debug for LoweredHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LoweredHost({})", self.name)
+    }
+}
+
+impl LoweredHost {
+    /// Run the embedder's function on the lifted arguments, and lower its results.
+    fn invoke(&self, args: &[Value]) -> Result<Vec<Value>, String> {
+        if args.len() != self.params.len() {
+            return Err(format!(
+                "the import {} takes {} arguments, and {} were given",
+                self.name,
+                self.params.len(),
+                args.len()
+            ));
+        }
+        let mut values = Vec::with_capacity(args.len());
+        for (arg, scalar) in args.iter().zip(&self.params) {
+            values.push(lift(arg.clone(), *scalar)?);
+        }
+        let results = (self.closure)(&values)?;
+        match (self.result, results.as_slice()) {
+            (None, []) => Ok(Vec::new()),
+            (Some(scalar), [value]) if value.scalar() == scalar => Ok(vec![lower(*value)]),
+            _ => Err(format!(
+                "the import {} returned values that do not match its type",
+                self.name
+            )),
+        }
+    }
+}
+
+impl HostFunction for LoweredHost {
+    fn function_type(&self) -> FunctionType {
+        FunctionType {
+            params: ResultType(self.params.iter().map(|scalar| scalar.flat()).collect()),
+            results: ResultType(self.result.map(Scalar::flat).into_iter().collect()),
+        }
+    }
+
+    fn call(&self, args: &[Value]) -> Result<Vec<Value>, String> {
+        self.invoke(args)
+    }
 }
 
 /// An exported component function, ready to call.
@@ -597,7 +783,7 @@ struct LiftedExport {
 
 /// Bind the import module `module` to the core instance at `instance`: a runtime instance
 /// binds all of its exports, and an inline-exports instance binds each of its functions to
-/// the export that runs it.
+/// what runs for it.
 fn bind(linker: &mut Linker, module: &str, slots: &[Slot], instance: usize) -> Result<(), String> {
     match &slots[instance] {
         Slot::Runtime(runtime) => linker
@@ -606,13 +792,23 @@ fn bind(linker: &mut Linker, module: &str, slots: &[Slot], instance: usize) -> R
             .map_err(|error| error.to_string()),
         Slot::Exports(bound) => {
             for export in bound {
-                let Slot::Runtime(source) = &slots[export.source] else {
-                    return Err("an alias names an inline-exports instance".to_owned());
-                };
-                linker
-                    .define_export(module, export.name.as_str(), source, &export.export)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())?;
+                match &export.target {
+                    Target::Alias {
+                        source,
+                        export: name,
+                    } => {
+                        let Slot::Runtime(source) = &slots[*source] else {
+                            return Err("an alias names an inline-exports instance".to_owned());
+                        };
+                        linker
+                            .define_export(module, export.name.as_str(), source, name)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Target::Host(host) => {
+                        linker.define_function(module, export.name.as_str(), host.clone());
+                    }
+                }
             }
             Ok(())
         }
@@ -698,42 +894,50 @@ impl ComponentInstance {
     }
 
     /// Call an export of core instance `instance`. For an inline-exports instance, the call
-    /// runs the function it names, in the instance that defines it.
+    /// runs what the export names: a function of its defining instance, or an embedder function.
     pub fn call_core(
         &mut self,
         instance: usize,
         name: &str,
         args: Vec<Value>,
     ) -> Result<Vec<Value>, ComponentError> {
-        let (target, export) = match self
+        let target = match self
             .slots
             .get(instance)
             .ok_or(ComponentError::NoSuchInstance { instance })?
         {
-            Slot::Runtime(_) => (instance, name.to_owned()),
-            Slot::Exports(bound) => {
-                let export = bound
-                    .iter()
-                    .find(|export| export.name == name)
-                    .ok_or_else(|| ComponentError::Call {
+            Slot::Runtime(_) => Target::Alias {
+                source: instance,
+                export: name.to_owned(),
+            },
+            Slot::Exports(bound) => bound
+                .iter()
+                .find(|export| export.name == name)
+                .map(|export| export.target.clone())
+                .ok_or_else(|| ComponentError::Call {
+                    instance,
+                    message: format!("there is no export named {name}"),
+                })?,
+        };
+        match target {
+            Target::Alias { source, export } => {
+                let Slot::Runtime(runtime) = &mut self.slots[source] else {
+                    return Err(ComponentError::Call {
                         instance,
-                        message: format!("there is no export named {name}"),
-                    })?;
-                (export.source, export.export.clone())
+                        message: "the export's source is not a runtime instance".to_owned(),
+                    });
+                };
+                runtime
+                    .call(&export, args)
+                    .map_err(|error| ComponentError::Call {
+                        instance,
+                        message: error.to_string(),
+                    })
             }
-        };
-        let Slot::Runtime(runtime) = &mut self.slots[target] else {
-            return Err(ComponentError::Call {
-                instance,
-                message: "the export's source is not a runtime instance".to_owned(),
-            });
-        };
-        runtime
-            .call(&export, args)
-            .map_err(|error| ComponentError::Call {
-                instance,
-                message: error.to_string(),
-            })
+            Target::Host(host) => host
+                .invoke(&args)
+                .map_err(|message| ComponentError::Call { instance, message }),
+        }
     }
 }
 
@@ -805,7 +1009,7 @@ fn decode_aliases(
                 offset: at,
             });
         }
-        functions.push(CoreFunction { instance, export });
+        functions.push(CoreFunction::Alias { instance, export });
     }
     Ok(())
 }
@@ -915,7 +1119,10 @@ fn decode_types(
         }
         let at_result = reader.position();
         let result = match reader.byte()? {
-            0x00 => Some(scalar(reader.byte()?, reader.position() - 1)?),
+            0x00 => {
+                let at_type = reader.position();
+                Some(scalar(reader.byte()?, at_type)?)
+            }
             0x01 => {
                 if reader.byte()? != 0x00 {
                     return Err(ComponentError::Malformed { offset: at_result });
@@ -929,11 +1136,56 @@ fn decode_types(
     Ok(())
 }
 
-/// Decode a canon section's contents: a count, then each canonical function. Only lifts of
-/// core functions with no options are supported.
+/// Decode an import section's contents: a count, then each import. Only a function import,
+/// with no attributes, is supported; the embedder supplies its implementation by name.
+fn decode_imports(
+    reader: &mut Reader<'_>,
+    types: &[ComponentFuncType],
+    functions: &mut Vec<ComponentFunction>,
+) -> Result<(), ComponentError> {
+    let count = reader.u32()?;
+    for _ in 0..count {
+        let at = reader.position();
+        match reader.byte()? {
+            0x00 | 0x01 => {}
+            0x02 => {
+                return Err(ComponentError::UnsupportedImport {
+                    what: "import with attributes",
+                    offset: at,
+                })
+            }
+            _ => return Err(ComponentError::Malformed { offset: at }),
+        }
+        let name = reader.name()?;
+        let sort_at = reader.position();
+        if reader.byte()? != EXTERN_FUNC {
+            return Err(ComponentError::UnsupportedImport {
+                what: "import of a sort other than function",
+                offset: sort_at,
+            });
+        }
+        let ty = reader.u32()?;
+        if ty as usize >= types.len() {
+            return Err(ComponentError::NoSuchType { index: ty });
+        }
+        let duplicate = functions.iter().any(|function| {
+            matches!(function, ComponentFunction::Import { name: existing, .. } if *existing == name)
+        });
+        if duplicate {
+            return Err(ComponentError::Malformed { offset: at });
+        }
+        functions.push(ComponentFunction::Import { name, ty });
+    }
+    Ok(())
+}
+
+/// Decode a canon section's contents: a count, then each canonical function. A lift turns a
+/// core function into a component function; a lower turns an import into a core function.
+/// Canonical options are refused, and so are lowers of anything but an import and lifts of
+/// anything but an alias.
 fn decode_canon(
     reader: &mut Reader<'_>,
-    core_functions: &[CoreFunction],
+    core_functions: &mut Vec<CoreFunction>,
     types: &[ComponentFuncType],
     functions: &mut Vec<ComponentFunction>,
 ) -> Result<(), ComponentError> {
@@ -941,38 +1193,58 @@ fn decode_canon(
     for _ in 0..count {
         let at = reader.position();
         let form = reader.byte()?;
-        if form == CANON_LOWER {
-            return Err(ComponentError::UnsupportedCanon {
-                what: "canon lower",
-                offset: at,
-            });
-        }
-        if form != CANON_LIFT || reader.byte()? != SORT_FUNC {
+        if form != CANON_LIFT && form != CANON_LOWER {
             return Err(ComponentError::Malformed { offset: at });
         }
-        let core_function = reader.u32()?;
-        if core_function as usize >= core_functions.len() {
-            return Err(ComponentError::NoSuchFunction {
-                function: core_function,
-            });
+        if reader.byte()? != SORT_FUNC {
+            return Err(ComponentError::Malformed { offset: at });
         }
-        if reader.u32()? != 0 {
+        let index = reader.u32()?;
+        let options = reader.u32()?;
+        if options != 0 {
             return Err(ComponentError::UnsupportedCanon {
                 what: "canonical options",
                 offset: at,
             });
         }
-        let ty = reader.u32()?;
-        if ty as usize >= types.len() {
-            return Err(ComponentError::NoSuchType { index: ty });
+        if form == CANON_LOWER {
+            match functions.get(index as usize) {
+                None => return Err(ComponentError::NoSuchComponentFunction { function: index }),
+                Some(ComponentFunction::Lift { .. }) => {
+                    return Err(ComponentError::UnsupportedCanon {
+                        what: "lowering a function the component defines",
+                        offset: at,
+                    })
+                }
+                Some(ComponentFunction::Import { .. }) => {
+                    core_functions.push(CoreFunction::Lowered { function: index });
+                }
+            }
+        } else {
+            let ty = reader.u32()?;
+            if index as usize >= core_functions.len() {
+                return Err(ComponentError::NoSuchFunction { function: index });
+            }
+            if ty as usize >= types.len() {
+                return Err(ComponentError::NoSuchType { index: ty });
+            }
+            if let CoreFunction::Lowered { .. } = core_functions[index as usize] {
+                return Err(ComponentError::UnsupportedCanon {
+                    what: "lifting a lowered function",
+                    offset: at,
+                });
+            }
+            functions.push(ComponentFunction::Lift {
+                core_function: index,
+                ty,
+            });
         }
-        functions.push(ComponentFunction { core_function, ty });
     }
     Ok(())
 }
 
-/// Decode an export section's contents: a count, then each export of a component function
-/// with no extern type.
+/// Decode an export section's contents: a count, then each export of a lifted component
+/// function with no extern type.
 fn decode_exports(
     reader: &mut Reader<'_>,
     functions: &[ComponentFunction],
@@ -1000,8 +1272,15 @@ fn decode_exports(
             });
         }
         let function = reader.u32()?;
-        if function as usize >= functions.len() {
-            return Err(ComponentError::NoSuchComponentFunction { function });
+        match functions.get(function as usize) {
+            None => return Err(ComponentError::NoSuchComponentFunction { function }),
+            Some(ComponentFunction::Import { .. }) => {
+                return Err(ComponentError::UnsupportedExport {
+                    what: "export of an imported function",
+                    offset: sort_at,
+                })
+            }
+            Some(ComponentFunction::Lift { .. }) => {}
         }
         let flag_at = reader.position();
         match reader.byte()? {
@@ -1155,10 +1434,16 @@ mod tests {
         bytes
     }
 
+    /// A section with `content`, whose size fits in one byte.
+    fn section(id: u8, content: &[u8]) -> Vec<u8> {
+        assert!(content.len() < 128, "the test section is too large");
+        let mut out = vec![id, content.len() as u8];
+        out.extend_from_slice(content);
+        out
+    }
+
     fn module_section(module: &[u8]) -> Vec<u8> {
-        let mut section = vec![SECTION_CORE_MODULE, module.len() as u8];
-        section.extend_from_slice(module);
-        section
+        section(SECTION_CORE_MODULE, module)
     }
 
     /// Core instance 0 instantiates module 0 with no arguments.
@@ -1220,6 +1505,99 @@ mod tests {
 
     fn engine() -> Engine {
         Engine::new(tpt_wasm_runtime::Config::default()).expect("engine")
+    }
+
+    /// A core module that imports `env.add`, a function of two `i32` returning an `i32`, and
+    /// exports `run`, which calls it with 2 and 3.
+    fn host_user_module() -> Vec<u8> {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        bytes.extend(section(
+            1,
+            &[2, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 1, 0x7f],
+        ));
+        bytes.extend(section(
+            2,
+            &[1, 3, b'e', b'n', b'v', 3, b'a', b'd', b'd', 0, 0],
+        ));
+        bytes.extend(section(3, &[1, 1]));
+        bytes.extend(section(7, &[1, 3, b'r', b'u', b'n', 0, 1]));
+        bytes.extend(section(10, &[1, 8, 0, 0x41, 2, 0x41, 3, 0x10, 0, 0x0b]));
+        bytes
+    }
+
+    /// A component that imports `add: (s32, s32) -> s32`, lowers it, instantiates the host
+    /// user module with it, and exports `run: () -> s32`, which the module computes as
+    /// `add(2, 3)`.
+    fn host_component() -> Vec<u8> {
+        // Type 0 is (s32, s32) -> s32; type 1 is () -> s32.
+        let types = section(
+            SECTION_TYPE,
+            &[
+                2,
+                0x40,
+                2,
+                1,
+                b'a',
+                VALTYPE_S32,
+                1,
+                b'b',
+                VALTYPE_S32,
+                0,
+                VALTYPE_S32,
+                0x40,
+                0,
+                0,
+                VALTYPE_S32,
+            ],
+        );
+        let import = section(
+            SECTION_IMPORT,
+            &[1, 0x00, 3, b'a', b'd', b'd', EXTERN_FUNC, 0],
+        );
+        // Lower component function 0 (the import) into core function 0.
+        let lower = section(SECTION_CANON, &[1, CANON_LOWER, SORT_FUNC, 0, 0]);
+        // Core instance 0 is the inline "add"; core instance 1 runs the host user with "env"
+        // bound to instance 0.
+        let instances = section(
+            SECTION_CORE_INSTANCE,
+            &[
+                2,
+                0x01,
+                1,
+                3,
+                b'a',
+                b'd',
+                b'd',
+                SORT_FUNC,
+                0,
+                0x00,
+                0,
+                1,
+                3,
+                b'e',
+                b'n',
+                b'v',
+                SORT_CORE_INSTANCE,
+                0,
+            ],
+        );
+        // Core function 1 is the export `run` of core instance 1.
+        let alias = section(SECTION_ALIAS, &[1, 0, 0, 1, 1, 3, b'r', b'u', b'n']);
+        // Component function 1 lifts core function 1 with type 1.
+        let lift = section(SECTION_CANON, &[1, CANON_LIFT, SORT_FUNC, 1, 0, 1]);
+        let export = section(
+            SECTION_EXPORT,
+            &[1, 0x00, 3, b'r', b'u', b'n', COMPONENT_SORT_FUNC, 1, 0x00],
+        );
+        let mut bytes = with(&module_section(&host_user_module()));
+        bytes.extend(types);
+        bytes.extend(import);
+        bytes.extend(lower);
+        bytes.extend(instances);
+        bytes.extend(alias);
+        bytes.extend(lift);
+        bytes.extend(export);
+        bytes
     }
 
     #[test]
@@ -1347,7 +1725,7 @@ mod tests {
         let component = Component::decode(&bytes).expect("decodes");
         assert_eq!(
             component.core_functions(),
-            [CoreFunction {
+            [CoreFunction::Alias {
                 instance: 0,
                 export: "answer".to_owned(),
             }]
@@ -1631,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn canon_options_and_canon_lower_are_refused() {
+    fn canon_options_are_refused_and_a_lower_needs_an_import() {
         let with_options = [SECTION_CANON, 5, 1, CANON_LIFT, SORT_FUNC, 0, 1];
         assert!(matches!(
             Component::decode(&answer_component(
@@ -1644,14 +2022,12 @@ mod tests {
                 ..
             })
         ));
-        let lower = [SECTION_CANON, 4, 1, CANON_LOWER, SORT_FUNC, 0];
-        assert!(matches!(
+        // With no functions defined, a lower of function 0 names nothing.
+        let lower = [SECTION_CANON, 5, 1, CANON_LOWER, SORT_FUNC, 0, 0];
+        assert_eq!(
             Component::decode(&answer_component(&TYPE_NO_ARGUMENTS_S32, &lower, &[])),
-            Err(ComponentError::UnsupportedCanon {
-                what: "canon lower",
-                ..
-            })
-        ));
+            Err(ComponentError::NoSuchComponentFunction { function: 0 })
+        );
     }
 
     #[test]
@@ -1714,6 +2090,115 @@ mod tests {
             )),
             Err(ComponentError::NoSuchComponentFunction { function: 5 })
         );
+    }
+
+    #[test]
+    fn an_import_with_attributes_or_another_sort_is_refused() {
+        let with_attributes = section(SECTION_IMPORT, &[1, 0x02, 3, b'a', b'd', b'd', 0, 0]);
+        assert!(matches!(
+            Component::decode(&with(&with_attributes)),
+            Err(ComponentError::UnsupportedImport { .. })
+        ));
+        let instance_sort = section(SECTION_IMPORT, &[1, 0x00, 3, b'a', b'd', b'd', 0x05, 0]);
+        assert!(matches!(
+            Component::decode(&with(&instance_sort)),
+            Err(ComponentError::UnsupportedImport { .. })
+        ));
+    }
+
+    #[test]
+    fn an_export_of_an_imported_function_is_refused() {
+        let types = section(SECTION_TYPE, &[1, 0x40, 0, 0, VALTYPE_S32]);
+        let import = section(
+            SECTION_IMPORT,
+            &[1, 0x00, 3, b'a', b'd', b'd', EXTERN_FUNC, 0],
+        );
+        let export = section(
+            SECTION_EXPORT,
+            &[1, 0x00, 3, b'a', b'd', b'd', COMPONENT_SORT_FUNC, 0, 0x00],
+        );
+        let mut bytes = with(&types);
+        bytes.extend(import);
+        bytes.extend(export);
+        assert!(matches!(
+            Component::decode(&bytes),
+            Err(ComponentError::UnsupportedExport {
+                what: "export of an imported function",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lifting_a_lowered_function_is_refused() {
+        let types = section(SECTION_TYPE, &[1, 0x40, 0, 0, VALTYPE_S32]);
+        let import = section(
+            SECTION_IMPORT,
+            &[1, 0x00, 3, b'a', b'd', b'd', EXTERN_FUNC, 0],
+        );
+        let lower = section(SECTION_CANON, &[1, CANON_LOWER, SORT_FUNC, 0, 0]);
+        let lift_lowered = section(SECTION_CANON, &[1, CANON_LIFT, SORT_FUNC, 0, 0, 0]);
+        let mut bytes = with(&types);
+        bytes.extend(import);
+        bytes.extend(lower);
+        bytes.extend(lift_lowered);
+        assert!(matches!(
+            Component::decode(&bytes),
+            Err(ComponentError::UnsupportedCanon {
+                what: "lifting a lowered function",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_lowered_import_calls_the_embedder_function() {
+        let bytes = host_component();
+        let component = Component::decode(&bytes).expect("decodes");
+        assert_eq!(component.component_functions().len(), 2);
+        let mut imports = Imports::new();
+        imports.define_function("add", |args| match args {
+            [ComponentValue::S32(a), ComponentValue::S32(b)] => {
+                Ok(vec![ComponentValue::S32(a + b)])
+            }
+            _ => Err("add takes two s32 values".to_owned()),
+        });
+        let mut instance = component
+            .instantiate_with(&engine(), &imports)
+            .expect("instantiates");
+        // The module computes add(2, 3) through the lowered import.
+        assert_eq!(
+            instance.call_export("run", Vec::new()),
+            Ok(vec![ComponentValue::S32(5)])
+        );
+    }
+
+    #[test]
+    fn a_missing_import_is_refused_before_anything_runs() {
+        let component = Component::decode(&host_component()).expect("decodes");
+        let error = component
+            .instantiate(&engine())
+            .expect_err("the import is not supplied");
+        assert_eq!(
+            error,
+            ComponentError::MissingImport {
+                name: "add".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn an_embedder_function_error_stops_the_call() {
+        let component = Component::decode(&host_component()).expect("decodes");
+        let mut imports = Imports::new();
+        imports.define_function("add", |_| Err("refused".to_owned()));
+        let mut instance = component
+            .instantiate_with(&engine(), &imports)
+            .expect("instantiates");
+        assert!(matches!(
+            instance.call_export("run", Vec::new()),
+            Err(ComponentError::Call { .. })
+        ));
     }
 
     #[test]
