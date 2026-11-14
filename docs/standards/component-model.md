@@ -158,7 +158,7 @@ The scalar types `bool`, `s8`, `u8`, `s16`, `u16`, and `char` each flatten to on
 `bool` lifts to true for any non-zero value. The small integers keep the low bits of the core
 value, and the signed ones sign-extend them. A `char` lifts only when it is a Unicode scalar
 value, so a surrogate or a value above `0x10FFFF` is a call error, the canonical ABI's trap.
-These rules were checked against the same mirror as the strings.
+These rules were checked against the canonical files (see the end of the Strings paragraph).
 
 The decoder and the instantiation path take untrusted bytes, so a test truncates every
 fixture at every length and corrupts each byte in four ways. Each variant that decodes is
@@ -173,9 +173,12 @@ and must be valid UTF-8. The flattening rules (a maximum of 16 flat parameters, 
 and the return-pointer convention for a multi-value result) are the canonical ABI's, and the
 crate passes more than 16 flat parameters indirectly, as the Records paragraph explains.
 
-The rules were checked against a mirror of the Canonical ABI text, `clunt.github.io/component-model/design/mvp/CanonicalABI.html`,
-because the canonical file itself did not render for the fetch. They should be checked again
-against the canonical file before a release.
+The rules were checked against the canonical files, `design/mvp/CanonicalABI.md` and `design/mvp/Binary.md`
+at the `main` branch of `WebAssembly/component-model`, fetched on 2026-11-14. That check confirmed the
+alignment and size rules for every type, the discriminant sizes (one byte up to 256 cases, two up to
+65536), the flags sizes, the variant case's trailing refines byte, and the flat limits, including the
+pointer a lowered function takes past 16 parameters. An earlier pass used a mirror of the text, which the
+canonical file now supersedes. The file is still a moving target, so it should be read again before a release.
 
 Refused, each by name and offset: a string in a lowered import (the host call would need the
 caller's memory), a memory or `realloc` from another instance,
