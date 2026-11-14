@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing, and results and variants whose payloads differ in flat type, are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and results and variants whose payloads differ in flat type are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
