@@ -837,6 +837,79 @@ pub(super) fn unlink_file(
     errno::SUCCESS
 }
 
+/// One path of a two-path call: a directory descriptor and a path under it.
+pub(super) struct PathArg {
+    pub dirfd: u64,
+    pub path_at: u64,
+    pub path_len: u64,
+}
+
+/// `path_rename`: move a file or directory to a new name inside one preopen. A target that
+/// exists is replaced only when the two are alike: a file for a file, or an empty directory
+/// for a directory. A directory is never moved into itself. Descriptors already open on the
+/// old path are refused afterwards, as after an unlink, because descriptors name paths here.
+pub(super) fn rename(
+    fs: &mut FsState,
+    memory: &mut dyn GuestMemory,
+    from: PathArg,
+    to: PathArg,
+) -> i32 {
+    let (preopen, old) = match locate(fs, memory, from.dirfd, from.path_at, from.path_len) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    let (target, new) = match locate(fs, memory, to.dirfd, to.path_at, to.path_len) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    if preopen != target {
+        return errno::XDEV;
+    }
+    if !fs.preopens[preopen].writable {
+        return errno::NOTCAPABLE;
+    }
+    let root = &mut fs.preopens[preopen].root;
+    let (Some((old_name, old_parent)), Some((new_name, new_parent))) =
+        (old.split_last(), new.split_last())
+    else {
+        return errno::NOTCAPABLE;
+    };
+    let source = kind(root, &old);
+    if matches!(source, Kind::Missing) {
+        return errno::NOENT;
+    }
+    if old == new {
+        return errno::SUCCESS;
+    }
+    if matches!(source, Kind::Directory) && new.starts_with(&old) {
+        return errno::INVAL;
+    }
+    match kind(root, new_parent) {
+        Kind::Directory => {}
+        Kind::File => return errno::NOTDIR,
+        Kind::Missing => return errno::NOENT,
+    }
+    match kind(root, &new) {
+        Kind::Missing => {}
+        Kind::File if matches!(source, Kind::File) => {}
+        Kind::File => return errno::NOTDIR,
+        Kind::Directory if matches!(source, Kind::File) => return errno::ISDIR,
+        Kind::Directory => {
+            if dir_at(root, &new).is_some_and(|dir| !dir.entries.is_empty()) {
+                return errno::NOTEMPTY;
+            }
+        }
+    }
+    let Some(node) = dir_at_mut(root, old_parent).and_then(|dir| dir.entries.remove(old_name))
+    else {
+        return errno::NOENT;
+    };
+    if let Some(parent) = dir_at_mut(root, new_parent) {
+        parent.entries.insert(new_name.clone(), node);
+    }
+    errno::SUCCESS
+}
+
 /// `fd_close` on a file or directory descriptor, preopened or opened.
 pub(super) fn close(fs: &mut FsState, fd: u32) -> i32 {
     if fs.open.remove(&fd).is_some() {

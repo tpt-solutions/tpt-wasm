@@ -802,7 +802,18 @@ fn unlink_removes_the_file_for_later_opens_and_the_host() {
 #[test]
 fn a_read_only_grant_refuses_directory_creation_removal_and_unlink() {
     for mode in BOTH {
-        let calls: [(&str, Vec<Arg>); 3] = [
+        let calls: [(&str, Vec<Arg>); 4] = [
+            (
+                "path_rename",
+                vec![
+                    Arg::I32(3),
+                    Arg::I32(HELLO_PATH as i32),
+                    Arg::I32(9),
+                    Arg::I32(3),
+                    Arg::I32(RENAMED_PATH as i32),
+                    Arg::I32(11),
+                ],
+            ),
             (
                 "path_create_directory",
                 vec![Arg::I32(3), Arg::I32(NEW_PATH as i32), Arg::I32(6)],
@@ -821,7 +832,10 @@ fn a_read_only_grant_refuses_directory_creation_removal_and_unlink() {
                 mode,
                 grant(false),
                 &[(name, arguments)],
-                file_data_with(vec![(NEW_PATH, b"newdir".to_vec())]),
+                file_data_with(vec![
+                    (NEW_PATH, b"newdir".to_vec()),
+                    (RENAMED_PATH, b"renamed.txt".to_vec()),
+                ]),
             );
             assert_eq!(
                 result,
@@ -995,6 +1009,114 @@ enum Arg {
     I64(i64),
 }
 
+/// The arguments of `path_rename` from one path to another, both under descriptor 3.
+fn rename_arguments(from: (u32, u32), to: (u32, u32)) -> Vec<Arg> {
+    vec![
+        Arg::I32(3),
+        Arg::I32(from.0 as i32),
+        Arg::I32(from.1 as i32),
+        Arg::I32(3),
+        Arg::I32(to.0 as i32),
+        Arg::I32(to.1 as i32),
+    ]
+}
+
+#[test]
+fn rename_moves_a_file_and_leaves_the_old_name_empty() {
+    for mode in BOTH {
+        let (result, _, preview1) = run_files(
+            mode,
+            grant(true),
+            &[(
+                "path_rename",
+                rename_arguments((HELLO_PATH, 9), (RENAMED_PATH, 11)),
+            )],
+            file_data_with(vec![(RENAMED_PATH, b"renamed.txt".to_vec())]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert!(
+            preview1.read_file(0, "hello.txt").is_none(),
+            "{mode:?}: the old name is gone"
+        );
+        assert_eq!(
+            preview1.read_file(0, "renamed.txt").as_deref(),
+            Some(&b"hello world"[..]),
+            "{mode:?}: the contents moved"
+        );
+    }
+}
+
+#[test]
+fn rename_refuses_a_file_over_a_directory_and_a_missing_source() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[(
+                "path_rename",
+                rename_arguments((HELLO_PATH, 9), (SUB_PATH, 3)),
+            )],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::ISDIR)],
+            "{mode:?}: file over dir"
+        );
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[(
+                "path_rename",
+                rename_arguments((MISSING_PATH, 7), (RENAMED_PATH, 11)),
+            )],
+            file_data_with(vec![(RENAMED_PATH, b"renamed.txt".to_vec())]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOENT)], "{mode:?}: missing");
+    }
+}
+
+#[test]
+fn a_directory_cannot_be_moved_into_itself() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[(
+                "path_rename",
+                rename_arguments((SUB_PATH, 3), (INSIDE_PATH, 10)),
+            )],
+            file_data_with(vec![(INSIDE_PATH, b"sub/inside".to_vec())]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::INVAL)], "{mode:?}");
+    }
+}
+
+#[test]
+fn rename_cannot_cross_from_one_grant_to_another() {
+    for mode in BOTH {
+        let mut preopens = grant(true);
+        preopens.push(Preopen::new("/b", Directory::new(), true));
+        let (result, _, _) = run_files(
+            mode,
+            preopens,
+            &[(
+                "path_rename",
+                vec![
+                    Arg::I32(3),
+                    Arg::I32(HELLO_PATH as i32),
+                    Arg::I32(9),
+                    Arg::I32(4),
+                    Arg::I32(RENAMED_PATH as i32),
+                    Arg::I32(11),
+                ],
+            )],
+            file_data_with(vec![(RENAMED_PATH, b"renamed.txt".to_vec())]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::XDEV)], "{mode:?}");
+    }
+}
+
 /// The file-related imports, in the order their indices are given. A call names a
 /// function by its entry here, so the index is its position.
 fn file_imports() -> Vec<(&'static str, FunctionType)> {
@@ -1025,6 +1147,10 @@ fn file_imports() -> Vec<(&'static str, FunctionType)> {
         ("clock_res_get", two_pointer_signature()),
         ("clock_time_get", signature(&[I32, I64, I32], &[I32])),
         ("proc_raise", signature(&[I32], &[I32])),
+        (
+            "path_rename",
+            signature(&[I32, I32, I32, I32, I32, I32], &[I32]),
+        ),
     ]
 }
 
@@ -1124,6 +1250,8 @@ const COUNT_OUT: u32 = 4000;
 const SEEK_OUT: u32 = 4300;
 const PRESTAT_OUT: u32 = 4200;
 const NAME_OUT: u32 = 4400;
+const RENAMED_PATH: u32 = 1700; // "renamed.txt"
+const INSIDE_PATH: u32 = 1800; // "sub/inside"
 
 fn file_data(writes: &[u8]) -> Vec<(u32, Vec<u8>)> {
     let mut data = vec![

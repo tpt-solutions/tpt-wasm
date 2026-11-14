@@ -42,6 +42,7 @@ use fs::{FsState, OpenRequest};
 pub mod errno {
     pub const SUCCESS: i32 = 0;
     pub const BADF: i32 = 8;
+    pub const XDEV: i32 = 18;
     pub const EXIST: i32 = 20;
     pub const FAULT: i32 = 21;
     pub const FBIG: i32 = 27;
@@ -200,6 +201,7 @@ enum Function {
     PathCreateDirectory,
     PathRemoveDirectory,
     PathUnlinkFile,
+    PathRename,
     PollOneoff,
     SchedYield,
     ClockResGet,
@@ -208,7 +210,7 @@ enum Function {
 }
 
 impl Function {
-    const ALL: [Function; 25] = [
+    const ALL: [Function; 26] = [
         Function::ArgsSizesGet,
         Function::ArgsGet,
         Function::EnvironSizesGet,
@@ -229,6 +231,7 @@ impl Function {
         Function::PathCreateDirectory,
         Function::PathRemoveDirectory,
         Function::PathUnlinkFile,
+        Function::PathRename,
         Function::PollOneoff,
         Function::SchedYield,
         Function::ClockResGet,
@@ -258,6 +261,7 @@ impl Function {
             Function::PathCreateDirectory => "path_create_directory",
             Function::PathRemoveDirectory => "path_remove_directory",
             Function::PathUnlinkFile => "path_unlink_file",
+            Function::PathRename => "path_rename",
             Function::PollOneoff => "poll_oneoff",
             Function::SchedYield => "sched_yield",
             Function::ClockResGet => "clock_res_get",
@@ -290,6 +294,7 @@ impl Function {
             Function::PathCreateDirectory
             | Function::PathRemoveDirectory
             | Function::PathUnlinkFile => (vec![I32, I32, I32], vec![I32]),
+            Function::PathRename => (vec![I32, I32, I32, I32, I32, I32], vec![I32]),
             Function::PollOneoff => (vec![I32, I32, I32, I32], vec![I32]),
             Function::SchedYield => (Vec::new(), vec![I32]),
             Function::ProcRaise => (vec![I32], vec![I32]),
@@ -405,6 +410,20 @@ impl HostFunction for Implementation {
                 arguments[0],
                 arguments[1],
                 arguments[2],
+            ),
+            Function::PathRename => fs::rename(
+                &mut state.fs,
+                memory,
+                fs::PathArg {
+                    dirfd: arguments[0],
+                    path_at: arguments[1],
+                    path_len: arguments[2],
+                },
+                fs::PathArg {
+                    dirfd: arguments[3],
+                    path_at: arguments[4],
+                    path_len: arguments[5],
+                },
             ),
             Function::PollOneoff => poll_oneoff(
                 &mut state,
