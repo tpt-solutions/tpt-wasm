@@ -973,6 +973,57 @@ pub(super) fn rename(
     errno::SUCCESS
 }
 
+/// `fd_sync` and `fd_datasync`. The tree is in memory, so there is nothing to flush: an open
+/// descriptor succeeds, and an unknown one is `BADF`.
+pub(super) fn sync(fs: &FsState, fd: u32) -> i32 {
+    if fs.open.contains_key(&fd) {
+        errno::SUCCESS
+    } else {
+        errno::BADF
+    }
+}
+
+/// `fd_advise`: a hint about the access pattern, which an in-memory file has no use for. The
+/// advice must be one the ABI defines, 0 through 5.
+pub(super) fn advise(fs: &FsState, fd: u32, advice: u64) -> i32 {
+    if !fs.open.contains_key(&fd) {
+        return errno::BADF;
+    }
+    if advice > 5 {
+        errno::INVAL
+    } else {
+        errno::SUCCESS
+    }
+}
+
+/// `fd_allocate`: make a file at least `offset + length` bytes long, with the new bytes zero.
+/// A file is never shrunk and the position does not move. The file must be writable, and a
+/// directory is not a file.
+pub(super) fn allocate(fs: &mut FsState, fd: u32, offset: u64, length: u64) -> i32 {
+    let (preopen, path) = match fs.open.get(&fd) {
+        Some(Open::File { preopen, path, .. }) => (*preopen, path.clone()),
+        Some(Open::Directory { .. }) => return errno::ISDIR,
+        None => return errno::BADF,
+    };
+    if !fs.preopens[preopen].writable {
+        return errno::BADF;
+    }
+    if length == 0 {
+        return errno::INVAL;
+    }
+    let end = match offset.checked_add(length) {
+        Some(end) if end <= MAX_FILE_BYTES => end as usize,
+        _ => return errno::FBIG,
+    };
+    let Some(contents) = file_at_mut(&mut fs.preopens[preopen].root, &path) else {
+        return errno::BADF;
+    };
+    if contents.len() < end {
+        contents.resize(end, 0);
+    }
+    errno::SUCCESS
+}
+
 /// `fd_close` on a file or directory descriptor, preopened or opened.
 pub(super) fn close(fs: &mut FsState, fd: u32) -> i32 {
     if fs.open.remove(&fd).is_some() {

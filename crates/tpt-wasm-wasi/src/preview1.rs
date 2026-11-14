@@ -203,6 +203,10 @@ enum Function {
     PathUnlinkFile,
     PathRename,
     FdReaddir,
+    FdSync,
+    FdDatasync,
+    FdAdvise,
+    FdAllocate,
     PollOneoff,
     SchedYield,
     ClockResGet,
@@ -211,7 +215,7 @@ enum Function {
 }
 
 impl Function {
-    const ALL: [Function; 27] = [
+    const ALL: [Function; 31] = [
         Function::ArgsSizesGet,
         Function::ArgsGet,
         Function::EnvironSizesGet,
@@ -234,6 +238,10 @@ impl Function {
         Function::PathUnlinkFile,
         Function::PathRename,
         Function::FdReaddir,
+        Function::FdSync,
+        Function::FdDatasync,
+        Function::FdAdvise,
+        Function::FdAllocate,
         Function::PollOneoff,
         Function::SchedYield,
         Function::ClockResGet,
@@ -265,6 +273,10 @@ impl Function {
             Function::PathUnlinkFile => "path_unlink_file",
             Function::PathRename => "path_rename",
             Function::FdReaddir => "fd_readdir",
+            Function::FdSync => "fd_sync",
+            Function::FdDatasync => "fd_datasync",
+            Function::FdAdvise => "fd_advise",
+            Function::FdAllocate => "fd_allocate",
             Function::PollOneoff => "poll_oneoff",
             Function::SchedYield => "sched_yield",
             Function::ClockResGet => "clock_res_get",
@@ -284,7 +296,9 @@ impl Function {
             | Function::RandomGet => (vec![I32, I32], vec![I32]),
             Function::ClockTimeGet => (vec![I32, I64, I32], vec![I32]),
             Function::FdWrite | Function::FdRead => (vec![I32, I32, I32, I32], vec![I32]),
-            Function::FdClose => (vec![I32], vec![I32]),
+            Function::FdClose | Function::FdSync | Function::FdDatasync => (vec![I32], vec![I32]),
+            Function::FdAdvise => (vec![I32, I64, I64, I32], vec![I32]),
+            Function::FdAllocate => (vec![I32, I64, I64], vec![I32]),
             Function::FdSeek => (vec![I32, I64, I32, I32], vec![I32]),
             Function::FdPrestatGet => (vec![I32, I32], vec![I32]),
             Function::FdPrestatDirName => (vec![I32, I32, I32], vec![I32]),
@@ -346,8 +360,26 @@ impl HostFunction for Implementation {
         if self.function == Function::ProcExit {
             return proc_exit(&mut state, arguments[0]);
         }
-        // Neither of these touches memory, so they answer without it.
+        // None of these touches memory, so they answer without it.
         match self.function {
+            Function::FdSync | Function::FdDatasync => {
+                return Ok(vec![Value::I32(fd_sync(&state, arguments[0]))]);
+            }
+            Function::FdAdvise => {
+                return Ok(vec![Value::I32(fd_advise(
+                    &state,
+                    arguments[0],
+                    arguments[3],
+                ))]);
+            }
+            Function::FdAllocate => {
+                return Ok(vec![Value::I32(fd_allocate(
+                    &mut state,
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                ))]);
+            }
             // There is one thread, so yielding it is a no-op that succeeds.
             Function::SchedYield => return Ok(vec![Value::I32(errno::SUCCESS)]),
             // Signals are not delivered to a module, so raising one is refused.
@@ -447,7 +479,12 @@ impl HostFunction for Implementation {
                 arguments[3],
             ),
             Function::ClockResGet => clock_res_get(memory, arguments[0], arguments[1]),
-            Function::SchedYield | Function::ProcRaise => {
+            Function::SchedYield
+            | Function::ProcRaise
+            | Function::FdSync
+            | Function::FdDatasync
+            | Function::FdAdvise
+            | Function::FdAllocate => {
                 unreachable!("handled before the memory check")
             }
             Function::FdPrestatDirName => {
@@ -705,6 +742,42 @@ fn fd_tell(state: &State, memory: &mut dyn GuestMemory, fd: u64, at: u64) -> i32
     }
     if stream_granted(state, fd) {
         errno::SPIPE
+    } else {
+        errno::BADF
+    }
+}
+
+/// `fd_sync` and `fd_datasync`. A stream cannot be synced, so it is refused with `EINVAL`.
+fn fd_sync(state: &State, fd: u64) -> i32 {
+    if let Some(fd) = fs::file_descriptor(fd) {
+        return fs::sync(&state.fs, fd);
+    }
+    if stream_granted(state, fd) {
+        errno::INVAL
+    } else {
+        errno::BADF
+    }
+}
+
+/// `fd_advise`. A stream cannot take advice, so it is refused with `EINVAL`.
+fn fd_advise(state: &State, fd: u64, advice: u64) -> i32 {
+    if let Some(fd) = fs::file_descriptor(fd) {
+        return fs::advise(&state.fs, fd, advice);
+    }
+    if stream_granted(state, fd) {
+        errno::INVAL
+    } else {
+        errno::BADF
+    }
+}
+
+/// `fd_allocate`. A stream has no length to change, so it is refused with `EINVAL`.
+fn fd_allocate(state: &mut State, fd: u64, offset: u64, length: u64) -> i32 {
+    if let Some(fd) = fs::file_descriptor(fd) {
+        return fs::allocate(&mut state.fs, fd, offset, length);
+    }
+    if stream_granted(state, fd) {
+        errno::INVAL
     } else {
         errno::BADF
     }

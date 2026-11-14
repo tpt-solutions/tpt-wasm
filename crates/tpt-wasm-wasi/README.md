@@ -40,6 +40,8 @@ and operation behind every import, and supplies the function signature.
 - `path_create_directory`, `path_remove_directory`, `path_unlink_file`, `path_rename` — change
   the tree, in writable grants only; a rename stays inside one grant;
 - `fd_readdir` — list a granted directory: `.`, `..`, then the children in name order;
+- `fd_sync`, `fd_datasync`, `fd_advise` — succeed on an open descriptor (there is nothing to
+  flush or hint); `fd_allocate` — grow a writable file with zeros, never shrink it;
 - `fd_prestat_get`, `fd_prestat_dir_name` — name the granted directories to the module;
 - `poll_oneoff` (clock subscriptions, on the virtual clock), `clock_res_get`, `sched_yield`;
   `proc_raise` answers `ENOTSUP`;

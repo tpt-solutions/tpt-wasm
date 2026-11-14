@@ -1009,6 +1009,146 @@ enum Arg {
     I64(i64),
 }
 
+/// The arguments of `path_open` for `hello.txt` read-only, which leaves its descriptor at 4.
+fn open_hello_args() -> Vec<Arg> {
+    vec![
+        Arg::I32(3),
+        Arg::I32(0),
+        Arg::I32(HELLO_PATH as i32),
+        Arg::I32(9),
+        Arg::I32(0),
+        Arg::I64(2),
+        Arg::I64(0),
+        Arg::I32(0),
+        Arg::I32(FD_OUT as i32),
+    ]
+}
+
+#[test]
+fn allocate_grows_a_file_with_zeros_and_never_shrinks_it() {
+    for mode in BOTH {
+        let (result, _, preview1) = run_files(
+            mode,
+            grant(true),
+            &[
+                ("path_open", open_hello_args()),
+                ("fd_allocate", vec![Arg::I32(4), Arg::I64(0), Arg::I64(16)]),
+                ("fd_allocate", vec![Arg::I32(4), Arg::I64(0), Arg::I64(4)]),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        let mut expected = b"hello world".to_vec();
+        expected.resize(16, 0);
+        assert_eq!(
+            preview1.read_file(0, "hello.txt"),
+            Some(expected),
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn allocate_refuses_an_empty_range_a_directory_a_read_only_grant_and_a_huge_size() {
+    for mode in BOTH {
+        type Calls = Vec<(&'static str, Vec<Arg>)>;
+        let cases: [(Calls, Vec<Preopen>, i32); 4] = [
+            (
+                vec![
+                    ("path_open", open_hello_args()),
+                    ("fd_allocate", vec![Arg::I32(4), Arg::I64(0), Arg::I64(0)]),
+                ],
+                grant(true),
+                errno::INVAL,
+            ),
+            (
+                vec![
+                    ("path_open", open_hello_args()),
+                    (
+                        "fd_allocate",
+                        vec![Arg::I32(4), Arg::I64(0), Arg::I64(67_108_865)],
+                    ),
+                ],
+                grant(true),
+                errno::FBIG,
+            ),
+            (
+                vec![
+                    ("path_open", open_hello_args()),
+                    ("fd_allocate", vec![Arg::I32(4), Arg::I64(0), Arg::I64(16)]),
+                ],
+                grant(false),
+                errno::BADF,
+            ),
+            (
+                vec![("fd_allocate", vec![Arg::I32(3), Arg::I64(0), Arg::I64(16)])],
+                grant(true),
+                errno::ISDIR,
+            ),
+        ];
+        for (calls, preopens, expected) in cases {
+            let (result, _, _) = run_files(mode, preopens, &calls, file_data_with(vec![]));
+            assert_eq!(result, vec![Value::I32(expected)], "{mode:?}");
+        }
+    }
+}
+
+#[test]
+fn advice_must_be_defined_and_sync_checks_the_descriptor() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[(
+                "fd_advise",
+                vec![Arg::I32(3), Arg::I64(0), Arg::I64(16), Arg::I32(2)],
+            )],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}: random");
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[(
+                "fd_advise",
+                vec![Arg::I32(3), Arg::I64(0), Arg::I64(16), Arg::I32(9)],
+            )],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::INVAL)],
+            "{mode:?}: undefined"
+        );
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[
+                ("path_open", open_hello_args()),
+                ("fd_sync", vec![Arg::I32(4)]),
+                ("fd_datasync", vec![Arg::I32(4)]),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::SUCCESS)],
+            "{mode:?}: open file"
+        );
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[("fd_datasync", vec![Arg::I32(9)])],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::BADF)],
+            "{mode:?}: no descriptor"
+        );
+    }
+}
+
 const DIRENT_OUT: u32 = 7400;
 const DIRENT_USED: u32 = 7500;
 
@@ -1330,6 +1470,10 @@ fn file_imports() -> Vec<(&'static str, FunctionType)> {
             signature(&[I32, I32, I32, I32, I32, I32], &[I32]),
         ),
         ("fd_readdir", signature(&[I32, I32, I32, I64, I32], &[I32])),
+        ("fd_sync", signature(&[I32], &[I32])),
+        ("fd_datasync", signature(&[I32], &[I32])),
+        ("fd_advise", signature(&[I32, I64, I64, I32], &[I32])),
+        ("fd_allocate", signature(&[I32, I64, I64], &[I32])),
     ]
 }
 
