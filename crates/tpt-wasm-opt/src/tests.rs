@@ -838,7 +838,10 @@ fn generated_program(seed: u64) -> Module {
 /// the division by zero is emitted unconditionally rather than being left to
 /// chance.
 #[test]
-#[cfg_attr(miri, ignore = "optimizes and runs many generated programs; over half an hour under Miri even at ten seeds, and covered natively")]
+#[cfg_attr(
+    miri,
+    ignore = "optimizes and runs many generated programs; over half an hour under Miri even at ten seeds, and covered natively"
+)]
 fn optimization_preserves_behavior_over_generated_programs() {
     for seed in 0..2_000u64 {
         let fixture = generated_program(seed);
