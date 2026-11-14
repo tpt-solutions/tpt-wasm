@@ -363,8 +363,8 @@ fn encode_uleb(mut value: u64, out: &mut Vec<u8>) {
 #[test]
 fn folding_matches_the_baseline_executor() {
     let mut checked = 0usize;
-    for &left in I32_CORPUS {
-        for &right in I32_CORPUS {
+    for &left in sample(I32_CORPUS) {
+        for &right in sample(I32_CORPUS) {
             for &opcode in I32_BINARY_OPCODES {
                 let body = {
                     let mut body = const_i32(left);
@@ -383,8 +383,8 @@ fn folding_matches_the_baseline_executor() {
             }
         }
     }
-    for &left in I64_CORPUS {
-        for &right in I64_CORPUS {
+    for &left in sample(I64_CORPUS) {
+        for &right in sample(I64_CORPUS) {
             for &opcode in I64_BINARY_OPCODES {
                 let body = {
                     let mut body = const_i64(left);
@@ -419,8 +419,8 @@ fn folding_matches_the_baseline_executor() {
             }
         }
     }
-    for &left in F32_CORPUS {
-        for &right in F32_CORPUS {
+    for &left in sample(F32_CORPUS) {
+        for &right in sample(F32_CORPUS) {
             for &opcode in F32_BINARY_OPCODES {
                 let body = {
                     let mut body = const_f32(left);
@@ -439,8 +439,8 @@ fn folding_matches_the_baseline_executor() {
             }
         }
     }
-    for &left in F64_CORPUS {
-        for &right in F64_CORPUS {
+    for &left in sample(F64_CORPUS) {
+        for &right in sample(F64_CORPUS) {
             for &opcode in F64_BINARY_OPCODES {
                 let body = {
                     let mut body = const_f64(left);
@@ -1206,4 +1206,10 @@ fn seed_count(full: u64) -> u64 {
     } else {
         full
     }
+}
+
+/// The corpus values a loop runs over. Under Miri the cross product of the corpora is far too many
+/// modules, so the loop takes every few values there, and every value everywhere else.
+fn sample<T>(all: &[T]) -> impl Iterator<Item = &T> {
+    all.iter().step_by(if cfg!(miri) { all.len() / 6 + 1 } else { 1 })
 }
