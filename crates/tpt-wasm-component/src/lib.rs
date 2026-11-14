@@ -96,6 +96,8 @@ const OPTION_UTF8: u8 = 0x00;
 /// The string encoding options: UTF-16, and Latin-1 with UTF-16 as the fallback.
 const OPTION_UTF16: u8 = 0x01;
 const OPTION_LATIN1_UTF16: u8 = 0x02;
+/// The option naming a core function the runtime calls after a lift has read its result.
+const OPTION_POST_RETURN: u8 = 0x05;
 /// The longest string the canonical ABI admits, in bytes.
 const MAX_STRING_BYTE_LENGTH: usize = (1 << 28) - 1;
 /// The bit a `latin1+utf16` string's length carries when it is stored as UTF-16.
@@ -501,6 +503,8 @@ pub enum ComponentFunction {
         memory: Option<u32>,
         realloc: Option<u32>,
         encoding: StringEncoding,
+        /// The core function run after the result is read, if the lift names one.
+        post_return: Option<u32>,
     },
 }
 
@@ -877,6 +881,7 @@ impl Component {
                 ty,
                 memory,
                 realloc,
+                post_return,
                 ..
             } = function
             else {
@@ -915,6 +920,32 @@ impl Component {
                         "the core function has type {actual:?}, but the component type needs {expected:?}"
                     ),
                 });
+            }
+            if let Some(post_index) = post_return {
+                let CoreFunction::Alias {
+                    export: post_export,
+                    ..
+                } = &self.core_functions[*post_index as usize]
+                else {
+                    return Err(ComponentError::LiftMismatch {
+                        export: export.clone(),
+                        message: "the post-return is a lowered function".to_owned(),
+                    });
+                };
+                let expected_post = post_return_signature(func_type, &self.types);
+                let actual_post = core_signature(&self.core_modules[*module as usize], post_export)
+                    .map_err(|message| ComponentError::LiftMismatch {
+                        export: post_export.clone(),
+                        message,
+                    })?;
+                if actual_post != expected_post {
+                    return Err(ComponentError::LiftMismatch {
+                        export: post_export.clone(),
+                        message: format!(
+                            "the post-return has type {actual_post:?}, but the result needs {expected_post:?}"
+                        ),
+                    });
+                }
             }
             let runtime = match &slots[*instance as usize] {
                 Slot::Runtime(runtime) => runtime,
@@ -962,6 +993,7 @@ impl Component {
                 memory,
                 realloc,
                 encoding,
+                post_return,
             } = &self.functions[export.function as usize]
             else {
                 return Err(ComponentError::NoSuchComponentFunction {
@@ -992,6 +1024,12 @@ impl Component {
                     CoreFunction::Lowered { .. } => None,
                 }),
                 encoding: *encoding,
+                post_return: post_return.and_then(|index| {
+                    match &self.core_functions[index as usize] {
+                        CoreFunction::Alias { export, .. } => Some(export.clone()),
+                        CoreFunction::Lowered { .. } => None,
+                    }
+                }),
             });
         }
         Ok(ComponentInstance {
@@ -1343,6 +1381,26 @@ fn store(
     }
 }
 
+/// The core signature a post-return must have: it takes the flat values of the lifted result, or
+/// one pointer when they do not fit, and returns nothing.
+fn post_return_signature(func: &ComponentFuncType, types: &[ComponentTypeDef]) -> FunctionType {
+    let params = match func.result {
+        None => Vec::new(),
+        Some(ty) => {
+            let flat = flat_of(&ty, types);
+            if flat.len() > MAX_FLAT_RESULTS {
+                vec![ValueType::I32]
+            } else {
+                flat
+            }
+        }
+    };
+    FunctionType {
+        params: ResultType(params),
+        results: ResultType(Vec::new()),
+    }
+}
+
 /// The core signature of a lifted function. Past 16 flat parameters, the parameters are one pointer
 /// to them in memory, so the core function takes one `i32`.
 fn lift_signature(func: &ComponentFuncType, types: &[ComponentTypeDef]) -> FunctionType {
@@ -1630,6 +1688,8 @@ struct LiftedExport {
     realloc: Option<String>,
     /// The encoding the strings of this function are read and written in.
     encoding: StringEncoding,
+    /// The export name of the core function run after the result is read, if any.
+    post_return: Option<String>,
 }
 
 /// Bind the import module `module` to the core instance at `instance`: a runtime instance
@@ -1776,7 +1836,7 @@ impl ComponentInstance {
             }
         }
         let core_results = self.call_core(instance, &export.core_export, core_arguments)?;
-        match export.result {
+        let lifted = match export.result {
             None if core_results.is_empty() => Ok(Vec::new()),
             None => Err(ComponentError::Call {
                 instance,
@@ -1788,7 +1848,15 @@ impl ComponentInstance {
                     .map_err(|message| ComponentError::Call { instance, message })?;
                 Ok(vec![value])
             }
+        };
+        // The post-return runs once the result has been read, with the core values the function
+        // returned, so that the module may free what the result pointed into.
+        if lifted.is_ok() {
+            if let Some(post_return) = &export.post_return {
+                self.call_core(instance, post_return, core_results)?;
+            }
         }
+        lifted
     }
 
     /// Lower one argument of type `ty` to core values, appending them. A string or a list is
@@ -3445,6 +3513,7 @@ fn decode_canon(
         let option_count = reader.u32()?;
         let mut memory: Option<u32> = None;
         let mut realloc: Option<u32> = None;
+        let mut post_return: Option<u32> = None;
         let mut string_encoding: Option<StringEncoding> = None;
         for _ in 0..option_count {
             let option_at = reader.position();
@@ -3506,9 +3575,37 @@ fn decode_canon(
                     }
                     realloc = Some(realloc_index);
                 }
+                OPTION_POST_RETURN => {
+                    let post_index = reader.u32()?;
+                    let Some(found) = core_functions.get(post_index as usize) else {
+                        return Err(ComponentError::NoSuchFunction {
+                            function: post_index,
+                        });
+                    };
+                    let CoreFunction::Alias {
+                        instance: post_instance,
+                        ..
+                    } = found
+                    else {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "a post-return that is a lowered function",
+                            offset: option_at,
+                        });
+                    };
+                    if *post_instance != core_instance {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "a post-return of another instance",
+                            offset: option_at,
+                        });
+                    }
+                    if post_return.is_some() {
+                        return Err(ComponentError::Malformed { offset: option_at });
+                    }
+                    post_return = Some(post_index);
+                }
                 _ => {
                     return Err(ComponentError::UnsupportedCanon {
-                        what: "a canonical option other than a string encoding, memory, or realloc",
+                        what: "a canonical option other than a string encoding, memory, realloc, or post-return",
                         offset: option_at,
                     })
                 }
@@ -3573,6 +3670,7 @@ fn decode_canon(
             memory,
             realloc,
             encoding: string_encoding.unwrap_or(StringEncoding::Utf8),
+            post_return,
         });
     }
     Ok(())

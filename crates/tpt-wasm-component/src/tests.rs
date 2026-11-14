@@ -804,8 +804,8 @@ fn calls_check_the_argument_count_and_the_export_name() {
 
 #[test]
 fn canon_options_are_refused_and_a_lower_needs_an_import() {
-    // A lift with one option that is not utf8, memory, or realloc.
-    let with_options = [SECTION_CANON, 6, 1, CANON_LIFT, SORT_FUNC, 0, 1, 0x05];
+    // A lift with one option that is not a string encoding, memory, realloc, or post-return: async.
+    let with_options = [SECTION_CANON, 6, 1, CANON_LIFT, SORT_FUNC, 0, 1, 0x06];
     assert!(matches!(
         Component::decode(&answer_component(
             &TYPE_NO_ARGUMENTS_S32,
@@ -813,7 +813,8 @@ fn canon_options_are_refused_and_a_lower_needs_an_import() {
             &[]
         )),
         Err(ComponentError::UnsupportedCanon {
-            what: "a canonical option other than a string encoding, memory, or realloc",
+            what:
+                "a canonical option other than a string encoding, memory, realloc, or post-return",
             ..
         })
     ));
@@ -3382,4 +3383,115 @@ fn corrupted_string_images_do_not_panic() {
             }
         }
     }
+}
+
+/// A component over a module whose `pick` returns 7, and whose `post` stores its argument at 2048.
+/// The lift of `pick` names core function `post_index` as its post-return.
+fn post_component(post_index: u8) -> Vec<u8> {
+    post_component_with(&[2, OPTION_MEMORY, 0, OPTION_POST_RETURN, post_index])
+}
+
+/// The same component, with the given canonical options on its lift.
+fn post_component_with(options: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bytes.extend(section(1, &[2, 0x60, 0, 1, 0x7f, 0x60, 1, 0x7f, 0]));
+    bytes.extend(section(3, &[2, 0, 1]));
+    bytes.extend(section(5, &[1, 0x00, 1]));
+    bytes.extend(section(
+        7,
+        &[
+            3, 4, b'p', b'i', b'c', b'k', 0, 0, 4, b'p', b'o', b's', b't', 0, 1, 6, b'm', b'e',
+            b'm', b'o', b'r', b'y', 2, 0,
+        ],
+    ));
+    bytes.extend(section(
+        10,
+        &[
+            2, 4, 0, 0x41, 7, 0x0b, 10, 0, 0x41, 0x80, 0x10, 0x20, 0, 0x36, 2, 0, 0x0b,
+        ],
+    ));
+    let types = section(SECTION_TYPE, &[1, TYPE_FUNC, 0, 0x00, VALTYPE_U32]);
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            3, 0, 0, 1, 0, 4, b'p', b'i', b'c', b'k', 0, 0, 1, 0, 4, b'p', b'o', b's', b't', 0, 2,
+            1, 0, 6, b'm', b'e', b'm', b'o', b'r', b'y',
+        ],
+    );
+    let mut canon = vec![1, CANON_LIFT, SORT_FUNC, 0];
+    canon.extend_from_slice(options);
+    canon.push(0);
+    let canon = section(SECTION_CANON, &canon);
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            1,
+            0x00,
+            4,
+            b'p',
+            b'i',
+            b'c',
+            b'k',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+        ],
+    );
+    let mut component = with(&module_section(&bytes));
+    component.extend(types);
+    component.extend(instances);
+    component.extend(alias);
+    component.extend(canon);
+    component.extend(export);
+    component
+}
+
+#[test]
+fn a_post_return_runs_after_the_result_is_read() {
+    let mut instance = Component::decode(&post_component(1))
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("pick", Vec::new()),
+        Ok(vec![ComponentValue::U32(7)])
+    );
+    // The post-return was given the value the module returned, and stored it.
+    assert_eq!(
+        instance
+            .read_core_memory(0, "memory", 2048, 4)
+            .expect("reads"),
+        vec![7, 0, 0, 0]
+    );
+}
+
+#[test]
+fn a_post_return_of_the_wrong_type_is_refused_before_anything_runs() {
+    assert!(matches!(
+        Component::decode(&post_component(0))
+            .expect("decodes")
+            .instantiate(&engine()),
+        Err(ComponentError::LiftMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_second_post_return_is_malformed_and_one_naming_no_function_is_refused() {
+    assert!(matches!(
+        Component::decode(&post_component_with(&[
+            3,
+            OPTION_POST_RETURN,
+            1,
+            OPTION_POST_RETURN,
+            1,
+            OPTION_MEMORY,
+            0,
+        ])),
+        Err(ComponentError::Malformed { .. })
+    ));
+    assert!(matches!(
+        Component::decode(&post_component(9)),
+        Err(ComponentError::NoSuchFunction { .. })
+    ));
 }

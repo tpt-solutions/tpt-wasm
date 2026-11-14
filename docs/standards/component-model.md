@@ -64,7 +64,7 @@ error then, not at the first call.
 Canonical lifting, on the recommendation, covers the scalar subset only: `s32`, `u32`,
 `s64`, `u64`, `f32`, and `f64`. Each flattens to one core value of the same width, and the
 conversion is a reinterpretation of the bits, so no value changes. A canon lift (`0x00 0x00`)
-names a core function and a component function type, and takes no canonical options. A
+names a core function and a component function type, and takes the canonical options described below. A
 component function's flattened type (one core parameter per scalar, and at most one core
 result) must equal the core function's type, which is read from the nested module's bytes
 at instantiation, so a mismatch fails there and not at the first call. An export names a
@@ -185,6 +185,8 @@ alignment and size rules for every type, the discriminant sizes (one byte up to 
 pointer a lowered function takes past 16 parameters. An earlier pass used a mirror of the text, which the
 canonical file now supersedes. The file is still a moving target, so it should be read again before a release.
 
+A lift may name a post-return, a core function of the same instance that runs after the result has been read, with the core values the function returned. Its core type must take the flat values of the result (or the one pointer, when they do not fit) and return nothing, which is checked at instantiation. A post-return is run only after a lift succeeds, so a lift that fails leaves it uncalled. A second post-return option, or one naming a lowered or another instance's function, is refused.
+
 Refused, each by name and offset: a string in a lowered import (the host call would need the
 caller's memory), a memory or `realloc` from another instance,
 any other canonical option, and a string without the options it needs.
@@ -202,7 +204,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 `namespace:package/interface#function` is a plain string to this layer, so the WIT grammar is
 a separate stage, which will map each parsed function onto the same capability id.
 
-Not done: strings and records in lowered imports, `post-return`,
+Not done: strings and records in lowered imports,
 results and variants whose payloads differ in flat type, and parsing WIT to
 derive the capability ids.
 
