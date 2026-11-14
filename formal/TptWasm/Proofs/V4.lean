@@ -88,10 +88,10 @@ inductive Related : Instr -> IR.Instr -> Prop where
       Related (.i32Bin op) (.binI32 r b l rr)
   /-- A store to the same memory, address value and width. -/
   | store (arg : MemArg) (op : StoreOp) (index : Nat) (a v : IR.ValueId) :
-      Related (.store op index arg) (.store index a v (op.width))
+      Related (.store op index arg) (.store index a v arg.offset (op.width))
   /-- A load of the same width from the same memory. -/
   | load (arg : MemArg) (op : LoadOp) (index : Nat) (r a : IR.ValueId) :
-      Related (.load op index arg) (.load r index a (op.width))
+      Related (.load op index arg) (.load r index a arg.offset op)
   /-- A read of the same global. -/
   | globalGet (index : Nat) (r : IR.ValueId) :
       Related (.globalGet index) (.globalGet r index)
@@ -114,43 +114,43 @@ take its magnitude, and this is the step that decides *which* byte is touched. I
 the two disagreed -- a signed comparison on one side, an unsigned one on the
 other -- a store would land in a different place, and the address is exactly what
 an embedder can observe through a later load. -/
-theorem ir_address_agrees (s : IR.State) (a : IR.ValueId) (address : Int)
+theorem ir_address_agrees (s : IR.State) (a : IR.ValueId) (address : Int) (offset : Nat)
     (h : s.values a = .i32 address) :
-    (IR.intPayload (s.values a)).natAbs = address.natAbs := by
+    effectiveAddress (IR.intPayload (s.values a)) { offset := offset } = effectiveAddress address { offset := offset } := by
   simp [h, IR.intPayload]
 
 /- **V4: a store writes the same bytes, at the same address, on both sides.**
 
 Both the Wasm rule (`TptWasm.Transition`, the `store` step) and the IR executor
 (`TptWasm.IRExec`, the `.store` case) reduce a store to
-`memory.writeLE? address.natAbs width (storedBits value)`, with the same width
+`memory.writeLE? (effectiveAddress address { offset := offset }) width (storedBits value)`, with the same width
 (`op.width`, carried by the IR instruction) and the same bit pattern. Given that
 the two states hold the same address and the same operand, the two calls are
 equal, so the success result and the trap condition are one decision on both
 sides, not two that could drift apart. -/
-theorem store_write_agrees (memory : MemoryState) (width : Nat) (s : IR.State)
+theorem store_write_agrees (memory : MemoryState) (offset width : Nat) (s : IR.State)
     (a v : IR.ValueId) (address : Int) (operand : Value)
     (ha : s.values a = .i32 address) (hv : s.values v = operand) :
-    memory.writeLE? (IR.intPayload (s.values a)).natAbs width (storedBits (s.values v))
-      = memory.writeLE? address.natAbs width (storedBits operand) := by
-  simp [ha, hv, IR.intPayload]
+    memory.writeLE? (effectiveAddress (IR.intPayload (s.values a)) { offset := offset }) width (storedBits (s.values v))
+      = memory.writeLE? (effectiveAddress address { offset := offset }) width (storedBits operand) := by
+  simp [ha, hv, IR.intPayload, effectiveAddress]
 
 /-- The trap half of the same fact: an out-of-bounds store is a trap on both sides,
 and an in-bounds one is not, because the two results are equal. -/
-theorem store_trap_agrees (memory : MemoryState) (width : Nat) (s : IR.State)
+theorem store_trap_agrees (memory : MemoryState) (offset width : Nat) (s : IR.State)
     (a v : IR.ValueId) (address : Int) (operand : Value)
     (ha : s.values a = .i32 address) (hv : s.values v = operand) :
-    (memory.writeLE? (IR.intPayload (s.values a)).natAbs width (storedBits (s.values v))).isNone
-      = (memory.writeLE? address.natAbs width (storedBits operand)).isNone := by
-  rw [store_write_agrees memory width s a v address operand ha hv]
+    (memory.writeLE? (effectiveAddress (IR.intPayload (s.values a)) { offset := offset }) width (storedBits (s.values v))).isNone
+      = (memory.writeLE? (effectiveAddress address { offset := offset }) width (storedBits operand)).isNone := by
+  rw [store_write_agrees memory offset width s a v address operand ha hv]
 
 /-- The IR store and the Wasm store produce the same updated memory when they succeed. -/
-theorem store_updated_agrees (memory updated : MemoryState) (width : Nat) (s : IR.State)
+theorem store_updated_agrees (memory updated : MemoryState) (offset width : Nat) (s : IR.State)
     (a v : IR.ValueId) (address : Int) (operand : Value)
     (ha : s.values a = .i32 address) (hv : s.values v = operand)
-    (write : memory.writeLE? address.natAbs width (storedBits operand) = some updated) :
-    memory.writeLE? (IR.intPayload (s.values a)).natAbs width (storedBits (s.values v))
+    (write : memory.writeLE? (effectiveAddress address { offset := offset }) width (storedBits operand) = some updated) :
+    memory.writeLE? (effectiveAddress (IR.intPayload (s.values a)) { offset := offset }) width (storedBits (s.values v))
       = some updated := by
-  rw [store_write_agrees memory width s a v address operand ha hv, write]
+  rw [store_write_agrees memory offset width s a v address operand ha hv, write]
 
 end TptWasm

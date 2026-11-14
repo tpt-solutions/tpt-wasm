@@ -123,32 +123,18 @@ def binI64Eval : BinOp → Int → Int → Int
 /-- WebAssembly's rendering of a comparison result: 1 for true, 0 for false. -/
 def boolValue (b : Bool) : Value := .i32 (if b then 1 else 0)
 
-/-- The value a `width`-byte little-endian read produces.
-
-`Instruction.loadedValue` is written against a `LoadOp`, because a Wasm load
-carries its signedness. The IR models a load by its width alone -- signedness is a
-property of how the *consumer* reads the value, and encoding it in the load would
-make the IR commit to a reading the program may not take. The two agree on the
-unsigned widths, which are the ones the bounds argument in V2 depends on.
--/
-def loadValueOf (width raw : Nat) : Value :=
-  if width = 8 then .i32 (Int.ofNat (raw % 256))
-  else if width = 16 then .i32 (Int.ofNat (raw % 65536))
-  else .i64 (Int.ofNat raw)
-
-
 /-- Evaluate an `i32` comparison, yielding 0 or 1 as WebAssembly does. -/
 def cmpI32Eval : ICmp → Int → Int → Value
   | .eq, a, b => boolValue (a == b)
   | .ne, a, b => boolValue (a != b)
   | .ltS, a, b => boolValue (a < b)
-  | .ltU, a, b => boolValue (a.natAbs < b.natAbs)
+  | .ltU, a, b => boolValue (unsignedBits 32 a < unsignedBits 32 b)
   | .gtS, a, b => boolValue (a > b)
-  | .gtU, a, b => boolValue (a.natAbs > b.natAbs)
+  | .gtU, a, b => boolValue (unsignedBits 32 a > unsignedBits 32 b)
   | .leS, a, b => boolValue (a ≤ b)
-  | .leU, a, b => boolValue (a.natAbs ≤ b.natAbs)
+  | .leU, a, b => boolValue (unsignedBits 32 a ≤ unsignedBits 32 b)
   | .geS, a, b => boolValue (a ≥ b)
-  | .geU, a, b => boolValue (a.natAbs ≥ b.natAbs)
+  | .geU, a, b => boolValue (unsignedBits 32 a ≥ unsignedBits 32 b)
 /-- The integer payload of a value, or `0` for one that carries none.
 
 A value is a sum over four numeric types, so an `i32` operation applied to a
@@ -176,16 +162,16 @@ def execInstr : Instr → State → StepResult
       .ran s none [(r, .i64 (binI64Eval op (intPayload (s.values l)) (intPayload (s.values rr))))]
   | .cmpI32 r op l rr, s =>
       .ran s none [(r, cmpI32Eval op (intPayload (s.values l)) (intPayload (s.values rr)))]
-  | .load r memory address width, s =>
-      let addr := (intPayload (s.values address)).natAbs
+  | .load r memory address offset op, s =>
+      let addr := effectiveAddress (intPayload (s.values address)) { offset := offset }
       match s.store.memory? memory with
       | some m =>
-        match m.readLE? addr width with
-        | some raw => .ran s (some (TptWasm.Event.load addr width)) [(r, loadValueOf width raw)]
+        match m.readLE? addr op.width with
+        | some raw => .ran s (some (TptWasm.Event.load addr op.width)) [(r, loadedValue op raw)]
         | none => .trapped Trap.memoryOutOfBounds
       | none => .trapped Trap.memoryOutOfBounds
-  | .store memory address value width, s =>
-      let addr := (intPayload (s.values address)).natAbs
+  | .store memory address value offset width, s =>
+      let addr := effectiveAddress (intPayload (s.values address)) { offset := offset }
       match s.store.memory? memory with
       | some m =>
         match m.writeLE? addr width (storedBits (s.values value)) with

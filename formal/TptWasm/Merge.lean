@@ -36,8 +36,8 @@ def renameInstr (σ : ValueId → ValueId) : Instr → Instr
   | .binI32 r op l rr => .binI32 r op (σ l) (σ rr)
   | .binI64 r op l rr => .binI64 r op (σ l) (σ rr)
   | .cmpI32 r op l rr => .cmpI32 r op (σ l) (σ rr)
-  | .load r m a w => .load r m (σ a) w
-  | .store m a v w => .store m (σ a) (σ v) w
+  | .load r m a o op => .load r m (σ a) o op
+  | .store m a v o w => .store m (σ a) (σ v) o w
   | .globalGet r g => .globalGet r g
   | .globalSet g v => .globalSet g (σ v)
   | .call i args rs => .call i (args.map σ) rs

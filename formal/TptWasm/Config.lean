@@ -97,7 +97,7 @@ def withoutLast : List α → List α
 /-- `xs` with its `index`-th entry replaced by `x`, or `none` when out of range. -/
 def replaceAt? {α : Type} : List α → Nat → α → Option (List α)
   | [], _, _ => none
-  | _, 0, x => some [x]
+  | _ :: rest, 0, x => some (x :: rest)
   | head :: rest, n + 1, x => (replaceAt? rest n x).map (head :: ·)
 
 /-- A frame with its `index`-th local replaced, or `none` when out of range. -/

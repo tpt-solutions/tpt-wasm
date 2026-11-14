@@ -53,9 +53,9 @@ inductive MInstr where
   /-- Define `slot` to be `left <op> right`. -/
   | cmpI32 (slot : Slot) (op : ICmp) (left right : Slot)
   /-- Read memory, emitting an event. -/
-  | load (slot : Slot) (memory : MemoryId) (address : Slot) (width : Nat)
+  | load (slot : Slot) (memory : MemoryId) (address : Slot) (offset : Nat) (width : Nat)
   /-- Write memory, emitting an event. -/
-  | store (memory : MemoryId) (address value : Slot) (width : Nat)
+  | store (memory : MemoryId) (address value : Slot) (offset : Nat) (width : Nat)
   /-- Read a global, emitting an event. -/
   | globalGet (slot : Slot) (index : GlobalId)
   /-- Write a global, emitting an event. -/
@@ -84,7 +84,7 @@ The counterpart of `observable` in `TptWasm.Passes`, on the machine side. The
 two classifications have to agree, and that is an obligation rather than a
 definition, because nothing forces a lowering to preserve it. -/
 def isEffect : MInstr -> Bool
-  | .load _ _ _ _ | .store _ _ _ _ => true
+  | .load _ _ _ _ _ | .store _ _ _ _ _ => true
   | .globalGet _ _ | .globalSet _ _ => true
   | .call _ _ _ | .callHost _ _ _ _ => true
   | _ => false
@@ -149,8 +149,8 @@ def lowerInstr (isInstr : ValueId -> Slot) : Instr -> List MInstr
   | .binI32 r op l rr => [.binI32 (isInstr r) op (isInstr l) (isInstr rr)]
   | .binI64 _ _ _ _ => []
   | .cmpI32 r op l rr => [.cmpI32 (isInstr r) op (isInstr l) (isInstr rr)]
-  | .load r m a w => [.load (isInstr r) m (isInstr a) w]
-  | .store m a v w => [.store m (isInstr a) (isInstr v) w]
+  | .load r m a o op => [.load (isInstr r) m (isInstr a) o op.width]
+  | .store m a v o w => [.store m (isInstr a) (isInstr v) o w]
   | .globalGet r index => [.globalGet (isInstr r) index]
   | .globalSet index v => [.globalSet index (isInstr v)]
   | .call index args results => [.call index (args.map isInstr) (results.map isInstr)]

@@ -100,11 +100,11 @@ argument in here would restate V2 and obscure the claim.
 theorem store_not_inert (m : MemoryId) (a v : ValueId) (w : Nat) (s : State)
     (heap : MemoryState) (hmem : s.store.memory? m = some heap)
     (updated : MemoryState)
-    (hwrite : heap.writeLE? (intPayload (s.values a)).natAbs w (storedBits (s.values v))
+    (hwrite : heap.writeLE? (unsignedBits 32 (intPayload (s.values a))) w (storedBits (s.values v))
       = some updated) :
-    bodyTrace [.store m a v w] s
-      = [Event.store m (intPayload (s.values a)).natAbs w] :=
-  by simp [bodyTrace, runBody, execInstr, hmem, hwrite]
+    bodyTrace [.store m a v 0 w] s
+      = [Event.store m (unsignedBits 32 (intPayload (s.values a))) w] :=
+  by simp [bodyTrace, runBody, execInstr, hmem, effectiveAddress, hwrite]
 
 /-- **V5: a load is *not* inert**, symmetrically.
 
@@ -112,12 +112,13 @@ A load is observable because it can fault: deleting a read that would have been
 out of bounds deletes a trap, which is the trap-position clause of the contract in
 concrete form.
 -/
-theorem load_not_inert (m : MemoryId) (r : ValueId) (a : ValueId) (w : Nat) (s : State)
+theorem load_not_inert (m : MemoryId) (r : ValueId) (a : ValueId) (op : LoadOp) (s : State)
     (heap : MemoryState) (hmem : s.store.memory? m = some heap)
-    (raw : Nat) (hread : heap.readLE? (intPayload (s.values a)).natAbs w = some raw) :
-    bodyTrace [.load r m a w] s
-      = [Event.load (intPayload (s.values a)).natAbs w] :=
-  by simp [bodyTrace, runBody, execInstr, hmem, hread]
+    (raw : Nat) (hread : heap.readLE? (effectiveAddress (intPayload (s.values a)) { offset := 0 }) op.width = some raw) :
+    bodyTrace [.load r m a 0 op] s
+      = [Event.load (effectiveAddress (intPayload (s.values a)) { offset := 0 }) op.width] := by
+  simp only [effectiveAddress, Nat.add_zero] at hread
+  simp [bodyTrace, runBody, execInstr, hmem, effectiveAddress, hread]
 
 /-- **V5: a single fold step is observationally inert.**
 

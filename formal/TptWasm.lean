@@ -13,6 +13,7 @@ import TptWasm.Proofs.V1
 import TptWasm.Proofs.V2
 import TptWasm.Proofs.V3
 import TptWasm.Proofs.V4
+import TptWasm.Proofs.V4Straight
 import TptWasm.Proofs.V5
 import TptWasm.Proofs.V6
 import TptWasm.Proofs.CFG

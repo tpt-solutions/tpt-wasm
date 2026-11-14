@@ -29,6 +29,12 @@ Rust model expose a single `step()` and the runtime expose a single call result.
 namespace TptWasm
 
 /-- Looking up the last entry of a list appended with one more element. -/
+theorem get?_mid (before after : List Value) (v : Value) :
+    Store.get? (before ++ v :: after) before.length = some v := by
+  induction before with
+  | nil => rfl
+  | cons x xs ih => simp [Store.get?, ih]
+
 theorem get?_snoc (xs : List Value) (v : Value) :
     Store.get? (xs ++ v :: []) xs.length = some v := by
   induction xs with
@@ -47,6 +53,14 @@ theorem take_append_self (xs ys : List Value) : (xs ++ ys).take xs.length = xs :
 /-- Dropping as many entries as the first part has, leaves the second part. -/
 theorem drop_append_self (xs ys : List Value) : (xs ++ ys).drop xs.length = ys := by simp
 
+/-- Replacing the entry at `before.length` writes the new value there and keeps everything on both sides. -/
+theorem replaceAt?_mid (before after : List Value) (old value : Value) :
+    Configuration.replaceAt? (before ++ old :: after) before.length value
+      = some (before ++ value :: after) := by
+  induction before with
+  | nil => rfl
+  | cons x xs ih => simp [Configuration.replaceAt?, ih]
+
 /-- Replacing the last entry of a list with the same value changes nothing. -/
 theorem replaceAt?_snoc (xs : List Value) (v : Value) :
     Configuration.replaceAt? (xs ++ v :: []) xs.length v = some (xs ++ v :: []) := by
@@ -63,7 +77,7 @@ theorem execOp_sound {instr : Instr} {c : Configuration} {out : Outcome}
     (h : OpStep instr c out) : execOp instr c = some out := by
   cases h <;>
     simp_all [execOp, execReturn, Configuration.push, Configuration.pushCall,
-      Configuration.setLocal?, get?_snoc, replaceAt?_snoc, maxCallDepth] <;>
+      Configuration.setLocal?, get?_snoc, get?_mid, replaceAt?_snoc, replaceAt?_mid, maxCallDepth] <;>
 
     (try split) <;> omega <;>
     simp_all [execReturn, take_snoc, maxCallDepth, length_map_congr,

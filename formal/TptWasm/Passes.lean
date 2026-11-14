@@ -47,11 +47,11 @@ def substOperand (v replacement : ValueId) : Instr → Instr
       if l = v then .binI64 r op replacement rr else if rr = v then .binI64 r op l replacement else .binI64 r op l rr
   | .cmpI32 r op l rr =>
       if l = v then .cmpI32 r op replacement rr else if rr = v then .cmpI32 r op l replacement else .cmpI32 r op l rr
-  | .load r m a w => if a = v then .load r m replacement w else .load r m a w
-  | .store m a value w =>
-      if a = v then .store m replacement value w
-      else if value = v then .store m a replacement w
-      else .store m a value w
+  | .load r m a o w => if a = v then .load r m replacement o w else .load r m a o w
+  | .store m a value o w =>
+      if a = v then .store m replacement value o w
+      else if value = v then .store m a replacement o w
+      else .store m a value o w
   | .globalSet index value => if value = v then .globalSet index replacement else .globalSet index value
   | .call index args results => .call index (args.map fun a => if a = v then replacement else a) results
   | .callHost name granted args results =>
@@ -192,7 +192,7 @@ the modeled instructions that are not:
 The predicate is named for what it is -- not a claim about values, but about the
 instruction as a whole -- and it is deliberately the conservative answer. -/
 def observable : Instr -> Bool
-  | .load _ _ _ _ => true
+  | .load _ _ _ _ _ => true
   | .call _ _ _ => true
   | .callHost _ _ _ _ => true
   | .globalGet _ _ => true

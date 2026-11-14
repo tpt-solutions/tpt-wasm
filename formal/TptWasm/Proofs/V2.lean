@@ -59,34 +59,34 @@ theorem writeLE?_inBounds (m : MemoryState) (address width value : Nat)
 end MemoryState
 
 /-- V2: the premise a `load` rule needs implies the access is in bounds. -/
-theorem load_performed_is_bounded (memory : MemoryState) (op : LoadOp) (address : Int)
-    (raw : Nat) (h : memory.readLE? address.natAbs (op.width) = some raw) :
-    address.natAbs + op.width <= memory.bytes.length :=
-  MemoryState.readLE?_inBounds memory address.natAbs (op.width) raw h
+theorem load_performed_is_bounded (memory : MemoryState) (op : LoadOp) (arg : MemArg) (address : Int)
+    (raw : Nat) (h : memory.readLE? (effectiveAddress address arg) (op.width) = some raw) :
+    (effectiveAddress address arg) + op.width <= memory.bytes.length :=
+  MemoryState.readLE?_inBounds memory (effectiveAddress address arg) (op.width) raw h
 
 /-- V2: the premise a `store` rule needs implies the access is in bounds. -/
-theorem store_performed_is_bounded (memory : MemoryState) (op : StoreOp) (address : Int)
+theorem store_performed_is_bounded (memory : MemoryState) (op : StoreOp) (arg : MemArg) (address : Int)
     (operand : Value) (updated : MemoryState)
-    (h : memory.writeLE? address.natAbs (op.width) (storedBits operand) = some updated) :
-    address.natAbs + op.width <= memory.bytes.length :=
-  MemoryState.writeLE?_inBounds memory address.natAbs (op.width) (storedBits operand) updated h
+    (h : memory.writeLE? (effectiveAddress address arg) (op.width) (storedBits operand) = some updated) :
+    (effectiveAddress address arg) + op.width <= memory.bytes.length :=
+  MemoryState.writeLE?_inBounds memory (effectiveAddress address arg) (op.width) (storedBits operand) updated h
 
 /-- V2: an out-of-bounds load is a trap, not a silent no-op. -/
 theorem oob_load_traps {c : Configuration} (op : LoadOp) (index : Nat) (arg : MemArg)
     (address : Int) (rest : List Value) (memory : MemoryState)
     (stack : c.operandStack = .i32 address :: rest)
     (mem : c.store.memory? index = some memory)
-    (oob : memory.readLE? address.natAbs (op.width) = none) :
+    (oob : memory.readLE? (effectiveAddress address arg) (op.width) = none) :
     OpStep (.load op index arg) c (.trap .memoryOutOfBounds) :=
   OpStep.loadTrap c op index arg address rest memory stack mem oob
 
 /-- V2: an out-of-bounds store is a trap, not a silent no-op. -/
 theorem oob_store_traps {c : Configuration} (op : StoreOp) (index : Nat) (arg : MemArg)
     (address : Int) (operand : Value) (rest : List Value) (memory : MemoryState)
-    (stack : c.operandStack = .i32 address :: operand :: rest)
+    (stack : c.operandStack = operand :: .i32 address :: rest)
     (mem : c.store.memory? index = some memory)
     (typed : operand.type = op.operandType)
-    (oob : memory.writeLE? address.natAbs (op.width) (storedBits operand) = none) :
+    (oob : memory.writeLE? (effectiveAddress address arg) (op.width) (storedBits operand) = none) :
     OpStep (.store op index arg) c (.trap .memoryOutOfBounds) :=
   OpStep.storeTrap c op index arg address operand rest memory stack mem typed oob
 

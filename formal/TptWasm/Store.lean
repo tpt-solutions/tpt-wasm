@@ -56,6 +56,16 @@ def writeByte? (bytes : List Nat) (address : Nat) (value : Nat) : Option (List N
   | _ :: rest, 0 => some (value :: rest)
   | head :: rest, n + 1 => (writeByte? rest n value).map (head :: ·)
 
+/-- The `width` bytes of `value`, least significant first. Each byte is the value's next eight
+bits, so a value wider than `width` bytes is truncated, which is what a narrow store does. -/
+def leBytes (width value : Nat) : List Nat :=
+  (List.range width).map fun i => (value / 256 ^ i) % 256
+
+/-- The number that little-endian bytes stand for, least significant byte first. -/
+def leValue : List Nat → Nat
+  | [] => 0
+  | b :: bs => b + 256 * leValue bs
+
 /-- `bytes` with `width` bytes of `value` written little-endian at `address`.
 
 The whole access is rejected unless every one of its bytes is in bounds, which
@@ -63,14 +73,7 @@ is exactly the V2 obligation.
 -/
 def writeBytesLE? (bytes : List Nat) (address width : Nat) (value : Nat) : Option (List Nat) :=
   if address + width ≤ bytes.length then
-    let rec go (bs : List Nat) (a w : Nat) (v : Nat) (acc : List Nat := []) : Option (List Nat) :=
-      match w with
-      | 0 => some (acc ++ bs)
-      | w + 1 => match bs, a with
-        | [], _ => none
-        | _ :: rest, 0 => go rest 1 w (v % 256) (v / 256 :: acc)
-        | h :: rest, a + 1 => go rest (a + 1) w (v % 256) (v / 256 :: h :: acc)
-    go bytes address width value
+    some (bytes.take address ++ leBytes width value ++ bytes.drop (address + width))
   else none
 
 /-- This memory with `width` bytes of `value` written at `address`, or `none`
@@ -87,12 +90,7 @@ def growBy? (m : MemoryState) (delta : Nat) : Option MemoryState :=
 /-- The `width` bytes at `address`, read little-endian, when in bounds. -/
 def readLE? (m : MemoryState) (address width : Nat) : Option Nat :=
   if address + width ≤ m.bytes.length then
-    let rec go (bs : List Nat) (w : Nat) (acc : Nat) : Option Nat :=
-      match w, bs with
-      | 0, _ => some acc
-      | _ + 1, [] => none
-      | w + 1, b :: rest => go rest w (acc + b * 256 ^ w)
-    go m.bytes width 0
+    some (leValue ((m.bytes.drop address).take width))
   else none
 
 end MemoryState

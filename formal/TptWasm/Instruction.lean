@@ -29,11 +29,18 @@ inductive Trap where
   | hostFailure
   deriving DecidableEq, Repr
 
-/-- Reduce an integer into the two's-complement range of `bits` bits. -/
+/-- Reduce an integer into the two's-complement range of `bits` bits, that is into
+`[-2^(bits-1), 2^(bits-1))`, the range `Value.i32` and `Value.i64` are stated over. -/
 def wrap (bits : Nat) (value : Int) : Int :=
   let modulus := (2 : Int) ^ bits
   let r := value % modulus
-  if r < 0 then r + modulus else r
+  if r < (2 : Int) ^ (bits - 1) then r else r - modulus
+
+/-- The unsigned bit pattern of `value` in `bits` bits, as a natural number in `[0, 2^bits)`.
+A bitwise operator works on this pattern, not on the magnitude of its operand: the magnitude
+of `-1` is `1`, while its bit pattern is all ones. -/
+def unsignedBits (bits : Nat) (value : Int) : Nat :=
+  (value % (2 : Int) ^ bits).toNat
 
 /-- `i32` wraparound. -/
 def wrap32 (value : Int) : Int := wrap 32 value
@@ -67,6 +74,12 @@ inductive ICmp where
 structure MemArg where
   offset : Nat
   deriving DecidableEq, Repr, Inhabited
+
+/-- The effective address of a memory access: the operand's unsigned 32-bit pattern plus the
+static offset. The sum is not wrapped, so an address past `2^32` is out of bounds rather than
+wrapping around to a valid one, which is what the specification requires. -/
+def effectiveAddress (address : Int) (arg : MemArg) : Nat :=
+  unsignedBits 32 address + arg.offset
 
 /-- The fourteen MVP load operations, with the width each one touches. -/
 inductive LoadOp where

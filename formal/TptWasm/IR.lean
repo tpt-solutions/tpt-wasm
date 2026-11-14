@@ -1,5 +1,6 @@
 import TptWasm.Basic
 import TptWasm.Store
+import TptWasm.Instruction
 import TptWasm.Observation
 
 /-!
@@ -81,10 +82,12 @@ inductive Instr where
   | binI64 (result : ValueId) (op : BinOp) (left right : ValueId)
   /-- `left <op> right`, yielding an `i32` 0 or 1. -/
   | cmpI32 (result : ValueId) (op : ICmp) (left right : ValueId)
-  /-- Read `width` bytes at `address` from memory `memory`. -/
-  | load (result : ValueId) (memory : MemoryId) (address : ValueId) (width : Nat)
+  /-- Read the bytes of the load `op` at `address + offset` from memory `memory`, converted to the
+  result the load produces. The load carries its whole Wasm operation, as the Rust IR's
+  `MemoryLoad` does, so its width, result type, and signedness are the same on both sides. -/
+  | load (result : ValueId) (memory : MemoryId) (address : ValueId) (offset : Nat) (op : LoadOp)
   /-- Write `width` bytes of `value` at `address` to memory `memory`. -/
-  | store (memory : MemoryId) (address value : ValueId) (width : Nat)
+  | store (memory : MemoryId) (address value : ValueId) (offset : Nat) (width : Nat)
   /-- Read global `index`. -/
   | globalGet (result : ValueId) (index : GlobalId)
   /-- Write global `index`. -/
@@ -170,16 +173,16 @@ end Terminator
 /-- Every value an instruction defines, in order. A call may define several. -/
 def definedBy : Instr → List ValueId
   | .constI32 r _ | .constI64 r _ | .binI32 r _ _ _ | .binI64 r _ _ _
-  | .cmpI32 r _ _ _ | .load r _ _ _ | .globalGet r _ => [r]
-  | .store _ _ _ _ | .globalSet _ _ | .drop _ => []
+  | .cmpI32 r _ _ _ | .load r _ _ _ _ | .globalGet r _ => [r]
+  | .store _ _ _ _ _ | .globalSet _ _ | .drop _ => []
   | .call _ _ results | .callHost _ _ _ results => results
 
 /-- Every value an instruction reads. -/
 def usedBy : Instr → List ValueId
   | .constI32 _ _ | .constI64 _ _ => []
   | .binI32 _ _ l r | .binI64 _ _ l r | .cmpI32 _ _ l r => [l, r]
-  | .load _ _ address _ => [address]
-  | .store _ address value _ => [address, value]
+  | .load _ _ address _ _ => [address]
+  | .store _ address value _ _ => [address, value]
   | .globalGet _ _ => []
   | .globalSet _ value => [value]
   | .call _ args _ | .callHost _ _ args _ => args

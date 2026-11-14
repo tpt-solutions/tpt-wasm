@@ -41,6 +41,7 @@ goes to `.lake/`, which is gitignored.
 | `TptWasm/Passes.lean` | The three passes V5 is about: `foldBlock` and `deadBlock`. |
 | `TptWasm/Proofs/V5.lean` | V5: which instructions are observably inert, and which are not. |
 | `TptWasm/Proofs/V4.lean` | V4: the correspondence between Wasm and IR instructions, and the address agreement. |
+| `TptWasm/Proofs/V4Straight.lean` | V4 simulation on the straight-line subset: a Wasm body and its lowering step together, from an operand-stack correspondence to the IR run. |
 | `TptWasm/Proofs/V6.lean` | V6: the lowering skeleton -- the machine, the lowering, and the obligations. |
 | `TptWasm/CFG.lean` | Whole-function execution, block lookup, pruning, and the `Reachable` relation. |
 | `TptWasm/Proofs/CFG.lean` | CFG simplification: removing unreachable blocks preserves every run. |
@@ -128,11 +129,124 @@ models six binary operations and Wasm has sixteen. Mapping the other ten to
 and the correspondence would stop being evidence. Returning `none` records the
 gap where it is.
 
-**Not proved:** the store correspondence, and the simulation itself. Both the Wasm
-rule and the IR executor reduce a store to the same `writeLE?` call, so the trap
-condition is one decision rather than two -- but the `storedBits` terms are not
-yet in the same form on the two sides, and that is the work. The file says so
-where the lemma would have gone.
+**Proved:** the store correspondence. Both the Wasm rule and the IR executor reduce a
+store to the same `writeLE?` call, so the trap condition is one decision rather than
+two (`store_write_agrees`, `store_trap_agrees`, `store_updated_agrees`).
+
+**Simulation, straight-line subset:** `TptWasm/Proofs/V4Straight.lean` proves that a Wasm
+body of `i32` constants, the six lifted `i32` operators, the ten `i32` comparisons (which
+lower to `cmpI32`), and `i32`-valued loads and stores, run by `execOp`, and its lowering, run
+by the IR executor, end in the same operand values and the same store (`simulation`). The
+correspondence includes the memory: the two stores are equal before the run, and the Wasm
+store afterwards is the IR store. The events are exact: `runWasm` returns the memory events
+its rules perform (a load's effective address and width; a store's memory index, effective
+address, and width), and `simulation` says the IR run appends exactly those events. The
+events are compared inside the model. The Rust engine has no memory event trace to compare
+them with, so that comparison is not made by a translation check.
+
+The lowering is a model of the Rust lowerer on this subset. Both the lowering's results and
+the lowered IR's results are checked against the Micro engine by translation validation
+(`memory_validation.rs`, `straight_line_validation.rs`, `numeric_validation.rs`).
+
+Globals are in the simulation too: `global.get` and `global.set` lower to the IR's global
+instructions, under the premise that every global in the store is `i32`-typed.
+`global_validation.rs` checks the lowering of those bodies against Micro.
+
+Locals are in the simulation too. In SSA form a local needs no IR instruction: the lowering
+keeps the value id each local holds, `local.get` pushes that id, and `local.set` and
+`local.tee` replace it. The correspondence requires the Wasm frame's locals to hold the values
+of those ids, and the simulation concludes that the frame's locals afterwards hold the lowered
+final locals. `local_validation.rs` checks the lowered locals and globals against Micro.
+
+Traps are checked by `trap_validation.rs`: on bodies whose accesses sometimes leave the page, the Micro engine traps exactly when both the Wasm model run and the lowered IR run are `none`, and otherwise they agree on the value (200 bodies, 54 of them trapping). This is evidence about trap behaviour, not a proof of trap position; the simulation still covers successful runs only.
+
+**Traps:** `trap_position` proves that when the Wasm run traps at some instruction, the lowered
+IR run fails (`none`) on the same body and state. The trapping instruction is a memory access
+that leaves the page, and the prefix before it runs exactly as the simulation says. The
+simulation now concludes a full `Corresponds` for the final state, which is what lets the
+prefix split at the trap.
+
+**Not proved:** control flow, calls, and the lifted-away operators (division, shifts,
+rotations). Those are the rest of V4.
+
+**Model fixes.** The translation-validation tests in `crates/tpt-wasm-opt/tests/`
+(`straight_line_validation.rs` and `numeric_validation.rs`) compare the model with the
+Micro engine on generated bodies. They found errors in `TptWasm/Transition.lean` and
+`Instruction.lean` that the proofs could not see, because both sides of each proof
+shared the error. The first group is the stack and operator-order errors:
+
+- Results were appended to the bottom of the operand stack (`rest ++ [result]`), while
+  `Configuration` documents the top as the head. They now prepend.
+- `i32.sub`, `i64.sub` and the comparisons took the *top* of the stack as their left
+  operand. Wasm's left operand is the deeper one, so `a b sub` computes `a - b`. The
+  operand patterns are now `right :: left :: rest`.
+- `select` read its condition from the wrong position. It is now the top of the stack.
+- `wrap` reduced into `[0, 2^bits)`, but `Value.i32` is stated over the signed range,
+  and the bitwise operators worked on magnitudes, so `-1 & 5` was `1`. `wrap` now reduces
+  into the signed range, and the bitwise operators work on the unsigned bit pattern
+  (`unsignedBits`).
+
+The second group is the integer semantics, which the same tests found once the operator
+set was widened:
+
+- Unsigned operations used `natAbs`, the magnitude, where Wasm uses the bit pattern. That
+  covered memory addresses, stored bytes, `lt_u` and its relatives, `div_u`, `rem_u`,
+  shift counts, `shr_u`, rotations, bit counts, the unsigned extension, and the
+  reinterpretations. They now use `unsignedBits` at the operand's width (32 or 64).
+- Signed division and remainder used Lean's flooring `/` and `%`. Wasm truncates
+  (`div_s`) and gives the remainder the dividend's sign (`rem_s`), so they now use
+  `Int.tdiv` and `Int.tmod`. A shift right, `shr_s`, keeps flooring, which is correct for
+  an arithmetic shift.
+- The remainder by an unsigned divisor and the rotations were wrong: `rem_u` returned the
+  divisor for a nonzero remainder, and `rotr` did not reduce modulo `2^32`.
+- `ctzNat` counted the bit length rather than the trailing zeros.
+- `i64` comparisons and `i64.eqz` produced `i64` values through the 32-bit evaluator, and
+  `i64` bit counts used the 32-bit width. Wasm gives comparisons and `eqz` an `i32` result,
+  and counts an `i64` at 64 bits; that is now what the model does (`i64UnValue`,
+  `evalCmpBits 64`).
+
+After these, the tests agree with the Micro engine on every generated case (300 bodies of
+the lifted operators, 400 typed expressions over the integer set), and each test rejects a
+deliberately corrupted expectation.
+
+The third group is memory, found by `crates/tpt-wasm-opt/tests/memory_validation.rs`:
+
+- The byte-level read ignored the address and read from byte zero, and it weighted the first
+  byte as the most significant. The byte-level write dropped every byte before the address,
+  and placed the wrong bytes in the rest. Both are now the plain definitions: `readLE?` takes
+  the bytes at the address, and `writeBytesLE?` is the prefix, the little-endian bytes of the
+  value, and the suffix (`leBytes`, `leValue`).
+- Sign extension compared the raw value with `2^bits` rather than `2^(bits-1)`, so no byte
+  was ever sign-extended.
+- The Wasm load and store rules ignored the `memarg` offset. The effective address is now the
+  unsigned operand plus the offset, unwrapped (`effectiveAddress`), and the IR's load and
+  store carry the offset, as the Rust IR does.
+- A store took its address from the top of the stack; the value is on top, with the address
+  below it.
+- The IR load was typed by its width alone, so a four-byte load came back as an `i64`. The
+  IR load now carries the whole Wasm `LoadOp`, as the Rust IR's `MemoryLoad` does, so the
+  width, result type, and signedness are the same on both sides.
+
+The memory check agrees with Micro on 150 bodies that mix narrow and wide stores with loads
+of every width, with offsets, and it rejects a corrupted expectation on every case.
+
+The fourth group is the local and global variables, found by `state_validation.rs` and by
+the global lowering check once the simulation reached globals:
+
+- `local.set` and `global.set` left the written value on the operand stack, and were only
+  defined for a stack of exactly one value. They now pop it, and `local.tee` keeps it.
+- The local rules stated the locals as `before ++ value :: []`, which only matches the last
+  local. They now match `before ++ value :: after`.
+- `replaceAt?` returned `some [x]` at the index, dropping every local after it. It now keeps
+  the rest of the list (`replaceAt?_mid` and `get?_mid` are the general lemmas).
+
+Both checks agree with Micro after these corrections: `state_validation.rs` runs the locals
+and globals of the Wasm model (300 bodies), and `global_validation.rs` runs the lowered
+globals through the IR (300 bodies).
+
+Not yet covered by a translation check: control flow, calls, the
+`i64` division and remainder (the model omits them), and the overflowing `INT_MIN / -1`,
+which the model does not trap on.
 
 ## Dead-value elimination: what is proved, and the premise
 
