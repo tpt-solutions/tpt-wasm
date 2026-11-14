@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use tpt_wasm_runtime::{Engine, Instance};
+use tpt_wasm_runtime::{Engine, Instance, Linker};
 use tpt_wasm_types::Value;
 
 /// The component preamble: the magic, then version `0x0d` and layer `0x01`.
@@ -30,6 +30,8 @@ const SECTION_CORE_INSTANCE: u8 = 2;
 const INSTANTIATE: u8 = 0x00;
 /// The core-instance expression tag that builds an instance from inline exports.
 const INLINE_EXPORTS: u8 = 0x01;
+/// The sort byte of a core instance, which an instance argument names.
+const SORT_CORE_INSTANCE: u8 = 0x12;
 
 /// Why a component was refused or could not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,11 +98,24 @@ impl fmt::Display for ComponentError {
 impl std::error::Error for ComponentError {}
 
 /// One core instance a component declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreInstance {
-    /// Instantiate the nested core module with this index. The module has no imports, since
-    /// instance arguments are not supported yet.
-    Instantiate { module: u32 },
+    /// Instantiate the nested core module with index `module`. Each argument binds one of
+    /// the module's import modules to an earlier core instance.
+    Instantiate {
+        module: u32,
+        arguments: Vec<InstanceArgument>,
+    },
+}
+
+/// One instance argument: every import of the instantiated module under `name` resolves to
+/// the exports of the core instance with index `instance`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceArgument {
+    /// The import module name.
+    pub name: String,
+    /// The index of the core instance whose exports satisfy it.
+    pub instance: u32,
 }
 
 /// A decoded component envelope: the core modules it nests, and the core instances it
@@ -134,7 +149,7 @@ impl Component {
                 SECTION_CORE_INSTANCE => {
                     // The instances must fill the section exactly, with no bytes left over.
                     let mut section = Reader::new(bytes, start, end);
-                    component.core_instances = decode_instances(&mut section)?;
+                    decode_instances(&mut section, &mut component.core_instances)?;
                     if !section.at_end() {
                         return Err(ComponentError::Malformed {
                             offset: section.position(),
@@ -151,9 +166,9 @@ impl Component {
             reader = Reader::new(bytes, end, bytes.len());
         }
         for instance in &component.core_instances {
-            let CoreInstance::Instantiate { module } = *instance;
-            if module as usize >= component.core_modules.len() {
-                return Err(ComponentError::NoSuchModule { module });
+            let CoreInstance::Instantiate { module, .. } = instance;
+            if *module as usize >= component.core_modules.len() {
+                return Err(ComponentError::NoSuchModule { module: *module });
             }
         }
         Ok(component)
@@ -172,17 +187,28 @@ impl Component {
     /// Instantiate each core instance, in order, on `engine`. A component with no core
     /// instances runs nothing.
     pub fn instantiate(&self, engine: &Engine) -> Result<ComponentInstance, ComponentError> {
-        let mut instances = Vec::with_capacity(self.core_instances.len());
+        let mut instances: Vec<Instance> = Vec::with_capacity(self.core_instances.len());
         for (index, instance) in self.core_instances.iter().enumerate() {
-            let CoreInstance::Instantiate { module } = *instance;
-            let bytes = &self.core_modules[module as usize];
-            let runtime =
-                engine
-                    .instantiate_bytes(bytes)
+            let CoreInstance::Instantiate { module, arguments } = instance;
+            let bytes = &self.core_modules[*module as usize];
+            // Each core instance gets a linker of its own, so one instance's imports cannot
+            // leak into another.
+            let mut linker = Linker::new();
+            for argument in arguments {
+                let source = &instances[argument.instance as usize];
+                linker
+                    .define_instance(argument.name.as_str(), source)
                     .map_err(|error| ComponentError::Instantiate {
                         instance: index,
                         message: error.to_string(),
                     })?;
+            }
+            let runtime = engine
+                .instantiate_bytes_with_linker(bytes, &linker)
+                .map_err(|error| ComponentError::Instantiate {
+                    instance: index,
+                    message: error.to_string(),
+                })?;
             instances.push(runtime);
         }
         Ok(ComponentInstance { instances })
@@ -221,23 +247,39 @@ impl ComponentInstance {
     }
 }
 
-/// Decode a core-instance section's contents: a count, then each instance expression.
-fn decode_instances(reader: &mut Reader<'_>) -> Result<Vec<CoreInstance>, ComponentError> {
+/// Decode a core-instance section's contents: a count, then each instance expression, which
+/// are appended to `instances`. An argument may name only an instance declared before it,
+/// so every index is checked against the instances already there.
+fn decode_instances(
+    reader: &mut Reader<'_>,
+    instances: &mut Vec<CoreInstance>,
+) -> Result<(), ComponentError> {
     let count = reader.u32()?;
-    let mut instances = Vec::new();
     for _ in 0..count {
         let at = reader.position();
         match reader.byte()? {
             INSTANTIATE => {
                 let module = reader.u32()?;
-                let arguments = reader.u32()?;
-                if arguments != 0 {
-                    return Err(ComponentError::UnsupportedInstance {
-                        what: "instance arguments",
-                        offset: at,
-                    });
+                let argument_count = reader.u32()?;
+                let mut arguments: Vec<InstanceArgument> = Vec::new();
+                for _ in 0..argument_count {
+                    let name = reader.name()?;
+                    let tag_at = reader.position();
+                    if reader.byte()? != SORT_CORE_INSTANCE {
+                        return Err(ComponentError::Malformed { offset: tag_at });
+                    }
+                    let instance = reader.u32()?;
+                    if instance as usize >= instances.len() {
+                        return Err(ComponentError::NoSuchInstance {
+                            instance: instance as usize,
+                        });
+                    }
+                    if arguments.iter().any(|argument| argument.name == name) {
+                        return Err(ComponentError::Malformed { offset: tag_at });
+                    }
+                    arguments.push(InstanceArgument { name, instance });
                 }
-                instances.push(CoreInstance::Instantiate { module });
+                instances.push(CoreInstance::Instantiate { module, arguments });
             }
             INLINE_EXPORTS => {
                 return Err(ComponentError::UnsupportedInstance {
@@ -248,7 +290,7 @@ fn decode_instances(reader: &mut Reader<'_>) -> Result<Vec<CoreInstance>, Compon
             _ => return Err(ComponentError::Malformed { offset: at }),
         }
     }
-    Ok(instances)
+    Ok(())
 }
 
 /// A reader over `bytes[position..end]`. Every read is bounded by `end`, so a section can
@@ -287,6 +329,24 @@ impl<'a> Reader<'a> {
         Ok(byte)
     }
 
+    /// A core name: a `u32` length, then that many bytes of UTF-8.
+    fn name(&mut self) -> Result<String, ComponentError> {
+        let start = self.position;
+        let length = self.u32()? as usize;
+        let end = self
+            .position
+            .checked_add(length)
+            .filter(|end| *end <= self.end)
+            .ok_or(ComponentError::Truncated {
+                offset: self.position,
+            })?;
+        let text = std::str::from_utf8(&self.bytes[self.position..end])
+            .map_err(|_| ComponentError::Malformed { offset: start })?
+            .to_owned();
+        self.position = end;
+        Ok(text)
+    }
+
     /// A `u32` in unsigned `LEB128` form, at most five bytes and no more than `u32::MAX`.
     fn u32(&mut self) -> Result<u32, ComponentError> {
         let start = self.position;
@@ -318,6 +378,18 @@ mod tests {
         0x07, 0x0a, 0x01, 0x06, 0x61, 0x6e, 0x73, 0x77, 0x65, 0x72, 0x00,
         0x00, // export "answer"
         0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b, // code: i32.const 42
+    ];
+
+    /// A core module that imports `env.answer`, a function of no parameters returning `i32`,
+    /// and exports `relay`, which returns what `answer` returns.
+    const RELAY_MODULE: [u8; 54] = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic and version
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type: () -> i32
+        0x02, 0x0e, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x06, 0x61, 0x6e, 0x73, 0x77, 0x65, 0x72, 0x00,
+        0x00, // import env.answer, of type 0
+        0x03, 0x02, 0x01, 0x00, // function 1 has type 0
+        0x07, 0x09, 0x01, 0x05, 0x72, 0x65, 0x6c, 0x61, 0x79, 0x00, 0x01, // export "relay"
+        0x0a, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x0b, // code: call 0, end
     ];
 
     fn with(sections: &[u8]) -> Vec<u8> {
@@ -421,7 +493,10 @@ mod tests {
         let component = Component::decode(&bytes).expect("decodes");
         assert_eq!(
             component.core_instances(),
-            [CoreInstance::Instantiate { module: 0 }]
+            [CoreInstance::Instantiate {
+                module: 0,
+                arguments: Vec::new(),
+            }]
         );
     }
 
@@ -435,20 +510,11 @@ mod tests {
     }
 
     #[test]
-    fn instance_arguments_and_inline_exports_are_refused_for_now() {
-        let mut with_arguments = with(&module_section(&ANSWER_MODULE));
-        with_arguments.extend_from_slice(&[SECTION_CORE_INSTANCE, 5, 1, INSTANTIATE, 0, 1, 0x00]);
-        assert_eq!(
-            Component::decode(&with_arguments),
-            Err(ComponentError::UnsupportedInstance {
-                what: "instance arguments",
-                // 8 bytes of preamble, then the 41-byte module section, then 2 bytes of
-                // section header and 1 of count: the tag is at byte 52.
-                offset: 52,
-            })
-        );
+    fn inline_exports_are_refused_for_now() {
         let mut inline = with(&module_section(&ANSWER_MODULE));
         inline.extend_from_slice(&[SECTION_CORE_INSTANCE, 2, 1, INLINE_EXPORTS]);
+        // 8 bytes of preamble, then the 41-byte module section, then 2 bytes of section
+        // header and 1 of count: the tag is at byte 52.
         assert_eq!(
             Component::decode(&inline),
             Err(ComponentError::UnsupportedInstance {
@@ -456,6 +522,100 @@ mod tests {
                 offset: 52,
             })
         );
+    }
+
+    #[test]
+    fn an_argument_naming_a_later_instance_is_refused() {
+        let mut bytes = with(&module_section(&RELAY_MODULE));
+        // Module 0 with "env" bound to core instance 5, which is not declared yet.
+        bytes.extend_from_slice(&[
+            SECTION_CORE_INSTANCE,
+            10,
+            1,
+            INSTANTIATE,
+            0,
+            1,
+            3,
+            b'e',
+            b'n',
+            b'v',
+            SORT_CORE_INSTANCE,
+            5,
+        ]);
+        assert_eq!(
+            Component::decode(&bytes),
+            Err(ComponentError::NoSuchInstance { instance: 5 })
+        );
+    }
+
+    #[test]
+    fn a_duplicate_argument_name_is_malformed() {
+        let mut bytes = with(&module_section(&RELAY_MODULE));
+        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 4, 1, INSTANTIATE, 0, 0]);
+        let env = [3, b'e', b'n', b'v', SORT_CORE_INSTANCE, 0];
+        let mut section = vec![SECTION_CORE_INSTANCE, 16, 1, INSTANTIATE, 0, 2];
+        section.extend_from_slice(&env);
+        section.extend_from_slice(&env);
+        bytes.extend_from_slice(&section);
+        assert!(matches!(
+            Component::decode(&bytes),
+            Err(ComponentError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn an_argument_links_an_import_to_an_earlier_instance() {
+        let mut bytes = with(&module_section(&ANSWER_MODULE));
+        bytes.extend(module_section(&RELAY_MODULE));
+        // Instance 0 is the answer module. Instance 1 is the relay module, whose import
+        // env.answer is bound to instance 0.
+        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 4, 1, INSTANTIATE, 0, 0]);
+        bytes.extend_from_slice(&[
+            SECTION_CORE_INSTANCE,
+            10,
+            1,
+            INSTANTIATE,
+            1,
+            1,
+            3,
+            b'e',
+            b'n',
+            b'v',
+            SORT_CORE_INSTANCE,
+            0,
+        ]);
+        let component = Component::decode(&bytes).expect("decodes");
+        assert_eq!(
+            component.core_instances()[1],
+            CoreInstance::Instantiate {
+                module: 1,
+                arguments: vec![InstanceArgument {
+                    name: "env".to_owned(),
+                    instance: 0,
+                }],
+            }
+        );
+        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
+        let mut instance = component.instantiate(&engine).expect("instantiates");
+        assert_eq!(
+            instance.call_core(1, "relay", Vec::new()),
+            Ok(vec![Value::I32(42)])
+        );
+    }
+
+    #[test]
+    fn an_unresolved_import_fails_to_instantiate() {
+        let mut bytes = with(&module_section(&RELAY_MODULE));
+        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 4, 1, INSTANTIATE, 0, 0]);
+        let component = Component::decode(&bytes).expect("decodes");
+        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
+        let error = component
+            .instantiate(&engine)
+            .expect_err("the import is missing");
+        assert!(matches!(
+            error,
+            ComponentError::Instantiate { instance: 0, .. }
+        ));
     }
 
     #[test]

@@ -616,7 +616,25 @@ impl Engine {
             .map_err(RuntimeError::Validation)?;
         let ir = self.cached_ir(bytes, &validated)?;
         let key = native_cache::module_key(bytes);
-        self.instantiate_prepared(validated, ir, Some(&key))
+        self.instantiate_prepared(validated, ir, Some(&key), &self.linker)
+    }
+
+    /// Decode, validate, and instantiate a binary module against `linker`, rather than the
+    /// engine's own linker. The caller owns the linker, so its definitions do not leak into
+    /// other instances, which is what a component needs when each core instance imports a
+    /// different set of exports. The native cache is not used for these instances, because
+    /// its key is the bytes alone and the imports resolve through the linker.
+    pub fn instantiate_bytes_with_linker(
+        &self,
+        bytes: &[u8],
+        linker: &Linker,
+    ) -> Result<Instance, RuntimeError> {
+        let module = decode(bytes).map_err(RuntimeError::Decode)?;
+        let validated = Validator::new()
+            .validate(module)
+            .map_err(RuntimeError::Validation)?;
+        let ir = self.cached_ir(bytes, &validated)?;
+        self.instantiate_prepared(validated, ir, None, linker)
     }
 
     /// Hit, miss, and entry counts for the compilation cache.
@@ -656,6 +674,7 @@ impl Engine {
         validated: ValidatedModule,
         ir: Option<Arc<IrModule>>,
         key: Option<&str>,
+        linker: &Linker,
     ) -> Result<Instance, RuntimeError> {
         let execution = if self.config.deterministic {
             ExecutionConfig::deterministic(0)
@@ -668,7 +687,7 @@ impl Engine {
         };
         instantiate_module(
             validated.module,
-            &self.linker,
+            linker,
             self.context.clone(),
             execution,
             &self.config,
@@ -699,7 +718,7 @@ impl Engine {
         // No bytes to key a cache entry by, so a structural module is compiled
         // every time. `instantiate_bytes` is the cached path.
         let ir = compile_ir(&validated, &self.config)?.map(Arc::new);
-        self.instantiate_prepared(validated, ir, None)
+        self.instantiate_prepared(validated, ir, None, &self.linker)
     }
 
     pub fn linker_mut(&mut self) -> &mut Linker {

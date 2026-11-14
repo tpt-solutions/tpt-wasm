@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope and the core-instance section, and instantiates core instances that have no arguments; imports between instances, inline exports, and the WIT mapping are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope and the core-instance section, and instantiates core instances, with each import bound to an earlier core instance; inline exports and the WIT mapping are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -45,13 +45,17 @@ sections carry types, aliases, canonical functions, imports, and exports, and ru
 component without them would be a silent partial run. Each is added with its own decoder
 and tests.
 
-Decided on the recommendation: an instance with arguments (imports from other instances)
-and an inline-exports instance are refused. Both need the instance index space and the
-core export index space, which come with the alias section. Until then a component can
-run only modules that import nothing.
+An instance argument binds one import module name to an earlier core instance, so every
+import under that name resolves to that instance's exports. The arguments name only
+instances already declared, which is checked at decode time, and a name may be bound once.
+Each core instance gets a linker of its own, through `Engine::instantiate_bytes_with_linker`,
+so one instance's imports cannot leak into another.
 
-Not done: instance arguments and inline exports, the alias section, the component's type
-and import checks, canonical lifting and lowering, and the WIT mapping to capabilities.
+Decided on the recommendation: an inline-exports instance is refused. It names core
+functions by index in the core export index space, which the alias section defines.
+
+Not done: the alias section, inline exports, the component's type and import checks,
+canonical lifting and lowering, and the WIT mapping to capabilities.
 
 ## Design constraint
 
