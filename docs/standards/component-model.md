@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`) and UTF-8 strings, and records of scalar fields; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and the other compound value types are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and the remaining compound value types are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -94,8 +94,14 @@ from memory at the pointer the function returns, which needs the memory option. 
 string or another record as a field, a record in an import, and a record passed indirectly
 (more than 16 flat parameters) are refused by name and offset.
 
+Lists (`0x70`) of scalars are supported for lifted exports, as a parameter or a result. A list is
+its pointer and its length, as a string is: a parameter is copied into the callee's memory with
+`realloc(0, 0, align, byte length)`, with the elements stored at the element size, and a result is
+read from the pointer the function returns, which needs the memory option. A list of strings or
+records, a list in a record, a list in an import, and a list in a lowered import are refused.
+
 Refused, each by name and offset, until its own decoder exists: value types beyond the ones
-supported (lists, variants, options, results, tuples, enums, flags, resources, and
+supported (variants, options, results, tuples, enums, flags, resources, and
 the rest), extern types on exports, and exports of any sort other than function. Exports of
 imported functions are refused too.
 
@@ -140,8 +146,8 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 a separate stage, which will map each parsed function onto the same capability id.
 
 Not done: strings and records in lowered imports, UTF-16 and Latin-1 encodings, `post-return`,
-records passed indirectly, lists and the other compound types, and parsing WIT to derive the
-capability ids.
+records passed indirectly, variants, options, results, tuples, enums, flags, and parsing WIT to
+derive the capability ids.
 
 ## Design constraint
 

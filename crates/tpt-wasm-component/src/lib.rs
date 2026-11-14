@@ -81,6 +81,7 @@ const EXTERN_FUNC: u8 = 0x01;
 /// The component type tag of a function type, and of a record.
 const TYPE_FUNC: u8 = 0x40;
 const TYPE_RECORD: u8 = 0x72;
+const TYPE_LIST: u8 = 0x70;
 /// The canon tag of a lift, and of a lower.
 const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
@@ -323,6 +324,8 @@ pub enum ComponentType {
     Scalar(Scalar),
     /// A record, by the index of its definition in the component's type table.
     Record(u32),
+    /// A list of scalars, by the index of its definition in the component's type table.
+    List(u32),
 }
 
 /// One field of a record type.
@@ -341,6 +344,8 @@ pub enum ComponentTypeDef {
     Func(ComponentFuncType),
     /// A record type, with its fields in order.
     Record(Vec<RecordField>),
+    /// A list type, whose elements are of one scalar type.
+    List(Scalar),
 }
 
 /// A component function type: parameter types and at most one result type.
@@ -370,6 +375,8 @@ pub enum ComponentValue {
     Char(char),
     /// A record: its fields, in the order of its definition.
     Record(Vec<(String, ComponentValue)>),
+    /// A list of scalars, whose elements all have the list's element type.
+    List(Vec<ComponentValue>),
 }
 
 impl ComponentValue {
@@ -389,7 +396,7 @@ impl ComponentValue {
             ComponentValue::S16(_) => Some(Scalar::S16),
             ComponentValue::U16(_) => Some(Scalar::U16),
             ComponentValue::Char(_) => Some(Scalar::Char),
-            ComponentValue::Record(_) => None,
+            ComponentValue::Record(_) | ComponentValue::List(_) => None,
         }
     }
 }
@@ -907,7 +914,7 @@ impl Component {
     fn func_type(&self, index: u32) -> Option<&ComponentFuncType> {
         match self.types.get(index as usize)? {
             ComponentTypeDef::Func(func) => Some(func),
-            ComponentTypeDef::Record(_) => None,
+            ComponentTypeDef::Record(_) | ComponentTypeDef::List(_) => None,
         }
     }
 
@@ -929,11 +936,15 @@ impl Component {
             .map(|ty| match ty {
                 ComponentType::Scalar(scalar) => Ok(*scalar),
                 ComponentType::Record(_) => Err(format!("the import {name} takes a record")),
+                ComponentType::List(_) => Err(format!("the import {name} takes a list")),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let result = match declared.result {
             None => None,
             Some(ComponentType::Scalar(scalar)) => Some(scalar),
+            Some(ComponentType::List(_)) => {
+                return Err(format!("the import {name} returns a list"))
+            }
             Some(ComponentType::Record(_)) => {
                 return Err(format!("the import {name} returns a record"))
             }
@@ -984,12 +995,19 @@ fn flat_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> Vec<ValueType> {
                 .collect(),
             _ => Vec::new(),
         },
+        // A list is its pointer and its length, as a string is.
+        ComponentType::List(_) => vec![ValueType::I32, ValueType::I32],
     }
 }
 
 /// Whether a component type holds a string, at the top level.
 fn holds_string(ty: &ComponentType) -> bool {
     matches!(ty, ComponentType::Scalar(Scalar::String))
+}
+
+/// Whether a component type is a list, at the top level.
+fn holds_list(ty: &ComponentType) -> bool {
+    matches!(ty, ComponentType::List(_))
 }
 
 /// The offsets of a record's fields in memory, and the record's size and alignment, by the
@@ -1275,8 +1293,8 @@ impl ComponentInstance {
         }
         let instance = export.core_instance;
         let mut core_arguments = Vec::new();
-        for argument in &arguments {
-            self.lower_argument(&export, argument, &mut core_arguments)
+        for (argument, ty) in arguments.iter().zip(&export.params) {
+            self.lower_argument(&export, argument, ty, &mut core_arguments)
                 .map_err(|message| ComponentError::Call { instance, message })?;
         }
         let core_results = self.call_core(instance, &export.core_export, core_arguments)?;
@@ -1295,15 +1313,72 @@ impl ComponentInstance {
         }
     }
 
-    /// Lower one argument to core values, appending them. A string is copied into the callee's
-    /// memory with its `realloc`, and what is appended is its pointer and length.
+    /// Lower one argument of type `ty` to core values, appending them. A string or a list is
+    /// copied into the callee's memory with its `realloc`, and what is appended is its pointer and
+    /// length.
     fn lower_argument(
         &mut self,
         export: &LiftedExport,
         argument: &ComponentValue,
+        ty: &ComponentType,
         out: &mut Vec<Value>,
     ) -> Result<(), String> {
         match argument {
+            ComponentValue::List(items) => {
+                let ComponentType::List(index) = ty else {
+                    return Err("a list argument is not a list type".to_owned());
+                };
+                let element = match self.types.get(*index as usize) {
+                    Some(ComponentTypeDef::List(element)) => *element,
+                    _ => return Err("the list is not defined".to_owned()),
+                };
+                let (Some(realloc), Some(memory)) = (&export.realloc, &export.memory) else {
+                    return Err("a list argument needs a memory and a realloc".to_owned());
+                };
+                let (size, align) = element.size_and_align();
+                let byte_length = items
+                    .len()
+                    .checked_mul(size)
+                    .and_then(|bytes| i32::try_from(bytes).ok())
+                    .ok_or_else(|| "a list argument is too long for a core length".to_owned())?;
+                let length = i32::try_from(items.len())
+                    .map_err(|_| "a list argument is too long for a core length".to_owned())?;
+                // Allocate the elements in the callee's memory, as the canonical ABI does:
+                // realloc(0, 0, align, byte length).
+                let allocated = self
+                    .call_core(
+                        export.core_instance,
+                        realloc,
+                        vec![
+                            Value::I32(0),
+                            Value::I32(0),
+                            Value::I32(align as i32),
+                            Value::I32(byte_length),
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+                let pointer = match allocated.as_slice() {
+                    [Value::I32(pointer)] => *pointer,
+                    _ => return Err("realloc did not return one i32".to_owned()),
+                };
+                let mut bytes = Vec::with_capacity(byte_length as usize);
+                for item in items {
+                    bytes.extend(
+                        scalar_bytes(item, element)
+                            .ok_or_else(|| "a list element does not match its type".to_owned())?,
+                    );
+                }
+                self.write_core_memory(
+                    export.core_instance,
+                    memory,
+                    u64::from(pointer as u32),
+                    &bytes,
+                )
+                .map_err(|error| error.to_string())?;
+                out.push(Value::I32(pointer));
+                out.push(Value::I32(length));
+                Ok(())
+            }
             ComponentValue::String(text) => {
                 let (Some(realloc), Some(memory)) = (&export.realloc, &export.memory) else {
                     return Err("a string argument needs a memory and a realloc".to_owned());
@@ -1426,6 +1501,30 @@ impl ComponentInstance {
             ComponentType::Scalar(scalar) => {
                 self.load_scalar(instance, memory, u64::from(pointer), *scalar)
             }
+            ComponentType::List(index) => {
+                let Some(ComponentTypeDef::List(element)) = self.types.get(*index as usize) else {
+                    return Err("the list is not defined".to_owned());
+                };
+                let element = *element;
+                // The list is its pointer and its length, and its elements are at the pointer.
+                let header = self
+                    .read_core_memory(instance, memory, u64::from(pointer), 8)
+                    .map_err(|error| error.to_string())?;
+                let data_pointer = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+                let data_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+                let (size, _) = element.size_and_align();
+                let byte_length = (data_length as usize)
+                    .checked_mul(size)
+                    .ok_or_else(|| "the list is too long".to_owned())?;
+                let bytes = self
+                    .read_core_memory(instance, memory, u64::from(data_pointer), byte_length)
+                    .map_err(|error| error.to_string())?;
+                let mut items = Vec::new();
+                for chunk in bytes.chunks_exact(size) {
+                    items.push(scalar_from_bytes(element, chunk)?);
+                }
+                Ok(ComponentValue::List(items))
+            }
             ComponentType::Record(index) => {
                 let Some(ComponentTypeDef::Record(fields)) = self.types.get(*index as usize) else {
                     return Err("the record is not defined".to_owned());
@@ -1459,22 +1558,7 @@ impl ComponentInstance {
         let bytes = self
             .read_core_memory(instance, memory, offset, size)
             .map_err(|error| error.to_string())?;
-        let mut buffer = [0u8; 8];
-        buffer[..size].copy_from_slice(&bytes);
-        let value = match scalar {
-            Scalar::S64 | Scalar::U64 | Scalar::F64 => Value::I64(i64::from_le_bytes(buffer)),
-            Scalar::F32 => Value::F32(u32::from_le_bytes([
-                buffer[0], buffer[1], buffer[2], buffer[3],
-            ])),
-            _ => Value::I32(i32::from_le_bytes([
-                buffer[0], buffer[1], buffer[2], buffer[3],
-            ])),
-        };
-        let value = match (scalar, value) {
-            (Scalar::F64, Value::I64(bits)) => Value::F64(bits as u64),
-            (_, value) => value,
-        };
-        lift(value, scalar)
+        scalar_from_bytes(scalar, &bytes)
     }
 
     /// Read `length` bytes at `offset` from the memory `memory` of core instance `instance`.
@@ -1586,13 +1670,35 @@ fn value_matches(value: &ComponentValue, ty: &ComponentType, types: &[ComponentT
                     *name == field.name && value.scalar() == Some(field.ty)
                 })
         }
+        (ComponentValue::List(items), ComponentType::List(index)) => {
+            let Some(ComponentTypeDef::List(element)) = types.get(*index as usize) else {
+                return false;
+            };
+            items.iter().all(|item| item.scalar() == Some(*element))
+        }
         (value, ComponentType::Scalar(scalar)) => value.scalar() == Some(*scalar),
         _ => false,
     }
 }
 
-/// The core value a scalar lowers to, or `None` for a string or a record, which are not single
-/// scalars. Signed and unsigned values share their bits.
+/// The little-endian bytes of one list element of scalar type `element`, or `None` if the value is
+/// not of that type.
+fn scalar_bytes(value: &ComponentValue, element: Scalar) -> Option<Vec<u8>> {
+    if value.scalar() != Some(element) {
+        return None;
+    }
+    let (size, _) = element.size_and_align();
+    match lower_scalar(value)? {
+        Value::I32(value) => Some(value.to_le_bytes()[..size].to_vec()),
+        Value::I64(value) => Some(value.to_le_bytes().to_vec()),
+        Value::F32(bits) => Some(bits.to_le_bytes().to_vec()),
+        Value::F64(bits) => Some(bits.to_le_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+/// The core value a scalar lowers to, or `None` for a string, a record, or a list, which are not
+/// single scalars. Signed and unsigned values share their bits.
 fn lower_scalar(value: &ComponentValue) -> Option<Value> {
     match value {
         ComponentValue::S32(value) => Some(Value::I32(*value)),
@@ -1607,8 +1713,30 @@ fn lower_scalar(value: &ComponentValue) -> Option<Value> {
         ComponentValue::S16(value) => Some(Value::I32(i32::from(*value))),
         ComponentValue::U16(value) => Some(Value::I32(i32::from(*value))),
         ComponentValue::Char(value) => Some(Value::I32(*value as u32 as i32)),
-        ComponentValue::String(_) | ComponentValue::Record(_) => None,
+        ComponentValue::String(_) | ComponentValue::Record(_) | ComponentValue::List(_) => None,
     }
+}
+
+/// The scalar that `bytes`, read little-endian and zero-extended, lifts to. `bytes` is exactly the
+/// scalar's size in memory.
+fn scalar_from_bytes(scalar: Scalar, bytes: &[u8]) -> Result<ComponentValue, String> {
+    let (size, _) = scalar.size_and_align();
+    if bytes.len() != size {
+        return Err(format!("{} bytes do not hold a {scalar:?}", bytes.len()));
+    }
+    let mut buffer = [0u8; 8];
+    buffer[..size].copy_from_slice(bytes);
+    let value = match scalar {
+        Scalar::S64 | Scalar::U64 => Value::I64(i64::from_le_bytes(buffer)),
+        Scalar::F64 => Value::F64(u64::from_le_bytes(buffer)),
+        Scalar::F32 => Value::F32(u32::from_le_bytes([
+            buffer[0], buffer[1], buffer[2], buffer[3],
+        ])),
+        _ => Value::I32(i32::from_le_bytes([
+            buffer[0], buffer[1], buffer[2], buffer[3],
+        ])),
+    };
+    lift(value, scalar)
 }
 
 /// The scalar a core value lifts to, when the core value has the scalar's type. A string is not
@@ -1792,6 +1920,7 @@ fn value_type(
     let index = reader.u32()?;
     match types.get(index as usize) {
         Some(ComponentTypeDef::Record(_)) => Ok(ComponentType::Record(index)),
+        Some(ComponentTypeDef::List(_)) => Ok(ComponentType::List(index)),
         Some(ComponentTypeDef::Func(_)) => Err(ComponentError::UnsupportedType {
             what: "a function type used as a value",
             offset: at,
@@ -1849,6 +1978,12 @@ fn decode_types(
                             })
                         }
                         ComponentType::Scalar(ty) => fields.push(RecordField { name, ty }),
+                        ComponentType::List(_) => {
+                            return Err(ComponentError::UnsupportedType {
+                                what: "a list in a record",
+                                offset: at_field,
+                            })
+                        }
                         ComponentType::Record(_) => {
                             return Err(ComponentError::UnsupportedType {
                                 what: "a record in a record",
@@ -1859,9 +1994,28 @@ fn decode_types(
                 }
                 types.push(ComponentTypeDef::Record(fields));
             }
+            TYPE_LIST => {
+                let element_at = reader.position();
+                let element = match value_type(reader, types)? {
+                    ComponentType::Scalar(Scalar::String) => {
+                        return Err(ComponentError::UnsupportedType {
+                            what: "a list of strings",
+                            offset: element_at,
+                        })
+                    }
+                    ComponentType::Scalar(scalar) => scalar,
+                    ComponentType::Record(_) | ComponentType::List(_) => {
+                        return Err(ComponentError::UnsupportedType {
+                            what: "a list of records or lists",
+                            offset: element_at,
+                        })
+                    }
+                };
+                types.push(ComponentTypeDef::List(element));
+            }
             _ => {
                 return Err(ComponentError::UnsupportedType {
-                    what: "a type other than a function type or a record",
+                    what: "a type other than a function type, a record, or a list",
                     offset: at,
                 })
             }
@@ -1907,10 +2061,10 @@ fn decode_imports(
             .params
             .iter()
             .chain(func.result.iter())
-            .any(|ty| matches!(ty, ComponentType::Record(_)));
+            .any(|ty| matches!(ty, ComponentType::Record(_) | ComponentType::List(_)));
         if has_record {
             return Err(ComponentError::UnsupportedImport {
-                what: "import with a record in its type",
+                what: "import with a record or list in its type",
                 offset: at,
             });
         }
@@ -1976,14 +2130,11 @@ fn decode_canon(
                     let Some(ComponentTypeDef::Func(func)) = types.get(*ty as usize) else {
                         return Err(ComponentError::NoSuchType { index: *ty });
                     };
-                    if func
-                        .params
-                        .iter()
-                        .chain(func.result.iter())
-                        .any(|ty| holds_string(ty) || matches!(ty, ComponentType::Record(_)))
-                    {
+                    if func.params.iter().chain(func.result.iter()).any(|ty| {
+                        holds_string(ty) || holds_list(ty) || matches!(ty, ComponentType::Record(_))
+                    }) {
                         return Err(ComponentError::UnsupportedCanon {
-                            what: "lowering a function with strings or records",
+                            what: "lowering a function with strings, lists, or records",
                             offset: at,
                         });
                     }
@@ -2087,24 +2238,30 @@ fn decode_canon(
                 offset: at,
             });
         }
-        let has_string = func
+        // A string or a list lives in memory, as does a result that is returned through a pointer.
+        let needs_memory = func
             .params
             .iter()
             .chain(func.result.iter())
-            .any(holds_string);
+            .any(|ty| holds_string(ty) || holds_list(ty));
         let indirect_result = func
             .result
             .map(|ty| flat_of(&ty, types).len() > MAX_FLAT_RESULTS)
             .unwrap_or(false);
-        if (has_string || indirect_result) && memory.is_none() {
+        if (needs_memory || indirect_result) && memory.is_none() {
             return Err(ComponentError::UnsupportedCanon {
-                what: "a string or an indirect result without a memory option",
+                what: "a string, list, or indirect result without a memory option",
                 offset: at,
             });
         }
-        if func.params.iter().any(holds_string) && realloc.is_none() {
+        if func
+            .params
+            .iter()
+            .any(|ty| holds_string(ty) || holds_list(ty))
+            && realloc.is_none()
+        {
             return Err(ComponentError::UnsupportedCanon {
-                what: "a string parameter without a realloc option",
+                what: "a string or list parameter without a realloc option",
                 offset: at,
             });
         }

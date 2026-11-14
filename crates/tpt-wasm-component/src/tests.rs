@@ -58,10 +58,20 @@ fn with(sections: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// A section with `content`, whose size fits in one byte.
+/// A section with `content`. Its size is an unsigned LEB128, as the format gives it, so a section
+/// of 127 bytes or fewer is one size byte.
 fn section(id: u8, content: &[u8]) -> Vec<u8> {
-    assert!(content.len() < 128, "the test section is too large");
-    let mut out = vec![id, content.len() as u8];
+    let mut out = vec![id];
+    let mut size = content.len();
+    loop {
+        let byte = (size & 0x7f) as u8;
+        size >>= 7;
+        if size == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
     out.extend_from_slice(content);
     out
 }
@@ -1114,7 +1124,7 @@ fn a_string_parameter_without_realloc_is_refused() {
     assert!(matches!(
         Component::decode(&string_component(&memory_only)),
         Err(ComponentError::UnsupportedCanon {
-            what: "a string parameter without a realloc option",
+            what: "a string or list parameter without a realloc option",
             ..
         })
     ));
@@ -1127,7 +1137,7 @@ fn a_string_without_memory_is_refused() {
     assert!(matches!(
         Component::decode(&string_component(&no_options)),
         Err(ComponentError::UnsupportedCanon {
-            what: "a string or an indirect result without a memory option",
+            what: "a string, list, or indirect result without a memory option",
             ..
         })
     ));
@@ -1274,6 +1284,7 @@ fn no_truncation_or_corruption_of_a_component_panics() {
         answer_component(&TYPE_NO_ARGUMENTS_S32, &CANON_LIFT_ANSWER, &EXPORT_ANSWER),
         string_component(&complete_len_canon()),
         record_component(&complete_rec_canon()),
+        list_component(&complete_count_canon()),
     ];
     let mut decoded = 0usize;
     let mut instantiated = 0usize;
@@ -1541,7 +1552,7 @@ fn an_import_with_a_record_in_its_type_is_refused() {
     assert!(matches!(
         Component::decode(&bytes),
         Err(ComponentError::UnsupportedImport {
-            what: "import with a record in its type",
+            what: "import with a record or list in its type",
             ..
         })
     ));
@@ -1571,4 +1582,227 @@ fn a_record_is_laid_out_by_the_canonical_alignment_rules() {
         },
     ];
     assert_eq!(record_layout(&mixed), (vec![0, 8], 16, 8));
+}
+
+/// A core module with memory and `realloc`, and three functions over lists: `first(ptr, len)`
+/// returns the first byte, `count(ptr, len)` returns the length, and `items() -> i32` returns the
+/// address of a list of two `u32`s, 7 and 9, in the canonical layout.
+fn list_module() -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bytes.extend(section(
+        1,
+        &[
+            3, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 1, 0x7f, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1,
+            0x7f,
+        ],
+    ));
+    // Functions: first and count have type 0, items has type 1, realloc has type 2.
+    bytes.extend(section(3, &[4, 0, 0, 1, 2]));
+    bytes.extend(section(5, &[1, 0x00, 1]));
+    bytes.extend(section(
+        7,
+        &[
+            5, 6, b'm', b'e', b'm', b'o', b'r', b'y', 2, 0, 5, b'f', b'i', b'r', b's', b't', 0, 0,
+            5, b'c', b'o', b'u', b'n', b't', 0, 1, 5, b'i', b't', b'e', b'm', b's', 0, 2, 7, b'r',
+            b'e', b'a', b'l', b'l', b'o', b'c', 0, 3,
+        ],
+    ));
+    bytes.extend(section(
+        10,
+        &[
+            4, 7, 0, 0x20, 0, 0x2d, 0, 0, 0x0b, 4, 0, 0x20, 1, 0x0b, 5, 0, 0x41, 0x80, 0x10, 0x0b,
+            5, 0, 0x41, 0x80, 0x08, 0x0b,
+        ],
+    ));
+    // The list at 2048: a pointer to the elements (2056) and their count (2), then 7 and 9.
+    bytes.extend(section(
+        11,
+        &[
+            1, 0x00, 0x41, 0x80, 0x10, 0x0b, 16, 0x08, 0x08, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 9, 0, 0,
+            0,
+        ],
+    ));
+    bytes
+}
+
+/// A component over `list_module`: `first` and `count` take a `list<u8>` and `items` returns a
+/// `list<u32>`. `count_canon` is the canon entry for `count`.
+fn list_component(count_canon: &[u8]) -> Vec<u8> {
+    let types = section(
+        SECTION_TYPE,
+        &[
+            4,
+            TYPE_LIST,
+            VALTYPE_U8,
+            TYPE_LIST,
+            VALTYPE_U32,
+            TYPE_FUNC,
+            1,
+            1,
+            b'l',
+            0x00,
+            0x00,
+            VALTYPE_U32,
+            TYPE_FUNC,
+            0,
+            0x00,
+            0x01,
+        ],
+    );
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            5, 0, 0, 1, 0, 5, b'f', b'i', b'r', b's', b't', 0, 0, 1, 0, 5, b'c', b'o', b'u', b'n',
+            b't', 0, 0, 1, 0, 5, b'i', b't', b'e', b'm', b's', 0, 0, 1, 0, 7, b'r', b'e', b'a',
+            b'l', b'l', b'o', b'c', 0, 2, 1, 0, 6, b'm', b'e', b'm', b'o', b'r', b'y',
+        ],
+    );
+    // Canon: `first` and `count` lift with memory and realloc, `items` with memory only.
+    let mut canon = vec![
+        3,
+        CANON_LIFT,
+        SORT_FUNC,
+        0,
+        2,
+        OPTION_MEMORY,
+        0,
+        OPTION_REALLOC,
+        3,
+        2,
+    ];
+    canon.extend_from_slice(count_canon);
+    canon.extend_from_slice(&[CANON_LIFT, SORT_FUNC, 2, 1, OPTION_MEMORY, 0, 3]);
+    let canon = section(SECTION_CANON, &canon);
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            3,
+            0x00,
+            5,
+            b'f',
+            b'i',
+            b'r',
+            b's',
+            b't',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+            0x00,
+            5,
+            b'c',
+            b'o',
+            b'u',
+            b'n',
+            b't',
+            COMPONENT_SORT_FUNC,
+            1,
+            0x00,
+            0x00,
+            5,
+            b'i',
+            b't',
+            b'e',
+            b'm',
+            b's',
+            COMPONENT_SORT_FUNC,
+            2,
+            0x00,
+        ],
+    );
+    let mut bytes = with(&module_section(&list_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+/// The canon entry for `count` with memory and realloc, which is complete.
+fn complete_count_canon() -> Vec<u8> {
+    vec![
+        CANON_LIFT,
+        SORT_FUNC,
+        1,
+        2,
+        OPTION_MEMORY,
+        0,
+        OPTION_REALLOC,
+        3,
+        2,
+    ]
+}
+
+#[test]
+fn a_list_argument_is_copied_into_memory_and_read_by_the_module() {
+    let mut instance = Component::decode(&list_component(&complete_count_canon()))
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    let list = ComponentValue::List(vec![ComponentValue::U8(5), ComponentValue::U8(6)]);
+    // `first` reads the first byte at the pointer the list was copied to.
+    assert_eq!(
+        instance.call_export("first", vec![list.clone()]),
+        Ok(vec![ComponentValue::U32(5)])
+    );
+    assert_eq!(
+        instance.call_export("count", vec![list]),
+        Ok(vec![ComponentValue::U32(2)])
+    );
+}
+
+#[test]
+fn an_empty_list_argument_has_length_zero() {
+    let mut instance = Component::decode(&list_component(&complete_count_canon()))
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("count", vec![ComponentValue::List(Vec::new())]),
+        Ok(vec![ComponentValue::U32(0)])
+    );
+}
+
+#[test]
+fn a_list_result_is_read_back_from_memory_by_the_canonical_layout() {
+    let mut instance = Component::decode(&list_component(&complete_count_canon()))
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("items", Vec::new()),
+        Ok(vec![ComponentValue::List(vec![
+            ComponentValue::U32(7),
+            ComponentValue::U32(9),
+        ])])
+    );
+}
+
+#[test]
+fn a_list_element_of_another_type_is_refused() {
+    let mut instance = Component::decode(&list_component(&complete_count_canon()))
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert!(matches!(
+        instance.call_export(
+            "count",
+            vec![ComponentValue::List(vec![ComponentValue::U16(1)])]
+        ),
+        Err(ComponentError::ArgumentMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_list_parameter_without_realloc_is_refused() {
+    // Memory only: a list parameter has nowhere to be copied to.
+    let memory_only = [CANON_LIFT, SORT_FUNC, 1, 1, OPTION_MEMORY, 0, 2];
+    assert!(matches!(
+        Component::decode(&list_component(&memory_only)),
+        Err(ComponentError::UnsupportedCanon {
+            what: "a string or list parameter without a realloc option",
+            ..
+        })
+    ));
 }
