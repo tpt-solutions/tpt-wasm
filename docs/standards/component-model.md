@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`) and UTF-8 strings; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and the compound value types are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`) and UTF-8 strings, and records of scalar fields; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and the other compound value types are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -85,8 +85,17 @@ results against that type.
 Lowering a function the component defines, and lifting a lowered function, are refused,
 because they would need a component to call back into itself.
 
+Records (`0x72`) of scalar fields are supported for lifted exports, as a parameter or a result.
+A record is a type-index entry, and a function refers to it by that index. Its fields are laid
+out by the canonical ABI: each at the next offset its alignment allows, and the record rounded
+up to its largest alignment. A record flattens to its fields, so a record of up to 16 flat
+values is a direct parameter, and a record result that flattens to more than one value is read
+from memory at the pointer the function returns, which needs the memory option. A record with a
+string or another record as a field, a record in an import, and a record passed indirectly
+(more than 16 flat parameters) are refused by name and offset.
+
 Refused, each by name and offset, until its own decoder exists: value types beyond the ones
-supported (records, lists, variants, options, results, tuples, enums, flags, resources, and
+supported (lists, variants, options, results, tuples, enums, flags, resources, and
 the rest), extern types on exports, and exports of any sort other than function. Exports of
 imported functions are refused too.
 
@@ -130,8 +139,9 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 `namespace:package/interface#function` is a plain string to this layer, so the WIT grammar is
 a separate stage, which will map each parsed function onto the same capability id.
 
-Not done: strings in lowered imports, UTF-16 and Latin-1 encodings, `post-return`, records,
-lists, and the other compound types, and parsing WIT to derive the capability ids.
+Not done: strings and records in lowered imports, UTF-16 and Latin-1 encodings, `post-return`,
+records passed indirectly, lists and the other compound types, and parsing WIT to derive the
+capability ids.
 
 ## Design constraint
 
