@@ -143,6 +143,38 @@ fn every_truncation_of_a_module_artifact_is_refused() {
 }
 
 #[test]
+fn a_sealed_module_artifact_opens_and_runs_as_the_unsealed_one_does() {
+    // The seal is transparent: `open` returns the artifact exactly as sealed, so the same
+    // parser accepts it and the loaded code gives the same answers.
+    let key = b"0123456789abcdef0123456789abcdef";
+    let bytes = compile_module_artifact(&lowered(dispatch_module()), 1000, true)
+        .expect("compiles")
+        .to_bytes();
+    let sealed = crate::seal::seal(&bytes, key).expect("sealed");
+    let opened = crate::seal::open(&sealed, key).expect("opens under its key");
+    assert_eq!(opened, bytes.as_slice());
+    let artifact = ModuleArtifact::from_bytes(opened).expect("parses");
+    assert_eq!(artifact.to_bytes(), bytes);
+}
+
+#[test]
+fn a_flipped_byte_in_a_sealed_module_artifact_is_refused_before_it_is_parsed() {
+    let key = b"0123456789abcdef0123456789abcdef";
+    let bytes = compile_module_artifact(&lowered(dispatch_module()), 1000, true)
+        .expect("compiles")
+        .to_bytes();
+    let sealed = crate::seal::seal(&bytes, key).expect("sealed");
+    for position in (0..sealed.len()).step_by(11) {
+        let mut damaged = sealed.clone();
+        damaged[position] ^= 0x40;
+        assert!(
+            crate::seal::open(&damaged, key).is_err(),
+            "a flipped byte at {position} of the sealed artifact is refused"
+        );
+    }
+}
+
+#[test]
 fn a_flipped_byte_in_a_module_artifact_is_refused() {
     let bytes = compile_module_artifact(&lowered(dispatch_module()), 1000, true)
         .expect("compiles")

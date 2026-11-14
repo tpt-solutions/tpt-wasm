@@ -14,9 +14,10 @@
 //! An artifact is executable code. Loading one runs it, so an artifact is not a data format
 //! to parse from an untrusted source. The header's checksum catches corruption in storage or
 //! transit. It is an FNV-1a 64-bit digest, which detects accidental change but does not
-//! authenticate the artifact: a deliberate forgery can carry a matching checksum. Authenticating
-//! an artifact, by a signature from a key the loader trusts, is not done here, and is the
-//! condition for loading artifacts from anywhere but a trusted store.
+//! authenticate the artifact: a deliberate forgery can carry a matching checksum. Authentication
+//! is the [`seal`] module: an artifact sealed under a key the loader holds is opened only when
+//! its HMAC-SHA256 tag verifies. An unsealed artifact is still only safe to load from a trusted
+//! store.
 //!
 //! ## Format
 //!
@@ -87,6 +88,11 @@ pub enum AotError {
     Malformed(String),
     /// The code was read but could not be installed.
     Load(JitError),
+    /// A sealed artifact's tag does not match under the key: the key is wrong, or the artifact
+    /// or its tag was changed after sealing. See [`seal`].
+    Unauthenticated,
+    /// The key given to seal or open is shorter than [`seal::MIN_KEY_LEN`].
+    KeyTooShort { length: usize },
 }
 
 impl fmt::Display for AotError {
@@ -104,6 +110,15 @@ impl fmt::Display for AotError {
             }
             AotError::Malformed(what) => write!(f, "malformed artifact: {what}"),
             AotError::Load(error) => write!(f, "load: {error}"),
+            AotError::Unauthenticated => write!(
+                f,
+                "the artifact does not authenticate under this key: wrong key, or it was changed after sealing"
+            ),
+            AotError::KeyTooShort { length } => write!(
+                f,
+                "the seal key is {length} bytes, shorter than the {} bytes required",
+                seal::MIN_KEY_LEN
+            ),
         }
     }
 }
@@ -286,6 +301,8 @@ impl Artifact {
             .map_err(AotError::Load)
     }
 }
+
+pub mod seal;
 
 #[cfg(test)]
 mod module_tests;

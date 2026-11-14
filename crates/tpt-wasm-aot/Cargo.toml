@@ -17,6 +17,8 @@ tpt-wasm-types.workspace = true
 tpt-wasm-ir.workspace = true
 tpt-wasm-opt.workspace = true
 tpt-wasm-codegen.workspace = true
+hmac = "0.13"
+sha2 = "0.11"
 
 [dev-dependencies]
 tpt-wasm-format.workspace = true
