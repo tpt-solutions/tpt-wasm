@@ -87,6 +87,7 @@ const TYPE_ENUM: u8 = 0x6d;
 const TYPE_FLAGS: u8 = 0x6e;
 const TYPE_TUPLE: u8 = 0x6f;
 const TYPE_RESULT: u8 = 0x6a;
+const TYPE_VARIANT: u8 = 0x71;
 /// The canon tag of a lift, and of a lower.
 const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
@@ -341,6 +342,8 @@ pub enum ComponentType {
     Tuple(u32),
     /// A result, by the index of its definition in the component's type table.
     Result(u32),
+    /// A variant, by the index of its definition in the component's type table.
+    Variant(u32),
 }
 
 /// One field of a record type.
@@ -371,6 +374,11 @@ pub enum ComponentTypeDef {
     Result {
         ok: Option<Scalar>,
         err: Option<Scalar>,
+    },
+    /// A variant: each case's label and the scalar its payload holds, if it has one. Every
+    /// payload shares one flat type.
+    Variant {
+        cases: Vec<(String, Option<Scalar>)>,
     },
     /// A set of flags: its labels, at most 32, each a bit.
     Flags(Vec<String>),
@@ -413,6 +421,8 @@ pub enum ComponentValue {
     Tuple(Vec<ComponentValue>),
     /// A result: its ok or error case, and the case's payload if it has one.
     Result(Result<Option<Box<ComponentValue>>, Option<Box<ComponentValue>>>),
+    /// A variant: the label of its case, and the case's payload if it has one.
+    Variant(String, Option<Box<ComponentValue>>),
     /// A set of flags: the labels that are set.
     Flags(Vec<String>),
 }
@@ -440,7 +450,8 @@ impl ComponentValue {
             | ComponentValue::Enum(_)
             | ComponentValue::Flags(_)
             | ComponentValue::Tuple(_)
-            | ComponentValue::Result(_) => None,
+            | ComponentValue::Result(_)
+            | ComponentValue::Variant(..) => None,
         }
     }
 }
@@ -964,7 +975,8 @@ impl Component {
             | ComponentTypeDef::Enum(_)
             | ComponentTypeDef::Flags(_)
             | ComponentTypeDef::Tuple(_)
-            | ComponentTypeDef::Result { .. } => None,
+            | ComponentTypeDef::Result { .. }
+            | ComponentTypeDef::Variant { .. } => None,
         }
     }
 
@@ -990,7 +1002,7 @@ impl Component {
                 ComponentType::Option(_) => Err(format!("the import {name} takes an option")),
                 ComponentType::Enum(_) => Err(format!("the import {name} takes an enum")),
                 ComponentType::Flags(_) => Err(format!("the import {name} takes flags")),
-                ComponentType::Tuple(_) | ComponentType::Result(_) => {
+                ComponentType::Tuple(_) | ComponentType::Result(_) | ComponentType::Variant(_) => {
                     Err(format!("the import {name} takes a tuple"))
                 }
             })
@@ -1002,7 +1014,8 @@ impl Component {
                 ComponentType::Enum(_)
                 | ComponentType::Flags(_)
                 | ComponentType::Tuple(_)
-                | ComponentType::Result(_),
+                | ComponentType::Result(_)
+                | ComponentType::Variant(_),
             ) => return Err(format!("the import {name} returns an enum")),
             Some(ComponentType::List(_)) => {
                 return Err(format!("the import {name} returns a list"))
@@ -1086,6 +1099,16 @@ fn flat_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> Vec<ValueType> {
             let mut flat = vec![ValueType::I32];
             if let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) {
                 if let Some(payload) = ok.or(*err) {
+                    flat.extend(payload.flat_params());
+                }
+            }
+            flat
+        }
+        // A variant is its case index, then the one flat value every payload shares.
+        ComponentType::Variant(index) => {
+            let mut flat = vec![ValueType::I32];
+            if let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) {
+                if let Some(payload) = shared_payload(cases) {
                     flat.extend(payload.flat_params());
                 }
             }
@@ -1501,6 +1524,41 @@ impl ComponentInstance {
                 }
                 Ok(())
             }
+            ComponentValue::Variant(label, payload) => {
+                let ComponentType::Variant(index) = ty else {
+                    return Err("a variant argument is not a variant type".to_owned());
+                };
+                let cases = match self.types.get(*index as usize) {
+                    Some(ComponentTypeDef::Variant { cases }) => cases,
+                    _ => return Err("the variant is not defined".to_owned()),
+                };
+                let case = cases
+                    .iter()
+                    .position(|(name, _)| name == label)
+                    .ok_or_else(|| format!("the variant has no case {label}"))?;
+                let case_type = cases[case].1;
+                let value = match (case_type, payload.as_deref()) {
+                    (None, None) => None,
+                    (Some(scalar), Some(value)) => {
+                        if value.scalar() != Some(scalar) {
+                            return Err("a variant payload does not match its case".to_owned());
+                        }
+                        Some(
+                            lower_scalar(value)
+                                .ok_or_else(|| "a variant payload did not lower".to_owned())?,
+                        )
+                    }
+                    _ => return Err("a variant payload does not match its case".to_owned()),
+                };
+                out.push(Value::I32(case as i32));
+                // The shared payload slot holds the case's value, or zero for a case without one.
+                if let Some(flat) =
+                    shared_payload(cases).and_then(|s| s.flat_params().first().copied())
+                {
+                    out.push(value.unwrap_or_else(|| zero_value(flat)));
+                }
+                Ok(())
+            }
             ComponentValue::Result(outcome) => {
                 let ComponentType::Result(index) = ty else {
                     return Err("a result argument is not a result type".to_owned());
@@ -1670,6 +1728,18 @@ impl ComponentInstance {
         match (ty, core_results) {
             (ComponentType::Scalar(scalar), [value]) => lift(value.clone(), *scalar),
             // A result with no payloads is its discriminant alone, so it is a direct value.
+            // A variant with no payloads is its case index alone, so it is a direct value.
+            (ComponentType::Variant(index), [value]) => {
+                let Some(ComponentTypeDef::Variant { cases }) = self.types.get(*index as usize)
+                else {
+                    return Err("the result's variant is not defined".to_owned());
+                };
+                if shared_payload(cases).is_some() {
+                    return Err("a variant with payloads is returned through memory".to_owned());
+                }
+                let case = enum_case(value, cases.len())?;
+                Ok(ComponentValue::Variant(cases[case].0.clone(), None))
+            }
             (ComponentType::Result(index), [Value::I32(discriminant)]) => {
                 let Some(ComponentTypeDef::Result { ok, err }) = self.types.get(*index as usize)
                 else {
@@ -1829,6 +1899,36 @@ impl ComponentInstance {
                     }
                     _ => Err("an option's discriminant is neither 0 nor 1".to_owned()),
                 }
+            }
+            ComponentType::Variant(index) => {
+                let Some(ComponentTypeDef::Variant { cases }) = self.types.get(*index as usize)
+                else {
+                    return Err("the variant is not defined".to_owned());
+                };
+                // The discriminant is one byte, and the payload follows at the offset its
+                // widest case needs.
+                let discriminant = self
+                    .read_core_memory(instance, memory, u64::from(pointer), 1)
+                    .map_err(|error| error.to_string())?[0];
+                let Some((label, case_type)) = cases.get(usize::from(discriminant)) else {
+                    return Err("a variant's discriminant names no case".to_owned());
+                };
+                let payload = match case_type {
+                    None => None,
+                    Some(scalar) => {
+                        let align = cases
+                            .iter()
+                            .filter_map(|(_, payload)| *payload)
+                            .map(|payload| payload.size_and_align().1)
+                            .max()
+                            .unwrap_or(1);
+                        let offset = u64::from(pointer) + align_to(1, align) as u64;
+                        Some(Box::new(
+                            self.load_scalar(instance, memory, offset, *scalar)?,
+                        ))
+                    }
+                };
+                Ok(ComponentValue::Variant(label.clone(), payload))
             }
             ComponentType::Result(index) => {
                 let Some(ComponentTypeDef::Result { ok, err }) = self.types.get(*index as usize)
@@ -2068,6 +2168,18 @@ fn value_matches(value: &ComponentValue, ty: &ComponentType, types: &[ComponentT
             };
             items.iter().all(|item| item.scalar() == Some(*element))
         }
+        (ComponentValue::Variant(label, payload), ComponentType::Variant(index)) => {
+            let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) else {
+                return false;
+            };
+            match cases.iter().find(|(name, _)| name == label) {
+                Some((_, None)) => payload.is_none(),
+                Some((_, Some(scalar))) => payload
+                    .as_deref()
+                    .is_some_and(|value| value.scalar() == Some(*scalar)),
+                None => false,
+            }
+        }
         (ComponentValue::Result(outcome), ComponentType::Result(index)) => {
             let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) else {
                 return false;
@@ -2126,7 +2238,8 @@ fn lower_scalar(value: &ComponentValue) -> Option<Value> {
         | ComponentValue::Enum(_)
         | ComponentValue::Flags(_)
         | ComponentValue::Tuple(_)
-        | ComponentValue::Result(_) => None,
+        | ComponentValue::Result(_)
+        | ComponentValue::Variant(..) => None,
     }
 }
 
@@ -2359,6 +2472,7 @@ fn value_type(
         Some(ComponentTypeDef::Flags(_)) => Ok(ComponentType::Flags(index)),
         Some(ComponentTypeDef::Tuple(_)) => Ok(ComponentType::Tuple(index)),
         Some(ComponentTypeDef::Result { .. }) => Ok(ComponentType::Result(index)),
+        Some(ComponentTypeDef::Variant { .. }) => Ok(ComponentType::Variant(index)),
         Some(ComponentTypeDef::Func(_)) => Err(ComponentError::UnsupportedType {
             what: "a function type used as a value",
             offset: at,
@@ -2420,7 +2534,8 @@ fn decode_types(
                         | ComponentType::Enum(_)
                         | ComponentType::Flags(_)
                         | ComponentType::Tuple(_)
-                        | ComponentType::Result(_) => {
+                        | ComponentType::Result(_)
+                        | ComponentType::Variant(_) => {
                             return Err(ComponentError::UnsupportedType {
                                 what: "an option or an enum in a record",
                                 offset: at_field,
@@ -2458,7 +2573,8 @@ fn decode_types(
                     | ComponentType::Enum(_)
                     | ComponentType::Flags(_)
                     | ComponentType::Tuple(_)
-                    | ComponentType::Result(_) => {
+                    | ComponentType::Result(_)
+                    | ComponentType::Variant(_) => {
                         return Err(ComponentError::UnsupportedType {
                             what: "an option of a record, list, or option",
                             offset: payload_at,
@@ -2565,6 +2681,68 @@ fn decode_types(
                 }
                 types.push(ComponentTypeDef::Result { ok, err });
             }
+            TYPE_VARIANT => {
+                let case_count = reader.u32()?;
+                if case_count == 0 {
+                    return Err(ComponentError::Malformed { offset: at });
+                }
+                if case_count > 256 {
+                    return Err(ComponentError::UnsupportedType {
+                        what: "a variant of more than 256 cases",
+                        offset: at,
+                    });
+                }
+                let mut cases: Vec<(String, Option<Scalar>)> = Vec::new();
+                for _ in 0..case_count {
+                    let at_label = reader.position();
+                    let label = reader.name()?;
+                    if cases.iter().any(|(defined, _)| *defined == label) {
+                        return Err(ComponentError::Malformed { offset: at_label });
+                    }
+                    let at_case = reader.position();
+                    let payload = match reader.byte()? {
+                        0x00 => None,
+                        0x01 => {
+                            let at_payload = reader.position();
+                            match value_type(reader, types)? {
+                                ComponentType::Scalar(Scalar::String) => {
+                                    return Err(ComponentError::UnsupportedType {
+                                        what: "a string in a variant",
+                                        offset: at_payload,
+                                    })
+                                }
+                                ComponentType::Scalar(scalar) => Some(scalar),
+                                _ => {
+                                    return Err(ComponentError::UnsupportedType {
+                                        what: "a compound type in a variant",
+                                        offset: at_payload,
+                                    })
+                                }
+                            }
+                        }
+                        _ => return Err(ComponentError::Malformed { offset: at_case }),
+                    };
+                    // The case's refines field is `0x00`; a refining case is not supported.
+                    let at_refines = reader.position();
+                    if reader.byte()? != 0x00 {
+                        return Err(ComponentError::Malformed { offset: at_refines });
+                    }
+                    cases.push((label, payload));
+                }
+                let mut flats = cases
+                    .iter()
+                    .filter_map(|(_, payload)| *payload)
+                    .map(|payload| payload.flat_params());
+                if let Some(first) = flats.next() {
+                    if flats.any(|flat| flat != first) {
+                        return Err(ComponentError::UnsupportedType {
+                            what: "a variant whose payloads have different flat types",
+                            offset: at,
+                        });
+                    }
+                }
+                types.push(ComponentTypeDef::Variant { cases });
+            }
             TYPE_LIST => {
                 let element_at = reader.position();
                 let element = match value_type(reader, types)? {
@@ -2581,7 +2759,8 @@ fn decode_types(
                     | ComponentType::Enum(_)
                     | ComponentType::Flags(_)
                     | ComponentType::Tuple(_)
-                    | ComponentType::Result(_) => {
+                    | ComponentType::Result(_)
+                    | ComponentType::Variant(_) => {
                         return Err(ComponentError::UnsupportedType {
                             what: "a list of records, lists, or options",
                             offset: element_at,
@@ -2644,6 +2823,7 @@ fn decode_imports(
                     | ComponentType::Flags(_)
                     | ComponentType::Tuple(_)
                     | ComponentType::Result(_)
+                    | ComponentType::Variant(_)
             )
         });
         if has_record {
@@ -2725,6 +2905,7 @@ fn decode_canon(
                                     | ComponentType::Flags(_)
                                     | ComponentType::Tuple(_)
                                     | ComponentType::Result(_)
+                                    | ComponentType::Variant(_)
                             )
                     }) {
                         return Err(ComponentError::UnsupportedCanon {
@@ -3004,3 +3185,9 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests;
+
+/// The scalar every payload of a variant's cases shares, if any case has one. Decoding refuses a
+/// variant whose payloads differ in flat type, so the first payload found is the one all share.
+fn shared_payload(cases: &[(String, Option<Scalar>)]) -> Option<Scalar> {
+    cases.iter().find_map(|(_, payload)| *payload)
+}

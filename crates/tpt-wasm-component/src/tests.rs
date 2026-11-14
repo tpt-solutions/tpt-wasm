@@ -1290,6 +1290,7 @@ fn no_truncation_or_corruption_of_a_component_panics() {
         flags_component(),
         tuple_component(),
         result_component(),
+        variant_component(),
     ];
     let mut decoded = 0usize;
     let mut instantiated = 0usize;
@@ -2630,6 +2631,306 @@ fn a_result_whose_payloads_differ_in_flat_type_is_refused() {
 fn a_result_case_with_an_unknown_tag_is_malformed() {
     assert!(matches!(
         Component::decode(&with(&section(SECTION_TYPE, &[1, TYPE_RESULT, 2]))),
+        Err(ComponentError::Malformed { .. })
+    ));
+}
+
+/// A core module with a memory and three functions. `make` returns a pointer to a variant in
+/// memory, the `count` case holding 42. `take` returns the payload of the variant passed as its
+/// two flat values. `pick` returns the discriminant of a payload-free variant's second case.
+fn variant_module() -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bytes.extend(section(
+        1,
+        &[2, 0x60, 0, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 1, 0x7f],
+    ));
+    bytes.extend(section(3, &[3, 0, 1, 0]));
+    bytes.extend(section(5, &[1, 0x00, 1]));
+    bytes.extend(section(
+        7,
+        &[
+            4, 4, b'm', b'a', b'k', b'e', 0, 0, 4, b't', b'a', b'k', b'e', 0, 1, 4, b'p', b'i',
+            b'c', b'k', 0, 2, 6, b'm', b'e', b'm', b'o', b'r', b'y', 2, 0,
+        ],
+    ));
+    bytes.extend(section(
+        10,
+        &[
+            3, 4, 0, 0x41, 16, 0x0b, 4, 0, 0x20, 1, 0x0b, 4, 0, 0x41, 1, 0x0b,
+        ],
+    ));
+    // At 16: discriminant 1 (`count`), then the payload 42 at offset 4.
+    bytes.extend(section(
+        11,
+        &[1, 0, 0x41, 16, 0x0b, 8, 1, 0, 0, 0, 42, 0, 0, 0],
+    ));
+    bytes
+}
+
+/// A component over `variant_module`: `variant { empty, count(u32), flag }` returned by `make`,
+/// `variant { a, b }` returned by `pick`, and `take`, from the first variant to `u32`.
+fn variant_component() -> Vec<u8> {
+    let types = section(
+        SECTION_TYPE,
+        &[
+            5,
+            TYPE_VARIANT,
+            3,
+            5,
+            b'e',
+            b'm',
+            b'p',
+            b't',
+            b'y',
+            0,
+            0,
+            5,
+            b'c',
+            b'o',
+            b'u',
+            b'n',
+            b't',
+            1,
+            VALTYPE_U32,
+            0,
+            4,
+            b'f',
+            b'l',
+            b'a',
+            b'g',
+            0,
+            0,
+            TYPE_FUNC,
+            0,
+            0x00,
+            0,
+            TYPE_VARIANT,
+            2,
+            1,
+            b'a',
+            0,
+            0,
+            1,
+            b'b',
+            0,
+            0,
+            TYPE_FUNC,
+            0,
+            0x00,
+            2,
+            TYPE_FUNC,
+            1,
+            1,
+            b'x',
+            0x00,
+            0x00,
+            VALTYPE_U32,
+        ],
+    );
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            4, 0, 0, 1, 0, 4, b'm', b'a', b'k', b'e', 0, 0, 1, 0, 4, b't', b'a', b'k', b'e', 0, 0,
+            1, 0, 4, b'p', b'i', b'c', b'k', 0, 2, 1, 0, 6, b'm', b'e', b'm', b'o', b'r', b'y',
+        ],
+    );
+    let canon = section(
+        SECTION_CANON,
+        &[
+            3,
+            CANON_LIFT,
+            SORT_FUNC,
+            0,
+            1,
+            OPTION_MEMORY,
+            0,
+            1,
+            CANON_LIFT,
+            SORT_FUNC,
+            2,
+            0,
+            3,
+            CANON_LIFT,
+            SORT_FUNC,
+            1,
+            0,
+            4,
+        ],
+    );
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            3,
+            0x00,
+            4,
+            b'm',
+            b'a',
+            b'k',
+            b'e',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+            0x00,
+            4,
+            b'p',
+            b'i',
+            b'c',
+            b'k',
+            COMPONENT_SORT_FUNC,
+            1,
+            0x00,
+            0x00,
+            4,
+            b't',
+            b'a',
+            b'k',
+            b'e',
+            COMPONENT_SORT_FUNC,
+            2,
+            0x00,
+        ],
+    );
+    let mut bytes = with(&module_section(&variant_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+#[test]
+fn a_variant_with_a_payload_is_read_back_from_memory() {
+    let mut instance = Component::decode(&variant_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("make", Vec::new()),
+        Ok(vec![ComponentValue::Variant(
+            "count".to_owned(),
+            Some(Box::new(ComponentValue::U32(42)))
+        )])
+    );
+}
+
+#[test]
+fn a_variant_without_payloads_is_a_direct_case_index() {
+    let mut instance = Component::decode(&variant_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    // The module returns 1, the second case of `variant { a, b }`.
+    assert_eq!(
+        instance.call_export("pick", Vec::new()),
+        Ok(vec![ComponentValue::Variant("b".to_owned(), None)])
+    );
+}
+
+#[test]
+fn a_variant_argument_passes_its_case_and_payload() {
+    let mut instance = Component::decode(&variant_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export(
+            "take",
+            vec![ComponentValue::Variant(
+                "count".to_owned(),
+                Some(Box::new(ComponentValue::U32(9)))
+            )]
+        ),
+        Ok(vec![ComponentValue::U32(9)])
+    );
+    // A case without a payload passes zero in the payload's place.
+    assert_eq!(
+        instance.call_export(
+            "take",
+            vec![ComponentValue::Variant("empty".to_owned(), None)]
+        ),
+        Ok(vec![ComponentValue::U32(0)])
+    );
+}
+
+#[test]
+fn a_variant_argument_that_does_not_match_its_type_is_refused() {
+    let mut instance = Component::decode(&variant_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    let refused = [
+        ComponentValue::Variant("count".to_owned(), None),
+        ComponentValue::Variant("empty".to_owned(), Some(Box::new(ComponentValue::U32(1)))),
+        ComponentValue::Variant("nope".to_owned(), None),
+        ComponentValue::Variant("count".to_owned(), Some(Box::new(ComponentValue::S32(1)))),
+    ];
+    for argument in refused {
+        assert!(matches!(
+            instance.call_export("take", vec![argument]),
+            Err(ComponentError::ArgumentMismatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn a_variant_with_a_string_or_a_repeated_label_is_refused() {
+    assert!(matches!(
+        Component::decode(&with(&section(
+            SECTION_TYPE,
+            &[1, TYPE_VARIANT, 1, 1, b'a', 0x01, VALTYPE_STRING, 0]
+        ))),
+        Err(ComponentError::UnsupportedType {
+            what: "a string in a variant",
+            ..
+        })
+    ));
+    assert!(matches!(
+        Component::decode(&with(&section(
+            SECTION_TYPE,
+            &[1, TYPE_VARIANT, 2, 1, b'a', 0, 0, 1, b'a', 0, 0]
+        ))),
+        Err(ComponentError::Malformed { .. })
+    ));
+}
+
+#[test]
+fn a_variant_whose_payloads_differ_in_flat_type_or_have_no_cases_is_refused() {
+    assert!(matches!(
+        Component::decode(&with(&section(
+            SECTION_TYPE,
+            &[
+                1,
+                TYPE_VARIANT,
+                2,
+                1,
+                b'a',
+                1,
+                VALTYPE_U32,
+                0,
+                1,
+                b'b',
+                1,
+                VALTYPE_F32,
+                0
+            ]
+        ))),
+        Err(ComponentError::UnsupportedType {
+            what: "a variant whose payloads have different flat types",
+            ..
+        })
+    ));
+    assert!(matches!(
+        Component::decode(&with(&section(SECTION_TYPE, &[1, TYPE_VARIANT, 0]))),
+        Err(ComponentError::Malformed { .. })
+    ));
+    // A refines field other than `0x00` is malformed.
+    assert!(matches!(
+        Component::decode(&with(&section(
+            SECTION_TYPE,
+            &[1, TYPE_VARIANT, 1, 1, b'a', 0, 1]
+        ))),
         Err(ComponentError::Malformed { .. })
     ));
 }
