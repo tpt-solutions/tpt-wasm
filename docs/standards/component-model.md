@@ -89,8 +89,18 @@ memory, and realloc, which need the lifting of linear memory), the other value t
 exports, and exports of any sort other than function. Exports of imported functions are
 refused too.
 
-Not done: canonical options, the other value types, the component's import type checks
-against the embedder's functions, and the WIT mapping to capabilities.
+The decoder and the instantiation path take untrusted bytes, so a test truncates every
+fixture at every length and corrupts each byte in four ways. Each variant that decodes is
+instantiated and called, and none may panic.
+
+Strings are deferred, on purpose. Their flattening into core parameters, the return-pointer
+convention for results that flatten to more than one value, and the lifting and lowering
+through `memory` and `realloc` are the parts of the canonical ABI that this stage could not
+check against the specification text, so they are not implemented from memory. The runtime
+also has a read path for guest memory and no public write path, which a lowered string needs.
+
+Not done: canonical options (strings first), the other value types, the component's import
+type checks against the embedder's functions, and the WIT mapping to capabilities.
 
 ## Design constraint
 

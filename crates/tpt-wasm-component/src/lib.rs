@@ -2201,6 +2201,55 @@ mod tests {
         ));
     }
 
+    /// Every truncation and every single-byte corruption of the fixtures is decoded, and every
+    /// one that decodes is instantiated. None may panic: the bytes are untrusted, and a panic
+    /// here is a denial of service in the embedder.
+    #[test]
+    fn no_truncation_or_corruption_of_a_component_panics() {
+        let engine = engine();
+        let fixtures = [
+            host_component(),
+            answer_component(&TYPE_NO_ARGUMENTS_S32, &CANON_LIFT_ANSWER, &EXPORT_ANSWER),
+        ];
+        let mut decoded = 0usize;
+        let mut instantiated = 0usize;
+        for fixture in &fixtures {
+            for length in 0..fixture.len() {
+                let _ = Component::decode(&fixture[..length]);
+            }
+            for position in 0..fixture.len() {
+                for mask in [0x01u8, 0x40, 0x80, 0xff] {
+                    let mut bytes = fixture.clone();
+                    bytes[position] ^= mask;
+                    let Ok(component) = Component::decode(&bytes) else {
+                        continue;
+                    };
+                    decoded += 1;
+                    let mut imports = Imports::new();
+                    imports.define_function("add", |args| match args {
+                        [ComponentValue::S32(a), ComponentValue::S32(b)] => {
+                            Ok(vec![ComponentValue::S32(a.wrapping_add(*b))])
+                        }
+                        _ => Err("add takes two s32 values".to_owned()),
+                    });
+                    if let Ok(mut instance) = component.instantiate_with(&engine, &imports) {
+                        instantiated += 1;
+                        for name in instance
+                            .export_names()
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                        {
+                            let _ = instance.call_export(&name, Vec::new());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(decoded > 0, "some corruptions must still decode");
+        assert!(instantiated > 0, "some corruptions must still instantiate");
+    }
+
     #[test]
     fn scalars_lower_and_lift_by_their_bits() {
         assert_eq!(lower(ComponentValue::U32(u32::MAX)), Value::I32(-1));
