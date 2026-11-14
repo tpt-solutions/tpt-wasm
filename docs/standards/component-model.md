@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types; and takes imported functions from the embedder, lowering them so core code can call them. The WIT mapping and the options and value types beyond scalars are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types and UTF-8 strings; and takes imported functions from the embedder, lowering them so core code can call them. The WIT mapping and the remaining value types are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -93,14 +93,26 @@ The decoder and the instantiation path take untrusted bytes, so a test truncates
 fixture at every length and corrupts each byte in four ways. Each variant that decodes is
 instantiated and called, and none may panic.
 
-Strings are deferred, on purpose. Their flattening into core parameters, the return-pointer
-convention for results that flatten to more than one value, and the lifting and lowering
-through `memory` and `realloc` are the parts of the canonical ABI that this stage could not
-check against the specification text, so they are not implemented from memory. The runtime
-also has a read path for guest memory and no public write path, which a lowered string needs.
+Strings are supported for lifted exports, as UTF-8 through the canonical `memory` and
+`realloc` options. A string flattens to two core values, a pointer and a length, and a string
+result is returned as a pointer to that pair in memory. A string argument is copied in with
+`realloc(0, 0, 1, length)`, the canonical UTF-8 copy, and then written into the memory with
+`Instance::write_memory`. A string result is read back from the pointer the function returns,
+and must be valid UTF-8. The flattening rules (a maximum of 16 flat parameters, one flat result,
+and the return-pointer convention for a multi-value result) are the canonical ABI's, and the
+crate refuses a type that would need the indirect form rather than implementing it.
 
-Not done: canonical options (strings first), the other value types, the component's import
-type checks against the embedder's functions, and the WIT mapping to capabilities.
+The rules were checked against a mirror of the Canonical ABI text, `clunt.github.io/component-model/design/mvp/CanonicalABI.html`,
+because the canonical file itself did not render for the fetch. They should be checked again
+against the canonical file before a release.
+
+Refused, each by name and offset: a string in a lowered import (the host call would need the
+caller's memory), more than 16 flat parameters, a memory or `realloc` from another instance,
+any other canonical option, and a string without the options it needs.
+
+Not done: strings in lowered imports, UTF-16 and Latin-1 encodings, `post-return`, the other
+value types (`bool`, the small integers, `char`, records, lists), the component's import type
+checks against the embedder's functions, and the WIT mapping to capabilities.
 
 ## Design constraint
 

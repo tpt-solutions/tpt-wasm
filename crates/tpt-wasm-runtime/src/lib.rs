@@ -2032,6 +2032,51 @@ impl Instance {
             .map_err(RuntimeError::Store)
     }
 
+    /// Write `bytes` at `offset` in the memory exported as `name`, between calls. This is how
+    /// the host passes data into a module, such as a string argument. The write is refused, and
+    /// changes nothing, if any of it falls outside the memory.
+    pub fn write_memory(&self, name: &str, offset: u64, bytes: &[u8]) -> Result<(), RuntimeError> {
+        let index = match self.exports.get(name) {
+            Some(ExportDesc::Memory(index)) => *index,
+            Some(_) => {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: "memory export".into(),
+                    actual: "non-memory export".into(),
+                })
+            }
+            None => return Err(RuntimeError::UnknownExport(name.to_owned())),
+        };
+        if let Some(module) = self.baseline.as_ref() {
+            // The compiled backend owns its memory, and MVP modules have only index 0.
+            if index != 0 {
+                return Err(RuntimeError::UnsupportedFeature(
+                    "memory index other than 0",
+                ));
+            }
+            let handle = module
+                .memory_handle()
+                .ok_or(RuntimeError::UnsupportedFeature("module has no memory"))?;
+            let mut memory = handle.lock().map_err(|_| RuntimeError::StorePoisoned)?;
+            return if tpt_wasm_types::GuestMemory::write(&mut *memory, offset, bytes) {
+                Ok(())
+            } else {
+                Err(RuntimeError::Store(StoreError::MemoryOutOfBounds))
+            };
+        }
+        let mut store = lock_store(&self.context.store)?;
+        let address = *store
+            .instance(self.index)
+            .map_err(RuntimeError::Store)?
+            .memory_addrs
+            .get(index as usize)
+            .ok_or(RuntimeError::Store(StoreError::UnknownMemory(index)))?;
+        store
+            .memory_mut(address)
+            .map_err(RuntimeError::Store)?
+            .write(offset, bytes)
+            .map_err(RuntimeError::Store)
+    }
+
     pub fn store(&self) -> Result<MutexGuard<'_, Store>, RuntimeError> {
         lock_store(&self.context.store)
     }

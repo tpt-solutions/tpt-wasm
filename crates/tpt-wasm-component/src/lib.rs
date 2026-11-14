@@ -12,11 +12,14 @@
 //! decodes the type (7), import (10), canon (8), alias (6), core-instance (2) and export (11)
 //! sections, and runs the instances on a runtime `Engine`.
 //!
-//! The values that cross the boundary are scalars: `s32`, `u32`, `s64`, `u64`, `f32`, and
-//! `f64`. A component function is either an import the embedder supplies, or a core function
-//! lifted to a component type. An import can be lowered to a core function, which a core
-//! module calls back into the embedder through. Every other section, and every form the
-//! crate does not implement, is refused by name and offset rather than skipped.
+//! The values that cross the boundary are scalars (`s32`, `u32`, `s64`, `u64`, `f32`, `f64`)
+//! and UTF-8 strings. A scalar is one core value reinterpreted at the boundary. A string is
+//! two core values, a pointer and a length, into the instance's linear memory, and it is
+//! copied in through the instance's `realloc`, and copied out from its memory. A component
+//! function is either an import the embedder supplies, or a core function lifted to a
+//! component type. An import can be lowered to a core function, which a core module calls
+//! back into the embedder through. Every other section, and every form the crate does not
+//! implement, is refused by name and offset rather than skipped.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -28,6 +31,10 @@ use tpt_wasm_types::{FunctionType, ResultType, Value, ValueType};
 
 /// The component preamble: the magic, then version `0x0d` and layer `0x01`.
 pub const PREAMBLE: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
+
+/// The most flat core parameters a lifted function takes directly. More are passed through
+/// one pointer, which this crate does not implement, so such a function is refused.
+const MAX_FLAT_PARAMS: usize = 16;
 
 /// The section id of a custom section, which is skipped.
 const SECTION_CUSTOM: u8 = 0;
@@ -54,6 +61,8 @@ const INLINE_EXPORTS: u8 = 0x01;
 const SORT_CORE_WRAPPER: u8 = 0x00;
 /// The core sort of a function, and the sort of a function in a sort index.
 const SORT_FUNC: u8 = 0x00;
+/// The core sort of a memory.
+const SORT_CORE_MEMORY: u8 = 0x02;
 /// The sort byte of a core instance, which an instance argument names.
 const SORT_CORE_INSTANCE: u8 = 0x12;
 /// The alias tag that takes an export of a core instance.
@@ -68,6 +77,10 @@ const TYPE_FUNC: u8 = 0x40;
 /// The canon tag of a lift, and of a lower.
 const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
+/// The canonical option tags: the string encoding (UTF-8 only), a memory, and a `realloc`.
+const OPTION_UTF8: u8 = 0x00;
+const OPTION_MEMORY: u8 = 0x03;
+const OPTION_REALLOC: u8 = 0x04;
 /// The value type bytes this crate supports.
 const VALTYPE_S32: u8 = 0x7a;
 const VALTYPE_U32: u8 = 0x79;
@@ -75,6 +88,7 @@ const VALTYPE_S64: u8 = 0x78;
 const VALTYPE_U64: u8 = 0x77;
 const VALTYPE_F32: u8 = 0x76;
 const VALTYPE_F64: u8 = 0x75;
+const VALTYPE_STRING: u8 = 0x73;
 
 /// Why a component was refused or could not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +122,8 @@ pub enum ComponentError {
     NoSuchInstance { instance: usize },
     /// A reference names a core function that is not defined before it.
     NoSuchFunction { function: u32 },
+    /// A reference names a core memory that is not defined before it.
+    NoSuchMemory { memory: u32 },
     /// A reference names a component type that is not declared before it.
     NoSuchType { index: u32 },
     /// A reference names a component function that is not defined before it.
@@ -118,11 +134,12 @@ pub enum ComponentError {
     MissingImport { name: String },
     /// A core instance could not be created, with the runtime's reason.
     Instantiate { instance: usize, message: String },
-    /// A lifted function's core type does not match its component type.
+    /// A lifted function's core type does not match its component type, or its memory or
+    /// `realloc` does not exist.
     LiftMismatch { export: String, message: String },
     /// A call's arguments do not match the export's type.
     ArgumentMismatch { export: String, message: String },
-    /// A call into a core instance, or into an embedder function, failed.
+    /// A call into a core instance, into its memory, or into an embedder function failed.
     Call { instance: usize, message: String },
 }
 
@@ -166,6 +183,12 @@ impl fmt::Display for ComponentError {
                     "there is no core function {function} defined before this use"
                 )
             }
+            ComponentError::NoSuchMemory { memory } => {
+                write!(
+                    f,
+                    "there is no core memory {memory} defined before this use"
+                )
+            }
             ComponentError::NoSuchType { index } => {
                 write!(
                     f,
@@ -203,7 +226,7 @@ impl fmt::Display for ComponentError {
 
 impl std::error::Error for ComponentError {}
 
-/// A scalar component type: one core value, reinterpreted at the boundary.
+/// A component value type: a scalar, or a UTF-8 string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scalar {
     S32,
@@ -212,22 +235,39 @@ pub enum Scalar {
     U64,
     F32,
     F64,
+    /// A UTF-8 string, passed as a pointer and a length into linear memory.
+    String,
 }
 
 impl Scalar {
-    /// The core value type this scalar lowers to.
-    fn flat(self) -> ValueType {
+    /// The core value type one value of this type takes in one position. A string's pointer
+    /// takes one, and its length a second.
+    fn single(self) -> ValueType {
         match self {
-            Scalar::S32 | Scalar::U32 => ValueType::I32,
+            Scalar::S32 | Scalar::U32 | Scalar::String => ValueType::I32,
             Scalar::S64 | Scalar::U64 => ValueType::I64,
             Scalar::F32 => ValueType::F32,
             Scalar::F64 => ValueType::F64,
         }
     }
+
+    /// The core parameters this type flattens to: a string is its pointer and its length.
+    fn flat_params(self) -> Vec<ValueType> {
+        match self {
+            Scalar::String => vec![ValueType::I32, ValueType::I32],
+            other => vec![other.single()],
+        }
+    }
+
+    /// The core result this type flattens to: a string is returned as a pointer to its
+    /// pointer and length in memory.
+    fn flat_result(self) -> Vec<ValueType> {
+        vec![self.single()]
+    }
 }
 
-/// A value of a scalar component type, as the caller sees it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A value of a component type, as the caller sees it.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ComponentValue {
     S32(i32),
     U32(u32),
@@ -235,11 +275,12 @@ pub enum ComponentValue {
     U64(u64),
     F32(f32),
     F64(f64),
+    String(String),
 }
 
 impl ComponentValue {
-    /// The scalar type of this value.
-    pub fn scalar(self) -> Scalar {
+    /// The type of this value.
+    pub fn scalar(&self) -> Scalar {
         match self {
             ComponentValue::S32(_) => Scalar::S32,
             ComponentValue::U32(_) => Scalar::U32,
@@ -247,11 +288,12 @@ impl ComponentValue {
             ComponentValue::U64(_) => Scalar::U64,
             ComponentValue::F32(_) => Scalar::F32,
             ComponentValue::F64(_) => Scalar::F64,
+            ComponentValue::String(_) => Scalar::String,
         }
     }
 }
 
-/// A component function type: scalar parameters and at most one scalar result.
+/// A component function type: parameter types and at most one result type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentFuncType {
     /// The parameter types, in order.
@@ -260,13 +302,34 @@ pub struct ComponentFuncType {
     pub result: Option<Scalar>,
 }
 
+impl ComponentFuncType {
+    /// Whether any parameter or the result is a string.
+    fn has_string(&self) -> bool {
+        self.params.contains(&Scalar::String) || self.result == Some(Scalar::String)
+    }
+
+    /// The number of core parameters the function takes directly.
+    fn flat_param_count(&self) -> usize {
+        self.params
+            .iter()
+            .map(|scalar| scalar.flat_params().len())
+            .sum()
+    }
+}
+
 /// A component function: one entry of the component function index space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComponentFunction {
     /// A function the embedder supplies, under this name, of the type with index `ty`.
     Import { name: String, ty: u32 },
-    /// A core function lifted to the type with index `ty`.
-    Lift { core_function: u32, ty: u32 },
+    /// A core function lifted to the type with index `ty`. Its `memory` and `realloc` are the
+    /// core memory and function that a string crosses through, when it has one.
+    Lift {
+        core_function: u32,
+        ty: u32,
+        memory: Option<u32>,
+        realloc: Option<u32>,
+    },
 }
 
 /// One entry of the core function index space.
@@ -276,6 +339,15 @@ pub enum CoreFunction {
     Alias { instance: u32, export: String },
     /// A component import, lowered so that core code can call it.
     Lowered { function: u32 },
+}
+
+/// One entry of the core memory index space: an export of a core instance, named by an alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreMemory {
+    /// The index of the core instance that exports the memory.
+    pub instance: u32,
+    /// The name of the export.
+    pub export: String,
 }
 
 /// One export of the component: a name for a component function.
@@ -353,6 +425,7 @@ impl Imports {
 pub struct Component {
     core_modules: Vec<Vec<u8>>,
     core_functions: Vec<CoreFunction>,
+    core_memories: Vec<CoreMemory>,
     core_instances: Vec<CoreInstance>,
     types: Vec<ComponentFuncType>,
     functions: Vec<ComponentFunction>,
@@ -384,6 +457,7 @@ impl Component {
                     &mut section,
                     &component.core_instances,
                     &mut component.core_functions,
+                    &mut component.core_memories,
                 )?,
                 SECTION_CORE_INSTANCE => decode_instances(
                     &mut section,
@@ -397,6 +471,7 @@ impl Component {
                 SECTION_CANON => decode_canon(
                     &mut section,
                     &mut component.core_functions,
+                    &component.core_memories,
                     &component.types,
                     &mut component.functions,
                 )?,
@@ -438,6 +513,11 @@ impl Component {
         &self.core_functions
     }
 
+    /// The core memories, in index order.
+    pub fn core_memories(&self) -> &[CoreMemory] {
+        &self.core_memories
+    }
+
     /// The core instances the component declares, in order.
     pub fn core_instances(&self) -> &[CoreInstance] {
         &self.core_instances
@@ -465,7 +545,8 @@ impl Component {
 
     /// Instantiate each core instance, in order, on `engine`, with the embedder's `imports`.
     /// Every import must be supplied. Each lifted function's core type is then checked against
-    /// its component type, and the exports are recorded.
+    /// its component type, its memory and `realloc` are checked to exist, and the exports are
+    /// recorded.
     pub fn instantiate_with(
         &self,
         engine: &Engine,
@@ -557,16 +638,23 @@ impl Component {
             slots.push(slot);
         }
 
-        // Each lifted function's core type must be the flattening of its component type.
+        // Each lifted function's core type must be the flattening of its component type, and
+        // the memory and `realloc` it names must exist in the instance that defines it.
         for function in &self.functions {
-            let ComponentFunction::Lift { core_function, ty } = function else {
+            let ComponentFunction::Lift {
+                core_function,
+                ty,
+                memory,
+                realloc,
+            } = function
+            else {
                 continue;
             };
             let CoreFunction::Alias { instance, export } =
                 &self.core_functions[*core_function as usize]
             else {
-                return Err(ComponentError::Instantiate {
-                    instance: 0,
+                return Err(ComponentError::LiftMismatch {
+                    export: String::new(),
                     message: "a lift names a lowered function".to_owned(),
                 });
             };
@@ -593,12 +681,52 @@ impl Component {
                     ),
                 });
             }
+            let runtime = match &slots[*instance as usize] {
+                Slot::Runtime(runtime) => runtime,
+                Slot::Exports(_) => {
+                    return Err(ComponentError::LiftMismatch {
+                        export: export.clone(),
+                        message: "the function comes from an inline-exports instance".to_owned(),
+                    })
+                }
+            };
+            if let Some(index) = memory {
+                let name = &self.core_memories[*index as usize].export;
+                runtime
+                    .read_memory(name, 0, 0)
+                    .map_err(|error| ComponentError::LiftMismatch {
+                        export: export.clone(),
+                        message: format!("the memory {name} is missing: {error}"),
+                    })?;
+            }
+            if let Some(index) = realloc {
+                let CoreFunction::Alias {
+                    export: realloc_name,
+                    ..
+                } = &self.core_functions[*index as usize]
+                else {
+                    return Err(ComponentError::LiftMismatch {
+                        export: export.clone(),
+                        message: "the realloc option names a lowered function".to_owned(),
+                    });
+                };
+                runtime.get_function(realloc_name).map_err(|error| {
+                    ComponentError::LiftMismatch {
+                        export: export.clone(),
+                        message: format!("the realloc {realloc_name} is missing: {error}"),
+                    }
+                })?;
+            }
         }
 
         let mut exports = Vec::with_capacity(self.exports.len());
         for export in &self.exports {
-            let ComponentFunction::Lift { core_function, ty } =
-                &self.functions[export.function as usize]
+            let ComponentFunction::Lift {
+                core_function,
+                ty,
+                memory,
+                realloc,
+            } = &self.functions[export.function as usize]
             else {
                 return Err(ComponentError::NoSuchComponentFunction {
                     function: export.function,
@@ -620,6 +748,11 @@ impl Component {
                 result: ty.result,
                 core_instance: *instance as usize,
                 core_export: core_export.clone(),
+                memory: memory.map(|index| self.core_memories[index as usize].export.clone()),
+                realloc: realloc.and_then(|index| match &self.core_functions[index as usize] {
+                    CoreFunction::Alias { export, .. } => Some(export.clone()),
+                    CoreFunction::Lowered { .. } => None,
+                }),
             });
         }
         Ok(ComponentInstance { slots, exports })
@@ -648,8 +781,13 @@ impl Component {
 /// The core signature a component function of type `ty` flattens to.
 fn flat_signature(ty: &ComponentFuncType) -> FunctionType {
     FunctionType {
-        params: ResultType(ty.params.iter().map(|scalar| scalar.flat()).collect()),
-        results: ResultType(ty.result.map(Scalar::flat).into_iter().collect()),
+        params: ResultType(
+            ty.params
+                .iter()
+                .flat_map(|scalar| scalar.flat_params())
+                .collect(),
+        ),
+        results: ResultType(ty.result.map(Scalar::flat_result).unwrap_or_default()),
     }
 }
 
@@ -749,7 +887,9 @@ impl LoweredHost {
         let results = (self.closure)(&values)?;
         match (self.result, results.as_slice()) {
             (None, []) => Ok(Vec::new()),
-            (Some(scalar), [value]) if value.scalar() == scalar => Ok(vec![lower(*value)]),
+            (Some(scalar), [value]) if value.scalar() == scalar => lower_scalar(value)
+                .map(|lowered| vec![lowered])
+                .ok_or_else(|| format!("the import {} returned a string", self.name)),
             _ => Err(format!(
                 "the import {} returned values that do not match its type",
                 self.name
@@ -761,8 +901,13 @@ impl LoweredHost {
 impl HostFunction for LoweredHost {
     fn function_type(&self) -> FunctionType {
         FunctionType {
-            params: ResultType(self.params.iter().map(|scalar| scalar.flat()).collect()),
-            results: ResultType(self.result.map(Scalar::flat).into_iter().collect()),
+            params: ResultType(
+                self.params
+                    .iter()
+                    .flat_map(|scalar| scalar.flat_params())
+                    .collect(),
+            ),
+            results: ResultType(self.result.map(Scalar::flat_result).unwrap_or_default()),
         }
     }
 
@@ -772,13 +917,17 @@ impl HostFunction for LoweredHost {
 }
 
 /// An exported component function, ready to call.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LiftedExport {
     name: String,
     params: Vec<Scalar>,
     result: Option<Scalar>,
     core_instance: usize,
     core_export: String,
+    /// The export name of the memory a string crosses through, when the function has one.
+    memory: Option<String>,
+    /// The export name of the `realloc` a string argument is copied in through.
+    realloc: Option<String>,
 }
 
 /// Bind the import module `module` to the core instance at `instance`: a runtime instance
@@ -836,9 +985,10 @@ impl ComponentInstance {
             .collect()
     }
 
-    /// Call an exported component function with scalar arguments. The arguments must match
-    /// the export's parameter types in number and in type, and the result is lifted back to
-    /// the export's result type.
+    /// Call an exported component function. The arguments must match the export's parameter
+    /// types in number and in type. A string argument is copied into the instance's memory
+    /// through its `realloc`, and a string result is copied out of it. The result is lifted
+    /// back to the export's result type.
     pub fn call_export(
         &mut self,
         name: &str,
@@ -850,23 +1000,21 @@ impl ComponentInstance {
             .find(|export| export.name == name)
             .ok_or_else(|| ComponentError::NoSuchExport {
                 name: name.to_owned(),
-            })?;
-        let instance = export.core_instance;
-        let core_export = export.core_export.clone();
-        let params = export.params.clone();
-        let result = export.result;
-        if arguments.len() != params.len() {
+            })?
+            .clone();
+        if arguments.len() != export.params.len() {
             return Err(ComponentError::ArgumentMismatch {
                 export: name.to_owned(),
                 message: format!(
                     "it takes {} arguments, and {} were given",
-                    params.len(),
+                    export.params.len(),
                     arguments.len()
                 ),
             });
         }
+        let instance = export.core_instance;
         let mut core_arguments = Vec::with_capacity(arguments.len());
-        for (position, (expected, argument)) in params.iter().zip(&arguments).enumerate() {
+        for (position, (expected, argument)) in export.params.iter().zip(&arguments).enumerate() {
             if argument.scalar() != *expected {
                 return Err(ComponentError::ArgumentMismatch {
                     export: name.to_owned(),
@@ -877,11 +1025,87 @@ impl ComponentInstance {
                     ),
                 });
             }
-            core_arguments.push(lower(*argument));
+            match argument {
+                ComponentValue::String(text) => {
+                    let (Some(realloc), Some(memory)) = (&export.realloc, &export.memory) else {
+                        return Err(ComponentError::Call {
+                            instance,
+                            message: "a string argument needs a memory and a realloc".to_owned(),
+                        });
+                    };
+                    let length = i32::try_from(text.len()).map_err(|_| {
+                        ComponentError::ArgumentMismatch {
+                            export: name.to_owned(),
+                            message: format!("argument {position} is too long for a core length"),
+                        }
+                    })?;
+                    // Allocate the bytes in the callee's memory, as the canonical ABI does for a
+                    // UTF-8 copy: realloc(0, 0, 1, length).
+                    let allocated = self.call_core(
+                        instance,
+                        realloc,
+                        vec![
+                            Value::I32(0),
+                            Value::I32(0),
+                            Value::I32(1),
+                            Value::I32(length),
+                        ],
+                    )?;
+                    let pointer = match allocated.as_slice() {
+                        [Value::I32(pointer)] => *pointer,
+                        _ => {
+                            return Err(ComponentError::Call {
+                                instance,
+                                message: "realloc did not return one i32".to_owned(),
+                            })
+                        }
+                    };
+                    self.write_core_memory(
+                        instance,
+                        memory,
+                        u64::from(pointer as u32),
+                        text.as_bytes(),
+                    )?;
+                    core_arguments.push(Value::I32(pointer));
+                    core_arguments.push(Value::I32(length));
+                }
+                scalar => {
+                    let value = lower_scalar(scalar).ok_or_else(|| ComponentError::Call {
+                        instance,
+                        message: "a scalar argument did not lower".to_owned(),
+                    })?;
+                    core_arguments.push(value);
+                }
+            }
         }
-        let core_results = self.call_core(instance, &core_export, core_arguments)?;
-        match (result, core_results.as_slice()) {
+        let core_results = self.call_core(instance, &export.core_export, core_arguments)?;
+        match (export.result, core_results.as_slice()) {
             (None, []) => Ok(Vec::new()),
+            (Some(Scalar::String), [Value::I32(pointer)]) => {
+                let memory = export
+                    .memory
+                    .as_deref()
+                    .ok_or_else(|| ComponentError::Call {
+                        instance,
+                        message: "a string result needs a memory".to_owned(),
+                    })?;
+                // The core function returns a pointer to the string's pointer and length.
+                let header =
+                    self.read_core_memory(instance, memory, u64::from(*pointer as u32), 8)?;
+                let data_pointer = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+                let data_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+                let bytes = self.read_core_memory(
+                    instance,
+                    memory,
+                    u64::from(data_pointer),
+                    data_length as usize,
+                )?;
+                let text = String::from_utf8(bytes).map_err(|_| ComponentError::Call {
+                    instance,
+                    message: "the string is not valid UTF-8".to_owned(),
+                })?;
+                Ok(vec![ComponentValue::String(text)])
+            }
             (Some(scalar), [value]) => lift(value.clone(), scalar)
                 .map(|value| vec![value])
                 .map_err(|message| ComponentError::Call { instance, message }),
@@ -889,6 +1113,54 @@ impl ComponentInstance {
                 instance,
                 message: "the core function returned a different number of results than its type"
                     .to_owned(),
+            }),
+        }
+    }
+
+    /// Read `length` bytes at `offset` from the memory `memory` of core instance `instance`.
+    fn read_core_memory(
+        &self,
+        instance: usize,
+        memory: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, ComponentError> {
+        match self.slots.get(instance) {
+            Some(Slot::Runtime(runtime)) => {
+                runtime
+                    .read_memory(memory, offset, length)
+                    .map_err(|error| ComponentError::Call {
+                        instance,
+                        message: error.to_string(),
+                    })
+            }
+            _ => Err(ComponentError::Call {
+                instance,
+                message: "the memory's instance is not a runtime instance".to_owned(),
+            }),
+        }
+    }
+
+    /// Write `bytes` at `offset` in the memory `memory` of core instance `instance`.
+    fn write_core_memory(
+        &self,
+        instance: usize,
+        memory: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), ComponentError> {
+        match self.slots.get(instance) {
+            Some(Slot::Runtime(runtime)) => {
+                runtime
+                    .write_memory(memory, offset, bytes)
+                    .map_err(|error| ComponentError::Call {
+                        instance,
+                        message: error.to_string(),
+                    })
+            }
+            _ => Err(ComponentError::Call {
+                instance,
+                message: "the memory's instance is not a runtime instance".to_owned(),
             }),
         }
     }
@@ -941,19 +1213,22 @@ impl ComponentInstance {
     }
 }
 
-/// The core value a scalar lowers to. Signed and unsigned values share their bits.
-fn lower(value: ComponentValue) -> Value {
+/// The core value a scalar lowers to, or `None` for a string, which is copied through memory.
+/// Signed and unsigned values share their bits.
+fn lower_scalar(value: &ComponentValue) -> Option<Value> {
     match value {
-        ComponentValue::S32(value) => Value::I32(value),
-        ComponentValue::U32(value) => Value::I32(value as i32),
-        ComponentValue::S64(value) => Value::I64(value),
-        ComponentValue::U64(value) => Value::I64(value as i64),
-        ComponentValue::F32(value) => Value::F32(value.to_bits()),
-        ComponentValue::F64(value) => Value::F64(value.to_bits()),
+        ComponentValue::S32(value) => Some(Value::I32(*value)),
+        ComponentValue::U32(value) => Some(Value::I32(*value as i32)),
+        ComponentValue::S64(value) => Some(Value::I64(*value)),
+        ComponentValue::U64(value) => Some(Value::I64(*value as i64)),
+        ComponentValue::F32(value) => Some(Value::F32(value.to_bits())),
+        ComponentValue::F64(value) => Some(Value::F64(value.to_bits())),
+        ComponentValue::String(_) => None,
     }
 }
 
-/// The scalar a core value lifts to, when the core value has the scalar's type.
+/// The scalar a core value lifts to, when the core value has the scalar's type. A string is
+/// not lifted from a single value: it is read from memory.
 fn lift(value: Value, scalar: Scalar) -> Result<ComponentValue, String> {
     match (scalar, value) {
         (Scalar::S32, Value::I32(value)) => Ok(ComponentValue::S32(value)),
@@ -968,12 +1243,14 @@ fn lift(value: Value, scalar: Scalar) -> Result<ComponentValue, String> {
     }
 }
 
-/// Decode an alias section's contents: a count, then each alias. Only an export of a core
-/// instance that is a module instance defines a core function, so the other forms are refused.
+/// Decode an alias section's contents: a count, then each alias. An alias takes an export of a
+/// core instance that is a module instance: a function defines a core function, and a memory
+/// defines a core memory. The other forms are refused.
 fn decode_aliases(
     reader: &mut Reader<'_>,
     instances: &[CoreInstance],
     functions: &mut Vec<CoreFunction>,
+    memories: &mut Vec<CoreMemory>,
 ) -> Result<(), ComponentError> {
     let count = reader.u32()?;
     for _ in 0..count {
@@ -984,9 +1261,10 @@ fn decode_aliases(
                 offset: at,
             });
         }
-        if reader.byte()? != SORT_FUNC {
+        let sort = reader.byte()?;
+        if sort != SORT_FUNC && sort != SORT_CORE_MEMORY {
             return Err(ComponentError::UnsupportedAlias {
-                what: "alias of a core sort other than function",
+                what: "alias of a core sort other than function or memory",
                 offset: at,
             });
         }
@@ -1009,7 +1287,11 @@ fn decode_aliases(
                 offset: at,
             });
         }
-        functions.push(CoreFunction::Alias { instance, export });
+        if sort == SORT_FUNC {
+            functions.push(CoreFunction::Alias { instance, export });
+        } else {
+            memories.push(CoreMemory { instance, export });
+        }
     }
     Ok(())
 }
@@ -1078,7 +1360,7 @@ fn decode_instances(
     Ok(())
 }
 
-/// Decode a scalar value type byte, refusing every other type.
+/// Decode a value type byte at `offset`, refusing every type this crate does not support.
 fn scalar(byte: u8, offset: usize) -> Result<Scalar, ComponentError> {
     match byte {
         VALTYPE_S32 => Ok(Scalar::S32),
@@ -1087,8 +1369,9 @@ fn scalar(byte: u8, offset: usize) -> Result<Scalar, ComponentError> {
         VALTYPE_U64 => Ok(Scalar::U64),
         VALTYPE_F32 => Ok(Scalar::F32),
         VALTYPE_F64 => Ok(Scalar::F64),
+        VALTYPE_STRING => Ok(Scalar::String),
         _ => Err(ComponentError::UnsupportedType {
-            what: "a value type other than s32, u32, s64, u64, f32, or f64",
+            what: "a value type other than s32, u32, s64, u64, f32, f64, or string",
             offset,
         }),
     }
@@ -1179,13 +1462,17 @@ fn decode_imports(
     Ok(())
 }
 
-/// Decode a canon section's contents: a count, then each canonical function. A lift turns a
-/// core function into a component function; a lower turns an import into a core function.
-/// Canonical options are refused, and so are lowers of anything but an import and lifts of
-/// anything but an alias.
+/// Decode a canon section's contents: a count, then each canonical function.
+///
+/// A lift turns a core function into a component function. Its options may name a memory
+/// and a `realloc` of the same instance, and a string in its type needs them: a string
+/// parameter needs both, and a string result needs the memory. A lower turns an import into
+/// a core function, and takes no options. Lowering a component's own function, lifting a
+/// lowered one, and lowering an import with strings are refused.
 fn decode_canon(
     reader: &mut Reader<'_>,
     core_functions: &mut Vec<CoreFunction>,
+    core_memories: &[CoreMemory],
     types: &[ComponentFuncType],
     functions: &mut Vec<ComponentFunction>,
 ) -> Result<(), ComponentError> {
@@ -1200,14 +1487,14 @@ fn decode_canon(
             return Err(ComponentError::Malformed { offset: at });
         }
         let index = reader.u32()?;
-        let options = reader.u32()?;
-        if options != 0 {
-            return Err(ComponentError::UnsupportedCanon {
-                what: "canonical options",
-                offset: at,
-            });
-        }
         if form == CANON_LOWER {
+            let options = reader.u32()?;
+            if options != 0 {
+                return Err(ComponentError::UnsupportedCanon {
+                    what: "canonical options on a lower",
+                    offset: at,
+                });
+            }
             match functions.get(index as usize) {
                 None => return Err(ComponentError::NoSuchComponentFunction { function: index }),
                 Some(ComponentFunction::Lift { .. }) => {
@@ -1216,29 +1503,131 @@ fn decode_canon(
                         offset: at,
                     })
                 }
-                Some(ComponentFunction::Import { .. }) => {
+                Some(ComponentFunction::Import { ty, .. }) => {
+                    if types[*ty as usize].has_string() {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "lowering a function with strings",
+                            offset: at,
+                        });
+                    }
                     core_functions.push(CoreFunction::Lowered { function: index });
                 }
             }
-        } else {
-            let ty = reader.u32()?;
-            if index as usize >= core_functions.len() {
-                return Err(ComponentError::NoSuchFunction { function: index });
+            continue;
+        }
+
+        // A lift: the core function it names must exist and be an alias, not a lowering.
+        let Some(core) = core_functions.get(index as usize) else {
+            return Err(ComponentError::NoSuchFunction { function: index });
+        };
+        let CoreFunction::Alias {
+            instance: core_instance,
+            ..
+        } = core
+        else {
+            return Err(ComponentError::UnsupportedCanon {
+                what: "lifting a lowered function",
+                offset: at,
+            });
+        };
+        let core_instance = *core_instance;
+
+        let option_count = reader.u32()?;
+        let mut memory: Option<u32> = None;
+        let mut realloc: Option<u32> = None;
+        let mut utf8 = false;
+        for _ in 0..option_count {
+            let option_at = reader.position();
+            match reader.byte()? {
+                OPTION_UTF8 => {
+                    if utf8 {
+                        return Err(ComponentError::Malformed { offset: option_at });
+                    }
+                    utf8 = true;
+                }
+                OPTION_MEMORY => {
+                    let memory_index = reader.u32()?;
+                    let Some(found) = core_memories.get(memory_index as usize) else {
+                        return Err(ComponentError::NoSuchMemory {
+                            memory: memory_index,
+                        });
+                    };
+                    if memory.is_some() {
+                        return Err(ComponentError::Malformed { offset: option_at });
+                    }
+                    if found.instance != core_instance {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "a memory of another instance",
+                            offset: option_at,
+                        });
+                    }
+                    memory = Some(memory_index);
+                }
+                OPTION_REALLOC => {
+                    let realloc_index = reader.u32()?;
+                    let Some(found) = core_functions.get(realloc_index as usize) else {
+                        return Err(ComponentError::NoSuchFunction {
+                            function: realloc_index,
+                        });
+                    };
+                    let CoreFunction::Alias {
+                        instance: realloc_instance,
+                        ..
+                    } = found
+                    else {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "a realloc that is a lowered function",
+                            offset: option_at,
+                        });
+                    };
+                    if *realloc_instance != core_instance {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "a realloc of another instance",
+                            offset: option_at,
+                        });
+                    }
+                    if realloc.is_some() {
+                        return Err(ComponentError::Malformed { offset: option_at });
+                    }
+                    realloc = Some(realloc_index);
+                }
+                _ => {
+                    return Err(ComponentError::UnsupportedCanon {
+                        what: "a canonical option other than utf8, memory, or realloc",
+                        offset: option_at,
+                    })
+                }
             }
-            if ty as usize >= types.len() {
-                return Err(ComponentError::NoSuchType { index: ty });
-            }
-            if let CoreFunction::Lowered { .. } = core_functions[index as usize] {
-                return Err(ComponentError::UnsupportedCanon {
-                    what: "lifting a lowered function",
-                    offset: at,
-                });
-            }
-            functions.push(ComponentFunction::Lift {
-                core_function: index,
-                ty,
+        }
+
+        let ty = reader.u32()?;
+        let Some(component_type) = types.get(ty as usize) else {
+            return Err(ComponentError::NoSuchType { index: ty });
+        };
+        if component_type.flat_param_count() > MAX_FLAT_PARAMS {
+            return Err(ComponentError::UnsupportedCanon {
+                what: "more than 16 flat parameters",
+                offset: at,
             });
         }
+        if component_type.has_string() && memory.is_none() {
+            return Err(ComponentError::UnsupportedCanon {
+                what: "a string without a memory option",
+                offset: at,
+            });
+        }
+        if component_type.params.contains(&Scalar::String) && realloc.is_none() {
+            return Err(ComponentError::UnsupportedCanon {
+                what: "a string parameter without a realloc option",
+                offset: at,
+            });
+        }
+        functions.push(ComponentFunction::Lift {
+            core_function: index,
+            ty,
+            memory,
+            realloc,
+        });
     }
     Ok(())
 }
@@ -1600,12 +1989,141 @@ mod tests {
         bytes
     }
 
+    /// A core module with linear memory and `realloc`, and two functions over strings:
+    /// `len(ptr, len) -> i32` returns its length argument, and `greet() -> i32` returns the
+    /// address of a return area that holds a pointer and length to `"hello"`.
+    fn string_module() -> Vec<u8> {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Types: (i32, i32) -> i32; (i32, i32, i32, i32) -> i32; () -> i32.
+        bytes.extend(section(
+            1,
+            &[
+                3, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f, 0x60, 0,
+                1, 0x7f,
+            ],
+        ));
+        // Functions: realloc has type 1, len has type 0, greet has type 2.
+        bytes.extend(section(3, &[3, 1, 0, 2]));
+        // One memory of one page.
+        bytes.extend(section(5, &[1, 0x00, 1]));
+        // Exports: "memory", "realloc" (function 0), "len" (function 1), "greet" (function 2).
+        bytes.extend(section(
+            7,
+            &[
+                4, 6, b'm', b'e', b'm', b'o', b'r', b'y', 2, 0, 7, b'r', b'e', b'a', b'l', b'l',
+                b'o', b'c', 0, 0, 3, b'l', b'e', b'n', 0, 1, 5, b'g', b'r', b'e', b'e', b't', 0, 2,
+            ],
+        ));
+        // Bodies: realloc returns 1024; len returns its second parameter; greet returns 2048.
+        bytes.extend(section(
+            10,
+            &[
+                3, 5, 0x00, 0x41, 0x80, 0x08, 0x0b, 4, 0x00, 0x20, 0x01, 0x0b, 5, 0x00, 0x41, 0x80,
+                0x10, 0x0b,
+            ],
+        ));
+        // Data at 2048: a pointer to "hello" (at 2056) and its length, then "hello".
+        bytes.extend(section(
+            11,
+            &[
+                1, 0x00, 0x41, 0x80, 0x10, 0x0b, 13, 0x08, 0x08, 0, 0, 5, 0, 0, 0, b'h', b'e',
+                b'l', b'l', b'o',
+            ],
+        ));
+        bytes
+    }
+
+    /// A component over `string_module`. Its `len` lifts with the given canon entry, and
+    /// `greet` lifts with a memory, so the string result can be read.
+    fn string_component(len_canon: &[u8]) -> Vec<u8> {
+        // Types: 0 is (string) -> s32; 1 is () -> string.
+        let types = section(
+            SECTION_TYPE,
+            &[
+                2,
+                0x40,
+                1,
+                1,
+                b's',
+                VALTYPE_STRING,
+                0,
+                VALTYPE_S32,
+                0x40,
+                0,
+                0,
+                VALTYPE_STRING,
+            ],
+        );
+        let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+        // Core functions: realloc (0), len (1), greet (2). Core memory: memory (0).
+        let alias = section(
+            SECTION_ALIAS,
+            &[
+                4, 0, 0, 1, 0, 7, b'r', b'e', b'a', b'l', b'l', b'o', b'c', 0, 0, 1, 0, 3, b'l',
+                b'e', b'n', 0, 0, 1, 0, 5, b'g', b'r', b'e', b'e', b't', 0, 2, 1, 0, 6, b'm', b'e',
+                b'm', b'o', b'r', b'y',
+            ],
+        );
+        // Canon: lift len with `len_canon`; lift greet with the memory option.
+        let mut canon = vec![2];
+        canon.extend_from_slice(len_canon);
+        canon.extend_from_slice(&[CANON_LIFT, SORT_FUNC, 2, 1, OPTION_MEMORY, 0, 1]);
+        let canon = section(SECTION_CANON, &canon);
+        let export = section(
+            SECTION_EXPORT,
+            &[
+                2,
+                0x00,
+                3,
+                b'l',
+                b'e',
+                b'n',
+                COMPONENT_SORT_FUNC,
+                0,
+                0x00,
+                0x00,
+                5,
+                b'g',
+                b'r',
+                b'e',
+                b'e',
+                b't',
+                COMPONENT_SORT_FUNC,
+                1,
+                0x00,
+            ],
+        );
+        let mut bytes = with(&module_section(&string_module()));
+        bytes.extend(types);
+        bytes.extend(instances);
+        bytes.extend(alias);
+        bytes.extend(canon);
+        bytes.extend(export);
+        bytes
+    }
+
+    /// The canon entry that lifts `len` with a memory and a realloc, which is complete.
+    fn complete_len_canon() -> Vec<u8> {
+        vec![
+            CANON_LIFT,
+            SORT_FUNC,
+            1,
+            2,
+            OPTION_MEMORY,
+            0,
+            OPTION_REALLOC,
+            0,
+            0,
+        ]
+    }
+
     #[test]
     fn a_preamble_alone_is_an_empty_component() {
         let component = Component::decode(&PREAMBLE).expect("decodes");
         assert!(component.core_modules().is_empty());
         assert!(component.core_instances().is_empty());
         assert!(component.core_functions().is_empty());
+        assert!(component.core_memories().is_empty());
         assert!(component.component_types().is_empty());
         assert!(component.component_exports().is_empty());
     }
@@ -1744,7 +2262,7 @@ mod tests {
 
     #[test]
     fn an_alias_of_another_core_sort_is_refused() {
-        // A table: core sort 1 instead of function.
+        // A table: core sort 1 instead of function or memory.
         let bytes = with(&[
             SECTION_ALIAS,
             6,
@@ -1758,9 +2276,40 @@ mod tests {
         assert_eq!(
             Component::decode(&bytes),
             Err(ComponentError::UnsupportedAlias {
-                what: "alias of a core sort other than function",
+                what: "alias of a core sort other than function or memory",
                 offset: 11,
             })
+        );
+    }
+
+    #[test]
+    fn an_alias_of_a_memory_defines_a_core_memory() {
+        let mut bytes = with(&module_section(&string_module()));
+        bytes.extend(section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]));
+        bytes.extend(section(
+            SECTION_ALIAS,
+            &[
+                1,
+                0,
+                SORT_CORE_MEMORY,
+                1,
+                0,
+                6,
+                b'm',
+                b'e',
+                b'm',
+                b'o',
+                b'r',
+                b'y',
+            ],
+        ));
+        let component = Component::decode(&bytes).expect("decodes");
+        assert_eq!(
+            component.core_memories(),
+            [CoreMemory {
+                instance: 0,
+                export: "memory".to_owned(),
+            }]
         );
     }
 
@@ -2010,7 +2559,8 @@ mod tests {
 
     #[test]
     fn canon_options_are_refused_and_a_lower_needs_an_import() {
-        let with_options = [SECTION_CANON, 5, 1, CANON_LIFT, SORT_FUNC, 0, 1];
+        // A lift with one option that is not utf8, memory, or realloc.
+        let with_options = [SECTION_CANON, 6, 1, CANON_LIFT, SORT_FUNC, 0, 1, 0x05];
         assert!(matches!(
             Component::decode(&answer_component(
                 &TYPE_NO_ARGUMENTS_S32,
@@ -2018,7 +2568,7 @@ mod tests {
                 &[]
             )),
             Err(ComponentError::UnsupportedCanon {
-                what: "canonical options",
+                what: "a canonical option other than utf8, memory, or realloc",
                 ..
             })
         ));
@@ -2031,8 +2581,8 @@ mod tests {
     }
 
     #[test]
-    fn a_type_outside_the_scalar_subset_is_refused() {
-        // A bool result, which this crate does not lift yet.
+    fn a_type_outside_the_supported_set_is_refused() {
+        // A bool result, which this crate does not support yet.
         let bool_result = [SECTION_TYPE, 5, 1, TYPE_FUNC, 0, 0, 0x7f];
         assert!(matches!(
             Component::decode(&answer_component(&bool_result, &CANON_LIFT_ANSWER, &[])),
@@ -2201,6 +2751,88 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_string_crosses_into_and_out_of_linear_memory() {
+        let bytes = string_component(&complete_len_canon());
+        let component = Component::decode(&bytes).expect("decodes");
+        let mut instance = component.instantiate(&engine()).expect("instantiates");
+        // The argument is copied in through realloc and the module returns its length.
+        assert_eq!(
+            instance.call_export("len", vec![ComponentValue::String("hello".to_owned())]),
+            Ok(vec![ComponentValue::S32(5)])
+        );
+        assert_eq!(
+            instance.call_export("len", vec![ComponentValue::String(String::new())]),
+            Ok(vec![ComponentValue::S32(0)])
+        );
+        // The result is read out of memory, from the pointer and length the module returns.
+        assert_eq!(
+            instance.call_export("greet", Vec::new()),
+            Ok(vec![ComponentValue::String("hello".to_owned())])
+        );
+    }
+
+    #[test]
+    fn a_string_parameter_without_realloc_is_refused() {
+        // Memory only: a string parameter has nowhere to be copied to.
+        let memory_only = [CANON_LIFT, SORT_FUNC, 1, 1, OPTION_MEMORY, 0, 0];
+        assert!(matches!(
+            Component::decode(&string_component(&memory_only)),
+            Err(ComponentError::UnsupportedCanon {
+                what: "a string parameter without a realloc option",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_string_without_memory_is_refused() {
+        // No options at all: the string result has no memory to be read from.
+        let no_options = [CANON_LIFT, SORT_FUNC, 1, 0, 0];
+        assert!(matches!(
+            Component::decode(&string_component(&no_options)),
+            Err(ComponentError::UnsupportedCanon {
+                what: "a string without a memory option",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_string_crosses_on_the_compiled_backend_too() {
+        // The baseline backend keeps its own memory, so the host's writes and reads must go
+        // through it as well.
+        let config = tpt_wasm_runtime::Config {
+            engine_mode: tpt_wasm_runtime::EngineMode::Baseline,
+            ..tpt_wasm_runtime::Config::default()
+        };
+        let engine = Engine::new(config).expect("engine");
+        let bytes = string_component(&complete_len_canon());
+        let component = Component::decode(&bytes).expect("decodes");
+        let mut instance = component.instantiate(&engine).expect("instantiates");
+        assert_eq!(
+            instance.call_export("len", vec![ComponentValue::String("hello".to_owned())]),
+            Ok(vec![ComponentValue::S32(5)])
+        );
+        assert_eq!(
+            instance.call_export("greet", Vec::new()),
+            Ok(vec![ComponentValue::String("hello".to_owned())])
+        );
+    }
+
+    #[test]
+    fn a_string_argument_is_checked_against_its_type() {
+        let bytes = string_component(&complete_len_canon());
+        let mut instance = Component::decode(&bytes)
+            .expect("decodes")
+            .instantiate(&engine())
+            .expect("instantiates");
+        assert!(matches!(
+            instance.call_export("len", vec![ComponentValue::S32(5)]),
+            Err(ComponentError::ArgumentMismatch { .. })
+        ));
+    }
+
     /// Every truncation and every single-byte corruption of the fixtures is decoded, and every
     /// one that decodes is instantiated. None may panic: the bytes are untrusted, and a panic
     /// here is a denial of service in the embedder.
@@ -2210,6 +2842,7 @@ mod tests {
         let fixtures = [
             host_component(),
             answer_component(&TYPE_NO_ARGUMENTS_S32, &CANON_LIFT_ANSWER, &EXPORT_ANSWER),
+            string_component(&complete_len_canon()),
         ];
         let mut decoded = 0usize;
         let mut instantiated = 0usize;
@@ -2234,13 +2867,15 @@ mod tests {
                     });
                     if let Ok(mut instance) = component.instantiate_with(&engine, &imports) {
                         instantiated += 1;
-                        for name in instance
+                        let names: Vec<String> = instance
                             .export_names()
                             .into_iter()
                             .map(str::to_owned)
-                            .collect::<Vec<_>>()
-                        {
+                            .collect();
+                        for name in names {
                             let _ = instance.call_export(&name, Vec::new());
+                            let _ = instance
+                                .call_export(&name, vec![ComponentValue::String("hi".to_owned())]);
                         }
                     }
                 }
@@ -2252,7 +2887,10 @@ mod tests {
 
     #[test]
     fn scalars_lower_and_lift_by_their_bits() {
-        assert_eq!(lower(ComponentValue::U32(u32::MAX)), Value::I32(-1));
+        assert_eq!(
+            lower_scalar(&ComponentValue::U32(u32::MAX)),
+            Some(Value::I32(-1))
+        );
         assert_eq!(
             lift(Value::I32(-1), Scalar::U32),
             Ok(ComponentValue::U32(u32::MAX))
@@ -2263,7 +2901,7 @@ mod tests {
         );
         // A NaN with a payload keeps its bits through the round trip.
         let nan = f32::from_bits(0x7fc0_1234);
-        let lowered = lower(ComponentValue::F32(nan));
+        let lowered = lower_scalar(&ComponentValue::F32(nan)).expect("a scalar lowers");
         assert_eq!(lowered, Value::F32(0x7fc0_1234));
         assert_eq!(
             lift(lowered, Scalar::F32).map(|value| match value {
@@ -2273,5 +2911,6 @@ mod tests {
             Ok(0x7fc0_1234)
         );
         assert!(lift(Value::I64(1), Scalar::S32).is_err());
+        assert_eq!(lower_scalar(&ComponentValue::String("x".to_owned())), None);
     }
 }
