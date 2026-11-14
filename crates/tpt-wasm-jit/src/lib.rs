@@ -84,6 +84,8 @@ use tpt_wasm_ir::{
 use tpt_wasm_types::{Trap, ValueType};
 
 mod aarch64;
+/// The machine IR, the stage between the verified IR and native code. See the module docs.
+pub mod mir;
 mod riscv64;
 mod x86;
 
