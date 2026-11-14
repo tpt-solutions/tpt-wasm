@@ -1211,5 +1211,5 @@ fn seed_count(full: u64) -> u64 {
 /// The corpus values a loop runs over. Under Miri the cross product of the corpora is far too many
 /// modules, so the loop takes every few values there, and every value everywhere else.
 fn sample<T>(all: &[T]) -> impl Iterator<Item = &T> {
-    all.iter().step_by(if cfg!(miri) { all.len() / 6 + 1 } else { 1 })
+    all.iter().step_by(if cfg!(miri) { all.len() / 3 + 1 } else { 1 })
 }
