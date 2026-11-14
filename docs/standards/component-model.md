@@ -111,8 +111,13 @@ It flattens to its case index, so it is passed directly, and a result is read as
 returns. An index outside the cases is a call error. An enum in a record, a list, an option, an
 import, or a lowered import is refused.
 
+Flags (`0x6e`) are a set of at most 32 distinct labels, and a value is the set of labels that are
+set. A set flattens to one bitmask, one bit per label in definition order, so a flags value is
+passed directly in both directions. A bit beyond the labels names no flag, and is a call error.
+Flags in a record, a list, an option, an import, or a lowered import are refused.
+
 Refused, each by name and offset, until its own decoder exists: value types beyond the ones
-supported (variants, results, tuples, flags, resources, and
+supported (variants, results, tuples, resources, and
 the rest), extern types on exports, and exports of any sort other than function. Exports of
 imported functions are refused too.
 
@@ -157,7 +162,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 a separate stage, which will map each parsed function onto the same capability id.
 
 Not done: strings and records in lowered imports, UTF-16 and Latin-1 encodings, `post-return`,
-records passed indirectly, variants, results, tuples, flags, and parsing WIT to
+records passed indirectly, variants, results, tuples, and parsing WIT to
 derive the capability ids.
 
 ## Design constraint

@@ -1287,6 +1287,8 @@ fn no_truncation_or_corruption_of_a_component_panics() {
         list_component(&complete_count_canon()),
         option_component(),
         enum_component(),
+        flags_component(),
+        flags_component(),
     ];
     let mut decoded = 0usize;
     let mut instantiated = 0usize;
@@ -2100,5 +2102,135 @@ fn an_enum_with_a_repeated_case_is_malformed() {
     assert!(matches!(
         Component::decode(&bytes),
         Err(ComponentError::Malformed { .. })
+    ));
+}
+
+/// A component over `enum_module` whose type is a set of the flags `read`, `write`, and `exec`:
+/// `echo` takes and returns the set, and `three` returns the bits of the module's `three`, which
+/// is 8, a bit that names no flag.
+fn flags_component() -> Vec<u8> {
+    let types = section(
+        SECTION_TYPE,
+        &[
+            3, TYPE_FLAGS, 3, 4, b'r', b'e', b'a', b'd', 5, b'w', b'r', b'i', b't', b'e', 4, b'e',
+            b'x', b'e', b'c', TYPE_FUNC, 1, 1, b'f', 0x00, 0x00, 0x00, TYPE_FUNC, 0, 0x00, 0x00,
+        ],
+    );
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            2, 0, 0, 1, 0, 4, b'e', b'c', b'h', b'o', 0, 0, 1, 0, 5, b't', b'h', b'r', b'e', b'e',
+        ],
+    );
+    let canon = section(
+        SECTION_CANON,
+        &[
+            2, CANON_LIFT, SORT_FUNC, 0, 0, 1, CANON_LIFT, SORT_FUNC, 1, 0, 2,
+        ],
+    );
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            2,
+            0x00,
+            4,
+            b'e',
+            b'c',
+            b'h',
+            b'o',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+            0x00,
+            5,
+            b't',
+            b'h',
+            b'r',
+            b'e',
+            b'e',
+            COMPONENT_SORT_FUNC,
+            1,
+            0x00,
+        ],
+    );
+    // The `three` export of the enum module returns 3; here the module is the same, and `three`
+    // is checked through a set whose bit is 3 (value 8) by the test below.
+    let mut bytes = with(&module_section(&flags_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+#[test]
+fn a_set_of_flags_passes_its_bits_in_both_directions() {
+    let mut instance = Component::decode(&flags_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    let set = ComponentValue::Flags(vec!["read".to_owned(), "exec".to_owned()]);
+    assert_eq!(
+        instance.call_export("echo", vec![set.clone()]),
+        Ok(vec![set])
+    );
+    assert_eq!(
+        instance.call_export("echo", vec![ComponentValue::Flags(Vec::new())]),
+        Ok(vec![ComponentValue::Flags(Vec::new())])
+    );
+}
+
+#[test]
+fn a_flag_that_is_not_a_label_is_refused() {
+    let mut instance = Component::decode(&flags_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert!(matches!(
+        instance.call_export("echo", vec![ComponentValue::Flags(vec!["nope".to_owned()])]),
+        Err(ComponentError::ArgumentMismatch { .. })
+    ));
+}
+
+#[test]
+fn flags_with_more_than_32_labels_are_malformed() {
+    let mut content = vec![1, TYPE_FLAGS, 33];
+    for index in 0..33u8 {
+        content.push(1);
+        content.push(b'a' + index % 26);
+    }
+    assert!(matches!(
+        Component::decode(&with(&section(SECTION_TYPE, &content))),
+        Err(ComponentError::Malformed { .. })
+    ));
+}
+
+/// A core module like `enum_module`, but whose `three` returns 8: a set of three flags has no bit 3.
+fn flags_module() -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bytes.extend(section(1, &[2, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 0, 1, 0x7f]));
+    bytes.extend(section(3, &[2, 0, 1]));
+    bytes.extend(section(
+        7,
+        &[
+            2, 4, b'e', b'c', b'h', b'o', 0, 0, 5, b't', b'h', b'r', b'e', b'e', 0, 1,
+        ],
+    ));
+    bytes.extend(section(10, &[2, 4, 0, 0x20, 0, 0x0b, 4, 0, 0x41, 8, 0x0b]));
+    bytes
+}
+
+#[test]
+fn a_flags_result_with_a_bit_beyond_the_labels_is_a_call_error() {
+    let mut instance = Component::decode(&flags_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    // The module returns 8, which sets bit 3; the set has three labels, so bit 3 names no flag.
+    assert!(matches!(
+        instance.call_export("three", Vec::new()),
+        Err(ComponentError::Call { .. })
     ));
 }
