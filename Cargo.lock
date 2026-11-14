@@ -180,6 +180,7 @@ dependencies = [
 name = "tpt-wasm-component"
 version = "0.1.0"
 dependencies = [
+ "tpt-wasm-capability",
  "tpt-wasm-decode",
  "tpt-wasm-format",
  "tpt-wasm-runtime",
