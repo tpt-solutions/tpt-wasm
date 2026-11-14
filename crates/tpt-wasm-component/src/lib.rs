@@ -1466,14 +1466,12 @@ fn flat_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> Vec<ValueType> {
             }
             flat
         }
-        // A result is its discriminant, then the flat value of its payload. Decoding refuses
-        // payloads whose flat types differ, and a scalar payload is one value, so either case's
-        // payload gives the same shape.
+        // A result is its discriminant, then the joined flat value of its payloads.
         ComponentType::Result(index) => {
             let mut flat = vec![ValueType::I32];
             if let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) {
-                if let Some(payload) = ok.or(*err) {
-                    flat.extend(payload.flat_params());
+                if let Some(joined) = joined_flat([*ok, *err].into_iter().flatten()) {
+                    flat.push(joined);
                 }
             }
             flat
@@ -1482,8 +1480,8 @@ fn flat_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> Vec<ValueType> {
         ComponentType::Variant(index) => {
             let mut flat = vec![ValueType::I32];
             if let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) {
-                if let Some(payload) = shared_payload(cases) {
-                    flat.extend(payload.flat_params());
+                if let Some(joined) = joined_flat(cases.iter().filter_map(|(_, p)| *p)) {
+                    flat.push(joined);
                 }
             }
             flat
@@ -1980,11 +1978,13 @@ impl ComponentInstance {
                     _ => return Err("a variant payload does not match its case".to_owned()),
                 };
                 out.push(Value::I32(case as i32));
-                // The shared payload slot holds the case's value, or zero for a case without one.
-                if let Some(flat) =
-                    shared_payload(cases).and_then(|s| s.flat_params().first().copied())
-                {
-                    out.push(value.unwrap_or_else(|| zero_value(flat)));
+                // The joined payload slot holds the case's value, widened to the joined type, or
+                // zero for a case without one.
+                if let Some(joined) = joined_flat(cases.iter().filter_map(|(_, p)| *p)) {
+                    out.push(match value {
+                        Some(value) => widen(value, joined)?,
+                        None => zero_value(joined),
+                    });
                 }
                 Ok(())
             }
@@ -2016,16 +2016,14 @@ impl ComponentInstance {
                     }
                     _ => return Err(mismatch()),
                 };
-                // The shared payload slot holds the case's value, or zero for a case without one.
-                let slot = ok_type.or(err_type).map(|scalar| scalar.flat_params());
+                // The joined payload slot holds the case's value, widened to the joined type, or
+                // zero for a case without one.
                 out.push(Value::I32(discriminant));
-                match (slot.as_deref(), value) {
-                    (Some([_]), Some(value)) => out.push(value),
-                    (Some([flat]), None) => out.push(zero_value(*flat)),
-                    (Some(_), _) => {
-                        return Err("a result payload has no single flat value".to_owned())
-                    }
-                    (None, _) => {}
+                if let Some(joined) = joined_flat([ok_type, err_type].into_iter().flatten()) {
+                    out.push(match value {
+                        Some(value) => widen(value, joined)?,
+                        None => zero_value(joined),
+                    });
                 }
                 Ok(())
             }
@@ -3239,15 +3237,6 @@ fn decode_types(
                     }
                 }
                 let [ok, err] = cases;
-                // Both payloads must share one flat type, or the canonical ABI would join them.
-                if let (Some(ok_flat), Some(err_flat)) = (ok, err) {
-                    if ok_flat.flat_params() != err_flat.flat_params() {
-                        return Err(ComponentError::UnsupportedType {
-                            what: "a result whose payloads have different flat types",
-                            offset: at,
-                        });
-                    }
-                }
                 types.push(ComponentTypeDef::Result { ok, err });
             }
             TYPE_VARIANT => {
@@ -3297,18 +3286,6 @@ fn decode_types(
                         return Err(ComponentError::Malformed { offset: at_refines });
                     }
                     cases.push((label, payload));
-                }
-                let mut flats = cases
-                    .iter()
-                    .filter_map(|(_, payload)| *payload)
-                    .map(|payload| payload.flat_params());
-                if let Some(first) = flats.next() {
-                    if flats.any(|flat| flat != first) {
-                        return Err(ComponentError::UnsupportedType {
-                            what: "a variant whose payloads have different flat types",
-                            offset: at,
-                        });
-                    }
                 }
                 types.push(ComponentTypeDef::Variant { cases });
             }
@@ -3816,4 +3793,37 @@ mod tests;
 /// variant whose payloads differ in flat type, so the first payload found is the one all share.
 fn shared_payload(cases: &[(String, Option<Scalar>)]) -> Option<Scalar> {
     cases.iter().find_map(|(_, payload)| *payload)
+}
+
+/// The flat type that the canonical ABI's join gives the payloads of a variant or a result: equal
+/// types stay as they are, `i32` and `f32` join as `i32`, and any other two join as `i64`.
+fn join_flat(a: ValueType, b: ValueType) -> ValueType {
+    match (a, b) {
+        _ if a == b => a,
+        (ValueType::I32, ValueType::F32) | (ValueType::F32, ValueType::I32) => ValueType::I32,
+        _ => ValueType::I64,
+    }
+}
+
+/// The one flat type that the payloads of some cases join to, or `None` if no case has one.
+fn joined_flat(payloads: impl Iterator<Item = Scalar>) -> Option<ValueType> {
+    payloads
+        .filter_map(|scalar| scalar.flat_params().first().copied())
+        .reduce(join_flat)
+}
+
+/// Widen a lowered payload to the joined flat type of its variant or result, as the canonical ABI
+/// does: `i32` to `i64` by its unsigned value, and `f32` or `f64` to the integer of its bits.
+fn widen(value: Value, to: ValueType) -> Result<Value, String> {
+    Ok(match (value, to) {
+        (same @ Value::I32(_), ValueType::I32)
+        | (same @ Value::I64(_), ValueType::I64)
+        | (same @ Value::F32(_), ValueType::F32)
+        | (same @ Value::F64(_), ValueType::F64) => same,
+        (Value::I32(bits), ValueType::I64) => Value::I64(i64::from(bits as u32)),
+        (Value::F32(bits), ValueType::I32) => Value::I32(bits as i32),
+        (Value::F32(bits), ValueType::I64) => Value::I64(i64::from(bits)),
+        (Value::F64(bits), ValueType::I64) => Value::I64(bits as i64),
+        _ => return Err("a payload does not widen to the flat type of its variant".to_owned()),
+    })
 }

@@ -2616,20 +2616,6 @@ fn a_result_with_a_string_or_a_compound_payload_is_refused() {
 }
 
 #[test]
-fn a_result_whose_payloads_differ_in_flat_type_is_refused() {
-    assert!(matches!(
-        Component::decode(&with(&section(
-            SECTION_TYPE,
-            &[1, TYPE_RESULT, 1, VALTYPE_U32, 1, VALTYPE_F32]
-        ))),
-        Err(ComponentError::UnsupportedType {
-            what: "a result whose payloads have different flat types",
-            ..
-        })
-    ));
-}
-
-#[test]
 fn a_result_case_with_an_unknown_tag_is_malformed() {
     assert!(matches!(
         Component::decode(&with(&section(SECTION_TYPE, &[1, TYPE_RESULT, 2]))),
@@ -2898,31 +2884,7 @@ fn a_variant_with_a_string_or_a_repeated_label_is_refused() {
 }
 
 #[test]
-fn a_variant_whose_payloads_differ_in_flat_type_or_have_no_cases_is_refused() {
-    assert!(matches!(
-        Component::decode(&with(&section(
-            SECTION_TYPE,
-            &[
-                1,
-                TYPE_VARIANT,
-                2,
-                1,
-                b'a',
-                1,
-                VALTYPE_U32,
-                0,
-                1,
-                b'b',
-                1,
-                VALTYPE_F32,
-                0
-            ]
-        ))),
-        Err(ComponentError::UnsupportedType {
-            what: "a variant whose payloads have different flat types",
-            ..
-        })
-    ));
+fn a_variant_with_no_cases_or_a_refining_case_is_malformed() {
     assert!(matches!(
         Component::decode(&with(&section(SECTION_TYPE, &[1, TYPE_VARIANT, 0]))),
         Err(ComponentError::Malformed { .. })
@@ -3494,4 +3456,131 @@ fn a_second_post_return_is_malformed_and_one_naming_no_function_is_refused() {
         Component::decode(&post_component(9)),
         Err(ComponentError::NoSuchFunction { .. })
     ));
+}
+
+/// A component over `result_module` with one type, `defined`, and `take` from it to `u32`. The
+/// type's payloads join to one `i32`, so `take` passes them through the module's two `i32` values.
+fn mixed_component(defined: &[u8]) -> Vec<u8> {
+    let mut type_body = vec![2];
+    type_body.extend_from_slice(defined);
+    type_body.extend_from_slice(&[TYPE_FUNC, 1, 1, b'x', 0x00, 0x00, VALTYPE_U32]);
+    let types = section(SECTION_TYPE, &type_body);
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            5, 0, 0, 1, 0, 2, b'o', b'k', 0, 0, 1, 0, 3, b'e', b'r', b'r', 0, 0, 1, 0, 4, b'n',
+            b'o', b'n', b'e', 0, 0, 1, 0, 4, b't', b'a', b'k', b'e', 0, 2, 1, 0, 6, b'm', b'e',
+            b'm', b'o', b'r', b'y',
+        ],
+    );
+    let canon = section(SECTION_CANON, &[1, CANON_LIFT, SORT_FUNC, 3, 0, 1]);
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            1,
+            0x00,
+            4,
+            b't',
+            b'a',
+            b'k',
+            b'e',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+        ],
+    );
+    let mut bytes = with(&module_section(&result_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+#[test]
+fn a_result_whose_payloads_differ_in_flat_type_joins_as_the_canonical_abi_does() {
+    let defined = [TYPE_RESULT, 1, VALTYPE_U32, 1, VALTYPE_F32];
+    let mut instance = Component::decode(&mixed_component(&defined))
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export(
+            "take",
+            vec![ComponentValue::Result(Ok(Some(Box::new(
+                ComponentValue::U32(5)
+            ))))]
+        ),
+        Ok(vec![ComponentValue::U32(5)])
+    );
+    // An f32 joins with an i32 as an i32, so its bits pass through unchanged.
+    assert_eq!(
+        instance.call_export(
+            "take",
+            vec![ComponentValue::Result(Err(Some(Box::new(
+                ComponentValue::F32(1.5)
+            ))))]
+        ),
+        Ok(vec![ComponentValue::U32(1.5f32.to_bits())])
+    );
+}
+
+#[test]
+fn a_variant_whose_payloads_differ_in_flat_type_joins_as_the_canonical_abi_does() {
+    let defined = [
+        TYPE_VARIANT,
+        2,
+        1,
+        b'a',
+        1,
+        VALTYPE_U32,
+        0,
+        1,
+        b'b',
+        1,
+        VALTYPE_F32,
+        0,
+    ];
+    let mut instance = Component::decode(&mixed_component(&defined))
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export(
+            "take",
+            vec![ComponentValue::Variant(
+                "a".to_owned(),
+                Some(Box::new(ComponentValue::U32(5)))
+            )]
+        ),
+        Ok(vec![ComponentValue::U32(5)])
+    );
+    assert_eq!(
+        instance.call_export(
+            "take",
+            vec![ComponentValue::Variant(
+                "b".to_owned(),
+                Some(Box::new(ComponentValue::F32(1.5)))
+            )]
+        ),
+        Ok(vec![ComponentValue::U32(1.5f32.to_bits())])
+    );
+    // A case that needs its payload is refused without one.
+    assert!(matches!(
+        instance.call_export("take", vec![ComponentValue::Variant("a".to_owned(), None)]),
+        Err(ComponentError::ArgumentMismatch { .. })
+    ));
+}
+
+#[test]
+fn the_canonical_join_of_flat_types_is_i32_for_i32_and_f32_and_i64_otherwise() {
+    assert_eq!(join_flat(ValueType::I32, ValueType::I32), ValueType::I32);
+    assert_eq!(join_flat(ValueType::I32, ValueType::F32), ValueType::I32);
+    assert_eq!(join_flat(ValueType::F32, ValueType::I32), ValueType::I32);
+    assert_eq!(join_flat(ValueType::F32, ValueType::F32), ValueType::F32);
+    assert_eq!(join_flat(ValueType::I32, ValueType::I64), ValueType::I64);
+    assert_eq!(join_flat(ValueType::F32, ValueType::F64), ValueType::I64);
+    assert_eq!(join_flat(ValueType::F64, ValueType::F64), ValueType::F64);
 }

@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and results and variants whose payloads differ in flat type are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing is not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -134,20 +134,20 @@ the payload's flat value, so it is always returned through memory: a one-byte di
 then the payload at its alignment. A result with no payloads flattens to its discriminant alone, so it
 is passed directly. A parameter passes its case's value, with zero in the other case's place. A case
 without its value, or with a value of another type, is refused before the call, and a discriminant other
-than 0 or 1 is a call error. A payload that is a string or a compound type is refused, and so is a pair
-of payloads whose flat types differ, since the canonical ABI would join them with conversions that are
-not implemented here.
+than 0 or 1 is a call error. A payload that is a string or a compound type is refused. The payloads join
+to one flat type by the canonical ABI's rule: equal types stay, `i32` with `f32` gives `i32`, and any other
+pair gives `i64`. A parameter widens its payload to that type, an `i32` to an `i64` by its unsigned value,
+and an `f32` or `f64` to the integer of its bits.
 
-Variants (`0x71`) are supported for lifted exports, as a parameter or a result, when each case holds
-no payload or a scalar, and every payload shares one flat type. A variant is a list of labelled cases,
+Variants (`0x71`) are supported for lifted exports, as a parameter or a result, when each case holds no
+payload or a scalar. The payloads join to one flat type, as a result's do. A variant is a list of labelled cases,
 and a value names one of them. A variant with a payload flattens to its case index and the payload's
 flat value, so it is returned through memory: a one-byte case index at offset 0, then the payload at the
 largest alignment any case needs. A variant with no payloads flattens to its case index alone, so it is
 passed directly. A parameter passes the case's value, with zero in the payload's place for a case
 without one. A case with a value of another type, or a label that is not a case, is refused before the
 call, and an index beyond the cases is a call error. A variant has at most 256 cases. A string or a
-compound type as a payload, payloads of different flat types, and a case whose refines field is not
-`0x00` are refused at decode.
+compound type as a payload, and a case whose refines field is not `0x00`, are refused at decode.
 
 Refused, each by name and offset, until its own decoder exists: value types beyond the ones
 supported (resources, and
@@ -205,7 +205,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 a separate stage, which will map each parsed function onto the same capability id.
 
 Not done: strings and records in lowered imports,
-results and variants whose payloads differ in flat type, and parsing WIT to
+parsing WIT to
 derive the capability ids.
 
 ## Design constraint
