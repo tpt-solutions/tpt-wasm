@@ -859,7 +859,7 @@ impl Component {
             let func_type = self
                 .func_type(*ty)
                 .ok_or(ComponentError::NoSuchType { index: *ty })?;
-            let expected = flat_signature(func_type, &self.types);
+            let expected = lift_signature(func_type, &self.types);
             let Some(CoreInstance::Instantiate { module, .. }) =
                 self.core_instances.get(*instance as usize)
             else {
@@ -1035,6 +1035,286 @@ impl Component {
             capabilities: imports.capabilities.clone(),
         })
     }
+}
+
+/// The size and alignment a component type takes in memory, by the canonical ABI. A discriminant
+/// is one byte for up to 256 cases, two bytes up to 65536, and four beyond that.
+fn size_and_align_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> (usize, usize) {
+    match ty {
+        ComponentType::Scalar(scalar) => scalar.size_and_align(),
+        ComponentType::List(_) => (8, 4),
+        ComponentType::Record(index) => match types.get(*index as usize) {
+            Some(ComponentTypeDef::Record(fields)) => {
+                let (_, size, align) = record_layout(fields);
+                (size, align)
+            }
+            _ => (0, 1),
+        },
+        ComponentType::Tuple(index) => match types.get(*index as usize) {
+            Some(ComponentTypeDef::Tuple(scalars)) => {
+                let fields = tuple_fields(scalars);
+                let (_, size, align) = record_layout(&fields);
+                (size, align)
+            }
+            _ => (0, 1),
+        },
+        ComponentType::Enum(index) => match types.get(*index as usize) {
+            Some(ComponentTypeDef::Enum(labels)) => {
+                let size = discriminant_size(labels.len());
+                (size, size)
+            }
+            _ => (1, 1),
+        },
+        ComponentType::Flags(index) => match types.get(*index as usize) {
+            Some(ComponentTypeDef::Flags(labels)) => {
+                let size = match labels.len() {
+                    0..=8 => 1,
+                    9..=16 => 2,
+                    _ => 4,
+                };
+                (size, size)
+            }
+            _ => (1, 1),
+        },
+        ComponentType::Option(index) => match types.get(*index as usize) {
+            Some(ComponentTypeDef::Option(payload)) => case_layout(&[Some(*payload)]),
+            _ => (1, 1),
+        },
+        ComponentType::Result(index) => match types.get(*index as usize) {
+            Some(ComponentTypeDef::Result { ok, err }) => case_layout(&[*ok, *err]),
+            _ => (1, 1),
+        },
+        ComponentType::Variant(index) => match types.get(*index as usize) {
+            Some(ComponentTypeDef::Variant { cases }) => {
+                let payloads: Vec<Option<Scalar>> = cases.iter().map(|(_, p)| *p).collect();
+                case_layout(&payloads)
+            }
+            _ => (1, 1),
+        },
+    }
+}
+
+/// The size and alignment of a value with cases, each holding an optional scalar. The case
+/// index is one byte; the payload follows at the offset its widest case's alignment allows.
+fn case_layout(payloads: &[Option<Scalar>]) -> (usize, usize) {
+    let align = payloads
+        .iter()
+        .flatten()
+        .map(|payload| payload.size_and_align().1)
+        .fold(1, usize::max);
+    let payload_size = payloads
+        .iter()
+        .flatten()
+        .map(|payload| payload.size_and_align().0)
+        .fold(0, usize::max);
+    (align_to(align_to(1, align) + payload_size, align), align)
+}
+
+/// The number of bytes a discriminant of `count` cases takes.
+fn discriminant_size(count: usize) -> usize {
+    match count {
+        0..=256 => 1,
+        257..=65536 => 2,
+        _ => 4,
+    }
+}
+
+/// The fields of a tuple of scalars, unlabelled, for laying it out as a record is.
+fn tuple_fields(scalars: &[Scalar]) -> Vec<RecordField> {
+    scalars
+        .iter()
+        .map(|ty| RecordField {
+            name: String::new(),
+            ty: *ty,
+        })
+        .collect()
+}
+
+/// The offsets of a list of values laid out one after another, and the size and alignment of
+/// the whole, by the canonical record rules.
+fn layout_of(types: &[ComponentType], defined: &[ComponentTypeDef]) -> (Vec<usize>, usize, usize) {
+    let mut offsets = Vec::with_capacity(types.len());
+    let mut size = 0usize;
+    let mut align = 1usize;
+    for ty in types {
+        let (field_size, field_align) = size_and_align_of(ty, defined);
+        align = align.max(field_align);
+        let offset = align_to(size, field_align);
+        offsets.push(offset);
+        size = offset + field_size;
+    }
+    (offsets, align_to(size, align), align)
+}
+
+/// Write `bytes` into `buffer` at `at`, refusing a write past its end.
+fn write_at(buffer: &mut [u8], at: usize, bytes: &[u8]) -> Result<(), String> {
+    let end = at
+        .checked_add(bytes.len())
+        .filter(|end| *end <= buffer.len())
+        .ok_or_else(|| "a value is written past the end of its parameters".to_owned())?;
+    buffer[at..end].copy_from_slice(bytes);
+    Ok(())
+}
+
+/// Store a value of type `ty` into `buffer` at `at`, in the canonical layout. Strings and lists
+/// are refused, since their contents would need copying into memory of their own.
+fn store(
+    value: &ComponentValue,
+    ty: &ComponentType,
+    types: &[ComponentTypeDef],
+    buffer: &mut [u8],
+    at: usize,
+) -> Result<(), String> {
+    let mismatch = || "a value does not match its type".to_owned();
+    match (value, ty) {
+        (ComponentValue::String(_) | ComponentValue::List(_), _) => {
+            Err("a string or list among indirect parameters is not stored".to_owned())
+        }
+        (value, ComponentType::Scalar(scalar)) => {
+            let bytes = scalar_bytes(value, *scalar).ok_or_else(mismatch)?;
+            write_at(buffer, at, &bytes)
+        }
+        (ComponentValue::Record(fields), ComponentType::Record(index)) => {
+            let Some(ComponentTypeDef::Record(defined)) = types.get(*index as usize) else {
+                return Err(mismatch());
+            };
+            let (offsets, _, _) = record_layout(defined);
+            if fields.len() != defined.len() {
+                return Err(mismatch());
+            }
+            for (((_, value), field), offset) in fields.iter().zip(defined).zip(offsets) {
+                store(
+                    value,
+                    &ComponentType::Scalar(field.ty),
+                    types,
+                    buffer,
+                    at + offset,
+                )?;
+            }
+            Ok(())
+        }
+        (ComponentValue::Tuple(items), ComponentType::Tuple(index)) => {
+            let Some(ComponentTypeDef::Tuple(scalars)) = types.get(*index as usize) else {
+                return Err(mismatch());
+            };
+            let (offsets, _, _) = record_layout(&tuple_fields(scalars));
+            if items.len() != scalars.len() {
+                return Err(mismatch());
+            }
+            for ((item, scalar), offset) in items.iter().zip(scalars).zip(offsets) {
+                store(
+                    item,
+                    &ComponentType::Scalar(*scalar),
+                    types,
+                    buffer,
+                    at + offset,
+                )?;
+            }
+            Ok(())
+        }
+        (ComponentValue::Enum(label), ComponentType::Enum(index)) => {
+            let Some(ComponentTypeDef::Enum(labels)) = types.get(*index as usize) else {
+                return Err(mismatch());
+            };
+            let case = labels
+                .iter()
+                .position(|candidate| candidate == label)
+                .ok_or_else(mismatch)?;
+            let size = discriminant_size(labels.len());
+            write_at(buffer, at, &(case as u32).to_le_bytes()[..size])
+        }
+        (ComponentValue::Flags(set), ComponentType::Flags(index)) => {
+            let Some(ComponentTypeDef::Flags(defined)) = types.get(*index as usize) else {
+                return Err(mismatch());
+            };
+            let mut bits: u32 = 0;
+            for label in set {
+                let position = defined
+                    .iter()
+                    .position(|candidate| candidate == label)
+                    .ok_or_else(mismatch)?;
+                bits |= 1u32 << position;
+            }
+            let (size, _) = size_and_align_of(ty, types);
+            write_at(buffer, at, &bits.to_le_bytes()[..size])
+        }
+        (ComponentValue::Option(payload), ComponentType::Option(index)) => {
+            let Some(ComponentTypeDef::Option(element)) = types.get(*index as usize) else {
+                return Err(mismatch());
+            };
+            let (_, align) = case_layout(&[Some(*element)]);
+            match payload.as_deref() {
+                None => write_at(buffer, at, &[0u8]),
+                Some(value) => {
+                    write_at(buffer, at, &[1u8])?;
+                    store(
+                        value,
+                        &ComponentType::Scalar(*element),
+                        types,
+                        buffer,
+                        at + align_to(1, align),
+                    )
+                }
+            }
+        }
+        (ComponentValue::Result(outcome), ComponentType::Result(index)) => {
+            let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) else {
+                return Err(mismatch());
+            };
+            let (discriminant, case_type, payload) = match outcome {
+                Ok(payload) => (0u8, *ok, payload.as_deref()),
+                Err(payload) => (1u8, *err, payload.as_deref()),
+            };
+            // The payload sits at the alignment of the widest payload of either case.
+            let (_, align) = case_layout(&[*ok, *err]);
+            write_at(buffer, at, &[discriminant])?;
+            match (case_type, payload) {
+                (None, None) => Ok(()),
+                (Some(scalar), Some(value)) => store(
+                    value,
+                    &ComponentType::Scalar(scalar),
+                    types,
+                    buffer,
+                    at + align_to(1, align),
+                ),
+                _ => Err(mismatch()),
+            }
+        }
+        (ComponentValue::Variant(label, payload), ComponentType::Variant(index)) => {
+            let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) else {
+                return Err(mismatch());
+            };
+            let case = cases
+                .iter()
+                .position(|(name, _)| name == label)
+                .ok_or_else(mismatch)?;
+            let payloads: Vec<Option<Scalar>> = cases.iter().map(|(_, p)| *p).collect();
+            let (_, align) = case_layout(&payloads);
+            write_at(buffer, at, &[case as u8])?;
+            match (cases[case].1, payload.as_deref()) {
+                (None, None) => Ok(()),
+                (Some(scalar), Some(value)) => store(
+                    value,
+                    &ComponentType::Scalar(scalar),
+                    types,
+                    buffer,
+                    at + align_to(1, align),
+                ),
+                _ => Err(mismatch()),
+            }
+        }
+        _ => Err(mismatch()),
+    }
+}
+
+/// The core signature of a lifted function. Past 16 flat parameters, the parameters are one pointer
+/// to them in memory, so the core function takes one `i32`.
+fn lift_signature(func: &ComponentFuncType, types: &[ComponentTypeDef]) -> FunctionType {
+    let mut signature = flat_signature(func, types);
+    if flat_param_count(func, types) > MAX_FLAT_PARAMS {
+        signature.params = ResultType(vec![ValueType::I32]);
+    }
+    signature
 }
 
 /// The core signature a component function of type `func` flattens to. A result that flattens
@@ -1410,9 +1690,52 @@ impl ComponentInstance {
         }
         let instance = export.core_instance;
         let mut core_arguments = Vec::new();
-        for (argument, ty) in arguments.iter().zip(&export.params) {
-            self.lower_argument(&export, argument, ty, &mut core_arguments)
-                .map_err(|message| ComponentError::Call { instance, message })?;
+        let flat_count: usize = export
+            .params
+            .iter()
+            .map(|ty| flat_of(ty, &self.types).len())
+            .sum();
+        if flat_count > MAX_FLAT_PARAMS {
+            // The parameters are stored in one block, laid out as a record of them, and the core
+            // function takes a pointer to the block.
+            let (offsets, size, align) = layout_of(&export.params, &self.types);
+            let mut block = vec![0u8; size];
+            for ((argument, ty), offset) in arguments.iter().zip(&export.params).zip(offsets) {
+                store(argument, ty, &self.types, &mut block, offset)
+                    .map_err(|message| ComponentError::Call { instance, message })?;
+            }
+            let (Some(realloc), Some(memory)) = (&export.realloc, &export.memory) else {
+                return Err(ComponentError::Call {
+                    instance,
+                    message: "indirect parameters need a memory and a realloc".to_owned(),
+                });
+            };
+            let allocated = self.call_core(
+                instance,
+                realloc,
+                vec![
+                    Value::I32(0),
+                    Value::I32(0),
+                    Value::I32(align as i32),
+                    Value::I32(size as i32),
+                ],
+            )?;
+            let pointer = match allocated.as_slice() {
+                [Value::I32(pointer)] => *pointer,
+                _ => {
+                    return Err(ComponentError::Call {
+                        instance,
+                        message: "realloc did not return one i32".to_owned(),
+                    })
+                }
+            };
+            self.write_core_memory(instance, memory, u64::from(pointer as u32), &block)?;
+            core_arguments.push(Value::I32(pointer));
+        } else {
+            for (argument, ty) in arguments.iter().zip(&export.params) {
+                self.lower_argument(&export, argument, ty, &mut core_arguments)
+                    .map_err(|message| ComponentError::Call { instance, message })?;
+            }
         }
         let core_results = self.call_core(instance, &export.core_export, core_arguments)?;
         match export.result {
@@ -2894,6 +3217,12 @@ fn decode_canon(
                     let Some(ComponentTypeDef::Func(func)) = types.get(*ty as usize) else {
                         return Err(ComponentError::NoSuchType { index: *ty });
                     };
+                    if flat_param_count(func, types) > MAX_FLAT_PARAMS {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "lowering a function with more than 16 flat parameters",
+                            offset: at,
+                        });
+                    }
                     if func.params.iter().chain(func.result.iter()).any(|ty| {
                         holds_string(ty)
                             || holds_list(ty)
@@ -3007,11 +3336,26 @@ fn decode_canon(
         let Some(ComponentTypeDef::Func(func)) = types.get(ty as usize) else {
             return Err(ComponentError::NoSuchType { index: ty });
         };
+        // Past 16 flat parameters, they are passed as one pointer to them in memory, which is
+        // copied in through the memory and `realloc` options. A string or a list cannot be laid
+        // out that way here.
         if flat_param_count(func, types) > MAX_FLAT_PARAMS {
-            return Err(ComponentError::UnsupportedCanon {
-                what: "more than 16 flat parameters",
-                offset: at,
-            });
+            if func
+                .params
+                .iter()
+                .any(|ty| holds_string(ty) || holds_list(ty))
+            {
+                return Err(ComponentError::UnsupportedType {
+                    what: "a string or list among more than 16 flat parameters",
+                    offset: at,
+                });
+            }
+            if memory.is_none() || realloc.is_none() {
+                return Err(ComponentError::UnsupportedCanon {
+                    what: "more than 16 flat parameters without a memory and a realloc",
+                    offset: at,
+                });
+            }
         }
         // A string or a list lives in memory, as does a result that is returned through a pointer.
         let needs_memory = func

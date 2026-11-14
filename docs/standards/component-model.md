@@ -91,14 +91,21 @@ out by the canonical ABI: each at the next offset its alignment allows, and the 
 up to its largest alignment. A record flattens to its fields, so a record of up to 16 flat
 values is a direct parameter, and a record result that flattens to more than one value is read
 from memory at the pointer the function returns, which needs the memory option. A record with a
-string or another record as a field, a record in an import, and a record passed indirectly
-(more than 16 flat parameters) are refused by name and offset.
+string or another record as a field, and a record in an import, are refused by name and offset.
 
 Lists (`0x70`) of scalars are supported for lifted exports, as a parameter or a result. A list is
 its pointer and its length, as a string is: a parameter is copied into the callee's memory with
 `realloc(0, 0, align, byte length)`, with the elements stored at the element size, and a result is
 read from the pointer the function returns, which needs the memory option. A list of strings or
 records, a list in a record, a list in an import, and a list in a lowered import are refused.
+
+A lifted function with more than 16 flat parameters takes them indirectly. Its core function receives
+one `i32`, a pointer to a block laid out as a record of the parameters, in canonical order. The caller
+allocates the block with `realloc(0, 0, align, size)`, stores each argument at its offset, and writes
+the block with `Instance::write_memory`. The block holds scalars, enums, flags, options, results,
+variants, records, and tuples. A string or a list among the parameters is refused, since its contents
+would need copies of their own, and the function needs the memory and `realloc` options. An import is
+never passed indirectly, so an import with more than 16 flat parameters is refused by name.
 
 Options (`0x6b`) of a scalar are supported for lifted exports. An option flattens to a
 discriminant and the payload's flat values, so it is a direct parameter. As a result it is always
@@ -164,14 +171,14 @@ result is returned as a pointer to that pair in memory. A string argument is cop
 `Instance::write_memory`. A string result is read back from the pointer the function returns,
 and must be valid UTF-8. The flattening rules (a maximum of 16 flat parameters, one flat result,
 and the return-pointer convention for a multi-value result) are the canonical ABI's, and the
-crate refuses a type that would need the indirect form rather than implementing it.
+crate passes more than 16 flat parameters indirectly, as the Records paragraph explains.
 
 The rules were checked against a mirror of the Canonical ABI text, `clunt.github.io/component-model/design/mvp/CanonicalABI.html`,
 because the canonical file itself did not render for the fetch. They should be checked again
 against the canonical file before a release.
 
 Refused, each by name and offset: a string in a lowered import (the host call would need the
-caller's memory), more than 16 flat parameters, a memory or `realloc` from another instance,
+caller's memory), a memory or `realloc` from another instance,
 any other canonical option, and a string without the options it needs.
 
 ## Capabilities
@@ -188,7 +195,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 a separate stage, which will map each parsed function onto the same capability id.
 
 Not done: strings and records in lowered imports, UTF-16 and Latin-1 encodings, `post-return`,
-records passed indirectly, results and variants whose payloads differ in flat type, and parsing WIT to
+results and variants whose payloads differ in flat type, and parsing WIT to
 derive the capability ids.
 
 ## Design constraint

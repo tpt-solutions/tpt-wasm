@@ -1291,6 +1291,7 @@ fn no_truncation_or_corruption_of_a_component_panics() {
         tuple_component(),
         result_component(),
         variant_component(),
+        wide_component(&seventeen_u32_params(), &WIDE_OPTIONS),
     ];
     let mut decoded = 0usize;
     let mut instantiated = 0usize;
@@ -2933,4 +2934,173 @@ fn a_variant_whose_payloads_differ_in_flat_type_or_have_no_cases_is_refused() {
         ))),
         Err(ComponentError::Malformed { .. })
     ));
+}
+
+/// A core module whose `sum` takes a pointer to seventeen `u32` values in memory and returns their
+/// total, and whose `realloc` returns the address 1024, where the block is then read.
+fn wide_module() -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bytes.extend(section(
+        1,
+        &[
+            2, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f,
+        ],
+    ));
+    bytes.extend(section(3, &[2, 0, 1]));
+    bytes.extend(section(5, &[1, 0x00, 1]));
+    bytes.extend(section(
+        7,
+        &[
+            3, 3, b's', b'u', b'm', 0, 0, 7, b'r', b'e', b'a', b'l', b'l', b'o', b'c', 0, 1, 6,
+            b'm', b'e', b'm', b'o', b'r', b'y', 2, 0,
+        ],
+    ));
+    // sum: the first field, then each later one added on: local.get 0, i32.load align 2 offset.
+    let mut body = vec![0x00, 0x20, 0x00, 0x28, 0x02, 0x00];
+    for field in 1..17u8 {
+        body.extend_from_slice(&[0x20, 0x00, 0x28, 0x02, field * 4, 0x6a]);
+    }
+    body.push(0x0b);
+    let mut code = vec![2, body.len() as u8];
+    code.extend(&body);
+    code.extend_from_slice(&[5, 0, 0x41, 0x80, 0x08, 0x0b]);
+    bytes.extend(section(10, &code));
+    bytes
+}
+
+/// The parameter list of seventeen `u32` values, named `a` through `q`.
+fn seventeen_u32_params() -> Vec<u8> {
+    let mut params = vec![17];
+    for name in b'a'..b'a' + 17 {
+        params.extend_from_slice(&[1, name, VALTYPE_U32]);
+    }
+    params
+}
+
+/// A component over `wide_module` with one lifted function of the given parameters, returning a
+/// `u32`, and the given canonical options on its lift.
+fn wide_component(params: &[u8], options: &[u8]) -> Vec<u8> {
+    let mut type_body = vec![1, TYPE_FUNC];
+    type_body.extend_from_slice(params);
+    type_body.extend_from_slice(&[0x00, VALTYPE_U32]);
+    let types = section(SECTION_TYPE, &type_body);
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            3, 0, 0, 1, 0, 3, b's', b'u', b'm', 0, 0, 1, 0, 7, b'r', b'e', b'a', b'l', b'l', b'o',
+            b'c', 0, 2, 1, 0, 6, b'm', b'e', b'm', b'o', b'r', b'y',
+        ],
+    );
+    let mut canon = vec![1, CANON_LIFT, SORT_FUNC, 0];
+    canon.extend_from_slice(options);
+    canon.push(0);
+    let canon = section(SECTION_CANON, &canon);
+    let export = section(
+        SECTION_EXPORT,
+        &[1, 0x00, 3, b's', b'u', b'm', COMPONENT_SORT_FUNC, 0, 0x00],
+    );
+    let mut bytes = with(&module_section(&wide_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+/// The canonical options of a lift with a memory and a realloc.
+const WIDE_OPTIONS: [u8; 5] = [2, OPTION_MEMORY, 0, OPTION_REALLOC, 1];
+
+#[test]
+fn seventeen_parameters_are_stored_as_one_block_behind_a_pointer() {
+    let mut instance = Component::decode(&wide_component(&seventeen_u32_params(), &WIDE_OPTIONS))
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    let arguments: Vec<ComponentValue> = (1..=17).map(ComponentValue::U32).collect();
+    assert_eq!(
+        instance.call_export("sum", arguments),
+        Ok(vec![ComponentValue::U32(153)])
+    );
+}
+
+#[test]
+fn indirect_parameters_need_a_realloc_and_may_not_hold_a_string() {
+    assert!(matches!(
+        Component::decode(&wide_component(
+            &seventeen_u32_params(),
+            &[1, OPTION_MEMORY, 0]
+        )),
+        Err(ComponentError::UnsupportedCanon { .. })
+    ));
+    let mut with_string = vec![17, 1, b'a', VALTYPE_STRING];
+    for name in b'b'..b'b' + 16 {
+        with_string.extend_from_slice(&[1, name, VALTYPE_U32]);
+    }
+    assert!(matches!(
+        Component::decode(&wide_component(&with_string, &WIDE_OPTIONS)),
+        Err(ComponentError::UnsupportedType {
+            what: "a string or list among more than 16 flat parameters",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn an_import_with_more_than_16_flat_parameters_is_refused() {
+    let types = section(
+        SECTION_TYPE,
+        &[
+            &[1, TYPE_FUNC][..],
+            &seventeen_u32_params()[..],
+            &[0x00, VALTYPE_U32][..],
+        ]
+        .concat(),
+    );
+    let import = section(SECTION_IMPORT, &[1, 0x00, 1, b'f', 0x01, 0]);
+    let canon = section(SECTION_CANON, &[1, CANON_LOWER, SORT_FUNC, 0, 0]);
+    assert!(matches!(
+        Component::decode(&with(&[types, import, canon].concat())),
+        Err(ComponentError::UnsupportedCanon { .. })
+    ));
+}
+
+#[test]
+fn a_record_and_an_option_are_stored_at_their_canonical_offsets() {
+    let defined = vec![ComponentTypeDef::Record(vec![
+        RecordField {
+            name: "a".to_owned(),
+            ty: Scalar::U8,
+        },
+        RecordField {
+            name: "b".to_owned(),
+            ty: Scalar::U32,
+        },
+    ])];
+    let mut buffer = [0u8; 8];
+    store(
+        &ComponentValue::Record(vec![
+            ("a".to_owned(), ComponentValue::U8(7)),
+            ("b".to_owned(), ComponentValue::U32(0x0102_0304)),
+        ]),
+        &ComponentType::Record(0),
+        &defined,
+        &mut buffer,
+        0,
+    )
+    .expect("stores");
+    assert_eq!(buffer, [7, 0, 0, 0, 4, 3, 2, 1]);
+
+    let defined = vec![ComponentTypeDef::Option(Scalar::U32)];
+    let mut buffer = [0u8; 8];
+    store(
+        &ComponentValue::Option(Some(Box::new(ComponentValue::U32(5)))),
+        &ComponentType::Option(0),
+        &defined,
+        &mut buffer,
+        0,
+    )
+    .expect("stores");
+    assert_eq!(buffer, [1, 0, 0, 0, 5, 0, 0, 0]);
 }
