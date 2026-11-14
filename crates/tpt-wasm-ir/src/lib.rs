@@ -616,6 +616,21 @@ pub enum IrInstr {
         result: ValueId,
         value: ValueId,
     },
+    /// `table.get`: the reference at `index` in table `table`. An index past the
+    /// table's length traps, and an empty slot reads as the null reference of the
+    /// table's element type.
+    TableGet {
+        result: ValueId,
+        table: u32,
+        index: ValueId,
+    },
+    /// `table.set`: store `value` at `index` in table `table`. An index past the
+    /// table's length traps.
+    TableSet {
+        table: u32,
+        index: ValueId,
+        value: ValueId,
+    },
 }
 
 /// Whether a memory access still needs a run-time bounds check.

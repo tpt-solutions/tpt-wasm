@@ -212,6 +212,8 @@ fn execute_instruction(machine: &mut Machine, instruction: crate::instr::Instr) 
                 Err(step) => step,
             }
         }
+        crate::instr::Instr::TableGet(table_index) => table_get(machine, table_index),
+        crate::instr::Instr::TableSet(table_index) => table_set(machine, table_index),
         crate::instr::Instr::I32Const(value) => push_value(machine, Value::I32(value)),
         crate::instr::Instr::I64Const(value) => push_value(machine, Value::I64(value)),
         crate::instr::Instr::F32Const(value) => push_value(machine, Value::F32(value)),
@@ -694,6 +696,76 @@ fn call_indirect(machine: &mut Machine, type_index: u32, table_index: u32) -> St
         return Step::Trap(Trap::IndirectCallTypeMismatch);
     }
     call_address(machine, address)
+}
+
+/// The store address of the table `table_index` names in the running instance.
+fn table_address(machine: &Machine, table_index: u32) -> Result<u32, Trap> {
+    let instance_idx = match machine.frames.last() {
+        Some(frame) => frame.instance_idx,
+        None => return Err(Trap::HostFailure("no active frame".into())),
+    };
+    match machine.store.instance(instance_idx) {
+        Ok(instance) => instance
+            .table_addrs
+            .get(table_index as usize)
+            .copied()
+            .ok_or(Trap::TableOutOfBounds),
+        Err(_) => Err(Trap::HostFailure("unknown instance".into())),
+    }
+}
+
+/// `table.get`: pop an index and push the reference stored there. An empty slot reads as
+/// the null reference of the table's element type.
+fn table_get(machine: &mut Machine, table_index: u32) -> Step {
+    let address = match table_address(machine, table_index) {
+        Ok(address) => address,
+        Err(trap) => return Step::Trap(trap),
+    };
+    let index = match pop_typed_i32(machine) {
+        Ok(value) => value as u32,
+        Err(step) => return step,
+    };
+    let read = match machine.store.table(address) {
+        Ok(table) => match table.get(index) {
+            Ok(Some(reference)) => Ok(reference),
+            Ok(None) => Ok(RefValue::Null(table.element_type)),
+            Err(_) => Err(Trap::TableOutOfBounds),
+        },
+        Err(_) => Err(Trap::HostFailure("unknown table".into())),
+    };
+    match read {
+        Ok(reference) => push_value(machine, Value::Ref(reference)),
+        Err(trap) => Step::Trap(trap),
+    }
+}
+
+/// `table.set`: pop a reference, then an index, and store the reference there. The
+/// store refuses a reference of the wrong kind, which validation already rules out.
+fn table_set(machine: &mut Machine, table_index: u32) -> Step {
+    let address = match table_address(machine, table_index) {
+        Ok(address) => address,
+        Err(trap) => return Step::Trap(trap),
+    };
+    let reference = match pop_value(machine) {
+        Ok(Value::Ref(reference)) => reference,
+        Ok(_) => return Step::Trap(Trap::HostFailure("expected a reference operand".into())),
+        Err(step) => return step,
+    };
+    let index = match pop_typed_i32(machine) {
+        Ok(value) => value as u32,
+        Err(step) => return step,
+    };
+    let written = match machine.store.table_mut(address) {
+        Ok(table) => table.set(index, reference).map_err(|error| match error {
+            crate::store::StoreError::TableOutOfBounds => Trap::TableOutOfBounds,
+            other => Trap::HostFailure(format!("{other:?}")),
+        }),
+        Err(_) => Err(Trap::HostFailure("unknown table".into())),
+    };
+    match written {
+        Ok(()) => Step::Continue,
+        Err(trap) => Step::Trap(trap),
+    }
 }
 
 fn call_address(machine: &mut Machine, address: u32) -> Step {

@@ -159,7 +159,8 @@ with an IR `funcref` value, and imported-function resolution with an explicit
 1. explicit host-*effect* instructions beyond a call, so a compiled module can
    observe a granted capability's effects rather than only invoke it;
 2. passive and multiple element/data segments, and non-`funcref` tables;
-3. `table.get`/`table.set`, completing the reference-types surface;
+3. `externref` tables and non-active element segments, completing the reference-types
+   surface;
 4. imported tables, memories, and globals.
 
 Each addition requires an IR instruction form, verifier rule, lowering test,

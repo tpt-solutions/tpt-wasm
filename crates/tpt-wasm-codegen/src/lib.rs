@@ -375,6 +375,17 @@ pub enum BaselineOp {
         result: u32,
         value: u32,
     },
+    /// `table.get`: read the entry at `index` into `result`. An empty entry is the
+    /// null `funcref`, the only element type the baseline's table holds.
+    TableGet {
+        result: u32,
+        index: u32,
+    },
+    /// `table.set`: store the reference in `value` at `index`.
+    TableSet {
+        index: u32,
+        value: u32,
+    },
 }
 
 /// One basic block of a lowered baseline function.
@@ -1368,6 +1379,36 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     let value = state.slot(*value)?;
                     let result = state.define(*result)?;
                     ops.push(BaselineOp::RefIsNull { result, value });
+                }
+                IrInstr::TableGet {
+                    result,
+                    table,
+                    index,
+                } => {
+                    // The baseline holds one table, and the IR refuses a module
+                    // with more, so the table index is always 0 here.
+                    if *table != 0 {
+                        return Err(CodegenError::UnsupportedInstruction(
+                            "table index other than 0",
+                        ));
+                    }
+                    let index = state.expect(*index, ValueType::I32)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::TableGet { result, index });
+                }
+                IrInstr::TableSet {
+                    table,
+                    index,
+                    value,
+                } => {
+                    if *table != 0 {
+                        return Err(CodegenError::UnsupportedInstruction(
+                            "table index other than 0",
+                        ));
+                    }
+                    let index = state.expect(*index, ValueType::I32)?;
+                    let value = state.slot(*value)?;
+                    ops.push(BaselineOp::TableSet { index, value });
                 } // Every IR instruction is lowered above. When the IR grows, this
                   // arm becomes reachable again and rejects the new instruction
                   // rather than silently dropping it; until then it is dead, so the
@@ -2927,6 +2968,44 @@ fn exec_op(
                 }
             };
             slots[*result as usize] = Some(Value::I32(is_null as i32));
+        }
+        BaselineOp::TableGet { result, index } => {
+            let index = i32_slot(slots, *index)? as u32;
+            let table = state
+                .table
+                .as_deref()
+                .ok_or_else(|| Trap::HostFailure("baseline table.get needs a table".into()))?;
+            let entry = table
+                .elements
+                .get(index as usize)
+                .copied()
+                .ok_or(Trap::TableOutOfBounds)?;
+            let reference = match entry {
+                Some(function) => tpt_wasm_types::RefValue::FuncRef(function),
+                None => tpt_wasm_types::RefValue::Null(tpt_wasm_types::ReferenceType::FuncRef),
+            };
+            slots[*result as usize] = Some(Value::Ref(reference));
+        }
+        BaselineOp::TableSet { index, value } => {
+            let index = i32_slot(slots, *index)? as u32;
+            let entry = match read_slot(slots, *value)? {
+                Value::Ref(tpt_wasm_types::RefValue::FuncRef(function)) => Some(function),
+                Value::Ref(tpt_wasm_types::RefValue::Null(_)) => None,
+                other => {
+                    return Err(BaselineError::Trap(Trap::HostFailure(format!(
+                        "baseline table.set operand is not a funcref: {other:?}"
+                    ))))
+                }
+            };
+            let table = state
+                .table
+                .as_deref_mut()
+                .ok_or_else(|| Trap::HostFailure("baseline table.set needs a table".into()))?;
+            let slot = table
+                .elements
+                .get_mut(index as usize)
+                .ok_or(Trap::TableOutOfBounds)?;
+            *slot = entry;
         }
         BaselineOp::Branch { target, values } => {
             return Ok(OpFlow::Jump(*target, values.clone()));

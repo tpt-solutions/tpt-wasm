@@ -129,8 +129,9 @@ validator admits `funcref` and `externref` in function signatures, locals, globa
 and block result types; `v128` stays out, because the vector proposal has no
 instructions here to move it. A block may therefore carry a reference result, so
 a `funcref` travels through a label as a block parameter. The full
-reference-types proposal is still not implemented: there is no `table.get` or
-`table.set`, no `externref` table, and no passive or declarative element segment.
+reference-types proposal is still not implemented. `table.get` and `table.set` are
+lowered and run on every engine, over `funcref` tables only. There is no `externref`
+table, and no passive or declarative element segment.
 
 What is still outside the IR, and rejected explicitly rather than dropped or
 approximated:
@@ -142,8 +143,9 @@ approximated:
   initializer the IR could carry, so `lower_module` refuses one.
 - **Cross-instance imports.** An import resolved to another Wasm instance rather
   than a host function is a Wasm-to-Wasm call, which the baseline refuses.
-- **Remaining reference-types surface.** `table.get`/`table.set`, `externref`
-  tables, and non-active element segments have no IR form.
+- **Remaining reference-types surface.** `externref` tables and non-active element
+  segments have no IR form. Lowering refuses an `externref` table for `table.get` and
+  `table.set` rather than storing its values in a `funcref` table.
 
 Remaining numeric operations, a native backend, and imported-call resolution are
 tracked in [lowering.md](lowering.md) and the M7/M8 milestones.

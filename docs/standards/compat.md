@@ -38,7 +38,7 @@ is. The four evidence columns say what is checked, not what is implemented:
 ## Notes
 
 - **`mvp`**: Core suite: 45 files vendored and run on both backends; binary-format suite run; the rest is blocked on post-MVP proposals (docs in todo.md, M2). Decoder fuzz target in fuzz/ (not run in CI). Seeded differential generators in tpt-wasm-spec and tpt-wasm-opt. Lean V0-V3, V5 (partial), V6 skeleton.
-- **`reference_types`**: ref.null, ref.func, ref.is_null, funcref/externref in signatures and locals; exercised by the Core files that do not need table.get/set. Not tested: table.get/set, externref tables, passive and declarative element segments. The opt generator emits reference instructions; the spec differential does not.
+- **`reference_types`**: ref.null, ref.func, ref.is_null, funcref/externref in signatures and locals; exercised by the Core files that do not need table.get/set. table.get/table.set are validated, lowered, and run on every engine, with the same traps as Micro (crates/tpt-wasm-runtime/tests/table_instructions.rs). Not tested: externref tables, passive and declarative element segments, and table.get/set through a table shared between instances, where the baseline has the module-local index divergence recorded under M2. The opt generator emits reference instructions; the spec differential does not.
 - **`sign_extension_ops`**: i32.wast and i64.wast run in CI through the spec harness. The spec differential generator draws from the 0x45-0xc4 numeric range, which includes 0xc0-0xc4, but it does not target them specifically.
 
 ## MVP status ladder

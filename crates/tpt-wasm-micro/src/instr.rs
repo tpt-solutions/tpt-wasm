@@ -32,6 +32,10 @@ pub enum Instr {
     RefNull(tpt_wasm_types::RefType),
     RefIsNull,
     RefFunc(u32),
+    /// `table.get`: read the reference at an index of the named table.
+    TableGet(u32),
+    /// `table.set`: write a reference to an index of the named table.
+    TableSet(u32),
 
     // Parametric
     Drop,
@@ -401,6 +405,8 @@ fn decode_instruction(reader: &mut BodyReader<'_>) -> Result<Instr, InstrDecodeE
         0x0f => Instr::Return,
         0x10 => Instr::Call(reader.u32()?),
         0x11 => Instr::CallIndirect(reader.u32()?, reader.u32()?),
+        0x25 => Instr::TableGet(reader.u32()?),
+        0x26 => Instr::TableSet(reader.u32()?),
         0xd0 => Instr::RefNull(decode_ref_type(reader.byte()?)?),
         0xd1 => Instr::RefIsNull,
         0xd2 => Instr::RefFunc(reader.u32()?),

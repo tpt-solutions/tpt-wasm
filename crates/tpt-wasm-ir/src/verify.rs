@@ -840,6 +840,9 @@ pub fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
         RefNull { .. } | RefFunc { .. } => Vec::new(),
         // `ref.is_null` reads the reference it tests.
         RefIsNull { value, .. } => vec![*value],
+        // A table get reads its index; a table set reads the index and the reference.
+        TableGet { index, .. } => vec![*index],
+        TableSet { index, value, .. } => vec![*index, *value],
         // A get names its local; a set and tee read the stored value, and the
         // local they name is a pre-allocated slot rather than an operand.
         LocalGet { local, .. } => vec![*local],
@@ -943,7 +946,9 @@ pub fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
         CallHost { results, .. } => results.clone(),
         CallIndirect { results, .. } => results.clone(),
         // Neither a drop, a store, nor a `global.set` produces a new value.
-        Drop { .. } | LocalSet { .. } | Store { .. } | GlobalSet { .. } => Vec::new(),
+        Drop { .. } | LocalSet { .. } | Store { .. } | GlobalSet { .. } | TableSet { .. } => {
+            Vec::new()
+        }
         LocalGet { result, .. } | LocalTee { result, .. } | Select { result, .. } => {
             vec![*result]
         }
@@ -955,6 +960,7 @@ pub fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
         | RefNull { result, .. }
         | RefFunc { result, .. }
         | RefIsNull { result, .. }
+        | TableGet { result, .. }
         | ConstI32 { result, .. }
         | ConstI64 { result, .. }
         | ConstF32 { result, .. }
@@ -1750,6 +1756,36 @@ fn verify_instruction(
                 defined,
             )
         }
+        super::IrInstr::TableGet {
+            result,
+            table,
+            index,
+        } => {
+            let declaration = table_declaration(module, *table)?;
+            expect_defined_type(*index, ValueType::I32, function_index, values, defined)?;
+            define_value(
+                *result,
+                ValueType::Ref(declaration.element_type),
+                function_index,
+                values,
+                defined,
+            )
+        }
+        super::IrInstr::TableSet {
+            table,
+            index,
+            value,
+        } => {
+            let declaration = table_declaration(module, *table)?;
+            expect_defined_type(*index, ValueType::I32, function_index, values, defined)?;
+            expect_defined_type(
+                *value,
+                ValueType::Ref(declaration.element_type),
+                function_index,
+                values,
+                defined,
+            )
+        }
         super::IrInstr::RefIsNull { result, value } => {
             // Either reference kind is accepted, matching Wasm, so this checks
             // that the operand is a reference rather than which one.
@@ -1768,6 +1804,19 @@ fn verify_instruction(
             define_value(*result, ValueType::I32, function_index, values, defined)
         }
     }
+}
+
+/// The declaration of a table an instruction names. Only `funcref` tables exist in the
+/// IR, so any other element type is refused here rather than read as a function table.
+fn table_declaration(module: &IrModule, table: u32) -> Result<&super::IrTable, VerificationError> {
+    let declaration = module
+        .tables
+        .get(table as usize)
+        .ok_or(VerificationError::UnknownTable(table))?;
+    if declaration.element_type != ReferenceType::FuncRef {
+        return Err(VerificationError::NotAFunctionTable(table));
+    }
+    Ok(declaration)
 }
 
 fn define_value(

@@ -245,6 +245,10 @@ pub fn project_function_to_model(
             IrInstr::RefNull { .. } | IrInstr::RefFunc { .. } | IrInstr::RefIsNull { .. } => {
                 return Err(IrProjectionError::UnsupportedInstruction("reference"))
             }
+            // Tables are not in the formal model, so a table access is refused.
+            IrInstr::TableGet { .. } | IrInstr::TableSet { .. } => {
+                return Err(IrProjectionError::UnsupportedInstruction("table"))
+            }
             // A host call is capability-gated, and the projection has no way to
             // supply the grant, so it is refused rather than projected as a call
             // that would appear unconditional.

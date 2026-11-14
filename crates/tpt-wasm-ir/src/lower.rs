@@ -1221,6 +1221,29 @@ fn lower_body(
                 });
                 state.push(result, ValueType::Ref(reference_type));
             }
+            0x25 => {
+                let table = reader.u32()?;
+                let index = state.pop(ValueType::I32)?;
+                let reference_type = table_element_type(module, table)?;
+                let result = state.allocate(ValueType::Ref(reference_type))?;
+                builder.push(IrInstr::TableGet {
+                    result,
+                    table,
+                    index,
+                });
+                state.push(result, ValueType::Ref(reference_type));
+            }
+            0x26 => {
+                // The value sits above the index, so it is popped first.
+                let table = reader.u32()?;
+                let value = state.pop_reference()?;
+                let index = state.pop(ValueType::I32)?;
+                builder.push(IrInstr::TableSet {
+                    table,
+                    index,
+                    value,
+                });
+            }
             0xd1 => {
                 let value = state.pop_reference()?;
                 let result = state.allocate(ValueType::I32)?;
@@ -1268,7 +1291,7 @@ fn skip_immediates(opcode: u8, reader: &mut BodyReader<'_>) -> Result<(), Loweri
         0x00 | 0x01 | 0x05 | 0x0b | 0x0f | 0x1a | 0x1b | 0x45..=0xc4 | 0xd1 => {}
         // A single index: a branch, a call, a local or global access, and
         // `ref.func`.
-        0x0c | 0x0d | 0x10 | 0x20..=0x24 | 0xd2 => {
+        0x0c | 0x0d | 0x10 | 0x20..=0x26 | 0xd2 => {
             reader.u32()?;
         }
         0x11 => {
@@ -1630,6 +1653,37 @@ fn allocate_results(
             Ok(result)
         })
         .collect()
+}
+
+/// The element type of table `table`, counting imported tables first, as Wasm numbers
+/// them. Only `funcref` tables can be lowered: an `externref` table would hold values the
+/// baseline's table cannot represent, so it is refused rather than stored wrongly.
+fn table_element_type(
+    module: &tpt_wasm_format::Module,
+    table: u32,
+) -> Result<ReferenceType, LoweringError> {
+    let imported = module
+        .imports
+        .iter()
+        .filter_map(|import| match &import.desc {
+            tpt_wasm_format::ImportDesc::Table(table_type) => Some(table_type.element_type),
+            _ => None,
+        });
+    let defined = module
+        .tables
+        .iter()
+        .map(|table| table.table_type.element_type);
+    let element_type =
+        imported
+            .chain(defined)
+            .nth(table as usize)
+            .ok_or(LoweringError::UnsupportedFeature(
+                "table index out of range",
+            ))?;
+    if element_type != ReferenceType::FuncRef {
+        return Err(LoweringError::UnsupportedFeature("externref table"));
+    }
+    Ok(element_type)
 }
 
 fn lower_call_indirect(

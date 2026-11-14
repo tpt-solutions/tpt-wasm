@@ -730,6 +730,35 @@ fn reference_instruction(
     Ok(())
 }
 
+/// `table.get` and `table.set`. The element type comes from the named table's type, so
+/// a reference of the wrong kind is refused here rather than at run time.
+fn table_instruction(
+    opcode: u8,
+    reader: &mut Reader<'_>,
+    stack: &mut Vec<Option<ValueType>>,
+    controls: &[ControlFrame],
+    module: &ModuleContext,
+) -> Result<(), ValidationError> {
+    let index = reader.u32()?;
+    let table = module
+        .table_types
+        .get(index as usize)
+        .ok_or(ValidationError::UnknownTable(index))?;
+    let element = ValueType::Ref(table.element_type);
+    match opcode {
+        0x25 => {
+            pop_value(stack, controls, Some(ValueType::I32))?;
+            push_value(stack, element);
+        }
+        0x26 => {
+            pop_value(stack, controls, Some(element))?;
+            pop_value(stack, controls, Some(ValueType::I32))?;
+        }
+        _ => return Err(ValidationError::InvalidInstruction(opcode)),
+    }
+    Ok(())
+}
+
 fn constant_instruction(
     opcode: u8,
     reader: &mut Reader<'_>,
@@ -836,6 +865,7 @@ pub(crate) fn validate_instruction(
         0x28..=0x40 => memory_instruction(opcode, reader, stack, controls, module),
         0x41..=0x44 => constant_instruction(opcode, reader, stack),
         0xd0..=0xd2 => reference_instruction(opcode, reader, stack, controls, module),
+        0x25 | 0x26 => table_instruction(opcode, reader, stack, controls, module),
         _ => numeric_instruction(opcode, stack, controls),
     }
 }

@@ -105,6 +105,17 @@ fn decode_load(operation: super::MemoryLoad, bits: u64) -> Result<Value, Trap> {
 const PAGE_SIZE: usize = 65_536;
 const MAX_PAGES: u64 = 65_536;
 
+/// The `i32` table index an instruction reads, as an unsigned offset into a table.
+fn table_index(values: &HashMap<ValueId, Value>, operand: ValueId) -> Result<u32, Trap> {
+    values
+        .get(&operand)
+        .and_then(|value| match value {
+            Value::I32(index) => Some(*index as u32),
+            _ => None,
+        })
+        .ok_or_else(|| Trap::HostFailure("missing table index".into()))
+}
+
 /// Mutable module state shared by every frame of one execution: the linear
 /// memory and the global slots.
 struct ModuleState {
@@ -116,6 +127,9 @@ struct ModuleState {
     max_pages: Option<u64>,
     /// One slot per module global.
     globals: Vec<Value>,
+    /// The entries of each table, as the baseline holds them: `min` slots, with
+    /// the active element segment written at its offset. `None` is a null entry.
+    tables: Vec<Vec<Option<u32>>>,
 }
 
 impl ModuleState {
@@ -146,6 +160,19 @@ impl ModuleState {
                 .globals
                 .iter()
                 .map(|g| g.init.clone().unwrap_or(Value::I32(0)))
+                .collect(),
+            tables: module
+                .tables
+                .iter()
+                .map(|declaration| {
+                    let mut entries = vec![None; declaration.min as usize];
+                    for (position, entry) in declaration.elements.iter().enumerate() {
+                        let at = declaration.offset as usize + position;
+                        let slot = entries.get_mut(at).expect("element segment fits the table");
+                        *slot = *entry;
+                    }
+                    entries
+                })
                 .collect(),
         }
     }
@@ -530,6 +557,45 @@ fn execute_ir_function(
                         .get_mut(*global as usize)
                         .ok_or_else(|| Trap::HostFailure("missing global".into()))? = stored;
                 }
+                IrInstr::TableGet {
+                    result,
+                    table,
+                    index,
+                } => {
+                    let index = table_index(&values, *index)?;
+                    let entries = state
+                        .tables
+                        .get(*table as usize)
+                        .ok_or_else(|| Trap::HostFailure("unknown table".into()))?;
+                    let entry = entries
+                        .get(index as usize)
+                        .copied()
+                        .ok_or(Trap::TableOutOfBounds)?;
+                    let reference = match entry {
+                        Some(function) => RefValue::FuncRef(function),
+                        None => RefValue::Null(ReferenceType::FuncRef),
+                    };
+                    values.insert(*result, Value::Ref(reference));
+                }
+                IrInstr::TableSet {
+                    table,
+                    index,
+                    value,
+                } => {
+                    let index = table_index(&values, *index)?;
+                    let entry = match values.get(value) {
+                        Some(Value::Ref(RefValue::FuncRef(function))) => Some(*function),
+                        Some(Value::Ref(RefValue::Null(_))) => None,
+                        _ => return Err(Trap::HostFailure("table.set needs a funcref".into())),
+                    };
+                    let entries = state
+                        .tables
+                        .get_mut(*table as usize)
+                        .ok_or_else(|| Trap::HostFailure("unknown table".into()))?;
+                    *entries
+                        .get_mut(index as usize)
+                        .ok_or(Trap::TableOutOfBounds)? = entry;
+                }
                 IrInstr::RefNull {
                     result,
                     reference_type,
@@ -654,16 +720,14 @@ fn execute_ir_function(
                             _ => None,
                         })
                         .ok_or_else(|| Trap::HostFailure("missing table index".into()))?;
-                    let declaration = module
+                    let entries = state
                         .tables
                         .get(*table as usize)
                         .ok_or_else(|| Trap::HostFailure("unknown table".into()))?;
-                    let slot = declaration.offset as usize + index as usize;
-                    let target = declaration
-                        .elements
-                        .get(slot)
+                    let target = entries
+                        .get(index as usize)
                         .copied()
-                        .flatten()
+                        .ok_or(Trap::TableOutOfBounds)?
                         .ok_or(Trap::TableOutOfBounds)?;
                     let call_arguments = arguments
                         .iter()

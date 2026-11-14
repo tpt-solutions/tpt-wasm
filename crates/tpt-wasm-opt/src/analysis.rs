@@ -305,6 +305,7 @@ pub fn defines(instruction: &IrInstr) -> Option<ValueId> {
         | RefNull { result, .. }
         | RefFunc { result, .. }
         | RefIsNull { result, .. }
+        | TableGet { result, .. }
         | Load { result, .. }
         | MemorySize { result }
         | MemoryGrow { result, .. }
@@ -360,6 +361,7 @@ pub fn defines(instruction: &IrInstr) -> Option<ValueId> {
         | CallHost { .. }
         | Store { .. }
         | GlobalSet { .. }
+        | TableSet { .. }
         | CallIndirect { .. } => return None,
     })
 }
@@ -411,6 +413,9 @@ pub fn used_values(instruction: &IrInstr) -> Vec<ValueId> {
         | FloatConvert { value, .. }
         | FloatTrunc { value, .. }
         | RefIsNull { value, .. } => vec![*value],
+        // A table get reads its index; a table set reads the index and the reference.
+        TableGet { index, .. } => vec![*index],
+        TableSet { index, value, .. } => vec![*index, *value],
         RefNull { .. } | RefFunc { .. } | MemorySize { .. } | GlobalGet { .. } => Vec::new(),
         Load { address, .. } => vec![*address],
         Store { address, value, .. } => vec![*address, *value],
@@ -509,6 +514,8 @@ pub fn may_trap(instruction: &IrInstr) -> bool {
         // An index outside the table, a null entry, and a signature mismatch are
         // all traps, and the callee can trap too.
         CallIndirect { .. } | Call { .. } | CallHost { .. } => true,
+        // A table access outside the table traps, so it stays even when its result is unused.
+        TableGet { .. } | TableSet { .. } => true,
         // Everything else in the modeled instruction set is total.
         _ => false,
     }
@@ -527,6 +534,7 @@ pub fn has_side_effects(instruction: &IrInstr) -> bool {
         | Call { .. }
         | CallHost { .. }
         | CallIndirect { .. }
+        | TableSet { .. }
         | LocalSet { .. }
         | LocalTee { .. } => true,
         // A `drop` discards a value. Under the MVP there is nothing for a discard
@@ -590,6 +598,7 @@ pub fn reads_mutable_state(instruction: &IrInstr) -> bool {
             | IrInstr::GlobalGet { .. }
             | IrInstr::MemorySize { .. }
             | IrInstr::RefFunc { .. }
+            | IrInstr::TableGet { .. }
     )
 }
 
@@ -605,6 +614,7 @@ pub fn writes_mutable_state(instruction: &IrInstr) -> bool {
             | IrInstr::CallIndirect { .. }
             | IrInstr::LocalSet { .. }
             | IrInstr::LocalTee { .. }
+            | IrInstr::TableSet { .. }
     )
 }
 
@@ -834,6 +844,11 @@ pub fn map_operands(instruction: &mut IrInstr, mut f: impl FnMut(ValueId) -> Val
         | FloatConvert { value, .. }
         | FloatTrunc { value, .. }
         | RefIsNull { value, .. } => *value = f(*value),
+        TableGet { index, .. } => *index = f(*index),
+        TableSet { index, value, .. } => {
+            *index = f(*index);
+            *value = f(*value);
+        }
         _ => {
             let operands = used_values(instruction);
             if operands.len() == 2 {

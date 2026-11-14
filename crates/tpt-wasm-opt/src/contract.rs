@@ -85,6 +85,11 @@ pub enum Effect {
     Call(u32),
     /// An indirect call through the table.
     CallIndirect { type_index: u32, table: u32 },
+    /// A read of a table entry. Recorded because it can trap, and because its value
+    /// depends on earlier table writes.
+    TableGet(u32),
+    /// A write to a table entry.
+    TableSet(u32),
     /// A trap this module can reach, by the `Trap` value it carries.
     Trap(String),
     /// The function ended, returning this many values.
@@ -489,6 +494,8 @@ fn effect_of(instruction: &IrInstr, constants: &HashMap<ValueId, i64>) -> Option
             type_index: *type_index,
             table: *table,
         },
+        IrInstr::TableGet { table, .. } => Effect::TableGet(*table),
+        IrInstr::TableSet { table, .. } => Effect::TableSet(*table),
         _ => return None,
     })
 }
