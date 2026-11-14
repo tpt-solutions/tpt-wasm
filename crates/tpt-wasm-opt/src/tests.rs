@@ -1130,6 +1130,7 @@ fn run_with_failing_effect(
 /// same value. This is the host-effect half of the regression claim: the generated
 /// programs elsewhere in this file do not call the host at all.
 #[test]
+#[cfg_attr(miri, ignore = "runs the native backends, which execute JIT code that Miri cannot run; covered natively")]
 fn host_effects_are_preserved_by_every_backend_over_generated_programs() {
     use tpt_wasm_runtime::EngineMode;
 
@@ -1170,6 +1171,7 @@ fn host_effects_are_preserved_by_every_backend_over_generated_programs() {
 /// same call everywhere. The failure message names the call, so agreement means the
 /// same call, not merely some trap.
 #[test]
+#[cfg_attr(miri, ignore = "runs the native backends, which execute JIT code that Miri cannot run; covered natively")]
 fn host_traps_are_preserved_by_every_backend_over_generated_programs() {
     use tpt_wasm_runtime::EngineMode;
 
