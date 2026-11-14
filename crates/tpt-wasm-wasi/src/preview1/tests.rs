@@ -1242,6 +1242,104 @@ fn set_flags_accepts_only_the_empty_set_on_a_known_descriptor() {
     }
 }
 
+#[test]
+fn renumber_moves_a_descriptor_and_frees_its_old_number() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[
+                ("path_open", open_hello_args()),
+                ("fd_renumber", vec![Arg::I32(4), Arg::I32(10)]),
+                ("fd_tell", vec![Arg::I32(4), Arg::I32(TELL_OUT as i32)]),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::BADF)],
+            "{mode:?}: old number"
+        );
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[
+                ("path_open", open_hello_args()),
+                ("fd_renumber", vec![Arg::I32(4), Arg::I32(10)]),
+                ("fd_tell", vec![Arg::I32(10), Arg::I32(TELL_OUT as i32)]),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::SUCCESS)],
+            "{mode:?}: new number"
+        );
+    }
+}
+
+#[test]
+fn renumber_replaces_an_open_target_and_later_opens_do_not_reuse_the_number() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[
+                ("path_open", open_hello_args()),
+                ("path_open", open_hello_args()),
+                ("fd_renumber", vec![Arg::I32(4), Arg::I32(5)]),
+                ("fd_tell", vec![Arg::I32(4), Arg::I32(TELL_OUT as i32)]),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::BADF)],
+            "{mode:?}: moved away"
+        );
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[
+                ("path_open", open_hello_args()),
+                ("fd_renumber", vec![Arg::I32(4), Arg::I32(10)]),
+                ("path_open", open_hello_args()),
+                ("fd_tell", vec![Arg::I32(10), Arg::I32(TELL_OUT as i32)]),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::SUCCESS)],
+            "{mode:?}: not overwritten"
+        );
+    }
+}
+
+#[test]
+fn renumber_refuses_grants_stdio_and_targets_on_them() {
+    for mode in BOTH {
+        let cases: [(&str, Vec<Arg>); 3] = [
+            ("fd_renumber", vec![Arg::I32(3), Arg::I32(10)]),
+            ("fd_renumber", vec![Arg::I32(4), Arg::I32(2)]),
+            ("fd_renumber", vec![Arg::I32(4), Arg::I32(3)]),
+        ];
+        for (index, (name, arguments)) in cases.into_iter().enumerate() {
+            let mut calls = Vec::new();
+            if index > 0 {
+                calls.push(("path_open", open_hello_args()));
+            }
+            calls.push((name, arguments));
+            let (result, _, _) = run_files(mode, grant(true), &calls, file_data_with(vec![]));
+            assert_eq!(
+                result,
+                vec![Value::I32(errno::NOTSUP)],
+                "{mode:?}: case {index}"
+            );
+        }
+    }
+}
+
 const DIRENT_OUT: u32 = 7400;
 const DIRENT_USED: u32 = 7500;
 
@@ -1588,6 +1686,7 @@ fn file_imports() -> Vec<(&'static str, FunctionType)> {
             signature(&[I32, I64, I64, I32], &[I32]),
         ),
         ("fd_fdstat_set_flags", signature(&[I32, I32], &[I32])),
+        ("fd_renumber", signature(&[I32, I32], &[I32])),
     ]
 }
 

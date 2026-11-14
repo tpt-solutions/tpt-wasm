@@ -213,6 +213,7 @@ enum Function {
     PathFilestatSetTimes,
     FdFilestatSetTimes,
     FdFdstatSetFlags,
+    FdRenumber,
     PollOneoff,
     SchedYield,
     ClockResGet,
@@ -221,7 +222,7 @@ enum Function {
 }
 
 impl Function {
-    const ALL: [Function; 37] = [
+    const ALL: [Function; 38] = [
         Function::ArgsSizesGet,
         Function::ArgsGet,
         Function::EnvironSizesGet,
@@ -254,6 +255,7 @@ impl Function {
         Function::PathFilestatSetTimes,
         Function::FdFilestatSetTimes,
         Function::FdFdstatSetFlags,
+        Function::FdRenumber,
         Function::PollOneoff,
         Function::SchedYield,
         Function::ClockResGet,
@@ -295,6 +297,7 @@ impl Function {
             Function::PathFilestatSetTimes => "path_filestat_set_times",
             Function::FdFilestatSetTimes => "fd_filestat_set_times",
             Function::FdFdstatSetFlags => "fd_fdstat_set_flags",
+            Function::FdRenumber => "fd_renumber",
             Function::PollOneoff => "poll_oneoff",
             Function::SchedYield => "sched_yield",
             Function::ClockResGet => "clock_res_get",
@@ -322,7 +325,7 @@ impl Function {
             Function::PathReadlink => (vec![I32, I32, I32, I32, I32, I32], vec![I32]),
             Function::PathFilestatSetTimes => (vec![I32, I32, I32, I32, I64, I64, I32], vec![I32]),
             Function::FdFilestatSetTimes => (vec![I32, I64, I64, I32], vec![I32]),
-            Function::FdFdstatSetFlags => (vec![I32, I32], vec![I32]),
+            Function::FdFdstatSetFlags | Function::FdRenumber => (vec![I32, I32], vec![I32]),
             Function::FdSeek => (vec![I32, I64, I32, I32], vec![I32]),
             Function::FdPrestatGet => (vec![I32, I32], vec![I32]),
             Function::FdPrestatDirName => (vec![I32, I32, I32], vec![I32]),
@@ -393,6 +396,13 @@ impl HostFunction for Implementation {
             | Function::PathFilestatSetTimes
             | Function::FdFilestatSetTimes => {
                 return Ok(vec![Value::I32(errno::NOTSUP)]);
+            }
+            Function::FdRenumber => {
+                return Ok(vec![Value::I32(fd_renumber(
+                    &mut state,
+                    arguments[0],
+                    arguments[1],
+                ))]);
             }
             Function::FdFdstatSetFlags => {
                 return Ok(vec![Value::I32(fd_fdstat_set_flags(
@@ -529,7 +539,8 @@ impl HostFunction for Implementation {
             | Function::PathReadlink
             | Function::PathFilestatSetTimes
             | Function::FdFilestatSetTimes
-            | Function::FdFdstatSetFlags => {
+            | Function::FdFdstatSetFlags
+            | Function::FdRenumber => {
                 unreachable!("handled before the memory check")
             }
             Function::FdPrestatDirName => {
@@ -787,6 +798,21 @@ fn fd_tell(state: &State, memory: &mut dyn GuestMemory, fd: u64, at: u64) -> i32
     }
     if stream_granted(state, fd) {
         errno::SPIPE
+    } else {
+        errno::BADF
+    }
+}
+
+/// `fd_renumber`. A stream cannot be renumbered, so it is refused with `NOTSUP`.
+fn fd_renumber(state: &mut State, fd: u64, to: u64) -> i32 {
+    let Ok(to) = u32::try_from(to) else {
+        return errno::NOTSUP;
+    };
+    if let Some(fd) = fs::file_descriptor(fd) {
+        return fs::renumber(&mut state.fs, fd, to);
+    }
+    if stream_granted(state, fd) {
+        errno::NOTSUP
     } else {
         errno::BADF
     }

@@ -1036,6 +1036,31 @@ pub(super) fn set_flags(fs: &FsState, fd: u32, flags: u64) -> i32 {
     }
 }
 
+/// `fd_renumber`: move an open file or directory from `fd` to `to`. A descriptor already at
+/// `to` is closed first, as `dup2` does. The preopened grants cannot move, and no descriptor
+/// can be moved onto a grant's number or the stdio numbers, so both are `NOTSUP`. The number
+/// counter is advanced past `to`, so a later open cannot overwrite the moved descriptor.
+pub(super) fn renumber(fs: &mut FsState, fd: u32, to: u32) -> i32 {
+    if !fs.open.contains_key(&fd) {
+        return errno::BADF;
+    }
+    let preopen_end = FIRST_PREOPEN + fs.preopens.len() as u32;
+    if fd < preopen_end || to < preopen_end {
+        return errno::NOTSUP;
+    }
+    if fd == to {
+        return errno::SUCCESS;
+    }
+    let Some(after) = to.checked_add(1) else {
+        return errno::MFILE;
+    };
+    if let Some(entry) = fs.open.remove(&fd) {
+        fs.open.insert(to, entry);
+    }
+    fs.next_fd = fs.next_fd.max(after);
+    errno::SUCCESS
+}
+
 /// `fd_close` on a file or directory descriptor, preopened or opened.
 pub(super) fn close(fs: &mut FsState, fd: u32) -> i32 {
     if fs.open.remove(&fd).is_some() {
