@@ -78,8 +78,10 @@ fails with `MissingImport` before anything runs. Canon lower (`0x01 0x00`) turns
 a core function. That core function reaches a core module through an inline-exports instance,
 and binding it as an import registers the embedder's function as a host function, so the
 core module calls the embedder's closure with lifted arguments and lowers the results. The
-closure's type is not checked against the import's declared type, since a Rust closure has
-no type to check; the call still checks the number and kinds of its arguments and results.
+embedder states each function's type when it supplies it (`Imports::define_function`), and
+instantiation refuses a function whose type differs from the component's declared type for
+the import (`ImportMismatch`). Each call then checks the number and kinds of its arguments and
+results against that type.
 Lowering a function the component defines, and lifting a lowered function, are refused,
 because they would need a component to call back into itself.
 
@@ -116,8 +118,7 @@ caller's memory), more than 16 flat parameters, a memory or `realloc` from anoth
 any other canonical option, and a string without the options it needs.
 
 Not done: strings in lowered imports, UTF-16 and Latin-1 encodings, `post-return`, records,
-lists, and the other compound types, the component's import type checks against the embedder's
-functions, and the WIT mapping to capabilities.
+lists, and the other compound types, and the WIT mapping to capabilities.
 
 ## Design constraint
 

@@ -138,6 +138,8 @@ pub enum ComponentError {
     NoSuchExport { name: String },
     /// The component imports a function the embedder did not supply.
     MissingImport { name: String },
+    /// The embedder supplied a function whose type differs from the component's import.
+    ImportMismatch { name: String, message: String },
     /// A core instance could not be created, with the runtime's reason.
     Instantiate { instance: usize, message: String },
     /// A lifted function's core type does not match its component type, or its memory or
@@ -210,6 +212,12 @@ impl fmt::Display for ComponentError {
             ComponentError::NoSuchExport { name } => write!(f, "there is no export named {name}"),
             ComponentError::MissingImport { name } => {
                 write!(f, "the component imports {name}, which was not supplied")
+            }
+            ComponentError::ImportMismatch { name, message } => {
+                write!(
+                    f,
+                    "the supplied {name} does not match the component's import: {message}"
+                )
             }
             ComponentError::Instantiate { instance, message } => {
                 write!(f, "core instance {instance} did not instantiate: {message}")
@@ -431,10 +439,19 @@ pub enum CoreInstance {
 pub type ComponentFn =
     Arc<dyn Fn(&[ComponentValue]) -> Result<Vec<ComponentValue>, String> + Send + Sync>;
 
-/// The functions an embedder supplies for a component's imports, by name.
+/// An embedder function with the type it was supplied at.
+#[derive(Clone)]
+struct SuppliedFunction {
+    ty: ComponentFuncType,
+    closure: ComponentFn,
+}
+
+/// The functions an embedder supplies for a component's imports, by name, each with its type.
+/// The type must be the one the component declares for the import, or the instantiation is
+/// refused.
 #[derive(Default)]
 pub struct Imports {
-    functions: BTreeMap<String, ComponentFn>,
+    functions: BTreeMap<String, SuppliedFunction>,
 }
 
 impl Imports {
@@ -443,13 +460,24 @@ impl Imports {
         Self::default()
     }
 
-    /// Supply the import `name`. The function receives the arguments and returns the results,
-    /// or an error that stops the call that reached it.
-    pub fn define_function<F>(&mut self, name: impl Into<String>, function: F) -> &mut Self
+    /// Supply the import `name`, of type `ty`. The function receives the arguments and returns
+    /// the results, or an error that stops the call that reached it.
+    pub fn define_function<F>(
+        &mut self,
+        name: impl Into<String>,
+        ty: ComponentFuncType,
+        function: F,
+    ) -> &mut Self
     where
         F: Fn(&[ComponentValue]) -> Result<Vec<ComponentValue>, String> + Send + Sync + 'static,
     {
-        self.functions.insert(name.into(), Arc::new(function));
+        self.functions.insert(
+            name.into(),
+            SuppliedFunction {
+                ty,
+                closure: Arc::new(function),
+            },
+        );
         self
     }
 }
@@ -586,10 +614,22 @@ impl Component {
         engine: &Engine,
         imports: &Imports,
     ) -> Result<ComponentInstance, ComponentError> {
+        // Every import must be supplied, at the type the component declares for it.
         for function in &self.functions {
-            if let ComponentFunction::Import { name, .. } = function {
-                if !imports.functions.contains_key(name) {
-                    return Err(ComponentError::MissingImport { name: name.clone() });
+            if let ComponentFunction::Import { name, ty } = function {
+                let supplied = imports
+                    .functions
+                    .get(name)
+                    .ok_or_else(|| ComponentError::MissingImport { name: name.clone() })?;
+                let declared = &self.types[*ty as usize];
+                if supplied.ty != *declared {
+                    return Err(ComponentError::ImportMismatch {
+                        name: name.clone(),
+                        message: format!(
+                            "the component declares {declared:?}, and {:?} was supplied",
+                            supplied.ty
+                        ),
+                    });
                 }
             }
         }
@@ -800,7 +840,7 @@ impl Component {
         let closure = imports
             .functions
             .get(name)
-            .cloned()
+            .map(|supplied| supplied.closure.clone())
             .ok_or_else(|| format!("the import {name} was not supplied"))?;
         let ty = &self.types[*ty as usize];
         Ok(LoweredHost {
@@ -2763,7 +2803,7 @@ mod tests {
         let component = Component::decode(&bytes).expect("decodes");
         assert_eq!(component.component_functions().len(), 2);
         let mut imports = Imports::new();
-        imports.define_function("add", |args| match args {
+        imports.define_function("add", add_type(), |args| match args {
             [ComponentValue::S32(a), ComponentValue::S32(b)] => {
                 Ok(vec![ComponentValue::S32(a + b)])
             }
@@ -2777,6 +2817,36 @@ mod tests {
             instance.call_export("run", Vec::new()),
             Ok(vec![ComponentValue::S32(5)])
         );
+    }
+
+    /// The type of the host component's import `add`: (s32, s32) -> s32.
+    fn add_type() -> ComponentFuncType {
+        ComponentFuncType {
+            params: vec![Scalar::S32, Scalar::S32],
+            result: Some(Scalar::S32),
+        }
+    }
+
+    #[test]
+    fn a_supplied_import_of_another_type_is_refused_before_anything_runs() {
+        let component = Component::decode(&host_component()).expect("decodes");
+        let mut imports = Imports::new();
+        // The component declares (s32, s32) -> s32; this supplies (s64) -> s64.
+        imports.define_function(
+            "add",
+            ComponentFuncType {
+                params: vec![Scalar::S64],
+                result: Some(Scalar::S64),
+            },
+            |_| Ok(vec![ComponentValue::S64(0)]),
+        );
+        let error = component
+            .instantiate_with(&engine(), &imports)
+            .expect_err("the type differs");
+        assert!(matches!(
+            error,
+            ComponentError::ImportMismatch { ref name, .. } if name == "add"
+        ));
     }
 
     #[test]
@@ -2797,7 +2867,7 @@ mod tests {
     fn an_embedder_function_error_stops_the_call() {
         let component = Component::decode(&host_component()).expect("decodes");
         let mut imports = Imports::new();
-        imports.define_function("add", |_| Err("refused".to_owned()));
+        imports.define_function("add", add_type(), |_| Err("refused".to_owned()));
         let mut instance = component
             .instantiate_with(&engine(), &imports)
             .expect("instantiates");
@@ -3010,7 +3080,7 @@ mod tests {
                     };
                     decoded += 1;
                     let mut imports = Imports::new();
-                    imports.define_function("add", |args| match args {
+                    imports.define_function("add", add_type(), |args| match args {
                         [ComponentValue::S32(a), ComponentValue::S32(b)] => {
                             Ok(vec![ComponentValue::S32(a.wrapping_add(*b))])
                         }
