@@ -1,6 +1,6 @@
 [package]
 name = "tpt-wasm-component"
-description = "WebAssembly Component Model envelope decoding for tpt-wasm"
+description = "WebAssembly Component Model envelope and core instances for tpt-wasm"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -12,3 +12,5 @@ keywords = ["webassembly", "wasm", "component-model"]
 categories = ["wasm"]
 
 [dependencies]
+tpt-wasm-runtime.workspace = true
+tpt-wasm-types.workspace = true
