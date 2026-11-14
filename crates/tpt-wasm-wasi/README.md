@@ -25,22 +25,38 @@ and operation behind every import, and supplies the function signature.
 
 ## Preview 1 core
 
-`Preview1` implements the part of Preview 1 that needs no filesystem, against explicit grants
-in `Preview1Config`:
+`Preview1` implements Preview 1 against explicit grants in `Preview1Config`:
 
 - `args_sizes_get`, `args_get`, `environ_sizes_get`, `environ_get` — the arguments and
   environment the embedder supplied, laid out as the ABI specifies;
 - `clock_time_get` — a virtual clock the embedder starts and steps, so runs are reproducible;
 - `random_get` — bytes from a seed the embedder chose;
-- `fd_write`, `fd_read`, `fd_close` — descriptors 0–2 only, and only the streams granted;
+- `fd_write`, `fd_read`, `fd_close` — on the standard streams 0–2, only the streams granted,
+  and on files and directories opened in a granted directory;
+- `path_open`, `fd_seek`, `fd_tell` — open, create, or truncate files, and move or read a
+  file's position;
+- `path_filestat_get`, `fd_filestat_get`, `fd_fdstat_get` — describe files, directories, and
+  streams;
+- `path_create_directory`, `path_remove_directory`, `path_unlink_file` — change the tree, in
+  writable grants only;
+- `fd_prestat_get`, `fd_prestat_dir_name` — name the granted directories to the module;
+- `poll_oneoff` (clock subscriptions, on the virtual clock), `clock_res_get`, `sched_yield`;
+  `proc_raise` answers `ENOTSUP`;
 - `proc_exit` — records the exit code, which `Preview1::exit_code` returns after the run.
+
+Files live in `Preopen`s, which are in-memory `Directory` trees the embedder builds. Nothing
+reaches the host filesystem. A grant is read-only or writable as the embedder chooses. A path
+that is absolute or climbs above the descriptor's directory is `ENOTCAPABLE`, and a file
+cannot grow past `MAX_FILE_BYTES` (64 MiB). After a run, `Preview1::read_file` returns a
+granted file's contents.
 
 Pointers are checked against the caller's memory, so a bad pointer is an errno (`EFAULT`),
 not a trap. Install with `Preview1::define`. It is not installed by default, and it replaces
 a capability-backed binding for the same names, so use one or the other for each name.
 
-Not provided: `path_*`, file-backed `fd_*`, sockets, polling, and the other clock and
-random variants.
+Not provided: `path_*` other than `path_open` (unlink, rename, directory creation), file
+metadata queries, sockets, polling, and the other clock and random variants. Host-directory
+grants are not provided: copy a host tree into a `Directory` to grant it.
 
 ## Example
 

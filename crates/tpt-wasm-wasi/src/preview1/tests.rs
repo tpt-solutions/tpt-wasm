@@ -10,7 +10,7 @@
 use std::io::{self, Cursor, Write};
 use std::sync::{Arc, Mutex};
 
-use super::{errno, Preview1, Preview1Config};
+use super::{errno, Directory, Preopen, Preview1, Preview1Config, MAX_FILE_BYTES};
 use tpt_wasm_format::{
     ConstExpr, DataMode, DataSegment, Export, ExportDesc, Function, Import, ImportDesc, Memory,
     Module,
@@ -541,6 +541,1058 @@ fn a_closed_stream_is_badf_afterwards() {
         assert!(
             stdout.contents().is_empty(),
             "{mode:?}: nothing reached the closed stream"
+        );
+    }
+}
+
+// --- Files in granted directories -------------------------------------------------------
+
+const NEW_PATH: u32 = 1600; // "newdir"
+const TELL_OUT: u32 = 4320;
+const STAT_OUT: u32 = 4500;
+const POLL_SUB: u32 = 6000;
+const POLL_OUT: u32 = 6100;
+const POLL_COUNT: u32 = 6200;
+const CLOCK_OUT: u32 = 6300;
+const RES_OUT: u32 = 7000;
+
+/// The shared file layout plus a path or record a test needs.
+fn file_data_with(extra: Vec<(u32, Vec<u8>)>) -> Vec<(u32, Vec<u8>)> {
+    let mut data = file_data(&[]);
+    data.extend(extra);
+    data
+}
+
+/// A clock subscription: user data, the clock (monotonic), the timeout, and whether the
+/// timeout is an absolute deadline.
+fn clock_subscription(userdata: u64, timeout: u64, absolute: bool) -> Vec<u8> {
+    let mut record = vec![0u8; 48];
+    record[0..8].copy_from_slice(&userdata.to_le_bytes());
+    record[8] = 0;
+    record[16..20].copy_from_slice(&1u32.to_le_bytes());
+    record[24..32].copy_from_slice(&timeout.to_le_bytes());
+    record[40..42].copy_from_slice(&u16::from(absolute).to_le_bytes());
+    record
+}
+
+fn u64_at(instance: &Instance, at: u32) -> u64 {
+    let bytes = instance
+        .read_memory("mem", u64::from(at), 8)
+        .expect("reads");
+    u64::from_le_bytes(bytes.try_into().expect("eight bytes"))
+}
+
+#[test]
+fn fd_tell_and_fdstat_describe_an_open_file() {
+    for mode in BOTH {
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(2),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_seek",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I64(6),
+                        Arg::I32(0),
+                        Arg::I32(SEEK_OUT as i32),
+                    ],
+                ),
+                ("fd_tell", vec![Arg::I32(4), Arg::I32(TELL_OUT as i32)]),
+                (
+                    "fd_fdstat_get",
+                    vec![Arg::I32(4), Arg::I32(STAT_OUT as i32)],
+                ),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(
+            u64_at(&instance, TELL_OUT),
+            6,
+            "{mode:?}: tell reports the seek"
+        );
+        let stat = bytes_at(&instance, STAT_OUT, 24);
+        assert_eq!(stat[0], 4, "{mode:?}: a regular file");
+        let base = u64::from_le_bytes(stat[8..16].try_into().expect("eight bytes"));
+        assert_ne!(base & (1 << 1), 0, "{mode:?}: the descriptor can read");
+    }
+}
+
+#[test]
+fn filestat_reports_the_size_and_type_of_a_path() {
+    for mode in BOTH {
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[(
+                "path_filestat_get",
+                vec![
+                    Arg::I32(3),
+                    Arg::I32(0),
+                    Arg::I32(HELLO_PATH as i32),
+                    Arg::I32(9),
+                    Arg::I32(STAT_OUT as i32),
+                ],
+            )],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        let stat = bytes_at(&instance, STAT_OUT, 64);
+        assert_eq!(stat[16], 4, "{mode:?}: a regular file");
+        assert_eq!(
+            u64_at(&instance, STAT_OUT + 32),
+            11,
+            "{mode:?}: eleven bytes"
+        );
+
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[(
+                "path_filestat_get",
+                vec![
+                    Arg::I32(3),
+                    Arg::I32(0),
+                    Arg::I32(SUB_PATH as i32),
+                    Arg::I32(3),
+                    Arg::I32(STAT_OUT as i32),
+                ],
+            )],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(
+            bytes_at(&instance, STAT_OUT, 64)[16],
+            3,
+            "{mode:?}: a directory"
+        );
+    }
+}
+
+#[test]
+fn a_directory_is_created_once_and_removed_when_it_is_empty() {
+    let create = || {
+        (
+            "path_create_directory",
+            vec![Arg::I32(3), Arg::I32(NEW_PATH as i32), Arg::I32(6)],
+        )
+    };
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[create()],
+            file_data_with(vec![(NEW_PATH, b"newdir".to_vec())]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::SUCCESS)],
+            "{mode:?}: created"
+        );
+
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[create(), create()],
+            file_data_with(vec![(NEW_PATH, b"newdir".to_vec())]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::EXIST)],
+            "{mode:?}: exists the second time"
+        );
+
+        // Create, remove, then stat: the path is gone.
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[
+                create(),
+                (
+                    "path_remove_directory",
+                    vec![Arg::I32(3), Arg::I32(NEW_PATH as i32), Arg::I32(6)],
+                ),
+                (
+                    "path_filestat_get",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(NEW_PATH as i32),
+                        Arg::I32(6),
+                        Arg::I32(STAT_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data_with(vec![(NEW_PATH, b"newdir".to_vec())]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOENT)], "{mode:?}: removed");
+    }
+}
+
+#[test]
+fn a_directory_with_contents_is_not_removed() {
+    for mode in BOTH {
+        let root = Directory::new()
+            .with_file("sub/inner.txt", b"x".to_vec())
+            .expect("the fixture tree is valid");
+        let (result, _, _) = run_files(
+            mode,
+            vec![Preopen::new("/", root, true)],
+            &[(
+                "path_remove_directory",
+                vec![Arg::I32(3), Arg::I32(SUB_PATH as i32), Arg::I32(3)],
+            )],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOTEMPTY)], "{mode:?}");
+    }
+}
+
+#[test]
+fn unlink_removes_the_file_for_later_opens_and_the_host() {
+    for mode in BOTH {
+        let (result, _, preview1) = run_files(
+            mode,
+            grant(true),
+            &[
+                (
+                    "path_unlink_file",
+                    vec![Arg::I32(3), Arg::I32(HELLO_PATH as i32), Arg::I32(9)],
+                ),
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(2),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOENT)], "{mode:?}");
+        assert!(
+            preview1.read_file(0, "hello.txt").is_none(),
+            "{mode:?}: the host sees it gone"
+        );
+    }
+}
+
+#[test]
+fn a_read_only_grant_refuses_directory_creation_removal_and_unlink() {
+    for mode in BOTH {
+        let calls: [(&str, Vec<Arg>); 3] = [
+            (
+                "path_create_directory",
+                vec![Arg::I32(3), Arg::I32(NEW_PATH as i32), Arg::I32(6)],
+            ),
+            (
+                "path_unlink_file",
+                vec![Arg::I32(3), Arg::I32(HELLO_PATH as i32), Arg::I32(9)],
+            ),
+            (
+                "path_remove_directory",
+                vec![Arg::I32(3), Arg::I32(SUB_PATH as i32), Arg::I32(3)],
+            ),
+        ];
+        for (name, arguments) in calls {
+            let (result, _, _) = run_files(
+                mode,
+                grant(false),
+                &[(name, arguments)],
+                file_data_with(vec![(NEW_PATH, b"newdir".to_vec())]),
+            );
+            assert_eq!(
+                result,
+                vec![Value::I32(errno::NOTCAPABLE)],
+                "{mode:?}: {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stat_that_leaves_the_grant_is_not_capable() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(false),
+            &[(
+                "path_filestat_get",
+                vec![
+                    Arg::I32(3),
+                    Arg::I32(0),
+                    Arg::I32(ESCAPE_PATH as i32),
+                    Arg::I32(9),
+                    Arg::I32(STAT_OUT as i32),
+                ],
+            )],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOTCAPABLE)], "{mode:?}");
+    }
+}
+
+#[test]
+fn poll_oneoff_sleeps_on_the_virtual_clock_and_reports_the_event() {
+    for mode in BOTH {
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "poll_oneoff",
+                    vec![
+                        Arg::I32(POLL_SUB as i32),
+                        Arg::I32(POLL_OUT as i32),
+                        Arg::I32(1),
+                        Arg::I32(POLL_COUNT as i32),
+                    ],
+                ),
+                // The clock now reads the deadline, 5000 ns after the start.
+                (
+                    "clock_time_get",
+                    vec![Arg::I32(1), Arg::I64(0), Arg::I32(CLOCK_OUT as i32)],
+                ),
+            ],
+            file_data_with(vec![(POLL_SUB, clock_subscription(7, 5000, false))]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(
+            u64_at(&instance, CLOCK_OUT),
+            5000,
+            "{mode:?}: the clock slept to the deadline"
+        );
+        assert_eq!(le_at(&instance, POLL_COUNT), 1, "{mode:?}: one event");
+        assert_eq!(
+            u64_at(&instance, POLL_OUT),
+            7,
+            "{mode:?}: the user data comes back"
+        );
+        assert_eq!(
+            bytes_at(&instance, POLL_OUT + 10, 1)[0],
+            0,
+            "{mode:?}: a clock event"
+        );
+    }
+}
+
+#[test]
+fn a_descriptor_subscription_is_answered_without_sleeping() {
+    for mode in BOTH {
+        let mut descriptor = vec![0u8; 48];
+        descriptor[0..8].copy_from_slice(&9u64.to_le_bytes());
+        descriptor[8] = 1; // fd_read
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "poll_oneoff",
+                    vec![
+                        Arg::I32(POLL_SUB as i32),
+                        Arg::I32(POLL_OUT as i32),
+                        Arg::I32(1),
+                        Arg::I32(POLL_COUNT as i32),
+                    ],
+                ),
+                (
+                    "clock_time_get",
+                    vec![Arg::I32(1), Arg::I64(0), Arg::I32(CLOCK_OUT as i32)],
+                ),
+            ],
+            file_data_with(vec![(POLL_SUB, descriptor)]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(
+            u64_at(&instance, CLOCK_OUT),
+            0,
+            "{mode:?}: the clock did not move"
+        );
+        let error = bytes_at(&instance, POLL_OUT + 8, 2);
+        assert_eq!(
+            u16::from_le_bytes([error[0], error[1]]),
+            errno::NOTSUP as u16,
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn sched_yield_clock_resolution_and_proc_raise_answer_as_the_abi_says() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(false),
+            &[("sched_yield", vec![])],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::SUCCESS)],
+            "{mode:?}: yielding succeeds"
+        );
+
+        let (result, _, _) = run_files(
+            mode,
+            grant(false),
+            &[("proc_raise", vec![Arg::I32(9)])],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::NOTSUP)],
+            "{mode:?}: signals are refused"
+        );
+
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[("clock_res_get", vec![Arg::I32(1), Arg::I32(RES_OUT as i32)])],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(u64_at(&instance, RES_OUT), 1, "{mode:?}: one nanosecond");
+
+        let (result, _, _) = run_files(
+            mode,
+            grant(false),
+            &[("clock_res_get", vec![Arg::I32(7), Arg::I32(RES_OUT as i32)])],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::INVAL)],
+            "{mode:?}: an unknown clock"
+        );
+    }
+}
+
+/// An argument to a call in a test body: `i32` or `i64`, as the signature needs.
+enum Arg {
+    I32(i32),
+    I64(i64),
+}
+
+/// The file-related imports, in the order their indices are given. A call names a
+/// function by its entry here, so the index is its position.
+fn file_imports() -> Vec<(&'static str, FunctionType)> {
+    use ValueType::{I32, I64};
+    vec![
+        (
+            "path_open",
+            signature(&[I32, I32, I32, I32, I32, I64, I64, I32, I32], &[I32]),
+        ),
+        ("fd_read", fd_write_signature()),
+        ("fd_write", fd_write_signature()),
+        ("fd_close", signature(&[I32], &[I32])),
+        ("fd_seek", signature(&[I32, I64, I32, I32], &[I32])),
+        ("fd_prestat_get", two_pointer_signature()),
+        ("fd_prestat_dir_name", signature(&[I32, I32, I32], &[I32])),
+        ("fd_tell", two_pointer_signature()),
+        ("fd_fdstat_get", two_pointer_signature()),
+        ("fd_filestat_get", two_pointer_signature()),
+        (
+            "path_filestat_get",
+            signature(&[I32, I32, I32, I32, I32], &[I32]),
+        ),
+        ("path_create_directory", signature(&[I32, I32, I32], &[I32])),
+        ("path_remove_directory", signature(&[I32, I32, I32], &[I32])),
+        ("path_unlink_file", signature(&[I32, I32, I32], &[I32])),
+        ("poll_oneoff", signature(&[I32, I32, I32, I32], &[I32])),
+        ("sched_yield", signature(&[], &[I32])),
+        ("clock_res_get", two_pointer_signature()),
+        ("clock_time_get", signature(&[I32, I64, I32], &[I32])),
+        ("proc_raise", signature(&[I32], &[I32])),
+    ]
+}
+
+fn leb_i64(mut value: i64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+        if done {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// A body that calls each named file import in order with typed arguments. Every call
+/// but the last has its result dropped, so the last call's errno is what `run` returns.
+fn typed_body(calls: &[(&str, Vec<Arg>)]) -> Vec<u8> {
+    let imports = file_imports();
+    let mut out = Vec::new();
+    for (position, (name, arguments)) in calls.iter().enumerate() {
+        for argument in arguments {
+            match argument {
+                Arg::I32(value) => {
+                    out.push(0x41);
+                    leb_i32(*value, &mut out);
+                }
+                Arg::I64(value) => {
+                    out.push(0x42);
+                    leb_i64(*value, &mut out);
+                }
+            }
+        }
+        let index = imports
+            .iter()
+            .position(|(import, _)| import == name)
+            .expect("a named import") as u32;
+        out.push(0x10);
+        leb_u32(index, &mut out);
+        if position + 1 < calls.len() {
+            out.push(0x1a);
+        }
+    }
+    out.push(0x0b);
+    out
+}
+
+/// A run of `calls` against `preopens`, with `data` in memory. Returns the last call's
+/// errno, the instance (for reading memory), and the handle (for reading files).
+fn run_files(
+    mode: EngineMode,
+    preopens: Vec<Preopen>,
+    calls: &[(&str, Vec<Arg>)],
+    data: Vec<(u32, Vec<u8>)>,
+) -> (Vec<Value>, Instance, Preview1) {
+    use ValueType::I32;
+    let config = Preview1Config {
+        preopens,
+        ..Preview1Config::default()
+    };
+    let imports = file_imports();
+    let module = module(
+        &imports
+            .iter()
+            .map(|(name, sig)| (*name, sig.clone()))
+            .collect::<Vec<_>>(),
+        signature(&[], &[I32]),
+        typed_body(calls),
+        data,
+    );
+    let (mut instance, preview1) = instantiate(mode, config, module);
+    let result = instance.call("run", Vec::new()).expect("run returns");
+    (result, instance, preview1)
+}
+
+/// The bytes that go in memory at `at`: the path, or an iovec and its buffer.
+fn iov(buffer: u32, length: u32) -> Vec<u8> {
+    let mut out = buffer.to_le_bytes().to_vec();
+    out.extend_from_slice(&length.to_le_bytes());
+    out
+}
+
+/// Memory layout shared by the file tests.
+const HELLO_PATH: u32 = 1024; // "hello.txt"
+const OUT_PATH: u32 = 1100; // "out.txt"
+const ESCAPE_PATH: u32 = 1200; // "../secret"
+const ABSOLUTE_PATH: u32 = 1300; // "/etc"
+const MISSING_PATH: u32 = 1400; // "missing"
+const SUB_PATH: u32 = 1500; // "sub"
+const READ_IOV: u32 = 2000; // one iovec: 64 bytes at 3000
+const READ_BUFFER: u32 = 3000;
+const WRITE_IOV: u32 = 2100; // one iovec: "abc" at 5000
+const WRITE_DATA: u32 = 5000;
+const FD_OUT: u32 = 4100;
+const COUNT_OUT: u32 = 4000;
+const SEEK_OUT: u32 = 4300;
+const PRESTAT_OUT: u32 = 4200;
+const NAME_OUT: u32 = 4400;
+
+fn file_data(writes: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let mut data = vec![
+        (HELLO_PATH, b"hello.txt".to_vec()),
+        (OUT_PATH, b"out.txt".to_vec()),
+        (ESCAPE_PATH, b"../secret".to_vec()),
+        (ABSOLUTE_PATH, b"/etc".to_vec()),
+        (MISSING_PATH, b"missing".to_vec()),
+        (SUB_PATH, b"sub".to_vec()),
+        (READ_IOV, iov(READ_BUFFER, 64)),
+        (WRITE_IOV, iov(WRITE_DATA, writes.len() as u32)),
+    ];
+    if !writes.is_empty() {
+        data.push((WRITE_DATA, writes.to_vec()));
+    }
+    data
+}
+
+/// A writable or read-only grant of `hello.txt` ("hello world") and an empty `sub/`.
+fn grant(writable: bool) -> Vec<Preopen> {
+    let root = Directory::new()
+        .with_file("hello.txt", b"hello world".to_vec())
+        .and_then(|root| root.with_directory("sub"))
+        .expect("the fixture tree is valid");
+    vec![Preopen::new("/", root, writable)]
+}
+
+fn le_at(instance: &Instance, at: u32) -> u32 {
+    le_u32(
+        &instance
+            .read_memory("mem", u64::from(at), 4)
+            .expect("reads"),
+    )
+}
+
+fn bytes_at(instance: &Instance, at: u32, length: u32) -> Vec<u8> {
+    instance
+        .read_memory("mem", u64::from(at), length as usize)
+        .expect("reads")
+}
+
+#[test]
+fn a_file_in_a_granted_directory_is_opened_and_read() {
+    for mode in BOTH {
+        // Rights 2 is fd_read. The first opened file is descriptor 4: 3 is the grant.
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(2),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_read",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(READ_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I32(COUNT_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(
+            le_at(&instance, FD_OUT),
+            4,
+            "{mode:?}: the first file is fd 4"
+        );
+        assert_eq!(
+            le_at(&instance, COUNT_OUT),
+            11,
+            "{mode:?}: eleven bytes read"
+        );
+        assert_eq!(
+            bytes_at(&instance, READ_BUFFER, 11),
+            b"hello world",
+            "{mode:?}: the file's bytes arrived"
+        );
+    }
+}
+
+#[test]
+fn a_writable_grant_creates_a_file_that_the_host_can_read_back() {
+    for mode in BOTH {
+        let writes = b"abc";
+        // Create and write: oflags 1 is CREAT and rights 64 is fd_write.
+        let (result, instance, preview1) = run_files(
+            mode,
+            grant(true),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(OUT_PATH as i32),
+                        Arg::I32(7),
+                        Arg::I32(1),
+                        Arg::I64(64),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_write",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(WRITE_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I32(COUNT_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data(writes),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(
+            le_at(&instance, COUNT_OUT),
+            3,
+            "{mode:?}: three bytes written"
+        );
+        assert_eq!(
+            preview1.read_file(0, "out.txt").expect("the file exists"),
+            writes,
+            "{mode:?}: the file holds what the module wrote"
+        );
+    }
+}
+
+#[test]
+fn a_path_that_leaves_the_grant_is_refused_as_not_capable() {
+    for mode in BOTH {
+        for (path, label) in [(ESCAPE_PATH, "../secret"), (ABSOLUTE_PATH, "/etc")] {
+            let (result, _, _) = run_files(
+                mode,
+                grant(true),
+                &[(
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(path as i32),
+                        Arg::I32(label.len() as i32),
+                        Arg::I32(1),
+                        Arg::I64(64),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                )],
+                file_data(&[]),
+            );
+            assert_eq!(
+                result,
+                vec![Value::I32(errno::NOTCAPABLE)],
+                "{mode:?}: {label} is refused, and nothing outside the grant is reached"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_read_only_grant_refuses_every_write_and_every_create() {
+    for mode in BOTH {
+        let create = vec![
+            Arg::I32(3),
+            Arg::I32(0),
+            Arg::I32(OUT_PATH as i32),
+            Arg::I32(7),
+            Arg::I32(1),
+            Arg::I64(0),
+            Arg::I64(0),
+            Arg::I32(0),
+            Arg::I32(FD_OUT as i32),
+        ];
+        let (result, _, preview1) =
+            run_files(mode, grant(false), &[("path_open", create)], file_data(&[]));
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::NOTCAPABLE)],
+            "{mode:?}: creating a file in a read-only grant is refused"
+        );
+        assert!(
+            preview1.read_file(0, "out.txt").is_none(),
+            "{mode:?}: nothing was created"
+        );
+
+        // Opening an existing file for writing is refused too, by its write right.
+        let write_open = vec![
+            Arg::I32(3),
+            Arg::I32(0),
+            Arg::I32(HELLO_PATH as i32),
+            Arg::I32(9),
+            Arg::I32(0),
+            Arg::I64(64),
+            Arg::I64(0),
+            Arg::I32(0),
+            Arg::I32(FD_OUT as i32),
+        ];
+        let (result, _, _) = run_files(
+            mode,
+            grant(false),
+            &[("path_open", write_open)],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOTCAPABLE)], "{mode:?}");
+    }
+}
+
+#[test]
+fn a_missing_file_is_noent_and_an_exclusive_create_of_an_existing_one_is_exist() {
+    for mode in BOTH {
+        let open = |path: u32, length: i32, oflags: i32| {
+            vec![
+                Arg::I32(3),
+                Arg::I32(0),
+                Arg::I32(path as i32),
+                Arg::I32(length),
+                Arg::I32(oflags),
+                Arg::I64(2),
+                Arg::I64(0),
+                Arg::I32(0),
+                Arg::I32(FD_OUT as i32),
+            ]
+        };
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[("path_open", open(MISSING_PATH, 7, 0))],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOENT)], "{mode:?}");
+
+        // oflags 5 is CREAT and EXCL together.
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[("path_open", open(HELLO_PATH, 9, 5))],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::EXIST)], "{mode:?}");
+    }
+}
+
+#[test]
+fn fd_seek_moves_the_position_that_the_next_read_starts_from() {
+    for mode in BOTH {
+        // Seek to 6 from the start (whence 0), then read: the rest of "hello world".
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(2),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_seek",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I64(6),
+                        Arg::I32(0),
+                        Arg::I32(SEEK_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_read",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(READ_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I32(COUNT_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(
+            instance
+                .read_memory("mem", u64::from(SEEK_OUT), 8)
+                .expect("reads"),
+            6u64.to_le_bytes(),
+            "{mode:?}: the new position is written back"
+        );
+        assert_eq!(le_at(&instance, COUNT_OUT), 5, "{mode:?}");
+        assert_eq!(bytes_at(&instance, READ_BUFFER, 5), b"world", "{mode:?}");
+    }
+}
+
+#[test]
+fn the_preopened_directory_is_described_by_prestat_and_refused_past_the_grant() {
+    for mode in BOTH {
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "fd_prestat_get",
+                    vec![Arg::I32(3), Arg::I32(PRESTAT_OUT as i32)],
+                ),
+                (
+                    "fd_prestat_dir_name",
+                    vec![Arg::I32(3), Arg::I32(NAME_OUT as i32), Arg::I32(1)],
+                ),
+                // Descriptor 4 was never opened, so it is not a preopen.
+                (
+                    "fd_prestat_get",
+                    vec![Arg::I32(4), Arg::I32(PRESTAT_OUT as i32)],
+                ),
+            ],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::BADF)], "{mode:?}");
+        // The record is a tag of 0 (directory), three bytes of padding, then the length.
+        assert_eq!(
+            instance
+                .read_memory("mem", u64::from(PRESTAT_OUT), 8)
+                .expect("reads"),
+            [0, 0, 0, 0, 1, 0, 0, 0],
+            "{mode:?}: the preopen is a directory named by one byte"
+        );
+        assert_eq!(bytes_at(&instance, NAME_OUT, 1), b"/", "{mode:?}");
+    }
+}
+
+#[test]
+fn a_file_cannot_be_read_as_a_directory_or_used_after_it_is_closed() {
+    for mode in BOTH {
+        // Opening "sub" with oflags 2 (DIRECTORY) gives descriptor 4, which fd_read refuses.
+        let (result, _, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(SUB_PATH as i32),
+                        Arg::I32(3),
+                        Arg::I32(2),
+                        Arg::I64(0),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_read",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(READ_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I32(COUNT_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::ISDIR)], "{mode:?}");
+
+        // Close a file, then read it: the descriptor is gone.
+        let (result, _, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(2),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                ("fd_close", vec![Arg::I32(4)]),
+                (
+                    "fd_read",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(READ_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I32(COUNT_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::BADF)], "{mode:?}");
+    }
+}
+
+#[test]
+fn a_file_cannot_grow_past_the_cap_and_the_write_is_refused() {
+    for mode in BOTH {
+        // Seek to exactly the cap, then write one byte past it.
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(64),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_seek",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I64(MAX_FILE_BYTES as i64),
+                        Arg::I32(0),
+                        Arg::I32(SEEK_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_write",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(WRITE_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I32(COUNT_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data(b"x"),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::FBIG)],
+            "{mode:?}: a write that would grow the file past the cap is refused"
         );
     }
 }
