@@ -1340,6 +1340,42 @@ fn renumber_refuses_grants_stdio_and_targets_on_them() {
     }
 }
 
+#[test]
+fn tree_usage_counts_files_directories_and_bytes_after_a_run() {
+    for mode in BOTH {
+        let (_, _, preview1) = run_files(
+            mode,
+            grant(true),
+            &[("fd_fdstat_set_flags", vec![Arg::I32(3), Arg::I32(0)])],
+            file_data_with(vec![]),
+        );
+        // hello.txt ("hello world", 11 bytes), and the root and sub directories.
+        assert_eq!(
+            preview1.tree_usage(),
+            Some(super::TreeUsage {
+                files: 1,
+                directories: 2,
+                file_bytes: 11,
+            }),
+            "{mode:?}"
+        );
+        let (_, _, preview1) = run_files(
+            mode,
+            grant(true),
+            &[
+                ("path_open", open_hello_args()),
+                ("fd_allocate", vec![Arg::I32(4), Arg::I64(0), Arg::I64(16)]),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            preview1.tree_usage().map(|usage| usage.file_bytes),
+            Some(16),
+            "{mode:?}: growth is counted"
+        );
+    }
+}
+
 const DIRENT_OUT: u32 = 7400;
 const DIRENT_USED: u32 = 7500;
 

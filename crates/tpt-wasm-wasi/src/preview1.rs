@@ -34,7 +34,7 @@ use tpt_wasm_types::{FunctionType, GuestMemory, ResultType, Value, ValueType};
 
 mod fs;
 
-pub use fs::{Directory, Preopen, MAX_FILE_BYTES};
+pub use fs::{Directory, Preopen, TreeUsage, MAX_FILE_BYTES};
 
 use fs::{FsState, OpenRequest};
 
@@ -175,6 +175,13 @@ impl Preview1 {
             .lock()
             .ok()
             .and_then(|state| state.fs.read_file(preopen, path))
+    }
+
+    /// What the granted trees hold now: files, directories, and file bytes. This is the host
+    /// memory the module's files occupy, so it is the allocation a module causes outside its
+    /// linear memory. `None` only if the state is poisoned.
+    pub fn tree_usage(&self) -> Option<TreeUsage> {
+        self.state.lock().ok().map(|state| state.fs.tree_usage())
     }
 }
 

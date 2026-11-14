@@ -160,11 +160,46 @@ impl FsState {
         }
     }
 
+    /// How much the granted trees hold now, counted over every grant.
+    pub(super) fn tree_usage(&self) -> TreeUsage {
+        let mut usage = TreeUsage::default();
+        for preopen in &self.preopens {
+            count_tree(&preopen.root, &mut usage);
+        }
+        usage
+    }
+
     /// The contents of a file in a granted directory, read after the run.
     pub(super) fn read_file(&self, preopen: usize, path: &str) -> Option<Vec<u8>> {
         let root = &self.preopens.get(preopen)?.root;
         let parts = resolve(&[], path).ok()?;
         file_at(root, &parts).cloned()
+    }
+}
+
+/// What the granted trees hold: the number of files, the number of directories (each grant's
+/// root included), and the bytes of file contents. It is host memory the module's files take,
+/// which linear memory does not count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TreeUsage {
+    /// The files in the trees.
+    pub files: u64,
+    /// The directories in the trees, the grant roots included.
+    pub directories: u64,
+    /// The bytes of file contents.
+    pub file_bytes: u64,
+}
+
+fn count_tree(dir: &Directory, usage: &mut TreeUsage) {
+    usage.directories += 1;
+    for node in dir.entries.values() {
+        match node {
+            Node::Directory(child) => count_tree(child, usage),
+            Node::File(contents) => {
+                usage.files += 1;
+                usage.file_bytes += contents.len() as u64;
+            }
+        }
     }
 }
 
