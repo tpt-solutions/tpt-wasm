@@ -361,6 +361,7 @@ fn encode_uleb(mut value: u64, out: &mut Vec<u8>) {
 /// because those are exactly the inputs where a hand-written fold diverges from
 /// a real backend.
 #[test]
+#[cfg_attr(miri, ignore = "builds a module for every value pair and opcode; too slow under Miri, and covered natively")]
 fn folding_matches_the_baseline_executor() {
     let mut checked = 0usize;
     for &left in sample(I32_CORPUS) {
