@@ -86,6 +86,8 @@ use tpt_wasm_types::{Trap, ValueType};
 mod aarch64;
 /// The machine IR, the stage between the verified IR and native code. See the module docs.
 pub mod mir;
+#[cfg(target_arch = "x86_64")]
+mod mir_x86;
 mod riscv64;
 mod x86;
 
@@ -680,6 +682,30 @@ fn encode_for_host(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, JitE
 ///
 /// The function must be a verified function over integers that fits the subset described in the
 /// crate documentation.
+/// Compile a function through the machine IR to x86-64 code: `IR -> machine IR -> x86-64`.
+///
+/// This is the native path for the machine IR's `i32` slice. The result is run the same way as the
+/// output of [`compile`], and agrees with it and with Micro on that slice.
+///
+/// # Errors
+///
+/// A function outside the slice is refused with [`JitError::Unsupported`], and a host that cannot
+/// run generated code gets [`JitError::UnsupportedTarget`].
+#[cfg(target_arch = "x86_64")]
+pub fn compile_machine(function: &IrFunction) -> Result<CompiledFunction, JitError> {
+    let machine = mir::lower(function)?;
+    let code = mir_x86::encode(&machine, x86::Abi::host())?;
+    if !HOST_CAN_RUN_CODE {
+        return Err(JitError::UnsupportedTarget);
+    }
+    let executable = exec::ExecutableCode::new(&code)?;
+    Ok(CompiledFunction {
+        params: function.function_type.params.0.clone(),
+        result: function.function_type.results.0.first().copied(),
+        code: executable,
+    })
+}
+
 pub fn compile(function: &IrFunction) -> Result<CompiledFunction, JitError> {
     let params = function.function_type.params.0.clone();
     let result = function.function_type.results.0.first().copied();

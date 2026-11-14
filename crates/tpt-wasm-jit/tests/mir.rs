@@ -137,6 +137,7 @@ fn the_machine_ir_agrees_with_micro_on_random_control_flow() {
     let cases = 300;
     let mut rng = Lcg(0x5eed_1001);
     let mut runs = 0usize;
+    let mut native_runs = 0usize;
     let mut distinct = std::collections::BTreeSet::new();
     for case in 0..cases {
         let mut body = Vec::new();
@@ -175,6 +176,19 @@ fn the_machine_ir_agrees_with_micro_on_random_control_flow() {
                 vec![expected],
                 "case {case}: machine IR disagrees with Micro on ({a}, {b})"
             );
+            #[cfg(target_arch = "x86_64")]
+            {
+                let native = tpt_wasm_jit::compile_machine(function)
+                    .unwrap_or_else(|error| panic!("case {case}: native compile: {error:?}"));
+                let compiled = native
+                    .call(&[a, b])
+                    .unwrap_or_else(|error| panic!("case {case}: native call: {error:?}"));
+                assert_eq!(
+                    compiled, expected,
+                    "case {case}: native code from the machine IR disagrees with Micro on ({a}, {b})"
+                );
+                native_runs += 1;
+            }
             distinct.insert(expected);
             runs += 1;
         }
@@ -184,5 +198,7 @@ fn the_machine_ir_agrees_with_micro_on_random_control_flow() {
         "the expressions must produce varied results, got {} distinct",
         distinct.len()
     );
-    eprintln!("machine IR: {runs} runs over {cases} modules agree with Micro");
+    eprintln!(
+        "machine IR: {runs} runs over {cases} modules agree with Micro ({native_runs} native)"
+    );
 }
