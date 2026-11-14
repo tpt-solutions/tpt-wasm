@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing is not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing covers one document: its package, interfaces, functions, and worlds.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -206,13 +206,20 @@ function import is a capability whose id is the import's name, and whose only op
 not granted (`CapabilityDenied`), and an import with no capability set at all is not granted.
 Each call checks the grant again, so revoking it stops the later calls at once.
 
-The import's name is taken as the capability id without parsing it. A WIT name such as
-`namespace:package/interface#function` is a plain string to this layer, so the WIT grammar is
-a separate stage, which will map each parsed function onto the same capability id.
+The import's name is taken as the capability id where the component gives it, and the WIT that names it
+is read by `wit::WitDocument`. That parser reads one document: its package, its interfaces and their
+functions, and its worlds, and it reads past the types, `use`, `include`, and exports, which are not
+capabilities. A function a world imports by its own name is a capability with that name as its id. An
+interface a world imports gives one capability for each of its functions, named
+`namespace:package/interface@version#function`, the form the component gives the interface with the function
+after `#`, which is this crate's convention. An interface from outside the document is refused by name, since
+its functions are not in it. Exports and static or async functions are refused or read past as above.
 
-Not done: strings and lists in lowered imports (which need the caller's memory),
-parsing WIT to
-derive the capability ids.
+
+Not done: strings and lists in lowered imports (which need the caller's memory), and WIT beyond one document:
+other packages, and the mapping of types and resources to capabilities.
+
+
 
 ## Design constraint
 

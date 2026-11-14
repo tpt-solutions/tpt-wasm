@@ -3606,6 +3606,9 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests;
 
+/// Reading WIT, and mapping a world's imports to the capability ids they name.
+pub mod wit;
+
 /// The scalar every payload of a variant's cases shares, if any case has one. Decoding refuses a
 /// variant whose payloads differ in flat type, so the first payload found is the one all share.
 fn shared_payload(cases: &[(String, Option<Scalar>)]) -> Option<Scalar> {
