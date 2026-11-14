@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`) and UTF-8 strings; and takes imported functions from the embedder, lowering them so core code can call them. The WIT mapping and the compound value types are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`) and UTF-8 strings; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and the compound value types are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -117,8 +117,21 @@ Refused, each by name and offset: a string in a lowered import (the host call wo
 caller's memory), more than 16 flat parameters, a memory or `realloc` from another instance,
 any other canonical option, and a string without the options it needs.
 
+## Capabilities
+
+The mapping from a component's imports to TPT capabilities is decided as follows. Each
+function import is a capability whose id is the import's name, and whose only operation is
+`call`, which needs the execute permission. The embedder supplies a `CapabilitySet` in
+`Imports::with_capabilities`, and grants each import. Instantiation refuses an import that is
+not granted (`CapabilityDenied`), and an import with no capability set at all is not granted.
+Each call checks the grant again, so revoking it stops the later calls at once.
+
+The import's name is taken as the capability id without parsing it. A WIT name such as
+`namespace:package/interface#function` is a plain string to this layer, so the WIT grammar is
+a separate stage, which will map each parsed function onto the same capability id.
+
 Not done: strings in lowered imports, UTF-16 and Latin-1 encodings, `post-return`, records,
-lists, and the other compound types, and the WIT mapping to capabilities.
+lists, and the other compound types, and parsing WIT to derive the capability ids.
 
 ## Design constraint
 

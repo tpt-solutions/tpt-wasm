@@ -23,8 +23,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use tpt_wasm_capability::{CapabilityId, CapabilitySet, Operation};
 use tpt_wasm_format::{ExportDesc, ImportDesc};
 use tpt_wasm_runtime::{Engine, HostFunction, Instance, Linker};
 use tpt_wasm_types::{FunctionType, ResultType, Value, ValueType};
@@ -138,6 +139,8 @@ pub enum ComponentError {
     NoSuchExport { name: String },
     /// The component imports a function the embedder did not supply.
     MissingImport { name: String },
+    /// An import is not granted the `call` operation on its capability.
+    CapabilityDenied { name: String, message: String },
     /// The embedder supplied a function whose type differs from the component's import.
     ImportMismatch { name: String, message: String },
     /// A core instance could not be created, with the runtime's reason.
@@ -212,6 +215,9 @@ impl fmt::Display for ComponentError {
             ComponentError::NoSuchExport { name } => write!(f, "there is no export named {name}"),
             ComponentError::MissingImport { name } => {
                 write!(f, "the component imports {name}, which was not supplied")
+            }
+            ComponentError::CapabilityDenied { name, message } => {
+                write!(f, "the import {name} is not granted: {message}")
             }
             ComponentError::ImportMismatch { name, message } => {
                 write!(
@@ -449,15 +455,32 @@ struct SuppliedFunction {
 /// The functions an embedder supplies for a component's imports, by name, each with its type.
 /// The type must be the one the component declares for the import, or the instantiation is
 /// refused.
+///
+/// Each import is a capability whose id is its name, and whose only operation is `call`. An
+/// import runs only if the capability set grants that operation, and the grant is checked again
+/// on every call, so revoking a grant stops the later calls. Without a capability set, no import
+/// runs.
 #[derive(Default)]
 pub struct Imports {
     functions: BTreeMap<String, SuppliedFunction>,
+    capabilities: Option<Arc<Mutex<CapabilitySet>>>,
 }
 
+/// The operation an import's capability supports: calling the embedder's function.
+const CALL_OPERATION: &str = "call";
+
 impl Imports {
-    /// No imports.
+    /// No imports, and no capability set.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// No functions yet, drawing on `capabilities` for the grants each import needs.
+    pub fn with_capabilities(capabilities: Arc<Mutex<CapabilitySet>>) -> Self {
+        Self {
+            functions: BTreeMap::new(),
+            capabilities: Some(capabilities),
+        }
     }
 
     /// Supply the import `name`, of type `ty`. The function receives the arguments and returns
@@ -631,6 +654,18 @@ impl Component {
                         ),
                     });
                 }
+            }
+        }
+
+        // Every import must also be granted the `call` operation on its capability.
+        for function in &self.functions {
+            if let ComponentFunction::Import { name, .. } = function {
+                authorize_call(imports.capabilities.as_ref(), name).map_err(|message| {
+                    ComponentError::CapabilityDenied {
+                        name: name.clone(),
+                        message,
+                    }
+                })?;
             }
         }
 
@@ -848,6 +883,7 @@ impl Component {
             closure,
             params: ty.params.clone(),
             result: ty.result,
+            capabilities: imports.capabilities.clone(),
         })
     }
 }
@@ -928,6 +964,25 @@ struct BoundExport {
     target: Target,
 }
 
+/// Check that the import `name` is granted the `call` operation. With no capability set, nothing
+/// is granted.
+fn authorize_call(
+    capabilities: Option<&Arc<Mutex<CapabilitySet>>>,
+    name: &str,
+) -> Result<(), String> {
+    let Some(capabilities) = capabilities else {
+        return Err("no capability set was supplied".to_owned());
+    };
+    let set = capabilities
+        .lock()
+        .map_err(|_| "the capability set is poisoned".to_owned())?;
+    set.authorize(
+        &CapabilityId::new(name),
+        &Operation::execute(CALL_OPERATION),
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// An embedder function, as a core function: its arguments are lifted and its results lowered.
 #[derive(Clone)]
 struct LoweredHost {
@@ -935,6 +990,7 @@ struct LoweredHost {
     closure: ComponentFn,
     params: Vec<Scalar>,
     result: Option<Scalar>,
+    capabilities: Option<Arc<Mutex<CapabilitySet>>>,
 }
 
 impl fmt::Debug for LoweredHost {
@@ -946,6 +1002,8 @@ impl fmt::Debug for LoweredHost {
 impl LoweredHost {
     /// Run the embedder's function on the lifted arguments, and lower its results.
     fn invoke(&self, args: &[Value]) -> Result<Vec<Value>, String> {
+        // The grant is checked on every call, so a revoked import stops working at once.
+        authorize_call(self.capabilities.as_ref(), &self.name)?;
         if args.len() != self.params.len() {
             return Err(format!(
                 "the import {} takes {} arguments, and {} were given",
@@ -2802,7 +2860,7 @@ mod tests {
         let bytes = host_component();
         let component = Component::decode(&bytes).expect("decodes");
         assert_eq!(component.component_functions().len(), 2);
-        let mut imports = Imports::new();
+        let mut imports = granted("add").0;
         imports.define_function("add", add_type(), |args| match args {
             [ComponentValue::S32(a), ComponentValue::S32(b)] => {
                 Ok(vec![ComponentValue::S32(a + b)])
@@ -2817,6 +2875,77 @@ mod tests {
             instance.call_export("run", Vec::new()),
             Ok(vec![ComponentValue::S32(5)])
         );
+    }
+
+    /// Imports that draw on a capability set in which the import `name` is granted the `call`
+    /// operation. The set is returned too, so a test can revoke the grant.
+    fn granted(name: &str) -> (Imports, Arc<Mutex<CapabilitySet>>) {
+        let mut set = CapabilitySet::default();
+        set.register(tpt_wasm_capability::CapabilityDescriptor {
+            id: CapabilityId::new(name),
+            operations: vec![Operation::execute(CALL_OPERATION)],
+        })
+        .expect("registers");
+        set.grant(tpt_wasm_capability::CapabilityGrant {
+            capability: CapabilityId::new(name),
+            permissions: tpt_wasm_capability::Permissions {
+                execute: true,
+                ..tpt_wasm_capability::Permissions::default()
+            },
+        })
+        .expect("grants");
+        let set = Arc::new(Mutex::new(set));
+        (Imports::with_capabilities(set.clone()), set)
+    }
+
+    #[test]
+    fn an_import_without_a_grant_is_refused_before_anything_runs() {
+        let component = Component::decode(&host_component()).expect("decodes");
+        let (mut imports, set) = granted("add");
+        set.lock().expect("lock").revoke(&CapabilityId::new("add"));
+        imports.define_function("add", add_type(), |_| Ok(vec![ComponentValue::S32(0)]));
+        let error = component
+            .instantiate_with(&engine(), &imports)
+            .expect_err("the import is not granted");
+        assert!(matches!(
+            error,
+            ComponentError::CapabilityDenied { ref name, .. } if name == "add"
+        ));
+    }
+
+    #[test]
+    fn an_import_with_no_capability_set_is_refused() {
+        let component = Component::decode(&host_component()).expect("decodes");
+        let mut imports = Imports::new();
+        imports.define_function("add", add_type(), |_| Ok(vec![ComponentValue::S32(0)]));
+        let error = component
+            .instantiate_with(&engine(), &imports)
+            .expect_err("nothing is granted without a set");
+        assert!(matches!(error, ComponentError::CapabilityDenied { .. }));
+    }
+
+    #[test]
+    fn a_revoked_import_stops_the_next_call() {
+        let component = Component::decode(&host_component()).expect("decodes");
+        let (mut imports, set) = granted("add");
+        imports.define_function("add", add_type(), |args| match args {
+            [ComponentValue::S32(a), ComponentValue::S32(b)] => {
+                Ok(vec![ComponentValue::S32(a + b)])
+            }
+            _ => Err("add takes two s32 values".to_owned()),
+        });
+        let mut instance = component
+            .instantiate_with(&engine(), &imports)
+            .expect("instantiates");
+        assert_eq!(
+            instance.call_export("run", Vec::new()),
+            Ok(vec![ComponentValue::S32(5)])
+        );
+        set.lock().expect("lock").revoke(&CapabilityId::new("add"));
+        assert!(matches!(
+            instance.call_export("run", Vec::new()),
+            Err(ComponentError::Call { .. })
+        ));
     }
 
     /// The type of the host component's import `add`: (s32, s32) -> s32.
@@ -2866,7 +2995,7 @@ mod tests {
     #[test]
     fn an_embedder_function_error_stops_the_call() {
         let component = Component::decode(&host_component()).expect("decodes");
-        let mut imports = Imports::new();
+        let mut imports = granted("add").0;
         imports.define_function("add", add_type(), |_| Err("refused".to_owned()));
         let mut instance = component
             .instantiate_with(&engine(), &imports)
@@ -3079,7 +3208,7 @@ mod tests {
                         continue;
                     };
                     decoded += 1;
-                    let mut imports = Imports::new();
+                    let mut imports = granted("add").0;
                     imports.define_function("add", add_type(), |args| match args {
                         [ComponentValue::S32(a), ComponentValue::S32(b)] => {
                             Ok(vec![ComponentValue::S32(a.wrapping_add(*b))])
