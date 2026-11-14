@@ -164,13 +164,18 @@ The decoder and the instantiation path take untrusted bytes, so a test truncates
 fixture at every length and corrupts each byte in four ways. Each variant that decodes is
 instantiated and called, and none may panic.
 
-Strings are supported for lifted exports, as UTF-8 through the canonical `memory` and
-`realloc` options. A string flattens to two core values, a pointer and a length, and a string
-result is returned as a pointer to that pair in memory. A string argument is copied in with
-`realloc(0, 0, 1, length)`, the canonical UTF-8 copy, and then written into the memory with
-`Instance::write_memory`. A string result is read back from the pointer the function returns,
-and must be valid UTF-8. The flattening rules (a maximum of 16 flat parameters, one flat result,
-and the return-pointer convention for a multi-value result) are the canonical ABI's, and the
+Strings are supported for lifted exports, through the canonical `memory` and `realloc` options. A string
+flattens to two core values, a pointer and a length, and a string result is returned as a pointer to that
+pair in memory. The encoding is named by the lift's canonical options: UTF-8 (the default), UTF-16, or
+`latin1+utf16`, of which at most one may be named. A string argument is copied in with `realloc`, and then
+written into the memory with `Instance::write_memory`. For UTF-8 that is `realloc(0, 0, 1, length)`. For
+UTF-16 it is `realloc(0, 0, 2, 2 * length)`, shrunk to the encoded size when that is smaller. For
+`latin1+utf16` it is Latin-1 when every character fits, and UTF-16 with the length's top bit set when one
+does not, with the `realloc` steps the canonical ABI makes for each case. A string result is read back from
+the pointer the function returns, and must be aligned and valid in its encoding: a lone UTF-16 surrogate is
+a call error. The length's top bit selects UTF-16 under `latin1+utf16`. The flattening rules (a maximum of 16
+flat parameters, one flat result, and the return-pointer convention for a multi-value result) are the
+canonical ABI's, and the crate passes more than 16 flat parameters indirectly, as the Records paragraph explains.
 crate passes more than 16 flat parameters indirectly, as the Records paragraph explains.
 
 The rules were checked against the canonical files, `design/mvp/CanonicalABI.md` and `design/mvp/Binary.md`
@@ -197,7 +202,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 `namespace:package/interface#function` is a plain string to this layer, so the WIT grammar is
 a separate stage, which will map each parsed function onto the same capability id.
 
-Not done: strings and records in lowered imports, UTF-16 and Latin-1 encodings, `post-return`,
+Not done: strings and records in lowered imports, `post-return`,
 results and variants whose payloads differ in flat type, and parsing WIT to
 derive the capability ids.
 

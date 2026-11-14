@@ -93,6 +93,13 @@ const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
 /// The canonical option tags: the string encoding (UTF-8 only), a memory, and a `realloc`.
 const OPTION_UTF8: u8 = 0x00;
+/// The string encoding options: UTF-16, and Latin-1 with UTF-16 as the fallback.
+const OPTION_UTF16: u8 = 0x01;
+const OPTION_LATIN1_UTF16: u8 = 0x02;
+/// The longest string the canonical ABI admits, in bytes.
+const MAX_STRING_BYTE_LENGTH: usize = (1 << 28) - 1;
+/// The bit a `latin1+utf16` string's length carries when it is stored as UTF-16.
+const UTF16_TAG: u32 = 0x8000_0000;
 const OPTION_MEMORY: u8 = 0x03;
 const OPTION_REALLOC: u8 = 0x04;
 /// The value type bytes this crate supports.
@@ -456,6 +463,31 @@ impl ComponentValue {
     }
 }
 
+/// The encoding a lifted function's strings use, named by its canon lift options. The default is
+/// UTF-8, as the canonical ABI has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringEncoding {
+    /// UTF-8, one byte a code unit.
+    Utf8,
+    /// UTF-16, two bytes a code unit.
+    Utf16,
+    /// Latin-1 where the string fits it, and UTF-16 where it does not, marked by the length's tag.
+    Latin1Utf16,
+}
+
+/// How a string read from memory is decoded, which the encoding and the length tag select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringDecoding {
+    Utf8,
+    Utf16,
+    Latin1,
+}
+
+/// The little-endian UTF-16 bytes of `text`, two bytes a code unit.
+fn utf16_bytes(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
 /// A component function: one entry of the component function index space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComponentFunction {
@@ -468,6 +500,7 @@ pub enum ComponentFunction {
         ty: u32,
         memory: Option<u32>,
         realloc: Option<u32>,
+        encoding: StringEncoding,
     },
 }
 
@@ -844,6 +877,7 @@ impl Component {
                 ty,
                 memory,
                 realloc,
+                ..
             } = function
             else {
                 continue;
@@ -927,6 +961,7 @@ impl Component {
                 ty,
                 memory,
                 realloc,
+                encoding,
             } = &self.functions[export.function as usize]
             else {
                 return Err(ComponentError::NoSuchComponentFunction {
@@ -956,6 +991,7 @@ impl Component {
                     CoreFunction::Alias { export, .. } => Some(export.clone()),
                     CoreFunction::Lowered { .. } => None,
                 }),
+                encoding: *encoding,
             });
         }
         Ok(ComponentInstance {
@@ -1592,6 +1628,8 @@ struct LiftedExport {
     memory: Option<String>,
     /// The export name of the `realloc` a string argument is copied in through.
     realloc: Option<String>,
+    /// The encoding the strings of this function are read and written in.
+    encoding: StringEncoding,
 }
 
 /// Bind the import module `module` to the core instance at `instance`: a runtime instance
@@ -1979,36 +2017,7 @@ impl ComponentInstance {
                 Ok(())
             }
             ComponentValue::String(text) => {
-                let (Some(realloc), Some(memory)) = (&export.realloc, &export.memory) else {
-                    return Err("a string argument needs a memory and a realloc".to_owned());
-                };
-                let length = i32::try_from(text.len())
-                    .map_err(|_| "a string argument is too long for a core length".to_owned())?;
-                // Allocate the bytes in the callee's memory, as the canonical ABI does for a
-                // UTF-8 copy: realloc(0, 0, 1, length).
-                let allocated = self
-                    .call_core(
-                        export.core_instance,
-                        realloc,
-                        vec![
-                            Value::I32(0),
-                            Value::I32(0),
-                            Value::I32(1),
-                            Value::I32(length),
-                        ],
-                    )
-                    .map_err(|error| error.to_string())?;
-                let pointer = match allocated.as_slice() {
-                    [Value::I32(pointer)] => *pointer,
-                    _ => return Err("realloc did not return one i32".to_owned()),
-                };
-                self.write_core_memory(
-                    export.core_instance,
-                    memory,
-                    u64::from(pointer as u32),
-                    text.as_bytes(),
-                )
-                .map_err(|error| error.to_string())?;
+                let (pointer, length) = self.lower_string(export, text)?;
                 out.push(Value::I32(pointer));
                 out.push(Value::I32(length));
                 Ok(())
@@ -2046,7 +2055,13 @@ impl ComponentInstance {
                 .memory
                 .as_deref()
                 .ok_or_else(|| "an indirect result needs a memory".to_owned())?;
-            return self.load(export.core_instance, memory, *pointer as u32, ty);
+            return self.load(
+                export.core_instance,
+                memory,
+                *pointer as u32,
+                ty,
+                export.encoding,
+            );
         }
         match (ty, core_results) {
             (ComponentType::Scalar(scalar), [value]) => lift(value.clone(), *scalar),
@@ -2138,14 +2153,185 @@ impl ComponentInstance {
         }
     }
 
+    /// Lower a string into the callee's memory in the lift's encoding, by the canonical ABI's
+    /// `realloc` sequence. The result is the pointer and the length in code units, with the
+    /// Latin-1 tag bit set when the string is stored as UTF-16 under `latin1+utf16`.
+    fn lower_string(&mut self, export: &LiftedExport, text: &str) -> Result<(i32, i32), String> {
+        let (Some(realloc), Some(memory)) = (&export.realloc, &export.memory) else {
+            return Err("a string argument needs a memory and a realloc".to_owned());
+        };
+        let instance = export.core_instance;
+        let source_units = text.len();
+        if source_units > MAX_STRING_BYTE_LENGTH {
+            return Err("a string argument is too long for the canonical ABI".to_owned());
+        }
+        let (pointer, bytes, tagged) = match export.encoding {
+            StringEncoding::Utf8 => {
+                let pointer = self.canon_alloc(instance, realloc, 1, source_units)?;
+                (pointer, text.as_bytes().to_vec(), source_units as u32)
+            }
+            StringEncoding::Utf16 => {
+                let worst = 2 * source_units;
+                let mut pointer = self.canon_alloc(instance, realloc, 2, worst)?;
+                let encoded = utf16_bytes(text);
+                if encoded.len() < worst {
+                    pointer =
+                        self.canon_realloc(instance, realloc, pointer, worst, 2, encoded.len())?;
+                }
+                let units = (encoded.len() / 2) as u32;
+                (pointer, encoded, units)
+            }
+            StringEncoding::Latin1Utf16 => {
+                let mut pointer = self.canon_alloc(instance, realloc, 2, source_units)?;
+                if text.chars().all(|c| (c as u32) < 256) {
+                    let latin1: Vec<u8> = text.chars().map(|c| c as u8).collect();
+                    if latin1.len() < source_units {
+                        pointer = self.canon_realloc(
+                            instance,
+                            realloc,
+                            pointer,
+                            source_units,
+                            2,
+                            latin1.len(),
+                        )?;
+                    }
+                    let units = latin1.len() as u32;
+                    (pointer, latin1, units)
+                } else {
+                    let worst = 2 * source_units;
+                    pointer =
+                        self.canon_realloc(instance, realloc, pointer, source_units, 2, worst)?;
+                    let encoded = utf16_bytes(text);
+                    if worst > encoded.len() {
+                        pointer = self.canon_realloc(
+                            instance,
+                            realloc,
+                            pointer,
+                            worst,
+                            2,
+                            encoded.len(),
+                        )?;
+                    }
+                    let units = (encoded.len() / 2) as u32 | UTF16_TAG;
+                    (pointer, encoded, units)
+                }
+            }
+        };
+        self.write_core_memory(instance, memory, u64::from(pointer as u32), &bytes)
+            .map_err(|error| error.to_string())?;
+        Ok((pointer, tagged as i32))
+    }
+
+    /// `realloc(0, 0, align, size)`, which allocates a block in the callee's memory.
+    fn canon_alloc(
+        &mut self,
+        instance: usize,
+        realloc: &str,
+        align: usize,
+        size: usize,
+    ) -> Result<i32, String> {
+        self.canon_call(
+            instance,
+            realloc,
+            vec![
+                Value::I32(0),
+                Value::I32(0),
+                Value::I32(align as i32),
+                Value::I32(size as i32),
+            ],
+        )
+    }
+
+    /// `realloc(pointer, old size, align, new size)`, which resizes a block in the callee's memory.
+    fn canon_realloc(
+        &mut self,
+        instance: usize,
+        realloc: &str,
+        pointer: i32,
+        old_size: usize,
+        align: usize,
+        new_size: usize,
+    ) -> Result<i32, String> {
+        self.canon_call(
+            instance,
+            realloc,
+            vec![
+                Value::I32(pointer),
+                Value::I32(old_size as i32),
+                Value::I32(align as i32),
+                Value::I32(new_size as i32),
+            ],
+        )
+    }
+
+    fn canon_call(
+        &mut self,
+        instance: usize,
+        realloc: &str,
+        arguments: Vec<Value>,
+    ) -> Result<i32, String> {
+        let allocated = self
+            .call_core(instance, realloc, arguments)
+            .map_err(|error| error.to_string())?;
+        match allocated.as_slice() {
+            [Value::I32(pointer)] => Ok(*pointer),
+            _ => Err("realloc did not return one i32".to_owned()),
+        }
+    }
+
+    /// Read a string of the lift's encoding at `pointer`, whose length is `tagged_length` code
+    /// units, as the canonical ABI reads it: under `latin1+utf16` the tag bit selects UTF-16, and a
+    /// string must be aligned, within the length limit, and valid in its encoding.
+    fn load_string(
+        &self,
+        instance: usize,
+        memory: &str,
+        pointer: u32,
+        tagged_length: u32,
+        encoding: StringEncoding,
+    ) -> Result<String, String> {
+        let (byte_length, alignment, decoding) = match encoding {
+            StringEncoding::Utf8 => (u64::from(tagged_length), 1, StringDecoding::Utf8),
+            StringEncoding::Utf16 => (2 * u64::from(tagged_length), 2, StringDecoding::Utf16),
+            StringEncoding::Latin1Utf16 if tagged_length & UTF16_TAG != 0 => (
+                2 * u64::from(tagged_length ^ UTF16_TAG),
+                2,
+                StringDecoding::Utf16,
+            ),
+            StringEncoding::Latin1Utf16 => (u64::from(tagged_length), 2, StringDecoding::Latin1),
+        };
+        if byte_length > MAX_STRING_BYTE_LENGTH as u64 {
+            return Err("the string is too long for the canonical ABI".to_owned());
+        }
+        if !(pointer as usize).is_multiple_of(alignment) {
+            return Err("the string is not aligned for its encoding".to_owned());
+        }
+        let bytes = self
+            .read_core_memory(instance, memory, u64::from(pointer), byte_length as usize)
+            .map_err(|error| error.to_string())?;
+        match decoding {
+            StringDecoding::Utf8 => {
+                String::from_utf8(bytes).map_err(|_| "the string is not valid UTF-8".to_owned())
+            }
+            StringDecoding::Utf16 => {
+                // A byte length of a UTF-16 string is even, so every code unit is whole.
+                let (pairs, _) = bytes.as_chunks::<2>();
+                let units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
+                String::from_utf16(&units).map_err(|_| "the string is not valid UTF-16".to_owned())
+            }
+            StringDecoding::Latin1 => Ok(bytes.iter().map(|&byte| char::from(byte)).collect()),
+        }
+    }
+
     /// Load a value of type `ty` at `pointer` in the memory `memory` of core instance `instance`,
-    /// by the canonical layout.
+    /// by the canonical layout. A string is read in `encoding`.
     fn load(
         &self,
         instance: usize,
         memory: &str,
         pointer: u32,
         ty: &ComponentType,
+        encoding: StringEncoding,
     ) -> Result<ComponentValue, String> {
         match ty {
             ComponentType::Scalar(Scalar::String) => {
@@ -2153,18 +2339,10 @@ impl ComponentInstance {
                     .read_core_memory(instance, memory, u64::from(pointer), 8)
                     .map_err(|error| error.to_string())?;
                 let data_pointer = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-                let data_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-                let bytes = self
-                    .read_core_memory(
-                        instance,
-                        memory,
-                        u64::from(data_pointer),
-                        data_length as usize,
-                    )
-                    .map_err(|error| error.to_string())?;
-                String::from_utf8(bytes)
+                let tagged_length =
+                    u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+                self.load_string(instance, memory, data_pointer, tagged_length, encoding)
                     .map(ComponentValue::String)
-                    .map_err(|_| "the string is not valid UTF-8".to_owned())
             }
             ComponentType::Scalar(scalar) => {
                 self.load_scalar(instance, memory, u64::from(pointer), *scalar)
@@ -3267,15 +3445,20 @@ fn decode_canon(
         let option_count = reader.u32()?;
         let mut memory: Option<u32> = None;
         let mut realloc: Option<u32> = None;
-        let mut utf8 = false;
+        let mut string_encoding: Option<StringEncoding> = None;
         for _ in 0..option_count {
             let option_at = reader.position();
             match reader.byte()? {
-                OPTION_UTF8 => {
-                    if utf8 {
+                tag @ (OPTION_UTF8 | OPTION_UTF16 | OPTION_LATIN1_UTF16) => {
+                    // A lift names at most one string encoding.
+                    if string_encoding.is_some() {
                         return Err(ComponentError::Malformed { offset: option_at });
                     }
-                    utf8 = true;
+                    string_encoding = Some(match tag {
+                        OPTION_UTF8 => StringEncoding::Utf8,
+                        OPTION_UTF16 => StringEncoding::Utf16,
+                        _ => StringEncoding::Latin1Utf16,
+                    });
                 }
                 OPTION_MEMORY => {
                     let memory_index = reader.u32()?;
@@ -3325,7 +3508,7 @@ fn decode_canon(
                 }
                 _ => {
                     return Err(ComponentError::UnsupportedCanon {
-                        what: "a canonical option other than utf8, memory, or realloc",
+                        what: "a canonical option other than a string encoding, memory, or realloc",
                         offset: option_at,
                     })
                 }
@@ -3389,6 +3572,7 @@ fn decode_canon(
             ty,
             memory,
             realloc,
+            encoding: string_encoding.unwrap_or(StringEncoding::Utf8),
         });
     }
     Ok(())

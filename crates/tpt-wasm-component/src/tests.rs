@@ -813,7 +813,7 @@ fn canon_options_are_refused_and_a_lower_needs_an_import() {
             &[]
         )),
         Err(ComponentError::UnsupportedCanon {
-            what: "a canonical option other than utf8, memory, or realloc",
+            what: "a canonical option other than a string encoding, memory, or realloc",
             ..
         })
     ));
@@ -3103,4 +3103,283 @@ fn a_record_and_an_option_are_stored_at_their_canonical_offsets() {
     )
     .expect("stores");
     assert_eq!(buffer, [1, 0, 0, 0, 5, 0, 0, 0]);
+}
+
+/// A core module whose exports return string headers laid out in its memory: `a` at 16 for
+/// UTF-16 `hé`, `b` at 24 for Latin-1 `hé!`, `c` at 32 for UTF-16 `h€` with the tag bit, and `d` at
+/// 72 for a lone surrogate. `measure` returns the length it is given, and `realloc` returns 1024.
+fn text_module() -> Vec<u8> {
+    let mut image = vec![0u8; 96];
+    let mut place = |at: usize, bytes: &[u8]| image[at..at + bytes.len()].copy_from_slice(bytes);
+    place(16, &[40, 0, 0, 0, 2, 0, 0, 0]);
+    place(24, &[48, 0, 0, 0, 3, 0, 0, 0]);
+    place(32, &[56, 0, 0, 0, 2, 0, 0, 0x80]);
+    place(72, &[80, 0, 0, 0, 1, 0, 0, 0]);
+    place(40, &[0x68, 0, 0xE9, 0]);
+    place(48, &[0x68, 0xE9, 0x21]);
+    place(56, &[0x68, 0, 0xAC, 0x20]);
+    place(80, &[0x00, 0xD8]);
+
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bytes.extend(section(
+        1,
+        &[
+            3, 0x60, 0, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1,
+            0x7f,
+        ],
+    ));
+    bytes.extend(section(3, &[6, 0, 0, 0, 0, 1, 2]));
+    bytes.extend(section(5, &[1, 0x00, 1]));
+    bytes.extend(section(
+        7,
+        &[
+            7, 1, b'a', 0, 0, 1, b'b', 0, 1, 1, b'c', 0, 2, 1, b'd', 0, 3, 7, b'm', b'e', b'a',
+            b's', b'u', b'r', b'e', 0, 4, 7, b'r', b'e', b'a', b'l', b'l', b'o', b'c', 0, 5, 6,
+            b'm', b'e', b'm', b'o', b'r', b'y', 2, 0,
+        ],
+    ));
+    bytes.extend(section(
+        10,
+        &[
+            6, 4, 0, 0x41, 16, 0x0b, 4, 0, 0x41, 24, 0x0b, 4, 0, 0x41, 32, 0x0b, 5, 0, 0x41, 0xC8,
+            0x00, 0x0b, 4, 0, 0x20, 1, 0x0b, 5, 0, 0x41, 0x80, 0x08, 0x0b,
+        ],
+    ));
+    let mut data = vec![1, 0, 0x41, 0, 0x0b, image.len() as u8];
+    data.extend(&image);
+    bytes.extend(section(11, &data));
+    bytes
+}
+
+/// A component over `text_module`: `a`, `b`, `c`, and `d` return a string, and `measure` takes
+/// one and returns its length. Every lift takes the given canonical options, which name the
+/// memory and `realloc` (core function 5).
+fn text_component(options: &[u8]) -> Vec<u8> {
+    let types = section(
+        SECTION_TYPE,
+        &[
+            2,
+            TYPE_FUNC,
+            0,
+            0x00,
+            VALTYPE_STRING,
+            TYPE_FUNC,
+            1,
+            1,
+            b's',
+            VALTYPE_STRING,
+            0x00,
+            VALTYPE_U32,
+        ],
+    );
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            7, 0, 0, 1, 0, 1, b'a', 0, 0, 1, 0, 1, b'b', 0, 0, 1, 0, 1, b'c', 0, 0, 1, 0, 1, b'd',
+            0, 0, 1, 0, 7, b'm', b'e', b'a', b's', b'u', b'r', b'e', 0, 0, 1, 0, 7, b'r', b'e',
+            b'a', b'l', b'l', b'o', b'c', 0, 2, 1, 0, 6, b'm', b'e', b'm', b'o', b'r', b'y',
+        ],
+    );
+    let lift = |core: u8, ty: u8| {
+        let mut bytes = vec![CANON_LIFT, SORT_FUNC, core];
+        bytes.extend_from_slice(options);
+        bytes.push(ty);
+        bytes
+    };
+    let mut canon = vec![5];
+    canon.extend(lift(0, 0));
+    canon.extend(lift(1, 0));
+    canon.extend(lift(2, 0));
+    canon.extend(lift(3, 0));
+    canon.extend(lift(4, 1));
+    let canon = section(SECTION_CANON, &canon);
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            5,
+            0x00,
+            1,
+            b'a',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+            0x00,
+            1,
+            b'b',
+            COMPONENT_SORT_FUNC,
+            1,
+            0x00,
+            0x00,
+            1,
+            b'c',
+            COMPONENT_SORT_FUNC,
+            2,
+            0x00,
+            0x00,
+            1,
+            b'd',
+            COMPONENT_SORT_FUNC,
+            3,
+            0x00,
+            0x00,
+            7,
+            b'm',
+            b'e',
+            b'a',
+            b's',
+            b'u',
+            b'r',
+            b'e',
+            COMPONENT_SORT_FUNC,
+            4,
+            0x00,
+        ],
+    );
+    let mut bytes = with(&module_section(&text_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+/// The canonical options of a `utf16` lift, and of a `latin1+utf16` lift, with memory and realloc.
+const UTF16_OPTIONS: [u8; 6] = [3, OPTION_UTF16, OPTION_MEMORY, 0, OPTION_REALLOC, 5];
+const LATIN1_OPTIONS: [u8; 6] = [3, OPTION_LATIN1_UTF16, OPTION_MEMORY, 0, OPTION_REALLOC, 5];
+
+fn text_instance(options: &[u8]) -> ComponentInstance {
+    Component::decode(&text_component(options))
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates")
+}
+
+#[test]
+fn a_utf16_string_result_is_decoded_from_its_code_units() {
+    let mut instance = text_instance(&UTF16_OPTIONS);
+    assert_eq!(
+        instance.call_export("a", Vec::new()),
+        Ok(vec![ComponentValue::String("hé".to_owned())])
+    );
+}
+
+#[test]
+fn an_unpaired_surrogate_in_a_utf16_string_is_a_call_error() {
+    let mut instance = text_instance(&UTF16_OPTIONS);
+    assert!(matches!(
+        instance.call_export("d", Vec::new()),
+        Err(ComponentError::Call { .. })
+    ));
+}
+
+#[test]
+fn a_utf16_string_argument_is_copied_as_code_units() {
+    let mut instance = text_instance(&UTF16_OPTIONS);
+    assert_eq!(
+        instance.call_export("measure", vec![ComponentValue::String("hé".to_owned())]),
+        Ok(vec![ComponentValue::U32(2)])
+    );
+    assert_eq!(
+        instance
+            .read_core_memory(0, "memory", 1024, 4)
+            .expect("reads"),
+        vec![0x68, 0, 0xE9, 0]
+    );
+}
+
+#[test]
+fn latin1_and_utf16_strings_are_read_by_their_length_tag() {
+    let mut instance = text_instance(&LATIN1_OPTIONS);
+    assert_eq!(
+        instance.call_export("b", Vec::new()),
+        Ok(vec![ComponentValue::String("hé!".to_owned())])
+    );
+    assert_eq!(
+        instance.call_export("c", Vec::new()),
+        Ok(vec![ComponentValue::String("h€".to_owned())])
+    );
+}
+
+#[test]
+fn a_latin1_string_argument_stays_latin1_and_others_take_the_utf16_tag() {
+    let mut instance = text_instance(&LATIN1_OPTIONS);
+    assert_eq!(
+        instance.call_export("measure", vec![ComponentValue::String("hé".to_owned())]),
+        Ok(vec![ComponentValue::U32(2)])
+    );
+    assert_eq!(
+        instance
+            .read_core_memory(0, "memory", 1024, 2)
+            .expect("reads"),
+        vec![0x68, 0xE9]
+    );
+    assert_eq!(
+        instance.call_export("measure", vec![ComponentValue::String("h€".to_owned())]),
+        Ok(vec![ComponentValue::U32(0x8000_0002)])
+    );
+    assert_eq!(
+        instance
+            .read_core_memory(0, "memory", 1024, 4)
+            .expect("reads"),
+        vec![0x68, 0, 0xAC, 0x20]
+    );
+}
+
+#[test]
+fn a_lift_names_at_most_one_string_encoding() {
+    assert!(matches!(
+        Component::decode(&text_component(&[
+            4,
+            OPTION_UTF16,
+            OPTION_LATIN1_UTF16,
+            OPTION_MEMORY,
+            0,
+            OPTION_REALLOC,
+            5,
+        ])),
+        Err(ComponentError::Malformed { .. })
+    ));
+    assert!(matches!(
+        Component::decode(&text_component(&[
+            3,
+            0x05,
+            OPTION_MEMORY,
+            0,
+            OPTION_REALLOC,
+            5
+        ])),
+        Err(ComponentError::UnsupportedCanon { .. })
+    ));
+}
+
+/// Corrupting the bytes of the string data image, its headers and its text alike, may never panic.
+/// The whole component is too slow to corrupt at every length, so this covers only the image.
+#[test]
+fn corrupted_string_images_do_not_panic() {
+    let engine = engine();
+    let fixture = text_component(&LATIN1_OPTIONS);
+    // The image starts 16 bytes before the first header, which is `hé`'s pointer and length.
+    let header = fixture
+        .windows(8)
+        .position(|window| window == [40, 0, 0, 0, 2, 0, 0, 0])
+        .expect("the first header is in the fixture");
+    let image = header - 16;
+    for position in image..image + 96 {
+        for mask in [0x01u8, 0x80, 0xff] {
+            let mut bytes = fixture.clone();
+            bytes[position] ^= mask;
+            let Ok(component) = Component::decode(&bytes) else {
+                continue;
+            };
+            if let Ok(mut instance) = component.instantiate(&engine) {
+                for name in ["a", "b", "c", "d", "measure"] {
+                    let _ = instance.call_export(name, Vec::new());
+                    let _ =
+                        instance.call_export(name, vec![ComponentValue::String("hi".to_owned())]);
+                }
+            }
+        }
+    }
 }
