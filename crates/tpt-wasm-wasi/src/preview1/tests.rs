@@ -1149,6 +1149,99 @@ fn advice_must_be_defined_and_sync_checks_the_descriptor() {
     }
 }
 
+#[test]
+fn links_and_timestamps_are_not_supported_by_the_tree() {
+    for mode in BOTH {
+        let calls: [(&str, Vec<Arg>); 5] = [
+            (
+                "path_link",
+                vec![
+                    Arg::I32(3),
+                    Arg::I32(0),
+                    Arg::I32(HELLO_PATH as i32),
+                    Arg::I32(9),
+                    Arg::I32(3),
+                    Arg::I32(NEW_PATH as i32),
+                    Arg::I32(6),
+                ],
+            ),
+            (
+                "path_symlink",
+                vec![
+                    Arg::I32(HELLO_PATH as i32),
+                    Arg::I32(9),
+                    Arg::I32(3),
+                    Arg::I32(NEW_PATH as i32),
+                    Arg::I32(6),
+                ],
+            ),
+            (
+                "path_readlink",
+                vec![
+                    Arg::I32(3),
+                    Arg::I32(HELLO_PATH as i32),
+                    Arg::I32(9),
+                    Arg::I32(DIRENT_OUT as i32),
+                    Arg::I32(64),
+                    Arg::I32(DIRENT_USED as i32),
+                ],
+            ),
+            (
+                "path_filestat_set_times",
+                vec![
+                    Arg::I32(3),
+                    Arg::I32(0),
+                    Arg::I32(HELLO_PATH as i32),
+                    Arg::I32(9),
+                    Arg::I64(0),
+                    Arg::I64(0),
+                    Arg::I32(0),
+                ],
+            ),
+            (
+                "fd_filestat_set_times",
+                vec![Arg::I32(3), Arg::I64(0), Arg::I64(0), Arg::I32(0)],
+            ),
+        ];
+        for (name, arguments) in calls {
+            let (result, _, _) = run_files(
+                mode,
+                grant(true),
+                &[(name, arguments)],
+                file_data_with(vec![(NEW_PATH, b"newdir".to_vec())]),
+            );
+            assert_eq!(result, vec![Value::I32(errno::NOTSUP)], "{mode:?}: {name}");
+        }
+    }
+}
+
+#[test]
+fn set_flags_accepts_only_the_empty_set_on_a_known_descriptor() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[("fd_fdstat_set_flags", vec![Arg::I32(3), Arg::I32(0)])],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}: empty");
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[("fd_fdstat_set_flags", vec![Arg::I32(3), Arg::I32(1)])],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOTSUP)], "{mode:?}: append");
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[("fd_fdstat_set_flags", vec![Arg::I32(9), Arg::I32(0)])],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::BADF)], "{mode:?}: unknown");
+    }
+}
+
 const DIRENT_OUT: u32 = 7400;
 const DIRENT_USED: u32 = 7500;
 
@@ -1474,6 +1567,27 @@ fn file_imports() -> Vec<(&'static str, FunctionType)> {
         ("fd_datasync", signature(&[I32], &[I32])),
         ("fd_advise", signature(&[I32, I64, I64, I32], &[I32])),
         ("fd_allocate", signature(&[I32, I64, I64], &[I32])),
+        (
+            "path_link",
+            signature(&[I32, I32, I32, I32, I32, I32, I32], &[I32]),
+        ),
+        (
+            "path_symlink",
+            signature(&[I32, I32, I32, I32, I32], &[I32]),
+        ),
+        (
+            "path_readlink",
+            signature(&[I32, I32, I32, I32, I32, I32], &[I32]),
+        ),
+        (
+            "path_filestat_set_times",
+            signature(&[I32, I32, I32, I32, I64, I64, I32], &[I32]),
+        ),
+        (
+            "fd_filestat_set_times",
+            signature(&[I32, I64, I64, I32], &[I32]),
+        ),
+        ("fd_fdstat_set_flags", signature(&[I32, I32], &[I32])),
     ]
 }
 

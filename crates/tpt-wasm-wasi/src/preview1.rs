@@ -207,6 +207,12 @@ enum Function {
     FdDatasync,
     FdAdvise,
     FdAllocate,
+    PathLink,
+    PathSymlink,
+    PathReadlink,
+    PathFilestatSetTimes,
+    FdFilestatSetTimes,
+    FdFdstatSetFlags,
     PollOneoff,
     SchedYield,
     ClockResGet,
@@ -215,7 +221,7 @@ enum Function {
 }
 
 impl Function {
-    const ALL: [Function; 31] = [
+    const ALL: [Function; 37] = [
         Function::ArgsSizesGet,
         Function::ArgsGet,
         Function::EnvironSizesGet,
@@ -242,6 +248,12 @@ impl Function {
         Function::FdDatasync,
         Function::FdAdvise,
         Function::FdAllocate,
+        Function::PathLink,
+        Function::PathSymlink,
+        Function::PathReadlink,
+        Function::PathFilestatSetTimes,
+        Function::FdFilestatSetTimes,
+        Function::FdFdstatSetFlags,
         Function::PollOneoff,
         Function::SchedYield,
         Function::ClockResGet,
@@ -277,6 +289,12 @@ impl Function {
             Function::FdDatasync => "fd_datasync",
             Function::FdAdvise => "fd_advise",
             Function::FdAllocate => "fd_allocate",
+            Function::PathLink => "path_link",
+            Function::PathSymlink => "path_symlink",
+            Function::PathReadlink => "path_readlink",
+            Function::PathFilestatSetTimes => "path_filestat_set_times",
+            Function::FdFilestatSetTimes => "fd_filestat_set_times",
+            Function::FdFdstatSetFlags => "fd_fdstat_set_flags",
             Function::PollOneoff => "poll_oneoff",
             Function::SchedYield => "sched_yield",
             Function::ClockResGet => "clock_res_get",
@@ -299,6 +317,12 @@ impl Function {
             Function::FdClose | Function::FdSync | Function::FdDatasync => (vec![I32], vec![I32]),
             Function::FdAdvise => (vec![I32, I64, I64, I32], vec![I32]),
             Function::FdAllocate => (vec![I32, I64, I64], vec![I32]),
+            Function::PathLink => (vec![I32, I32, I32, I32, I32, I32, I32], vec![I32]),
+            Function::PathSymlink => (vec![I32, I32, I32, I32, I32], vec![I32]),
+            Function::PathReadlink => (vec![I32, I32, I32, I32, I32, I32], vec![I32]),
+            Function::PathFilestatSetTimes => (vec![I32, I32, I32, I32, I64, I64, I32], vec![I32]),
+            Function::FdFilestatSetTimes => (vec![I32, I64, I64, I32], vec![I32]),
+            Function::FdFdstatSetFlags => (vec![I32, I32], vec![I32]),
             Function::FdSeek => (vec![I32, I64, I32, I32], vec![I32]),
             Function::FdPrestatGet => (vec![I32, I32], vec![I32]),
             Function::FdPrestatDirName => (vec![I32, I32, I32], vec![I32]),
@@ -362,6 +386,21 @@ impl HostFunction for Implementation {
         }
         // None of these touches memory, so they answer without it.
         match self.function {
+            // The tree has no links and keeps no times, so these are not supported.
+            Function::PathLink
+            | Function::PathSymlink
+            | Function::PathReadlink
+            | Function::PathFilestatSetTimes
+            | Function::FdFilestatSetTimes => {
+                return Ok(vec![Value::I32(errno::NOTSUP)]);
+            }
+            Function::FdFdstatSetFlags => {
+                return Ok(vec![Value::I32(fd_fdstat_set_flags(
+                    &state,
+                    arguments[0],
+                    arguments[1],
+                ))]);
+            }
             Function::FdSync | Function::FdDatasync => {
                 return Ok(vec![Value::I32(fd_sync(&state, arguments[0]))]);
             }
@@ -484,7 +523,13 @@ impl HostFunction for Implementation {
             | Function::FdSync
             | Function::FdDatasync
             | Function::FdAdvise
-            | Function::FdAllocate => {
+            | Function::FdAllocate
+            | Function::PathLink
+            | Function::PathSymlink
+            | Function::PathReadlink
+            | Function::PathFilestatSetTimes
+            | Function::FdFilestatSetTimes
+            | Function::FdFdstatSetFlags => {
                 unreachable!("handled before the memory check")
             }
             Function::FdPrestatDirName => {
@@ -744,6 +789,21 @@ fn fd_tell(state: &State, memory: &mut dyn GuestMemory, fd: u64, at: u64) -> i32
         errno::SPIPE
     } else {
         errno::BADF
+    }
+}
+
+/// `fd_fdstat_set_flags`. A stream has no flags that can be set, so only the empty set is
+/// accepted for it.
+fn fd_fdstat_set_flags(state: &State, fd: u64, flags: u64) -> i32 {
+    if let Some(fd) = fs::file_descriptor(fd) {
+        return fs::set_flags(&state.fs, fd, flags);
+    }
+    if !stream_granted(state, fd) {
+        errno::BADF
+    } else if flags == 0 {
+        errno::SUCCESS
+    } else {
+        errno::NOTSUP
     }
 }
 

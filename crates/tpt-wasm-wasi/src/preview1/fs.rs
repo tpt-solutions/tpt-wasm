@@ -1024,6 +1024,18 @@ pub(super) fn allocate(fs: &mut FsState, fd: u32, offset: u64, length: u64) -> i
     errno::SUCCESS
 }
 
+/// `fd_fdstat_set_flags`. The tree has no append or non-blocking mode, so only the empty flag
+/// set can be set; any other flag is `NOTSUP`. An unknown descriptor is `BADF`.
+pub(super) fn set_flags(fs: &FsState, fd: u32, flags: u64) -> i32 {
+    if !fs.open.contains_key(&fd) {
+        errno::BADF
+    } else if flags == 0 {
+        errno::SUCCESS
+    } else {
+        errno::NOTSUP
+    }
+}
+
 /// `fd_close` on a file or directory descriptor, preopened or opened.
 pub(super) fn close(fs: &mut FsState, fd: u32) -> i32 {
     if fs.open.remove(&fd).is_some() {

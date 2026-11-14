@@ -42,6 +42,9 @@ and operation behind every import, and supplies the function signature.
 - `fd_readdir` — list a granted directory: `.`, `..`, then the children in name order;
 - `fd_sync`, `fd_datasync`, `fd_advise` — succeed on an open descriptor (there is nothing to
   flush or hint); `fd_allocate` — grow a writable file with zeros, never shrink it;
+- `fd_fdstat_set_flags` — accepts only the empty flag set; `path_link`, `path_symlink`,
+  `path_readlink`, `path_filestat_set_times`, `fd_filestat_set_times` — answer `ENOTSUP`,
+  because the tree has no links and keeps no times;
 - `fd_prestat_get`, `fd_prestat_dir_name` — name the granted directories to the module;
 - `poll_oneoff` (clock subscriptions, on the virtual clock), `clock_res_get`, `sched_yield`;
   `proc_raise` answers `ENOTSUP`;
