@@ -893,7 +893,7 @@ fn optimization_shrinks_a_redundant_program() {
 /// silently -- the cache would serve whichever module it happened to store.
 #[test]
 fn optimization_is_deterministic() {
-    for seed in 0..64u64 {
+    for seed in 0..seed_count(64) {
         let fixture = generated_program(seed);
         let validated = tpt_wasm_validate::validate(fixture.clone()).expect("must validate");
         let verified = lower_and_verify(&validated).expect("must lower");
@@ -940,7 +940,7 @@ fn each_pass_alone_verifies_and_satisfies_the_contract() {
         ("instruction-scheduling", sched::run),
         ("register-allocation", regalloc::run),
     ];
-    for seed in 0..300u64 {
+    for seed in 0..seed_count(300) {
         let fixture = generated_program(seed);
         let validated = tpt_wasm_validate::validate(fixture).expect("must validate");
         let original = lower_and_verify(&validated)
@@ -1133,7 +1133,7 @@ fn host_effects_are_preserved_by_every_backend_over_generated_programs() {
     use tpt_wasm_runtime::EngineMode;
 
     let mut distinct: Vec<Result<Vec<Value>, Trap>> = Vec::new();
-    for seed in 0..500u64 {
+    for seed in 0..seed_count(500) {
         let fixture = generated_host_program(seed);
         let expected = run_with_effect(&fixture, EngineMode::Micro);
         assert!(
@@ -1173,7 +1173,7 @@ fn host_traps_are_preserved_by_every_backend_over_generated_programs() {
     use tpt_wasm_runtime::EngineMode;
 
     let mut distinct_refusals = std::collections::BTreeSet::new();
-    for seed in 0..200u64 {
+    for seed in 0..seed_count(200) {
         let fixture = generated_host_program(seed);
         let fail_at = (seed % 5) as i32;
         let expected = run_with_failing_effect(&fixture, EngineMode::Micro, Some(fail_at));
@@ -1196,4 +1196,14 @@ fn host_traps_are_preserved_by_every_backend_over_generated_programs() {
         5,
         "the seeds must exercise every refused call index"
     );
+}
+
+/// How many seeds a generated-program test runs. Under Miri each program costs far more, so the
+/// loop runs a few programs there, and the full count everywhere else.
+fn seed_count(full: u64) -> u64 {
+    if cfg!(miri) {
+        full.min(10)
+    } else {
+        full
+    }
 }
