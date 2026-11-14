@@ -361,7 +361,10 @@ fn encode_uleb(mut value: u64, out: &mut Vec<u8>) {
 /// because those are exactly the inputs where a hand-written fold diverges from
 /// a real backend.
 #[test]
-#[cfg_attr(miri, ignore = "builds a module for every value pair and opcode; too slow under Miri, and covered natively")]
+#[cfg_attr(
+    miri,
+    ignore = "builds a module for every value pair and opcode; too slow under Miri, and covered natively"
+)]
 fn folding_matches_the_baseline_executor() {
     let mut checked = 0usize;
     for &left in sample(I32_CORPUS) {
@@ -1090,20 +1093,24 @@ fn generated_host_program(seed: u64) -> Module {
 }
 
 /// Run a host-calling module through the public engine on one backend, with a fresh
-/// stateful host, comparing the returned value or the trap.
-fn run_with_effect(
-    module: &Module,
-    mode: tpt_wasm_runtime::EngineMode,
-) -> Result<Vec<Value>, Trap> {
-    run_with_failing_effect(module, mode, None)
-}
-
-/// As `run_with_effect`, but the host refuses its `fail_at`th call (zero-based).
-fn run_with_failing_effect(
+/// stateful host, and return the result (the returned value or the trap) together with
+/// every host call the run made, in order. The host refuses its `fail_at`th call
+/// (zero-based) when one is given.
+///
+/// This is the only runner the host-effect tests use. It is also the only place the host
+/// function is set up, so a second copy cannot drift from it.
+///
+/// The trace is what the host-effect comparison checks: the result alone would not show
+/// an optimizer that reordered or dropped a call whose result was unused, and a trace that
+/// matches entry for entry shows the same calls with the same arguments and outcomes.
+fn run_traced(
     module: &Module,
     mode: tpt_wasm_runtime::EngineMode,
     fail_at: Option<i32>,
-) -> Result<Vec<Value>, Trap> {
+) -> (
+    Result<Vec<Value>, Trap>,
+    Vec<tpt_wasm_runtime::HostCallRecord>,
+) {
     let mut engine = tpt_wasm_runtime::Engine::new(tpt_wasm_runtime::Config {
         engine_mode: mode,
         ..tpt_wasm_runtime::Config::default()
@@ -1120,7 +1127,8 @@ fn run_with_failing_effect(
     let mut instance = engine
         .instantiate(module.clone())
         .unwrap_or_else(|error| panic!("the host program must instantiate in {mode:?}: {error:?}"));
-    instance.call("run", Vec::new()).map_err(trap_of)
+    let result = instance.call("run", Vec::new()).map_err(trap_of);
+    (result, instance.last_call_host_trace().to_vec())
 }
 
 /// Host effects are preserved by every backend, including the optimizer.
@@ -1130,23 +1138,39 @@ fn run_with_failing_effect(
 /// same value. This is the host-effect half of the regression claim: the generated
 /// programs elsewhere in this file do not call the host at all.
 #[test]
-#[cfg_attr(miri, ignore = "runs the native backends, which execute JIT code that Miri cannot run; covered natively")]
+#[cfg_attr(
+    miri,
+    ignore = "runs the native backends, which execute JIT code that Miri cannot run; covered natively"
+)]
 fn host_effects_are_preserved_by_every_backend_over_generated_programs() {
     use tpt_wasm_runtime::EngineMode;
 
     let mut distinct: Vec<Result<Vec<Value>, Trap>> = Vec::new();
     for seed in 0..seed_count(500) {
         let fixture = generated_host_program(seed);
-        let expected = run_with_effect(&fixture, EngineMode::Micro);
+        let (expected, expected_trace) = run_traced(&fixture, EngineMode::Micro, None);
         assert!(
             expected.is_ok(),
             "seed {seed}: Micro should not trap: {expected:?}"
         );
-        for mode in [EngineMode::Baseline, EngineMode::Optimizing] {
-            let actual = run_with_effect(&fixture, mode);
+        assert!(
+            !expected_trace.is_empty(),
+            "seed {seed}: the program must reach the host, or the trace compares nothing"
+        );
+        for mode in [
+            EngineMode::Baseline,
+            EngineMode::Optimizing,
+            EngineMode::Jit,
+        ] {
+            let (actual, actual_trace) = run_traced(&fixture, mode, None);
             assert_eq!(
                 expected, actual,
                 "seed {seed}: {mode:?} disagrees with Micro about the host effects"
+            );
+            assert_eq!(
+                expected_trace, actual_trace,
+                "seed {seed}: {mode:?} makes different host calls from Micro, \
+                 in order, with the same arguments and outcomes"
             );
         }
         if !distinct.contains(&expected) {
@@ -1171,7 +1195,10 @@ fn host_effects_are_preserved_by_every_backend_over_generated_programs() {
 /// same call everywhere. The failure message names the call, so agreement means the
 /// same call, not merely some trap.
 #[test]
-#[cfg_attr(miri, ignore = "runs the native backends, which execute JIT code that Miri cannot run; covered natively")]
+#[cfg_attr(
+    miri,
+    ignore = "runs the native backends, which execute JIT code that Miri cannot run; covered natively"
+)]
 fn host_traps_are_preserved_by_every_backend_over_generated_programs() {
     use tpt_wasm_runtime::EngineMode;
 
@@ -1179,17 +1206,32 @@ fn host_traps_are_preserved_by_every_backend_over_generated_programs() {
     for seed in 0..seed_count(200) {
         let fixture = generated_host_program(seed);
         let fail_at = (seed % 5) as i32;
-        let expected = run_with_failing_effect(&fixture, EngineMode::Micro, Some(fail_at));
+        let (expected, expected_trace) = run_traced(&fixture, EngineMode::Micro, Some(fail_at));
         assert!(
             matches!(expected, Err(Trap::HostFailure(ref message))
                 if message.contains(&format!("refused host call {fail_at}"))),
             "seed {seed}: Micro should trap at refused call {fail_at}: {expected:?}"
         );
-        for mode in [EngineMode::Baseline, EngineMode::Optimizing] {
-            let actual = run_with_failing_effect(&fixture, mode, Some(fail_at));
+        // The trace ends at the refused call: it is recorded as a failure, and nothing after it runs.
+        assert!(
+            expected_trace
+                .last()
+                .is_some_and(|record| record.outcome.is_err()),
+            "seed {seed}: the trace must end with the refused call: {expected_trace:?}"
+        );
+        for mode in [
+            EngineMode::Baseline,
+            EngineMode::Optimizing,
+            EngineMode::Jit,
+        ] {
+            let (actual, actual_trace) = run_traced(&fixture, mode, Some(fail_at));
             assert_eq!(
                 expected, actual,
                 "seed {seed}: {mode:?} disagrees with Micro about a refused host call"
+            );
+            assert_eq!(
+                expected_trace, actual_trace,
+                "seed {seed}: {mode:?} stops at a different host call from Micro"
             );
         }
         distinct_refusals.insert(fail_at);
@@ -1214,5 +1256,6 @@ fn seed_count(full: u64) -> u64 {
 /// The corpus values a loop runs over. Under Miri the cross product of the corpora is far too many
 /// modules, so the loop takes every few values there, and every value everywhere else.
 fn sample<T>(all: &[T]) -> impl Iterator<Item = &T> {
-    all.iter().step_by(if cfg!(miri) { all.len() / 3 + 1 } else { 1 })
+    all.iter()
+        .step_by(if cfg!(miri) { all.len() / 3 + 1 } else { 1 })
 }

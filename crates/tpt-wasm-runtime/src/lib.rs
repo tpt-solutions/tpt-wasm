@@ -850,6 +850,26 @@ pub struct Instance {
     /// Shared with the baseline's host boundary, which counts its calls here, since
     /// the boundary is owned by the compiled module rather than by this instance.
     baseline_host_counts: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// Every host call the most recent call made, in the order it was made.
+    last_call_host_trace: Vec<HostCallRecord>,
+    /// Shared with the baseline's host boundary, for the same reason as the counts.
+    baseline_host_trace: Arc<Mutex<Vec<HostCallRecord>>>,
+}
+
+/// One host call, as the embedder observes it.
+///
+/// The trace is what makes host effects observable rather than only countable: it
+/// records which capability was reached, with what arguments, and what came back.
+/// A call that failed records the failure's text, so two backends agree on a failure
+/// by its message as well as by the fact that it happened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostCallRecord {
+    /// The capability the call reached, named as `last_call_host_calls` names it.
+    pub import: String,
+    /// The arguments the guest passed, in order.
+    pub arguments: Vec<Value>,
+    /// The values the host returned, or the failure it reported.
+    pub outcome: Result<Vec<Value>, String>,
 }
 
 impl fmt::Debug for Instance {
@@ -1121,6 +1141,8 @@ struct BaselineHost {
     bindings: Vec<(String, String)>,
     /// Calls made through this boundary, keyed by `module::name`, for the instance.
     counts: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// The calls made through this boundary, in order, for the instance.
+    trace: Arc<Mutex<Vec<HostCallRecord>>>,
 }
 
 impl tpt_wasm_codegen::HostBoundary for BaselineHost {
@@ -1171,7 +1193,10 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
             last_call_profile: BTreeMap::new(),
             last_call_host_calls: BTreeMap::new(),
             baseline_host_counts: Arc::new(Mutex::new(BTreeMap::new())),
+            last_call_host_trace: Vec::new(),
+            baseline_host_trace: Arc::new(Mutex::new(Vec::new())),
         };
+        let arguments = args.clone();
         let result = instance.invoke_host_call(
             &tpt_wasm_micro::machine::HostCall {
                 func_name: callback.clone(),
@@ -1181,6 +1206,18 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
             memory,
         );
         drop(instance);
+        // Recorded here, once per call, under the same capability name Micro's
+        // trace uses, so the two backends' traces compare equal entry for entry.
+        if let Ok(mut trace) = self.trace.lock() {
+            trace.push(HostCallRecord {
+                import: capability_name(&callback).to_owned(),
+                arguments,
+                outcome: match &result {
+                    Ok(values) => Ok(values.clone()),
+                    Err(error) => Err(error.to_string()),
+                },
+            });
+        }
         // The interpreter's host failure is taken apart rather than stringified,
         // so both backends report the same name and message instead of the same
         // name wrapped in a second layer of prose.
@@ -1547,17 +1584,21 @@ fn instantiate_module(
         last_call_profile: BTreeMap::new(),
         last_call_host_calls: BTreeMap::new(),
         baseline_host_counts: Arc::new(Mutex::new(BTreeMap::new())),
+        last_call_host_trace: Vec::new(),
+        baseline_host_trace: Arc::new(Mutex::new(Vec::new())),
     };
     // The baseline's host boundary needs the resolved callbacks, which only exist
     // once the import loop has run. It is installed here, before the start
     // function, so a start function that calls a host function resolves too.
     let host_counts = Arc::clone(&instance.baseline_host_counts);
+    let host_trace = Arc::clone(&instance.baseline_host_trace);
     if let Some(module) = instance.baseline.as_mut() {
         if !baseline_bindings.is_empty() {
             module.set_host(BaselineHost {
                 context: Some(context.clone()),
                 bindings: baseline_bindings,
                 counts: host_counts,
+                trace: host_trace,
             });
         }
         // The baseline recurses to make a call, so it needs the same call-depth
@@ -1802,6 +1843,13 @@ impl Instance {
         let globals = self.baseline.as_ref()?.globals_handles();
         let mut bits = self.jit.global_bits(&globals)?;
         // The host calls go to the module's imports and boundary, which the native code reaches through this view.
+        // The boundary records into the shared counts and trace, so they start empty for this call.
+        if let Ok(mut counts) = self.baseline_host_counts.lock() {
+            counts.clear();
+        }
+        if let Ok(mut trace) = self.baseline_host_trace.lock() {
+            trace.clear();
+        }
         let module = self.baseline.as_mut()?;
         let (imports, host) = module.host_view();
         let mut native_host = jit_tier::NativeHost {
@@ -1853,11 +1901,21 @@ impl Instance {
             (Ok(values), Ok(())) => Ok(values),
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         };
-        // Native code charges no steps, keeps no profile, makes no host calls, and cannot
-        // grow memory, so the counters a call reports are all zero.
+        // Native code charges no steps and keeps no profile, so those counters are zero. Its host
+        // calls go through the same boundary as the baseline's, so they are reported from the
+        // shared counts and trace rather than dropped.
         self.last_call_steps = 0;
         self.last_call_profile.clear();
-        self.last_call_host_calls.clear();
+        self.last_call_host_calls = self
+            .baseline_host_counts
+            .lock()
+            .map(|counts| counts.clone())
+            .unwrap_or_default();
+        self.last_call_host_trace = self
+            .baseline_host_trace
+            .lock()
+            .map(|trace| trace.clone())
+            .unwrap_or_default();
         self.last_call_memory_pages_added = 0;
         Some(result)
     }
@@ -1898,6 +1956,14 @@ impl Instance {
     /// capability would conflict with deterministic execution.
     pub fn last_call_host_calls(&self) -> &BTreeMap<String, u64> {
         &self.last_call_host_calls
+    }
+
+    /// Every host call the most recent call made, in the order it was made, with the
+    /// arguments and the outcome of each. Unlike the counts, this shows which values
+    /// crossed the boundary, so two backends can be compared on their effects rather
+    /// than only on how many effects they produced. A call that trapped is included.
+    pub fn last_call_host_trace(&self) -> &[HostCallRecord] {
+        &self.last_call_host_trace
     }
 
     /// The pages the most recent call added to memory 0, or zero if it added none.
@@ -1951,8 +2017,12 @@ impl Instance {
         let index = self.baseline_index(name)?;
         self.last_call_profile.clear();
         self.last_call_host_calls.clear();
+        self.last_call_host_trace.clear();
         if let Ok(mut counts) = self.baseline_host_counts.lock() {
             counts.clear();
+        }
+        if let Ok(mut trace) = self.baseline_host_trace.lock() {
+            trace.clear();
         }
         let before = self.memory_pages();
         let module = self
@@ -1966,6 +2036,11 @@ impl Instance {
             .baseline_host_counts
             .lock()
             .map(|counts| counts.clone())
+            .unwrap_or_default();
+        self.last_call_host_trace = self
+            .baseline_host_trace
+            .lock()
+            .map(|trace| trace.clone())
             .unwrap_or_default();
         self.last_call_memory_pages_added = pages_added(before, self.memory_pages());
         result.map_err(baseline_error)
@@ -2116,6 +2191,7 @@ impl Instance {
         }
         self.last_call_profile.clear();
         self.last_call_host_calls.clear();
+        self.last_call_host_trace.clear();
         let function = {
             let store = lock_store(&self.context.store)?;
             store.function(address)?.clone()
@@ -2138,7 +2214,10 @@ impl Instance {
                     .last_call_host_calls
                     .entry(capability_name(&call.func_name).to_owned())
                     .or_insert(0) += 1;
-                return self.invoke_host_call(&call, None);
+                let arguments = call.args.clone();
+                let outcome = self.invoke_host_call(&call, None);
+                self.record_host_call(&call.func_name, arguments, &outcome);
+                return outcome;
             }
         };
         check_arguments(&func_type, &args)?;
@@ -2183,6 +2262,7 @@ impl Instance {
                         .last_call_host_calls
                         .entry(capability_name(&call.func_name).to_owned())
                         .or_insert(0) += 1;
+                    let arguments = call.args.clone();
                     let outcome = match caller_memory_address(&machine)
                         .and_then(|address| machine.store.memory_mut(address).ok())
                     {
@@ -2192,6 +2272,7 @@ impl Instance {
                         }
                         None => self.invoke_host_call(&call, None),
                     };
+                    self.record_host_call(&call.func_name, arguments, &outcome);
                     let results = match outcome {
                         Ok(results) => results,
                         Err(error) => {
@@ -2217,6 +2298,27 @@ impl Instance {
     fn commit_store(&self, store: Store) -> Result<(), RuntimeError> {
         *lock_store(&self.context.store)? = store;
         Ok(())
+    }
+
+    /// Append one host call to the trace of the call in progress.
+    ///
+    /// The Micro paths record here, after `invoke_host_call` has run. The baseline
+    /// records in its own boundary, because its calls reach the host through another
+    /// route; both use the same capability name and the same failure text.
+    fn record_host_call(
+        &mut self,
+        callback: &str,
+        arguments: Vec<Value>,
+        outcome: &Result<Vec<Value>, RuntimeError>,
+    ) {
+        self.last_call_host_trace.push(HostCallRecord {
+            import: capability_name(callback).to_owned(),
+            arguments,
+            outcome: match outcome {
+                Ok(values) => Ok(values.clone()),
+                Err(error) => Err(error.to_string()),
+            },
+        });
     }
 
     fn invoke_host_call(
@@ -2249,7 +2351,10 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
-    use super::{optimizing, Config, Engine, EngineMode, HostFunction, RuntimeError, Validator};
+    use super::{
+        optimizing, Config, Engine, EngineMode, HostCallRecord, HostFunction, RuntimeError,
+        Validator,
+    };
     use std::fs;
     use std::sync::Arc;
 
@@ -4262,6 +4367,52 @@ mod tests {
             Some(&1),
             "the baseline's count is for the last call too"
         );
+    }
+
+    /// The trace records each host call the most recent call made, in order, with its
+    /// arguments and its outcome, on every backend.
+    ///
+    /// This covers the native tier as well: its host calls go through the baseline's
+    /// boundary, and they were once dropped from the report, which read zero for a call
+    /// that had made one.
+    #[test]
+    fn host_calls_are_traced_in_order_on_every_backend() {
+        let build = |mode| {
+            let mut engine = Engine::new(Config {
+                engine_mode: mode,
+                ..Config::default()
+            })
+            .expect("accepted");
+            engine.linker_mut().define_function("env", "seven", Seven);
+            engine
+                .instantiate(importing_module())
+                .expect("instantiates")
+        };
+        let expected = vec![HostCallRecord {
+            import: "env::seven".into(),
+            arguments: Vec::new(),
+            outcome: Ok(vec![Value::I32(7)]),
+        }];
+
+        let mut modes = vec![EngineMode::Micro, EngineMode::Baseline];
+        if cfg!(feature = "jit") {
+            modes.push(EngineMode::Jit);
+        }
+        for mode in modes {
+            let mut instance = build(mode);
+            instance.call("run", Vec::new()).expect("run returns");
+            assert_eq!(
+                instance.last_call_host_trace(),
+                expected.as_slice(),
+                "{mode:?}: one host call, with its argument list and its result"
+            );
+            instance.call("run", Vec::new()).expect("run returns");
+            assert_eq!(
+                instance.last_call_host_trace(),
+                expected.as_slice(),
+                "{mode:?}: the trace is for the last call, not accumulated"
+            );
+        }
     }
 
     /// A host function that writes one byte through the caller's memory.
