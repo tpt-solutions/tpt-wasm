@@ -116,8 +116,13 @@ set. A set flattens to one bitmask, one bit per label in definition order, so a 
 passed directly in both directions. A bit beyond the labels names no flag, and is a call error.
 Flags in a record, a list, an option, an import, or a lowered import are refused.
 
+Tuples (`0x6f`) of scalars are supported for lifted exports. A tuple is a record without labels: it
+flattens to its values in order, lays out in memory as a record does, and a tuple of scalars is
+passed directly or read back through memory by the same rules. A tuple must hold at least one
+value, and a value may not be a string or another compound type.
+
 Refused, each by name and offset, until its own decoder exists: value types beyond the ones
-supported (variants, results, tuples, resources, and
+supported (variants, results, resources, and
 the rest), extern types on exports, and exports of any sort other than function. Exports of
 imported functions are refused too.
 
@@ -162,7 +167,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 a separate stage, which will map each parsed function onto the same capability id.
 
 Not done: strings and records in lowered imports, UTF-16 and Latin-1 encodings, `post-return`,
-records passed indirectly, variants, results, tuples, and parsing WIT to
+records passed indirectly, variants, results, and parsing WIT to
 derive the capability ids.
 
 ## Design constraint

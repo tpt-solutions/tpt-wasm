@@ -1288,7 +1288,9 @@ fn no_truncation_or_corruption_of_a_component_panics() {
         option_component(),
         enum_component(),
         flags_component(),
+        tuple_component(),
         flags_component(),
+        tuple_component(),
     ];
     let mut decoded = 0usize;
     let mut instantiated = 0usize;
@@ -2232,5 +2234,129 @@ fn a_flags_result_with_a_bit_beyond_the_labels_is_a_call_error() {
     assert!(matches!(
         instance.call_export("three", Vec::new()),
         Err(ComponentError::Call { .. })
+    ));
+}
+
+/// A component over `record_module` whose types are a tuple of `u32` and `u8`: `sum` takes the
+/// tuple, and `rec` returns it. The tuple lays out as the record does.
+fn tuple_component() -> Vec<u8> {
+    let types = section(
+        SECTION_TYPE,
+        &[
+            3,
+            TYPE_TUPLE,
+            2,
+            VALTYPE_U32,
+            VALTYPE_U8,
+            TYPE_FUNC,
+            1,
+            1,
+            b't',
+            0x00,
+            0x00,
+            VALTYPE_U32,
+            TYPE_FUNC,
+            0,
+            0x00,
+            0x00,
+        ],
+    );
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            3, 0, 0, 1, 0, 3, b's', b'u', b'm', 0, 0, 1, 0, 3, b'r', b'e', b'c', 0, 2, 1, 0, 6,
+            b'm', b'e', b'm', b'o', b'r', b'y',
+        ],
+    );
+    let mut canon = vec![2, CANON_LIFT, SORT_FUNC, 0, 0, 1];
+    canon.extend_from_slice(&[CANON_LIFT, SORT_FUNC, 1, 1, OPTION_MEMORY, 0, 2]);
+    let canon = section(SECTION_CANON, &canon);
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            2,
+            0x00,
+            3,
+            b's',
+            b'u',
+            b'm',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+            0x00,
+            3,
+            b'r',
+            b'e',
+            b'c',
+            COMPONENT_SORT_FUNC,
+            1,
+            0x00,
+        ],
+    );
+    let mut bytes = with(&module_section(&record_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+#[test]
+fn a_tuple_parameter_and_result_pass_their_values_in_order() {
+    let mut instance = Component::decode(&tuple_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export(
+            "sum",
+            vec![ComponentValue::Tuple(vec![
+                ComponentValue::U32(40),
+                ComponentValue::U8(2),
+            ])]
+        ),
+        Ok(vec![ComponentValue::U32(42)])
+    );
+    assert_eq!(
+        instance.call_export("rec", Vec::new()),
+        Ok(vec![ComponentValue::Tuple(vec![
+            ComponentValue::U32(42),
+            ComponentValue::U8(7),
+        ])])
+    );
+}
+
+#[test]
+fn a_tuple_with_the_wrong_arity_is_refused() {
+    let mut instance = Component::decode(&tuple_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert!(matches!(
+        instance.call_export(
+            "sum",
+            vec![ComponentValue::Tuple(vec![ComponentValue::U32(1)])]
+        ),
+        Err(ComponentError::ArgumentMismatch { .. })
+    ));
+}
+
+#[test]
+fn an_empty_tuple_is_malformed_and_a_string_in_a_tuple_is_refused() {
+    assert!(matches!(
+        Component::decode(&with(&section(SECTION_TYPE, &[1, TYPE_TUPLE, 0]))),
+        Err(ComponentError::Malformed { .. })
+    ));
+    assert!(matches!(
+        Component::decode(&with(&section(
+            SECTION_TYPE,
+            &[1, TYPE_TUPLE, 1, VALTYPE_STRING]
+        ))),
+        Err(ComponentError::UnsupportedType {
+            what: "a string in a tuple",
+            ..
+        })
     ));
 }

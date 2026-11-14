@@ -85,6 +85,7 @@ const TYPE_LIST: u8 = 0x70;
 const TYPE_OPTION: u8 = 0x6b;
 const TYPE_ENUM: u8 = 0x6d;
 const TYPE_FLAGS: u8 = 0x6e;
+const TYPE_TUPLE: u8 = 0x6f;
 /// The canon tag of a lift, and of a lower.
 const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
@@ -335,6 +336,8 @@ pub enum ComponentType {
     Enum(u32),
     /// A set of flags, by the index of its definition in the component's type table.
     Flags(u32),
+    /// A tuple of scalars, by the index of its definition in the type table.
+    Tuple(u32),
 }
 
 /// One field of a record type.
@@ -359,6 +362,8 @@ pub enum ComponentTypeDef {
     Option(Scalar),
     /// An enum type: its case labels, in order. A value is the index of one of them.
     Enum(Vec<String>),
+    /// A tuple of scalars, in order.
+    Tuple(Vec<Scalar>),
     /// A set of flags: its labels, at most 32, each a bit.
     Flags(Vec<String>),
 }
@@ -396,6 +401,8 @@ pub enum ComponentValue {
     Option(Option<Box<ComponentValue>>),
     /// An enum value: the label of one of its cases.
     Enum(String),
+    /// A tuple: its values, in order.
+    Tuple(Vec<ComponentValue>),
     /// A set of flags: the labels that are set.
     Flags(Vec<String>),
 }
@@ -421,7 +428,8 @@ impl ComponentValue {
             | ComponentValue::List(_)
             | ComponentValue::Option(_)
             | ComponentValue::Enum(_)
-            | ComponentValue::Flags(_) => None,
+            | ComponentValue::Flags(_)
+            | ComponentValue::Tuple(_) => None,
         }
     }
 }
@@ -943,7 +951,8 @@ impl Component {
             | ComponentTypeDef::List(_)
             | ComponentTypeDef::Option(_)
             | ComponentTypeDef::Enum(_)
-            | ComponentTypeDef::Flags(_) => None,
+            | ComponentTypeDef::Flags(_)
+            | ComponentTypeDef::Tuple(_) => None,
         }
     }
 
@@ -969,12 +978,13 @@ impl Component {
                 ComponentType::Option(_) => Err(format!("the import {name} takes an option")),
                 ComponentType::Enum(_) => Err(format!("the import {name} takes an enum")),
                 ComponentType::Flags(_) => Err(format!("the import {name} takes flags")),
+                ComponentType::Tuple(_) => Err(format!("the import {name} takes a tuple")),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let result = match declared.result {
             None => None,
             Some(ComponentType::Scalar(scalar)) => Some(scalar),
-            Some(ComponentType::Enum(_) | ComponentType::Flags(_)) => {
+            Some(ComponentType::Enum(_) | ComponentType::Flags(_) | ComponentType::Tuple(_)) => {
                 return Err(format!("the import {name} returns an enum"))
             }
             Some(ComponentType::List(_)) => {
@@ -1035,6 +1045,13 @@ fn flat_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> Vec<ValueType> {
         },
         // A list is its pointer and its length, as a string is.
         ComponentType::List(_) => vec![ValueType::I32, ValueType::I32],
+        ComponentType::Tuple(index) => match types.get(*index as usize) {
+            Some(ComponentTypeDef::Tuple(scalars)) => scalars
+                .iter()
+                .flat_map(|scalar| scalar.flat_params())
+                .collect(),
+            _ => Vec::new(),
+        },
         // An enum is its case index.
         ComponentType::Enum(_) | ComponentType::Flags(_) => vec![ValueType::I32],
         // An option is its discriminant, then its payload's flat values.
@@ -1372,6 +1389,28 @@ impl ComponentInstance {
         out: &mut Vec<Value>,
     ) -> Result<(), String> {
         match argument {
+            ComponentValue::Tuple(items) => {
+                let ComponentType::Tuple(index) = ty else {
+                    return Err("a tuple argument is not a tuple type".to_owned());
+                };
+                let scalars = match self.types.get(*index as usize) {
+                    Some(ComponentTypeDef::Tuple(scalars)) => scalars,
+                    _ => return Err("the tuple is not defined".to_owned()),
+                };
+                if items.len() != scalars.len() {
+                    return Err("the tuple has the wrong number of values".to_owned());
+                }
+                for (item, scalar) in items.iter().zip(scalars) {
+                    if item.scalar() != Some(*scalar) {
+                        return Err("a tuple value does not match its type".to_owned());
+                    }
+                    out.push(
+                        lower_scalar(item)
+                            .ok_or_else(|| "a tuple value did not lower".to_owned())?,
+                    );
+                }
+                Ok(())
+            }
             ComponentValue::Flags(set) => {
                 let ComponentType::Flags(index) = ty else {
                     return Err("a flags argument is not a flags type".to_owned());
@@ -1560,6 +1599,21 @@ impl ComponentInstance {
         }
         match (ty, core_results) {
             (ComponentType::Scalar(scalar), [value]) => lift(value.clone(), *scalar),
+            (ComponentType::Tuple(index), values) => {
+                let Some(ComponentTypeDef::Tuple(scalars)) = self.types.get(*index as usize) else {
+                    return Err("the result's tuple is not defined".to_owned());
+                };
+                if values.len() != scalars.len() {
+                    return Err(
+                        "the core function returned the wrong number of tuple values".to_owned(),
+                    );
+                }
+                let mut lifted = Vec::with_capacity(scalars.len());
+                for (scalar, value) in scalars.iter().zip(values) {
+                    lifted.push(lift(value.clone(), *scalar)?);
+                }
+                Ok(ComponentValue::Tuple(lifted))
+            }
             (ComponentType::Flags(index), [value]) => {
                 let Some(ComponentTypeDef::Flags(labels)) = self.types.get(*index as usize) else {
                     return Err("the result's flags are not defined".to_owned());
@@ -1636,6 +1690,30 @@ impl ComponentInstance {
             }
             ComponentType::Scalar(scalar) => {
                 self.load_scalar(instance, memory, u64::from(pointer), *scalar)
+            }
+            ComponentType::Tuple(index) => {
+                let Some(ComponentTypeDef::Tuple(scalars)) = self.types.get(*index as usize) else {
+                    return Err("the tuple is not defined".to_owned());
+                };
+                // A tuple lays out like a record whose fields have no labels.
+                let fields: Vec<RecordField> = scalars
+                    .iter()
+                    .map(|ty| RecordField {
+                        name: String::new(),
+                        ty: *ty,
+                    })
+                    .collect();
+                let (offsets, _, _) = record_layout(&fields);
+                let mut lifted = Vec::with_capacity(fields.len());
+                for (field, offset) in fields.iter().zip(offsets) {
+                    lifted.push(self.load_scalar(
+                        instance,
+                        memory,
+                        u64::from(pointer) + offset as u64,
+                        field.ty,
+                    )?);
+                }
+                Ok(ComponentValue::Tuple(lifted))
             }
             ComponentType::Enum(_) | ComponentType::Flags(_) => {
                 // An enum is only ever a direct value, so it is never read from memory.
@@ -1836,6 +1914,18 @@ fn value_matches(value: &ComponentValue, ty: &ComponentType, types: &[ComponentT
                     *name == field.name && value.scalar() == Some(field.ty)
                 })
         }
+        (ComponentValue::Tuple(items), ComponentType::Tuple(index)) => {
+            match types.get(*index as usize) {
+                Some(ComponentTypeDef::Tuple(scalars)) => {
+                    items.len() == scalars.len()
+                        && items
+                            .iter()
+                            .zip(scalars)
+                            .all(|(item, scalar)| item.scalar() == Some(*scalar))
+                }
+                _ => false,
+            }
+        }
         (ComponentValue::Flags(set), ComponentType::Flags(index)) => {
             match types.get(*index as usize) {
                 Some(ComponentTypeDef::Flags(defined)) => {
@@ -1904,7 +1994,8 @@ fn lower_scalar(value: &ComponentValue) -> Option<Value> {
         | ComponentValue::List(_)
         | ComponentValue::Option(_)
         | ComponentValue::Enum(_)
-        | ComponentValue::Flags(_) => None,
+        | ComponentValue::Flags(_)
+        | ComponentValue::Tuple(_) => None,
     }
 }
 
@@ -2135,6 +2226,7 @@ fn value_type(
         Some(ComponentTypeDef::Option(_)) => Ok(ComponentType::Option(index)),
         Some(ComponentTypeDef::Enum(_)) => Ok(ComponentType::Enum(index)),
         Some(ComponentTypeDef::Flags(_)) => Ok(ComponentType::Flags(index)),
+        Some(ComponentTypeDef::Tuple(_)) => Ok(ComponentType::Tuple(index)),
         Some(ComponentTypeDef::Func(_)) => Err(ComponentError::UnsupportedType {
             what: "a function type used as a value",
             offset: at,
@@ -2194,7 +2286,8 @@ fn decode_types(
                         ComponentType::Scalar(ty) => fields.push(RecordField { name, ty }),
                         ComponentType::Option(_)
                         | ComponentType::Enum(_)
-                        | ComponentType::Flags(_) => {
+                        | ComponentType::Flags(_)
+                        | ComponentType::Tuple(_) => {
                             return Err(ComponentError::UnsupportedType {
                                 what: "an option or an enum in a record",
                                 offset: at_field,
@@ -2230,7 +2323,8 @@ fn decode_types(
                     | ComponentType::List(_)
                     | ComponentType::Option(_)
                     | ComponentType::Enum(_)
-                    | ComponentType::Flags(_) => {
+                    | ComponentType::Flags(_)
+                    | ComponentType::Tuple(_) => {
                         return Err(ComponentError::UnsupportedType {
                             what: "an option of a record, list, or option",
                             offset: payload_at,
@@ -2238,6 +2332,32 @@ fn decode_types(
                     }
                 };
                 types.push(ComponentTypeDef::Option(payload));
+            }
+            TYPE_TUPLE => {
+                let count = reader.u32()?;
+                if count == 0 {
+                    return Err(ComponentError::Malformed { offset: at });
+                }
+                let mut scalars = Vec::new();
+                for _ in 0..count {
+                    let at_type = reader.position();
+                    match value_type(reader, types)? {
+                        ComponentType::Scalar(Scalar::String) => {
+                            return Err(ComponentError::UnsupportedType {
+                                what: "a string in a tuple",
+                                offset: at_type,
+                            })
+                        }
+                        ComponentType::Scalar(scalar) => scalars.push(scalar),
+                        _ => {
+                            return Err(ComponentError::UnsupportedType {
+                                what: "a compound type in a tuple",
+                                offset: at_type,
+                            })
+                        }
+                    }
+                }
+                types.push(ComponentTypeDef::Tuple(scalars));
             }
             TYPE_FLAGS => {
                 let label_count = reader.u32()?;
@@ -2285,7 +2405,8 @@ fn decode_types(
                     | ComponentType::List(_)
                     | ComponentType::Option(_)
                     | ComponentType::Enum(_)
-                    | ComponentType::Flags(_) => {
+                    | ComponentType::Flags(_)
+                    | ComponentType::Tuple(_) => {
                         return Err(ComponentError::UnsupportedType {
                             what: "a list of records, lists, or options",
                             offset: element_at,
@@ -2346,6 +2467,7 @@ fn decode_imports(
                     | ComponentType::Option(_)
                     | ComponentType::Enum(_)
                     | ComponentType::Flags(_)
+                    | ComponentType::Tuple(_)
             )
         });
         if has_record {
@@ -2425,6 +2547,7 @@ fn decode_canon(
                                     | ComponentType::Option(_)
                                     | ComponentType::Enum(_)
                                     | ComponentType::Flags(_)
+                                    | ComponentType::Tuple(_)
                             )
                     }) {
                         return Err(ComponentError::UnsupportedCanon {
