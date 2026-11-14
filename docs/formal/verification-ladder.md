@@ -115,11 +115,23 @@ store; the two memory theorems are what rule that out.
   exposed a bug in the model: `deadBlock` had been tested against the uses of the
   instructions *before* each one, not after, and so deleted values that later
   instructions read. The model now runs backwards, as `tpt-wasm-opt::dce` does.
-* **CFG simplification.** Not started. This is the one pass of the three that
-  moves control flow, so it needs the whole function rather than a block body, and
-  the reachability argument the Rust `graph` pass had to get right (see the
-  `thread_empty_blocks` and `merge_blocks` comments there for the two
-  arity-substitution bugs the spec suite found).
+* **CFG simplification.** Partly proved. Unreachable-block removal is sound over
+  whole functions (`TptWasm.Proofs.CFG.prune_sound` and `prune_reachable_sound`), and
+  empty-block threading preserves behaviour (`TptWasm.Proofs.Threading.thread_behaviour`).
+  Threading assumes that an edge into a chain carries no values, which the verifier's
+  arity rule guarantees. Block merging is proved over whole functions
+  (`TptWasm.Proofs.MergeBlocks.merge_behaviour`), under the pass's own conditions
+  (`MergeCtx`): a single predecessor, matching arity, parameters read only in their
+  block, and unique identifiers and definitions. Constant-condition folding is proved
+  over whole functions (`TptWasm.Proofs.FoldWhole.fold_behaviour`), from a dominance
+  invariant over the block graph (`TptWasm.Dominance`) and the verifier's checks, which
+  are stated as the `FoldCtx` hypotheses.
+* **Refinement of the Rust passes.** Translation validation, not proof:
+  `crates/tpt-wasm-opt/tests/translation_validation.rs` checks the CFG simplification
+  pass against the Lean model on generated functions in the modelled subset (opt-in,
+  with `TPT_TRANSLATION_VALIDATION=1`). It includes loops, agrees on every generated case,
+  and a corrupted copy is caught. It covers no locals, memory, or floats, so it is evidence
+  on a subset.
 * **Whole-function equivalence**, which needs the liveness computation the
   body-level statements take as a premise.
 * **Trap position under the fuel-bounded run**, which needs the multi-block run
