@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope and the core-instance section, and instantiates core instances, with each import bound to an earlier core instance; inline exports and the WIT mapping are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope and the core-instance section, and the alias section for core functions, and instantiates core instances with imports bound to earlier instances or to inline exports; the type and import checks and the WIT mapping are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -51,11 +51,18 @@ instances already declared, which is checked at decode time, and a name may be b
 Each core instance gets a linker of its own, through `Engine::instantiate_bytes_with_linker`,
 so one instance's imports cannot leak into another.
 
-Decided on the recommendation: an inline-exports instance is refused. It names core
-functions by index in the core export index space, which the alias section defines.
+The alias section (id 6) defines core functions: an alias takes an export of an earlier
+core instance that is a module instance. Other alias forms (other core sorts, outer aliases,
+aliases of component exports, and aliases of inline-exports instances) are refused.
 
-Not done: the alias section, inline exports, the component's type and import checks,
-canonical lifting and lowering, and the WIT mapping to capabilities.
+An inline-exports instance (`0x01`) groups core functions under names, and creates no
+runtime instance of its own. An import bound to it resolves each name to the function it
+names, through `Linker::define_export`, and a call into it runs that function in the
+instance that defines it. Each name is checked at instantiation, so a missing export is an
+error then, not at the first call.
+
+Not done: the component's type and import checks, canonical lifting and lowering, and the
+WIT mapping to capabilities.
 
 ## Design constraint
 

@@ -522,6 +522,41 @@ impl Linker {
         Ok(self)
     }
 
+    /// Register one export of `instance` under `module` and `name`, so an import of that name
+    /// resolves to the export `export` of the instance. A component uses this to bind an
+    /// import to one function of an instance, rather than to all of its exports.
+    pub fn define_export(
+        &mut self,
+        module: impl Into<String>,
+        name: impl Into<String>,
+        instance: &Instance,
+        export: &str,
+    ) -> Result<&mut Self, RuntimeError> {
+        let module = module.into();
+        let name = name.into();
+        let desc = *instance
+            .exports
+            .get(export)
+            .ok_or_else(|| RuntimeError::UnknownExport(export.to_owned()))?;
+        if self
+            .definitions
+            .contains_key(&(module.clone(), name.clone()))
+        {
+            return Err(RuntimeError::DuplicateDefinition { module, name });
+        }
+        let store = lock_store(&instance.context.store)?;
+        let address = export_address(&store, instance.index, desc)?;
+        drop(store);
+        self.definitions.insert(
+            (module, name),
+            LinkerDefinition::Instance(ExternalExport {
+                context: instance.context.clone(),
+                address,
+            }),
+        );
+        Ok(self)
+    }
+
     fn instance_context(&self) -> Result<Option<RuntimeContext>, RuntimeError> {
         let mut selected: Option<RuntimeContext> = None;
         for definition in self.definitions.values() {

@@ -2,14 +2,15 @@
 // Copyright (c) 2026 TPT Solutions
 
 #![forbid(unsafe_code)]
-//! The Component Model envelope and its core instances.
+//! The Component Model envelope, its aliases, and its core instances.
 //!
 //! A component is a binary with the Core Wasm magic, the version `0x0d` and the layer
 //! `0x01`, so it cannot be mistaken for a core module, whose layer is zero. After the
 //! preamble comes a sequence of sections: each is an id byte, a `u32` size, and the
 //! contents. This crate reads that framing, collects the core modules a component nests,
-//! and decodes the core-instance section (id 2). Every other section, and every instance
-//! form it does not implement, is refused rather than skipped.
+//! decodes the alias section (id 6) and the core-instance section (id 2), and runs the
+//! instances on a runtime `Engine`. Every other section, and every form it does not
+//! implement, is refused rather than skipped.
 
 use std::fmt;
 
@@ -25,13 +26,21 @@ const SECTION_CUSTOM: u8 = 0;
 const SECTION_CORE_MODULE: u8 = 1;
 /// The section id of core instances.
 const SECTION_CORE_INSTANCE: u8 = 2;
+/// The section id of aliases.
+const SECTION_ALIAS: u8 = 6;
 
 /// The core-instance expression tag that instantiates a module.
 const INSTANTIATE: u8 = 0x00;
 /// The core-instance expression tag that builds an instance from inline exports.
 const INLINE_EXPORTS: u8 = 0x01;
+/// The sort wrapper that marks a core sort in an alias.
+const SORT_CORE_WRAPPER: u8 = 0x00;
+/// The core sort of a function.
+const SORT_CORE_FUNC: u8 = 0x00;
 /// The sort byte of a core instance, which an instance argument names.
 const SORT_CORE_INSTANCE: u8 = 0x12;
+/// The alias tag that takes an export of a core instance.
+const ALIAS_CORE_EXPORT: u8 = 0x01;
 
 /// Why a component was refused or could not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,14 +56,18 @@ pub enum ComponentError {
     UnsupportedSection { id: u8, offset: usize },
     /// An instance form this crate does not implement yet.
     UnsupportedInstance { what: &'static str, offset: usize },
-    /// A tag or index that the grammar does not allow here.
+    /// An alias form this crate does not implement yet.
+    UnsupportedAlias { what: &'static str, offset: usize },
+    /// A tag or index that the grammar does not allow here, or a name that is not UTF-8.
     Malformed { offset: usize },
     /// A core instance names a module the component does not nest.
     NoSuchModule { module: u32 },
-    /// A core instance could not be instantiated, with the runtime's reason.
-    Instantiate { instance: usize, message: String },
-    /// No core instance has this index.
+    /// A reference names a core instance that is not declared before it.
     NoSuchInstance { instance: usize },
+    /// A reference names a core function that no alias defines before it.
+    NoSuchFunction { function: u32 },
+    /// A core instance could not be created, with the runtime's reason.
+    Instantiate { instance: usize, message: String },
     /// A call into a core instance failed, with the runtime's reason.
     Call { instance: usize, message: String },
 }
@@ -75,6 +88,9 @@ impl fmt::Display for ComponentError {
             ComponentError::UnsupportedInstance { what, offset } => {
                 write!(f, "{what} at byte {offset} is not supported yet")
             }
+            ComponentError::UnsupportedAlias { what, offset } => {
+                write!(f, "{what} at byte {offset} is not supported yet")
+            }
             ComponentError::Malformed { offset } => write!(f, "malformed entry at byte {offset}"),
             ComponentError::NoSuchModule { module } => {
                 write!(
@@ -82,11 +98,20 @@ impl fmt::Display for ComponentError {
                     "core instance names module {module}, which the component does not nest"
                 )
             }
+            ComponentError::NoSuchInstance { instance } => {
+                write!(
+                    f,
+                    "there is no core instance {instance} declared before this use"
+                )
+            }
+            ComponentError::NoSuchFunction { function } => {
+                write!(
+                    f,
+                    "there is no core function {function} defined before this use"
+                )
+            }
             ComponentError::Instantiate { instance, message } => {
                 write!(f, "core instance {instance} did not instantiate: {message}")
-            }
-            ComponentError::NoSuchInstance { instance } => {
-                write!(f, "there is no core instance {instance}")
             }
             ComponentError::Call { instance, message } => {
                 write!(f, "a call into core instance {instance} failed: {message}")
@@ -106,6 +131,10 @@ pub enum CoreInstance {
         module: u32,
         arguments: Vec<InstanceArgument>,
     },
+    /// A core instance that exists only to group functions: each export is one function of
+    /// the core function index space. Nothing runs for it; calling one of its exports runs
+    /// the function it names.
+    FromExports { exports: Vec<InlineExport> },
 }
 
 /// One instance argument: every import of the instantiated module under `name` resolves to
@@ -118,11 +147,31 @@ pub struct InstanceArgument {
     pub instance: u32,
 }
 
-/// A decoded component envelope: the core modules it nests, and the core instances it
-/// declares, in the order they appear.
+/// One export of an inline-exports instance: a name for a core function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineExport {
+    /// The export name.
+    pub name: String,
+    /// The index of the core function, in the core function index space.
+    pub function: u32,
+}
+
+/// One entry of the core function index space: an export of a core instance, named by an
+/// alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreFunction {
+    /// The index of the core instance that exports the function.
+    pub instance: u32,
+    /// The name of the export.
+    pub export: String,
+}
+
+/// A decoded component envelope: the core modules it nests, the core functions its aliases
+/// define, and the core instances it declares, in the order they appear.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Component {
     core_modules: Vec<Vec<u8>>,
+    core_functions: Vec<CoreFunction>,
     core_instances: Vec<CoreInstance>,
 }
 
@@ -143,19 +192,20 @@ impl Component {
                 .checked_add(size as usize)
                 .filter(|end| *end <= bytes.len())
                 .ok_or(ComponentError::Truncated { offset: start })?;
+            let mut section = Reader::new(bytes, start, end);
             match id {
                 SECTION_CUSTOM => {}
                 SECTION_CORE_MODULE => component.core_modules.push(bytes[start..end].to_vec()),
-                SECTION_CORE_INSTANCE => {
-                    // The instances must fill the section exactly, with no bytes left over.
-                    let mut section = Reader::new(bytes, start, end);
-                    decode_instances(&mut section, &mut component.core_instances)?;
-                    if !section.at_end() {
-                        return Err(ComponentError::Malformed {
-                            offset: section.position(),
-                        });
-                    }
-                }
+                SECTION_ALIAS => decode_aliases(
+                    &mut section,
+                    &component.core_instances,
+                    &mut component.core_functions,
+                )?,
+                SECTION_CORE_INSTANCE => decode_instances(
+                    &mut section,
+                    &component.core_functions,
+                    &mut component.core_instances,
+                )?,
                 other => {
                     return Err(ComponentError::UnsupportedSection {
                         id: other,
@@ -163,12 +213,19 @@ impl Component {
                     })
                 }
             }
+            // The aliases and instances must fill their sections exactly.
+            if matches!(id, SECTION_ALIAS | SECTION_CORE_INSTANCE) && !section.at_end() {
+                return Err(ComponentError::Malformed {
+                    offset: section.position(),
+                });
+            }
             reader = Reader::new(bytes, end, bytes.len());
         }
         for instance in &component.core_instances {
-            let CoreInstance::Instantiate { module, .. } = instance;
-            if *module as usize >= component.core_modules.len() {
-                return Err(ComponentError::NoSuchModule { module: *module });
+            if let CoreInstance::Instantiate { module, .. } = instance {
+                if *module as usize >= component.core_modules.len() {
+                    return Err(ComponentError::NoSuchModule { module: *module });
+                }
             }
         }
         Ok(component)
@@ -179,6 +236,11 @@ impl Component {
         &self.core_modules
     }
 
+    /// The core functions the component's aliases define, in index order.
+    pub fn core_functions(&self) -> &[CoreFunction] {
+        &self.core_functions
+    }
+
     /// The core instances the component declares, in order.
     pub fn core_instances(&self) -> &[CoreInstance] {
         &self.core_instances
@@ -187,59 +249,155 @@ impl Component {
     /// Instantiate each core instance, in order, on `engine`. A component with no core
     /// instances runs nothing.
     pub fn instantiate(&self, engine: &Engine) -> Result<ComponentInstance, ComponentError> {
-        let mut instances: Vec<Instance> = Vec::with_capacity(self.core_instances.len());
+        let mut slots: Vec<Slot> = Vec::with_capacity(self.core_instances.len());
         for (index, instance) in self.core_instances.iter().enumerate() {
-            let CoreInstance::Instantiate { module, arguments } = instance;
-            let bytes = &self.core_modules[*module as usize];
-            // Each core instance gets a linker of its own, so one instance's imports cannot
-            // leak into another.
-            let mut linker = Linker::new();
-            for argument in arguments {
-                let source = &instances[argument.instance as usize];
-                linker
-                    .define_instance(argument.name.as_str(), source)
-                    .map_err(|error| ComponentError::Instantiate {
-                        instance: index,
-                        message: error.to_string(),
-                    })?;
-            }
-            let runtime = engine
-                .instantiate_bytes_with_linker(bytes, &linker)
-                .map_err(|error| ComponentError::Instantiate {
-                    instance: index,
-                    message: error.to_string(),
-                })?;
-            instances.push(runtime);
+            let slot = match instance {
+                CoreInstance::Instantiate { module, arguments } => {
+                    let bytes = &self.core_modules[*module as usize];
+                    // Each core instance gets a linker of its own, so one instance's imports
+                    // cannot leak into another.
+                    let mut linker = Linker::new();
+                    for argument in arguments {
+                        bind(
+                            &mut linker,
+                            &argument.name,
+                            &slots,
+                            argument.instance as usize,
+                        )
+                        .map_err(|message| {
+                            ComponentError::Instantiate {
+                                instance: index,
+                                message,
+                            }
+                        })?;
+                    }
+                    let runtime = engine
+                        .instantiate_bytes_with_linker(bytes, &linker)
+                        .map_err(|error| ComponentError::Instantiate {
+                            instance: index,
+                            message: error.to_string(),
+                        })?;
+                    Slot::Runtime(Box::new(runtime))
+                }
+                CoreInstance::FromExports { exports } => {
+                    let mut bound = Vec::with_capacity(exports.len());
+                    for export in exports {
+                        let function = &self.core_functions[export.function as usize];
+                        let Slot::Runtime(source) = &slots[function.instance as usize] else {
+                            return Err(ComponentError::Instantiate {
+                                instance: index,
+                                message: "an alias names an inline-exports instance".to_owned(),
+                            });
+                        };
+                        // Check now that the export exists, so a missing one is an error here
+                        // and not at the first call.
+                        source.get_function(&function.export).map_err(|error| {
+                            ComponentError::Instantiate {
+                                instance: index,
+                                message: error.to_string(),
+                            }
+                        })?;
+                        bound.push(BoundExport {
+                            name: export.name.clone(),
+                            source: function.instance as usize,
+                            export: function.export.clone(),
+                        });
+                    }
+                    Slot::Exports(bound)
+                }
+            };
+            slots.push(slot);
         }
-        Ok(ComponentInstance { instances })
+        Ok(ComponentInstance { slots })
+    }
+}
+
+/// One core instance as it exists at run time.
+#[derive(Debug)]
+enum Slot {
+    /// An instance created on the engine. Boxed, so the variants stay close in size.
+    Runtime(Box<Instance>),
+    /// An inline-exports instance: each export names a function of a runtime instance.
+    Exports(Vec<BoundExport>),
+}
+
+/// One export of an inline-exports instance, resolved to the instance that runs it.
+#[derive(Debug)]
+struct BoundExport {
+    name: String,
+    source: usize,
+    export: String,
+}
+
+/// Bind the import module `module` to the core instance at `instance`: a runtime instance
+/// binds all of its exports, and an inline-exports instance binds each of its functions to
+/// the export that runs it.
+fn bind(linker: &mut Linker, module: &str, slots: &[Slot], instance: usize) -> Result<(), String> {
+    match &slots[instance] {
+        Slot::Runtime(runtime) => linker
+            .define_instance(module, runtime)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Slot::Exports(bound) => {
+            for export in bound {
+                let Slot::Runtime(source) = &slots[export.source] else {
+                    return Err("an alias names an inline-exports instance".to_owned());
+                };
+                linker
+                    .define_export(module, export.name.as_str(), source, &export.export)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
     }
 }
 
 /// The core instances of a running component, in the order the component declares them.
 #[derive(Debug)]
 pub struct ComponentInstance {
-    instances: Vec<Instance>,
+    slots: Vec<Slot>,
 }
 
 impl ComponentInstance {
     /// How many core instances the component has.
     pub fn core_instance_count(&self) -> usize {
-        self.instances.len()
+        self.slots.len()
     }
 
-    /// Call an export of core instance `instance`.
+    /// Call an export of core instance `instance`. For an inline-exports instance, the call
+    /// runs the function it names, in the instance that defines it.
     pub fn call_core(
         &mut self,
         instance: usize,
         name: &str,
         args: Vec<Value>,
     ) -> Result<Vec<Value>, ComponentError> {
-        let runtime = self
-            .instances
-            .get_mut(instance)
-            .ok_or(ComponentError::NoSuchInstance { instance })?;
+        let (target, export) = match self
+            .slots
+            .get(instance)
+            .ok_or(ComponentError::NoSuchInstance { instance })?
+        {
+            Slot::Runtime(_) => (instance, name.to_owned()),
+            Slot::Exports(bound) => {
+                let export = bound
+                    .iter()
+                    .find(|export| export.name == name)
+                    .ok_or_else(|| ComponentError::Call {
+                        instance,
+                        message: format!("there is no export named {name}"),
+                    })?;
+                (export.source, export.export.clone())
+            }
+        };
+        let Slot::Runtime(runtime) = &mut self.slots[target] else {
+            return Err(ComponentError::Call {
+                instance,
+                message: "the export's source is not a runtime instance".to_owned(),
+            });
+        };
         runtime
-            .call(name, args)
+            .call(&export, args)
             .map_err(|error| ComponentError::Call {
                 instance,
                 message: error.to_string(),
@@ -247,11 +405,58 @@ impl ComponentInstance {
     }
 }
 
+/// Decode an alias section's contents: a count, then each alias. Only an export of a core
+/// instance that is a module instance defines a core function, so the other forms are refused.
+fn decode_aliases(
+    reader: &mut Reader<'_>,
+    instances: &[CoreInstance],
+    functions: &mut Vec<CoreFunction>,
+) -> Result<(), ComponentError> {
+    let count = reader.u32()?;
+    for _ in 0..count {
+        let at = reader.position();
+        if reader.byte()? != SORT_CORE_WRAPPER {
+            return Err(ComponentError::UnsupportedAlias {
+                what: "alias of a non-core sort",
+                offset: at,
+            });
+        }
+        if reader.byte()? != SORT_CORE_FUNC {
+            return Err(ComponentError::UnsupportedAlias {
+                what: "alias of a core sort other than function",
+                offset: at,
+            });
+        }
+        if reader.byte()? != ALIAS_CORE_EXPORT {
+            return Err(ComponentError::UnsupportedAlias {
+                what: "outer alias",
+                offset: at,
+            });
+        }
+        let instance = reader.u32()?;
+        let export = reader.name()?;
+        let source = instances
+            .get(instance as usize)
+            .ok_or(ComponentError::NoSuchInstance {
+                instance: instance as usize,
+            })?;
+        if let CoreInstance::FromExports { .. } = source {
+            return Err(ComponentError::UnsupportedAlias {
+                what: "alias of an inline-exports instance",
+                offset: at,
+            });
+        }
+        functions.push(CoreFunction { instance, export });
+    }
+    Ok(())
+}
+
 /// Decode a core-instance section's contents: a count, then each instance expression, which
-/// are appended to `instances`. An argument may name only an instance declared before it,
-/// so every index is checked against the instances already there.
+/// are appended to `instances`. An argument or an inline export may name only what is
+/// already declared, so every index is checked against what is there.
 fn decode_instances(
     reader: &mut Reader<'_>,
+    functions: &[CoreFunction],
     instances: &mut Vec<CoreInstance>,
 ) -> Result<(), ComponentError> {
     let count = reader.u32()?;
@@ -282,10 +487,27 @@ fn decode_instances(
                 instances.push(CoreInstance::Instantiate { module, arguments });
             }
             INLINE_EXPORTS => {
-                return Err(ComponentError::UnsupportedInstance {
-                    what: "inline exports",
-                    offset: at,
-                })
+                let export_count = reader.u32()?;
+                let mut exports: Vec<InlineExport> = Vec::new();
+                for _ in 0..export_count {
+                    let name = reader.name()?;
+                    let sort_at = reader.position();
+                    if reader.byte()? != SORT_CORE_FUNC {
+                        return Err(ComponentError::UnsupportedInstance {
+                            what: "inline export of a sort other than function",
+                            offset: sort_at,
+                        });
+                    }
+                    let function = reader.u32()?;
+                    if function as usize >= functions.len() {
+                        return Err(ComponentError::NoSuchFunction { function });
+                    }
+                    if exports.iter().any(|export| export.name == name) {
+                        return Err(ComponentError::Malformed { offset: sort_at });
+                    }
+                    exports.push(InlineExport { name, function });
+                }
+                instances.push(CoreInstance::FromExports { exports });
             }
             _ => return Err(ComponentError::Malformed { offset: at }),
         }
@@ -404,11 +626,57 @@ mod tests {
         section
     }
 
+    /// Core instance 0 instantiates module 0 with no arguments.
+    fn instantiate_module_zero() -> Vec<u8> {
+        vec![SECTION_CORE_INSTANCE, 4, 1, INSTANTIATE, 0, 0]
+    }
+
+    /// Core function 0 is the export `answer` of core instance 0.
+    fn alias_answer() -> Vec<u8> {
+        vec![
+            SECTION_ALIAS,
+            12,
+            1,
+            SORT_CORE_WRAPPER,
+            SORT_CORE_FUNC,
+            ALIAS_CORE_EXPORT,
+            0,
+            6,
+            b'a',
+            b'n',
+            b's',
+            b'w',
+            b'e',
+            b'r',
+        ]
+    }
+
+    /// Core instance 1 is an inline-exports instance exporting core function 0 as `answer`.
+    fn inline_answer() -> Vec<u8> {
+        vec![
+            SECTION_CORE_INSTANCE,
+            12,
+            1,
+            INLINE_EXPORTS,
+            1,
+            6,
+            b'a',
+            b'n',
+            b's',
+            b'w',
+            b'e',
+            b'r',
+            SORT_CORE_FUNC,
+            0,
+        ]
+    }
+
     #[test]
     fn a_preamble_alone_is_an_empty_component() {
         let component = Component::decode(&PREAMBLE).expect("decodes");
         assert!(component.core_modules().is_empty());
         assert!(component.core_instances().is_empty());
+        assert!(component.core_functions().is_empty());
     }
 
     #[test]
@@ -487,9 +755,8 @@ mod tests {
 
     #[test]
     fn an_instantiate_of_a_nested_module_is_decoded() {
-        // One core instance: instantiate module 0 with no arguments.
         let mut bytes = with(&module_section(&ANSWER_MODULE));
-        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 4, 1, INSTANTIATE, 0, 0]);
+        bytes.extend(instantiate_module_zero());
         let component = Component::decode(&bytes).expect("decodes");
         assert_eq!(
             component.core_instances(),
@@ -510,18 +777,168 @@ mod tests {
     }
 
     #[test]
-    fn inline_exports_are_refused_for_now() {
-        let mut inline = with(&module_section(&ANSWER_MODULE));
-        inline.extend_from_slice(&[SECTION_CORE_INSTANCE, 2, 1, INLINE_EXPORTS]);
-        // 8 bytes of preamble, then the 41-byte module section, then 2 bytes of section
-        // header and 1 of count: the tag is at byte 52.
+    fn an_instance_section_with_leftover_bytes_is_malformed() {
+        let mut bytes = with(&module_section(&ANSWER_MODULE));
+        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 5, 0, 0xff, 0xff, 0xff, 0xff]);
+        assert!(matches!(
+            Component::decode(&bytes),
+            Err(ComponentError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn an_alias_of_a_core_export_defines_a_core_function() {
+        let mut bytes = with(&module_section(&ANSWER_MODULE));
+        bytes.extend(instantiate_module_zero());
+        bytes.extend(alias_answer());
+        let component = Component::decode(&bytes).expect("decodes");
         assert_eq!(
-            Component::decode(&inline),
-            Err(ComponentError::UnsupportedInstance {
-                what: "inline exports",
-                offset: 52,
+            component.core_functions(),
+            [CoreFunction {
+                instance: 0,
+                export: "answer".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_alias_of_an_undeclared_instance_is_refused() {
+        let mut bytes = with(&module_section(&ANSWER_MODULE));
+        bytes.extend(alias_answer());
+        assert_eq!(
+            Component::decode(&bytes),
+            Err(ComponentError::NoSuchInstance { instance: 0 })
+        );
+    }
+
+    #[test]
+    fn an_alias_of_another_core_sort_is_refused() {
+        // A table: core sort 1 instead of function.
+        let bytes = with(&[
+            SECTION_ALIAS,
+            6,
+            1,
+            SORT_CORE_WRAPPER,
+            1,
+            ALIAS_CORE_EXPORT,
+            0,
+            0,
+        ]);
+        assert_eq!(
+            Component::decode(&bytes),
+            Err(ComponentError::UnsupportedAlias {
+                what: "alias of a core sort other than function",
+                offset: 11,
             })
         );
+    }
+
+    #[test]
+    fn an_inline_export_of_a_missing_function_is_refused() {
+        let mut bytes = with(&module_section(&ANSWER_MODULE));
+        bytes.extend(instantiate_module_zero());
+        bytes.extend(inline_answer_naming(3));
+        assert_eq!(
+            Component::decode(&bytes),
+            Err(ComponentError::NoSuchFunction { function: 3 })
+        );
+    }
+
+    /// An inline-exports instance exporting `answer` as the function with index `function`.
+    fn inline_answer_naming(function: u8) -> Vec<u8> {
+        let mut section = inline_answer();
+        let last = section.len() - 1;
+        section[last] = function;
+        section
+    }
+
+    #[test]
+    fn an_inline_exports_instance_runs_the_function_it_names() {
+        let mut bytes = with(&module_section(&ANSWER_MODULE));
+        bytes.extend(instantiate_module_zero());
+        bytes.extend(alias_answer());
+        bytes.extend(inline_answer());
+        let component = Component::decode(&bytes).expect("decodes");
+        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
+        let mut instance = component.instantiate(&engine).expect("instantiates");
+        assert_eq!(instance.core_instance_count(), 2);
+        assert_eq!(
+            instance.call_core(1, "answer", Vec::new()),
+            Ok(vec![Value::I32(42)])
+        );
+        assert_eq!(
+            instance.call_core(0, "answer", Vec::new()),
+            Ok(vec![Value::I32(42)])
+        );
+        assert!(matches!(
+            instance.call_core(1, "missing", Vec::new()),
+            Err(ComponentError::Call { instance: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn an_import_binds_to_an_inline_export() {
+        let mut bytes = with(&module_section(&ANSWER_MODULE));
+        bytes.extend(module_section(&RELAY_MODULE));
+        bytes.extend(instantiate_module_zero());
+        bytes.extend(alias_answer());
+        bytes.extend(inline_answer());
+        // Core instance 2 instantiates module 1 (relay) with "env" bound to instance 1.
+        bytes.extend_from_slice(&[
+            SECTION_CORE_INSTANCE,
+            10,
+            1,
+            INSTANTIATE,
+            1,
+            1,
+            3,
+            b'e',
+            b'n',
+            b'v',
+            SORT_CORE_INSTANCE,
+            1,
+        ]);
+        let component = Component::decode(&bytes).expect("decodes");
+        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
+        let mut instance = component.instantiate(&engine).expect("instantiates");
+        assert_eq!(
+            instance.call_core(2, "relay", Vec::new()),
+            Ok(vec![Value::I32(42)])
+        );
+    }
+
+    #[test]
+    fn an_inline_export_of_a_name_the_source_lacks_fails_at_instantiation() {
+        let mut bytes = with(&module_section(&ANSWER_MODULE));
+        bytes.extend(instantiate_module_zero());
+        // An alias to "missing", which the module does not export.
+        bytes.extend_from_slice(&[
+            SECTION_ALIAS,
+            13,
+            1,
+            SORT_CORE_WRAPPER,
+            SORT_CORE_FUNC,
+            ALIAS_CORE_EXPORT,
+            0,
+            7,
+            b'm',
+            b'i',
+            b's',
+            b's',
+            b'i',
+            b'n',
+            b'g',
+        ]);
+        bytes.extend(inline_answer());
+        let component = Component::decode(&bytes).expect("decodes");
+        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
+        let error = component
+            .instantiate(&engine)
+            .expect_err("the export is missing");
+        assert!(matches!(
+            error,
+            ComponentError::Instantiate { instance: 1, .. }
+        ));
     }
 
     #[test]
@@ -551,7 +968,7 @@ mod tests {
     #[test]
     fn a_duplicate_argument_name_is_malformed() {
         let mut bytes = with(&module_section(&RELAY_MODULE));
-        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 4, 1, INSTANTIATE, 0, 0]);
+        bytes.extend(instantiate_module_zero());
         let env = [3, b'e', b'n', b'v', SORT_CORE_INSTANCE, 0];
         let mut section = vec![SECTION_CORE_INSTANCE, 16, 1, INSTANTIATE, 0, 2];
         section.extend_from_slice(&env);
@@ -564,49 +981,9 @@ mod tests {
     }
 
     #[test]
-    fn an_argument_links_an_import_to_an_earlier_instance() {
-        let mut bytes = with(&module_section(&ANSWER_MODULE));
-        bytes.extend(module_section(&RELAY_MODULE));
-        // Instance 0 is the answer module. Instance 1 is the relay module, whose import
-        // env.answer is bound to instance 0.
-        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 4, 1, INSTANTIATE, 0, 0]);
-        bytes.extend_from_slice(&[
-            SECTION_CORE_INSTANCE,
-            10,
-            1,
-            INSTANTIATE,
-            1,
-            1,
-            3,
-            b'e',
-            b'n',
-            b'v',
-            SORT_CORE_INSTANCE,
-            0,
-        ]);
-        let component = Component::decode(&bytes).expect("decodes");
-        assert_eq!(
-            component.core_instances()[1],
-            CoreInstance::Instantiate {
-                module: 1,
-                arguments: vec![InstanceArgument {
-                    name: "env".to_owned(),
-                    instance: 0,
-                }],
-            }
-        );
-        let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
-        let mut instance = component.instantiate(&engine).expect("instantiates");
-        assert_eq!(
-            instance.call_core(1, "relay", Vec::new()),
-            Ok(vec![Value::I32(42)])
-        );
-    }
-
-    #[test]
     fn an_unresolved_import_fails_to_instantiate() {
         let mut bytes = with(&module_section(&RELAY_MODULE));
-        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 4, 1, INSTANTIATE, 0, 0]);
+        bytes.extend(instantiate_module_zero());
         let component = Component::decode(&bytes).expect("decodes");
         let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
         let error = component
@@ -619,19 +996,9 @@ mod tests {
     }
 
     #[test]
-    fn an_instance_section_with_leftover_bytes_is_malformed() {
-        let mut bytes = with(&module_section(&ANSWER_MODULE));
-        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 5, 0, 0xff, 0xff, 0xff, 0xff]);
-        assert!(matches!(
-            Component::decode(&bytes),
-            Err(ComponentError::Malformed { .. })
-        ));
-    }
-
-    #[test]
     fn a_nested_module_instantiates_and_its_export_runs() {
         let mut bytes = with(&module_section(&ANSWER_MODULE));
-        bytes.extend_from_slice(&[SECTION_CORE_INSTANCE, 4, 1, INSTANTIATE, 0, 0]);
+        bytes.extend(instantiate_module_zero());
         let component = Component::decode(&bytes).expect("decodes");
         let engine = Engine::new(tpt_wasm_runtime::Config::default()).expect("engine");
         let mut instance = component.instantiate(&engine).expect("instantiates");
