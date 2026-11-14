@@ -10,8 +10,9 @@
 //! import carries it, with the function after `#`. That `#` form is this crate's convention, since
 //! the Component Model names an interface import as a whole instance.
 //!
-//! An interface that a world imports from outside the document is refused by name, because its
-//! functions are not in this document. Comments are `//` and nested `/* */`, as WIT has them.
+//! An interface a world imports is found in the document, or, given several documents, in the one
+//! whose package has the path's name and version. An interface found in none is refused by name.
+//! Comments are `//` and nested `/* */`, as WIT has them.
 
 use std::fmt;
 
@@ -154,32 +155,7 @@ impl WitDocument {
     /// The capability ids of a world's imports, in the order the world lists them. A function
     /// import gives its own name. An interface import gives one id for each of its functions.
     pub fn capability_ids(&self, world: &str) -> Result<Vec<String>, WitError> {
-        let world_def = self
-            .worlds
-            .iter()
-            .find(|candidate| candidate.name == world)
-            .ok_or_else(|| WitError::NoSuchWorld(world.to_owned()))?;
-        let mut ids = Vec::new();
-        for import in &world_def.imports {
-            match import {
-                WitImport::Function(function) => ids.push(function.name.clone()),
-                WitImport::Interface(path) => {
-                    let interface = self
-                        .interfaces
-                        .iter()
-                        .find(|candidate| candidate.name == *path)
-                        .ok_or_else(|| WitError::UnresolvedInterface {
-                            world: world_def.name.clone(),
-                            interface: path.clone(),
-                        })?;
-                    let prefix = self.interface_name(&interface.name)?;
-                    for function in &interface.functions {
-                        ids.push(format!("{prefix}#{}", function.name));
-                    }
-                }
-            }
-        }
-        Ok(ids)
+        capability_ids_across(std::slice::from_ref(self), 0, world)
     }
 
     /// The name a component import gives an interface of this document: `namespace:package/name`,
@@ -193,6 +169,82 @@ impl WitDocument {
         }
         Ok(full)
     }
+}
+
+/// The capability ids of the world named `world` in `documents[index]`. An interface the world
+/// imports is looked up by the document's own names, or, when the import is a path, in the
+/// document whose package has that name and version.
+pub fn capability_ids_across(
+    documents: &[WitDocument],
+    index: usize,
+    world: &str,
+) -> Result<Vec<String>, WitError> {
+    let home = documents
+        .get(index)
+        .ok_or_else(|| WitError::NoSuchWorld(world.to_owned()))?;
+    let world_def = home
+        .worlds
+        .iter()
+        .find(|candidate| candidate.name == world)
+        .ok_or_else(|| WitError::NoSuchWorld(world.to_owned()))?;
+    let mut ids = Vec::new();
+    for import in &world_def.imports {
+        match import {
+            WitImport::Function(function) => ids.push(function.name.clone()),
+            WitImport::Interface(path) => {
+                let (owner, interface) =
+                    find_interface(documents, index, path).ok_or_else(|| {
+                        WitError::UnresolvedInterface {
+                            world: world_def.name.clone(),
+                            interface: path.clone(),
+                        }
+                    })?;
+                let prefix = owner.interface_name(&interface.name)?;
+                for function in &interface.functions {
+                    ids.push(format!("{prefix}#{}", function.name));
+                }
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// The document and the interface a world's import names. A plain name is an interface of the
+/// document at `home`. A path `namespace:package/interface@version` is an interface of the document
+/// whose package has that name, and that version when the path gives one.
+fn find_interface<'a>(
+    documents: &'a [WitDocument],
+    home: usize,
+    path: &str,
+) -> Option<(&'a WitDocument, &'a WitInterface)> {
+    let Some((package_path, rest)) = path.split_once('/') else {
+        let document = documents.get(home)?;
+        let interface = document
+            .interfaces
+            .iter()
+            .find(|candidate| candidate.name == path)?;
+        return Some((document, interface));
+    };
+    let (interface_name, version) = match rest.split_once('@') {
+        Some((name, version)) => (name, Some(version)),
+        None => (rest, None),
+    };
+    documents.iter().find_map(|document| {
+        let package = document.package.as_ref()?;
+        if package.unversioned() != package_path {
+            return None;
+        }
+        if let Some(wanted) = version {
+            if package.version.as_deref() != Some(wanted) {
+                return None;
+            }
+        }
+        let interface = document
+            .interfaces
+            .iter()
+            .find(|candidate| candidate.name == interface_name)?;
+        Some((document, interface))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -616,6 +668,42 @@ world imports {
         assert_eq!(
             document.capability_ids("w"),
             Ok(vec!["local:demo/foo#a".to_owned()])
+        );
+    }
+
+    #[test]
+    fn an_interface_of_another_document_is_found_by_its_package_path() {
+        let wasi = WitDocument::parse(
+            "package wasi:io@0.2.0;\ninterface poll { ready: func() -> bool; }\n",
+        )
+        .expect("parses");
+        let app = WitDocument::parse(
+            "package local:app;\nworld w { import wasi:io/poll@0.2.0; import ping: func(); }\n",
+        )
+        .expect("parses");
+        let documents = [app.clone(), wasi.clone()];
+        assert_eq!(
+            capability_ids_across(&documents, 0, "w"),
+            Ok(vec![
+                "wasi:io/poll@0.2.0#ready".to_owned(),
+                "ping".to_owned(),
+            ])
+        );
+        // A version the other package does not have does not resolve.
+        let wrong =
+            WitDocument::parse("package local:app;\nworld w { import wasi:io/poll@0.1.0; }\n")
+                .expect("parses");
+        assert!(matches!(
+            capability_ids_across(&[wrong, wasi.clone()], 0, "w"),
+            Err(WitError::UnresolvedInterface { .. })
+        ));
+        // A path without a version finds the package whatever its version.
+        let unversioned =
+            WitDocument::parse("package local:app;\nworld w { import wasi:io/poll; }\n")
+                .expect("parses");
+        assert_eq!(
+            capability_ids_across(&[unversioned, wasi], 0, "w"),
+            Ok(vec!["wasi:io/poll@0.2.0#ready".to_owned()])
         );
     }
 

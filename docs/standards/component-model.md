@@ -212,12 +212,12 @@ functions, and its worlds, and it reads past the types, `use`, `include`, and ex
 capabilities. A function a world imports by its own name is a capability with that name as its id. An
 interface a world imports gives one capability for each of its functions, named
 `namespace:package/interface@version#function`, the form the component gives the interface with the function
-after `#`, which is this crate's convention. An interface from outside the document is refused by name, since
-its functions are not in it. Exports and static or async functions are refused or read past as above.
+after `#`, which is this crate's convention. An interface a world imports is looked up in the document, and, across several documents, in the one whose
+package has its path and version. An interface found in none is refused by name. Exports are read past, and static or async functions are refused.
 
 
-Not done: strings and lists in lowered imports (which need the caller's memory), and WIT beyond one document:
-other packages, and the mapping of types and resources to capabilities.
+Not done: strings and lists in lowered imports (which need the caller's memory), and WIT beyond the packages given:
+the mapping of types and resources to capabilities, and fetching the packages a document names.
 
 
 
