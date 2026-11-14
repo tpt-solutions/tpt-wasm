@@ -671,6 +671,69 @@ pub(super) fn tell(fs: &FsState, memory: &mut dyn GuestMemory, fd: u32, at: u64)
     }
 }
 
+/// `fd_readdir`: write the entries of a directory from `cookie` on. Each entry is a 24-byte
+/// `dirent` header (the next cookie, the inode, the name length, and the file type, padded),
+/// then its name. The last entry may be cut short where the buffer ends, and `used`
+/// reports how many bytes were written. `.` and `..` come first, then the children in name
+/// order. A cookie is an index: an entry's next cookie is the index after it.
+pub(super) fn readdir(
+    fs: &FsState,
+    memory: &mut dyn GuestMemory,
+    fd: u64,
+    buf: u64,
+    buf_len: u64,
+    cookie: u64,
+    used_at: u64,
+) -> i32 {
+    let fd = match u32::try_from(fd) {
+        Ok(fd) => fd,
+        Err(_) => return errno::BADF,
+    };
+    let (preopen, path) = match fs.open.get(&fd) {
+        Some(Open::Directory { preopen, path }) => (*preopen, path),
+        Some(Open::File { .. }) => return errno::NOTDIR,
+        None => return errno::BADF,
+    };
+    let Some(dir) = dir_at(&fs.preopens[preopen].root, path) else {
+        return errno::NOENT;
+    };
+    let parent = &path[..path.len().saturating_sub(1)];
+    let mut entries: Vec<(String, u64, u8)> = vec![
+        (".".to_owned(), inode(preopen, path), FILETYPE_DIRECTORY),
+        ("..".to_owned(), inode(preopen, parent), FILETYPE_DIRECTORY),
+    ];
+    for (name, node) in &dir.entries {
+        let mut child = path.clone();
+        child.push(name.clone());
+        let filetype = match node {
+            Node::Directory(_) => FILETYPE_DIRECTORY,
+            Node::File(_) => FILETYPE_REGULAR_FILE,
+        };
+        entries.push((name.clone(), inode(preopen, &child), filetype));
+    }
+    // Stop once the buffer is full, so a large buffer over a small directory stays small.
+    let capacity = usize::try_from(buf_len).unwrap_or(usize::MAX);
+    let start = usize::try_from(cookie).unwrap_or(usize::MAX);
+    let mut out: Vec<u8> = Vec::new();
+    for (index, (name, inode, filetype)) in entries.iter().enumerate().skip(start) {
+        if out.len() >= capacity {
+            break;
+        }
+        out.extend_from_slice(&((index as u64) + 1).to_le_bytes());
+        out.extend_from_slice(&inode.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.push(*filetype);
+        out.extend_from_slice(&[0, 0, 0]);
+        out.extend_from_slice(name.as_bytes());
+    }
+    out.truncate(capacity);
+    let used = out.len() as u32;
+    if !memory.write(buf, &out) || !memory.write(used_at, &used.to_le_bytes()) {
+        return errno::FAULT;
+    }
+    errno::SUCCESS
+}
+
 /// `fd_fdstat_get` on a standard stream, which is a character device.
 pub(super) fn stream_fdstat(memory: &mut dyn GuestMemory, at: u64, base: u64) -> i32 {
     write_fdstat(memory, at, FILETYPE_CHARACTER_DEVICE, base, 0)

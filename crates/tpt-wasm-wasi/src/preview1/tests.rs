@@ -1009,6 +1009,184 @@ enum Arg {
     I64(i64),
 }
 
+const DIRENT_OUT: u32 = 7400;
+const DIRENT_USED: u32 = 7500;
+
+/// The arguments of `fd_readdir` on the root grant, writing at `DIRENT_OUT` into a buffer of
+/// `buffer` bytes and starting at `cookie`.
+fn readdir_call(cookie: i64, buffer: i32) -> Vec<Arg> {
+    vec![
+        Arg::I32(3),
+        Arg::I32(DIRENT_OUT as i32),
+        Arg::I32(buffer),
+        Arg::I64(cookie),
+        Arg::I32(DIRENT_USED as i32),
+    ]
+}
+
+/// The records `fd_readdir` wrote: each entry's next cookie, name, and file type.
+fn dirents(instance: &Instance, at: u32, used: u32) -> Vec<(u64, String, u8)> {
+    let bytes = bytes_at(instance, at, used);
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset + 24 <= bytes.len() {
+        let next = u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("eight bytes"));
+        let namlen = le_u32(&bytes[offset + 16..offset + 20]) as usize;
+        let filetype = bytes[offset + 20];
+        let name_end = (offset + 24 + namlen).min(bytes.len());
+        let name = String::from_utf8_lossy(&bytes[offset + 24..name_end]).into_owned();
+        out.push((next, name, filetype));
+        offset = name_end;
+    }
+    out
+}
+
+#[test]
+fn readdir_lists_dot_entries_then_children_in_name_order() {
+    for mode in BOTH {
+        let (result, instance, _) = run_files(
+            mode,
+            grant(true),
+            &[("fd_readdir", readdir_call(0, 512))],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        let used = le_u32(&bytes_at(&instance, DIRENT_USED, 4));
+        let entries = dirents(&instance, DIRENT_OUT, used);
+        let names: Vec<&str> = entries.iter().map(|(_, name, _)| name.as_str()).collect();
+        assert_eq!(names, [".", "..", "hello.txt", "sub"], "{mode:?}");
+        let nexts: Vec<u64> = entries.iter().map(|(next, _, _)| *next).collect();
+        assert_eq!(
+            nexts,
+            [1, 2, 3, 4],
+            "{mode:?}: each cookie names the next entry"
+        );
+        // 3 is a directory, 4 a regular file.
+        let types: Vec<u8> = entries.iter().map(|(_, _, filetype)| *filetype).collect();
+        assert_eq!(types, [3, 3, 4, 3], "{mode:?}");
+    }
+}
+
+#[test]
+fn readdir_resumes_from_a_cookie() {
+    for mode in BOTH {
+        let (result, instance, _) = run_files(
+            mode,
+            grant(true),
+            &[("fd_readdir", readdir_call(2, 512))],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        let used = le_u32(&bytes_at(&instance, DIRENT_USED, 4));
+        let names: Vec<String> = dirents(&instance, DIRENT_OUT, used)
+            .into_iter()
+            .map(|(_, name, _)| name)
+            .collect();
+        assert_eq!(names, ["hello.txt", "sub"], "{mode:?}");
+    }
+}
+
+#[test]
+fn readdir_cuts_the_last_entry_where_the_buffer_ends() {
+    for mode in BOTH {
+        let (result, instance, _) = run_files(
+            mode,
+            grant(true),
+            &[("fd_readdir", readdir_call(0, 30))],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        let used = le_u32(&bytes_at(&instance, DIRENT_USED, 4));
+        // "." is 25 bytes; the next record is cut at the buffer's end.
+        assert_eq!(used, 30, "{mode:?}: the buffer is filled");
+        let entries = dirents(&instance, DIRENT_OUT, used);
+        assert_eq!(
+            entries.len(),
+            1,
+            "{mode:?}: only whole records are read back"
+        );
+        assert_eq!(entries[0].1, ".", "{mode:?}");
+    }
+}
+
+#[test]
+fn readdir_refuses_a_file_a_bad_descriptor_and_a_bad_buffer() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(2),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_readdir",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(DIRENT_OUT as i32),
+                        Arg::I32(512),
+                        Arg::I64(0),
+                        Arg::I32(DIRENT_USED as i32),
+                    ],
+                ),
+            ],
+            file_data_with(vec![]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOTDIR)], "{mode:?}: a file");
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[(
+                "fd_readdir",
+                vec![
+                    Arg::I32(9),
+                    Arg::I32(DIRENT_OUT as i32),
+                    Arg::I32(512),
+                    Arg::I64(0),
+                    Arg::I32(DIRENT_USED as i32),
+                ],
+            )],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::BADF)],
+            "{mode:?}: no descriptor"
+        );
+        let (result, _, _) = run_files(
+            mode,
+            grant(true),
+            &[(
+                "fd_readdir",
+                vec![
+                    Arg::I32(3),
+                    Arg::I32(0x7fff_0000),
+                    Arg::I32(512),
+                    Arg::I64(0),
+                    Arg::I32(DIRENT_USED as i32),
+                ],
+            )],
+            file_data_with(vec![]),
+        );
+        assert_eq!(
+            result,
+            vec![Value::I32(errno::FAULT)],
+            "{mode:?}: buffer outside memory"
+        );
+    }
+}
+
 /// The arguments of `path_rename` from one path to another, both under descriptor 3.
 fn rename_arguments(from: (u32, u32), to: (u32, u32)) -> Vec<Arg> {
     vec![
@@ -1151,6 +1329,7 @@ fn file_imports() -> Vec<(&'static str, FunctionType)> {
             "path_rename",
             signature(&[I32, I32, I32, I32, I32, I32], &[I32]),
         ),
+        ("fd_readdir", signature(&[I32, I32, I32, I64, I32], &[I32])),
     ]
 }
 

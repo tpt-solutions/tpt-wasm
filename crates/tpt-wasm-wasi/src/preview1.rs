@@ -202,6 +202,7 @@ enum Function {
     PathRemoveDirectory,
     PathUnlinkFile,
     PathRename,
+    FdReaddir,
     PollOneoff,
     SchedYield,
     ClockResGet,
@@ -210,7 +211,7 @@ enum Function {
 }
 
 impl Function {
-    const ALL: [Function; 26] = [
+    const ALL: [Function; 27] = [
         Function::ArgsSizesGet,
         Function::ArgsGet,
         Function::EnvironSizesGet,
@@ -232,6 +233,7 @@ impl Function {
         Function::PathRemoveDirectory,
         Function::PathUnlinkFile,
         Function::PathRename,
+        Function::FdReaddir,
         Function::PollOneoff,
         Function::SchedYield,
         Function::ClockResGet,
@@ -262,6 +264,7 @@ impl Function {
             Function::PathRemoveDirectory => "path_remove_directory",
             Function::PathUnlinkFile => "path_unlink_file",
             Function::PathRename => "path_rename",
+            Function::FdReaddir => "fd_readdir",
             Function::PollOneoff => "poll_oneoff",
             Function::SchedYield => "sched_yield",
             Function::ClockResGet => "clock_res_get",
@@ -295,6 +298,7 @@ impl Function {
             | Function::PathRemoveDirectory
             | Function::PathUnlinkFile => (vec![I32, I32, I32], vec![I32]),
             Function::PathRename => (vec![I32, I32, I32, I32, I32, I32], vec![I32]),
+            Function::FdReaddir => (vec![I32, I32, I32, I64, I32], vec![I32]),
             Function::PollOneoff => (vec![I32, I32, I32, I32], vec![I32]),
             Function::SchedYield => (Vec::new(), vec![I32]),
             Function::ProcRaise => (vec![I32], vec![I32]),
@@ -410,6 +414,15 @@ impl HostFunction for Implementation {
                 arguments[0],
                 arguments[1],
                 arguments[2],
+            ),
+            Function::FdReaddir => fs::readdir(
+                &state.fs,
+                memory,
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
             ),
             Function::PathRename => fs::rename(
                 &mut state.fs,
