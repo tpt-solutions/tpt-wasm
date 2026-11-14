@@ -6,6 +6,7 @@ import TptWasm.Transition
 import TptWasm.Observation
 import TptWasm.IR
 import TptWasm.IRExec
+import TptWasm.CFG
 import TptWasm.Passes
 import TptWasm.Invariants
 import TptWasm.Proofs.V1
@@ -14,3 +15,13 @@ import TptWasm.Proofs.V3
 import TptWasm.Proofs.V4
 import TptWasm.Proofs.V5
 import TptWasm.Proofs.V6
+import TptWasm.Proofs.CFG
+import TptWasm.Proofs.Threading
+import TptWasm.Merge
+import TptWasm.Proofs.Merge
+import TptWasm.Proofs.MergeGlobal
+import TptWasm.Proofs.MergeBlocks
+import TptWasm.Proofs.Fold
+import TptWasm.Dominance
+import TptWasm.Proofs.FoldGlobal
+import TptWasm.Proofs.FoldWhole

@@ -42,6 +42,17 @@ goes to `.lake/`, which is gitignored.
 | `TptWasm/Proofs/V5.lean` | V5: which instructions are observably inert, and which are not. |
 | `TptWasm/Proofs/V4.lean` | V4: the correspondence between Wasm and IR instructions, and the address agreement. |
 | `TptWasm/Proofs/V6.lean` | V6: the lowering skeleton -- the machine, the lowering, and the obligations. |
+| `TptWasm/CFG.lean` | Whole-function execution, block lookup, pruning, and the `Reachable` relation. |
+| `TptWasm/Proofs/CFG.lean` | CFG simplification: removing unreachable blocks preserves every run. |
+| `TptWasm/Proofs/Threading.lean` | CFG simplification: redirecting an edge past a chain of empty blocks preserves behaviour. |
+| `TptWasm/Merge.lean` | Block merging: the parameter substitution, operand renaming, and the merged block. |
+| `TptWasm/Proofs/Merge.lean` | Block merging: the renamed bodies run as the original bodies do, and the merged function's lookups. |
+| `TptWasm/Proofs/MergeGlobal.lean` | Block merging: the run-level and terminator-level facts, with the state relation. |
+| `TptWasm/Proofs/MergeBlocks.lean` | Block merging: the forward and backward simulations, and `merge_behaviour`. |
+| `TptWasm/Dominance.lean` | Block graph edges, reachability avoiding a block, and dominance. |
+| `TptWasm/Proofs/Fold.lean` | Constant-condition folding: the block-level step, given the condition's binding. |
+| `TptWasm/Proofs/FoldGlobal.lean` | Constant-condition folding: the invariant, its preservation, and the body lemmas. |
+| `TptWasm/Proofs/FoldWhole.lean` | Constant-condition folding: `fold_behaviour`, the whole function. |
 
 `TptWasm.lean` imports all of them, so `lake build` checks the whole model.
 
@@ -142,8 +153,12 @@ reader and deleted a constant that a later `binI32` read. It also omitted
 backwards, as `tpt-wasm-opt::dce` does, and `globalGet` is observable.
 
 CFG simplification moves control flow, so it cannot use the block-body
-formulation the other two passes use. It is whole-function work, and is the one
-pass still open.
+formulation the other two passes use. It is whole-function work. `TptWasm/CFG.lean`
+gives the whole-function run and pruning, and `TptWasm/Proofs/CFG.lean` proves that
+removing unreachable blocks is sound. `TptWasm/Proofs/Threading.lean` proves that
+empty-block threading preserves behaviour, and `TptWasm/Proofs/MergeBlocks.lean` proves that
+block merging preserves behaviour. `TptWasm/Proofs/FoldWhole.lean` proves that constant-condition folding
+preserves behaviour, from a dominance invariant over the block graph (`TptWasm/Dominance.lean`).
 
 ## V6
 
