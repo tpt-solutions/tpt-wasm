@@ -1532,41 +1532,6 @@ fn a_record_result_without_memory_is_refused() {
 }
 
 #[test]
-fn an_import_with_a_record_in_its_type_is_refused() {
-    let types = section(
-        SECTION_TYPE,
-        &[
-            2,
-            TYPE_RECORD,
-            1,
-            1,
-            b'x',
-            VALTYPE_U32,
-            TYPE_FUNC,
-            1,
-            1,
-            b'r',
-            0x00,
-            0x00,
-            VALTYPE_U32,
-        ],
-    );
-    let import = section(
-        SECTION_IMPORT,
-        &[1, 0x00, 3, b'a', b'd', b'd', EXTERN_FUNC, 1],
-    );
-    let mut bytes = with(&types);
-    bytes.extend(import);
-    assert!(matches!(
-        Component::decode(&bytes),
-        Err(ComponentError::UnsupportedImport {
-            what: "import with a record or list in its type",
-            ..
-        })
-    ));
-}
-
-#[test]
 fn a_record_is_laid_out_by_the_canonical_alignment_rules() {
     let point = [
         RecordField {
@@ -3583,4 +3548,184 @@ fn the_canonical_join_of_flat_types_is_i32_for_i32_and_f32_and_i64_otherwise() {
     assert_eq!(join_flat(ValueType::I32, ValueType::I64), ValueType::I64);
     assert_eq!(join_flat(ValueType::F32, ValueType::F64), ValueType::I64);
     assert_eq!(join_flat(ValueType::F64, ValueType::F64), ValueType::F64);
+}
+
+/// Types for a lowered import of `pick: func(p: record) -> enum`, where the record is
+/// `{ a: u32, b: u8 }` and the enum is `red | green | blue`. Its core flats are two `i32`s and one.
+fn pick_types() -> Vec<u8> {
+    let mut bytes = vec![4];
+    bytes.extend_from_slice(&[TYPE_RECORD, 2, 1, b'a', VALTYPE_U32, 1, b'b', VALTYPE_U8]);
+    bytes.extend_from_slice(&[
+        TYPE_ENUM, 3, 3, b'r', b'e', b'd', 5, b'g', b'r', b'e', b'e', b'n', 4, b'b', b'l', b'u',
+        b'e',
+    ]);
+    bytes.extend_from_slice(&[TYPE_FUNC, 1, 1, b'p', 0x00, 0x00, 0x01]);
+    bytes.extend_from_slice(&[TYPE_FUNC, 0, 0x00, 0x01]);
+    bytes
+}
+
+/// A component that imports `pick` (type 2), lowers it, instantiates the host user module with
+/// it under the name `add`, and exports `run: () -> enum`, which the module computes as
+/// `pick(2, 3)`.
+fn pick_component() -> Vec<u8> {
+    let types = section(SECTION_TYPE, &pick_types());
+    let import = section(
+        SECTION_IMPORT,
+        &[1, 0x00, 4, b'p', b'i', b'c', b'k', EXTERN_FUNC, 2],
+    );
+    let lower = section(SECTION_CANON, &[1, CANON_LOWER, SORT_FUNC, 0, 0]);
+    let instances = section(
+        SECTION_CORE_INSTANCE,
+        &[
+            2,
+            0x01,
+            1,
+            3,
+            b'a',
+            b'd',
+            b'd',
+            SORT_FUNC,
+            0,
+            0x00,
+            0,
+            1,
+            3,
+            b'e',
+            b'n',
+            b'v',
+            SORT_CORE_INSTANCE,
+            0,
+        ],
+    );
+    let alias = section(SECTION_ALIAS, &[1, 0, 0, 1, 1, 3, b'r', b'u', b'n']);
+    let lift = section(SECTION_CANON, &[1, CANON_LIFT, SORT_FUNC, 1, 0, 3]);
+    let export = section(
+        SECTION_EXPORT,
+        &[1, 0x00, 3, b'r', b'u', b'n', COMPONENT_SORT_FUNC, 1, 0x00],
+    );
+    let mut bytes = with(&module_section(&host_user_module()));
+    bytes.extend(types);
+    bytes.extend(import);
+    bytes.extend(lower);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(lift);
+    bytes.extend(export);
+    bytes
+}
+
+#[test]
+fn a_lowered_import_takes_a_record_and_returns_an_enum() {
+    let pick_type = ComponentFuncType {
+        params: vec![ComponentType::Record(0)],
+        result: Some(ComponentType::Enum(1)),
+    };
+    let (mut imports, _) = granted("pick");
+    imports.define_function("pick", pick_type, |args| match args {
+        [ComponentValue::Record(fields)] => {
+            let total: u32 = fields
+                .iter()
+                .map(|(name, value)| match (name.as_str(), value) {
+                    ("a", ComponentValue::U32(a)) => *a,
+                    ("b", ComponentValue::U8(b)) => u32::from(*b),
+                    _ => 0,
+                })
+                .sum();
+            let label = if total == 5 { "blue" } else { "red" };
+            Ok(vec![ComponentValue::Enum(label.to_owned())])
+        }
+        _ => Err("pick takes one record".to_owned()),
+    });
+    let mut instance = Component::decode(&pick_component())
+        .expect("decodes")
+        .instantiate_with(&engine(), &imports)
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("run", Vec::new()),
+        Ok(vec![ComponentValue::Enum("blue".to_owned())])
+    );
+}
+
+#[test]
+fn a_record_import_decodes_but_a_list_import_is_refused() {
+    let record_types = section(
+        SECTION_TYPE,
+        &[
+            2,
+            TYPE_RECORD,
+            1,
+            1,
+            b'x',
+            VALTYPE_U32,
+            TYPE_FUNC,
+            1,
+            1,
+            b'r',
+            0x00,
+            0x00,
+            VALTYPE_U32,
+        ],
+    );
+    let import = section(
+        SECTION_IMPORT,
+        &[1, 0x00, 3, b'a', b'd', b'd', EXTERN_FUNC, 1],
+    );
+    assert!(Component::decode(&with(&[record_types, import.clone()].concat())).is_ok());
+    let list_types = section(
+        SECTION_TYPE,
+        &[
+            2,
+            TYPE_LIST,
+            VALTYPE_U8,
+            TYPE_FUNC,
+            1,
+            1,
+            b'r',
+            0x00,
+            0x00,
+            VALTYPE_U32,
+        ],
+    );
+    assert!(matches!(
+        Component::decode(&with(&[list_types, import].concat())),
+        Err(ComponentError::UnsupportedImport {
+            what: "import with a string or a list in its type",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_lowered_import_returning_more_than_one_value_is_refused() {
+    // `pick` returns the two-field record, which flattens to two core values: it needs memory.
+    let types = section(
+        SECTION_TYPE,
+        &[
+            2,
+            TYPE_RECORD,
+            2,
+            1,
+            b'a',
+            VALTYPE_U32,
+            1,
+            b'b',
+            VALTYPE_U8,
+            TYPE_FUNC,
+            0,
+            0x00,
+            0,
+        ],
+    );
+    let import = section(
+        SECTION_IMPORT,
+        &[1, 0x00, 4, b'p', b'i', b'c', b'k', EXTERN_FUNC, 1],
+    );
+    let lower = section(SECTION_CANON, &[1, CANON_LOWER, SORT_FUNC, 0, 0]);
+    assert!(matches!(
+        Component::decode(&with(&[types, import, lower].concat())),
+        Err(ComponentError::UnsupportedCanon {
+            what: "lowering a function whose result is returned through memory",
+            ..
+        })
+    ));
 }

@@ -1066,46 +1066,30 @@ impl Component {
         let declared = self
             .func_type(*ty)
             .ok_or_else(|| format!("the import {name} is not a function"))?;
-        let params = declared
+        // A parameter or a result that holds a string or a list lives in memory, which a lowered
+        // import has no caller memory for, so it is refused here. A result that flattens to more
+        // than one value is returned through memory, and is refused for the same reason.
+        if declared
             .params
             .iter()
-            .map(|ty| match ty {
-                ComponentType::Scalar(scalar) => Ok(*scalar),
-                ComponentType::Record(_) => Err(format!("the import {name} takes a record")),
-                ComponentType::List(_) => Err(format!("the import {name} takes a list")),
-                ComponentType::Option(_) => Err(format!("the import {name} takes an option")),
-                ComponentType::Enum(_) => Err(format!("the import {name} takes an enum")),
-                ComponentType::Flags(_) => Err(format!("the import {name} takes flags")),
-                ComponentType::Tuple(_) | ComponentType::Result(_) | ComponentType::Variant(_) => {
-                    Err(format!("the import {name} takes a tuple"))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let result = match declared.result {
-            None => None,
-            Some(ComponentType::Scalar(scalar)) => Some(scalar),
-            Some(
-                ComponentType::Enum(_)
-                | ComponentType::Flags(_)
-                | ComponentType::Tuple(_)
-                | ComponentType::Result(_)
-                | ComponentType::Variant(_),
-            ) => return Err(format!("the import {name} returns an enum")),
-            Some(ComponentType::List(_)) => {
-                return Err(format!("the import {name} returns a list"))
+            .chain(declared.result.iter())
+            .any(|ty| holds_string(ty) || holds_list(ty))
+        {
+            return Err(format!(
+                "the import {name} takes or returns a string or a list"
+            ));
+        }
+        if let Some(result) = &declared.result {
+            if flat_of(result, &self.types).len() > MAX_FLAT_RESULTS {
+                return Err(format!("the import {name} returns a value through memory"));
             }
-            Some(ComponentType::Option(_)) => {
-                return Err(format!("the import {name} returns an option"))
-            }
-            Some(ComponentType::Record(_)) => {
-                return Err(format!("the import {name} returns a record"))
-            }
-        };
+        }
         Ok(LoweredHost {
             name: name.clone(),
             closure: supplied.closure.clone(),
-            params,
-            result,
+            params: declared.params.clone(),
+            result: declared.result,
+            types: self.types.clone(),
             capabilities: imports.capabilities.clone(),
         })
     }
@@ -1608,8 +1592,9 @@ struct BoundExport {
 struct LoweredHost {
     name: String,
     closure: ComponentFn,
-    params: Vec<Scalar>,
-    result: Option<Scalar>,
+    params: Vec<ComponentType>,
+    result: Option<ComponentType>,
+    types: Vec<ComponentTypeDef>,
     capabilities: Option<Arc<Mutex<CapabilitySet>>>,
 }
 
@@ -1620,28 +1605,31 @@ impl fmt::Debug for LoweredHost {
 }
 
 impl LoweredHost {
-    /// Run the embedder's function on the lifted arguments, and lower its results.
+    /// Lift the core values into the parameters, run the embedder's function, and lower its
+    /// result back to core values. Parameters and results pass directly, so none of them needs
+    /// memory.
     fn invoke(&self, args: &[Value]) -> Result<Vec<Value>, String> {
         // The grant is checked on every call, so a revoked import stops working at once.
         authorize_call(self.capabilities.as_ref(), &self.name)?;
-        if args.len() != self.params.len() {
+        let mut remaining = args.iter();
+        let mut values = Vec::with_capacity(self.params.len());
+        for ty in &self.params {
+            values.push(lift_flats(&mut remaining, ty, &self.types)?);
+        }
+        if remaining.next().is_some() {
             return Err(format!(
-                "the import {} takes {} arguments, and {} were given",
-                self.name,
-                self.params.len(),
-                args.len()
+                "the import {} was given more core values than its type has",
+                self.name
             ));
         }
-        let mut values = Vec::with_capacity(args.len());
-        for (arg, scalar) in args.iter().zip(&self.params) {
-            values.push(lift(arg.clone(), *scalar)?);
-        }
         let results = (self.closure)(&values)?;
-        match (self.result, results.as_slice()) {
+        match (self.result.as_ref(), results.as_slice()) {
             (None, []) => Ok(Vec::new()),
-            (Some(scalar), [value]) if value.scalar() == Some(scalar) => lower_scalar(value)
-                .map(|lowered| vec![lowered])
-                .ok_or_else(|| format!("the import {} returned a string", self.name)),
+            (Some(ty), [value]) if value_matches(value, ty, &self.types) => {
+                let mut lowered = Vec::new();
+                lower_flats(value, ty, &self.types, &mut lowered)?;
+                Ok(lowered)
+            }
             _ => Err(format!(
                 "the import {} returned values that do not match its type",
                 self.name
@@ -1656,12 +1644,13 @@ impl HostFunction for LoweredHost {
             params: ResultType(
                 self.params
                     .iter()
-                    .flat_map(|scalar| scalar.flat_params())
+                    .flat_map(|ty| flat_of(ty, &self.types))
                     .collect(),
             ),
             results: ResultType(
                 self.result
-                    .map(|scalar| scalar.flat_params())
+                    .as_ref()
+                    .map(|ty| flat_of(ty, &self.types))
                     .unwrap_or_default(),
             ),
         }
@@ -1868,165 +1857,6 @@ impl ComponentInstance {
         out: &mut Vec<Value>,
     ) -> Result<(), String> {
         match argument {
-            ComponentValue::Tuple(items) => {
-                let ComponentType::Tuple(index) = ty else {
-                    return Err("a tuple argument is not a tuple type".to_owned());
-                };
-                let scalars = match self.types.get(*index as usize) {
-                    Some(ComponentTypeDef::Tuple(scalars)) => scalars,
-                    _ => return Err("the tuple is not defined".to_owned()),
-                };
-                if items.len() != scalars.len() {
-                    return Err("the tuple has the wrong number of values".to_owned());
-                }
-                for (item, scalar) in items.iter().zip(scalars) {
-                    if item.scalar() != Some(*scalar) {
-                        return Err("a tuple value does not match its type".to_owned());
-                    }
-                    out.push(
-                        lower_scalar(item)
-                            .ok_or_else(|| "a tuple value did not lower".to_owned())?,
-                    );
-                }
-                Ok(())
-            }
-            ComponentValue::Flags(set) => {
-                let ComponentType::Flags(index) = ty else {
-                    return Err("a flags argument is not a flags type".to_owned());
-                };
-                let defined = match self.types.get(*index as usize) {
-                    Some(ComponentTypeDef::Flags(defined)) => defined,
-                    _ => return Err("the flags are not defined".to_owned()),
-                };
-                let mut bits: u32 = 0;
-                for label in set {
-                    let position = defined
-                        .iter()
-                        .position(|candidate| candidate == label)
-                        .ok_or_else(|| format!("the flags have no label {label}"))?;
-                    bits |= 1u32 << position;
-                }
-                out.push(Value::I32(bits as i32));
-                Ok(())
-            }
-            ComponentValue::Enum(label) => {
-                let ComponentType::Enum(index) = ty else {
-                    return Err("an enum argument is not an enum type".to_owned());
-                };
-                let labels = match self.types.get(*index as usize) {
-                    Some(ComponentTypeDef::Enum(labels)) => labels,
-                    _ => return Err("the enum is not defined".to_owned()),
-                };
-                let case = labels
-                    .iter()
-                    .position(|candidate| candidate == label)
-                    .ok_or_else(|| format!("the enum has no case {label}"))?;
-                out.push(Value::I32(case as i32));
-                Ok(())
-            }
-            ComponentValue::Option(payload) => {
-                let ComponentType::Option(index) = ty else {
-                    return Err("an option argument is not an option type".to_owned());
-                };
-                let payload_type = match self.types.get(*index as usize) {
-                    Some(ComponentTypeDef::Option(payload_type)) => *payload_type,
-                    _ => return Err("the option is not defined".to_owned()),
-                };
-                match payload {
-                    None => {
-                        // The discriminant is 0, and the payload is zero, as the canonical ABI gives it.
-                        out.push(Value::I32(0));
-                        out.extend(payload_type.flat_params().into_iter().map(zero_value));
-                    }
-                    Some(value) => {
-                        if value.scalar() != Some(payload_type) {
-                            return Err("an option payload does not match its type".to_owned());
-                        }
-                        out.push(Value::I32(1));
-                        out.push(
-                            lower_scalar(value)
-                                .ok_or_else(|| "an option payload did not lower".to_owned())?,
-                        );
-                    }
-                }
-                Ok(())
-            }
-            ComponentValue::Variant(label, payload) => {
-                let ComponentType::Variant(index) = ty else {
-                    return Err("a variant argument is not a variant type".to_owned());
-                };
-                let cases = match self.types.get(*index as usize) {
-                    Some(ComponentTypeDef::Variant { cases }) => cases,
-                    _ => return Err("the variant is not defined".to_owned()),
-                };
-                let case = cases
-                    .iter()
-                    .position(|(name, _)| name == label)
-                    .ok_or_else(|| format!("the variant has no case {label}"))?;
-                let case_type = cases[case].1;
-                let value = match (case_type, payload.as_deref()) {
-                    (None, None) => None,
-                    (Some(scalar), Some(value)) => {
-                        if value.scalar() != Some(scalar) {
-                            return Err("a variant payload does not match its case".to_owned());
-                        }
-                        Some(
-                            lower_scalar(value)
-                                .ok_or_else(|| "a variant payload did not lower".to_owned())?,
-                        )
-                    }
-                    _ => return Err("a variant payload does not match its case".to_owned()),
-                };
-                out.push(Value::I32(case as i32));
-                // The joined payload slot holds the case's value, widened to the joined type, or
-                // zero for a case without one.
-                if let Some(joined) = joined_flat(cases.iter().filter_map(|(_, p)| *p)) {
-                    out.push(match value {
-                        Some(value) => widen(value, joined)?,
-                        None => zero_value(joined),
-                    });
-                }
-                Ok(())
-            }
-            ComponentValue::Result(outcome) => {
-                let ComponentType::Result(index) = ty else {
-                    return Err("a result argument is not a result type".to_owned());
-                };
-                let (ok_type, err_type) = match self.types.get(*index as usize) {
-                    Some(ComponentTypeDef::Result { ok, err }) => (*ok, *err),
-                    _ => return Err("the result is not defined".to_owned()),
-                };
-                let (discriminant, case_type, payload) = match outcome {
-                    Ok(payload) => (0, ok_type, payload.as_deref()),
-                    Err(payload) => (1, err_type, payload.as_deref()),
-                };
-                // The payload's flat value is one value, shared by both cases; a case without a
-                // payload gets zero in its place, as the canonical ABI does.
-                let mismatch = || "a result payload does not match its case".to_owned();
-                let value = match (case_type, payload) {
-                    (None, None) => None,
-                    (Some(scalar), Some(value)) => {
-                        if value.scalar() != Some(scalar) {
-                            return Err(mismatch());
-                        }
-                        Some(
-                            lower_scalar(value)
-                                .ok_or_else(|| "a result payload did not lower".to_owned())?,
-                        )
-                    }
-                    _ => return Err(mismatch()),
-                };
-                // The joined payload slot holds the case's value, widened to the joined type, or
-                // zero for a case without one.
-                out.push(Value::I32(discriminant));
-                if let Some(joined) = joined_flat([ok_type, err_type].into_iter().flatten()) {
-                    out.push(match value {
-                        Some(value) => widen(value, joined)?,
-                        None => zero_value(joined),
-                    });
-                }
-                Ok(())
-            }
             ComponentValue::List(items) => {
                 let ComponentType::List(index) = ty else {
                     return Err("a list argument is not a list type".to_owned());
@@ -2088,19 +1918,7 @@ impl ComponentInstance {
                 out.push(Value::I32(length));
                 Ok(())
             }
-            ComponentValue::Record(fields) => {
-                for (_, value) in fields {
-                    out.push(
-                        lower_scalar(value)
-                            .ok_or_else(|| "a record field is a string".to_owned())?,
-                    );
-                }
-                Ok(())
-            }
-            scalar => {
-                out.push(lower_scalar(scalar).ok_or_else(|| "a scalar did not lower".to_owned())?);
-                Ok(())
-            }
+            other => lower_flats(other, ty, &self.types, out),
         }
     }
 
@@ -3359,22 +3177,16 @@ fn decode_imports(
         let Some(ComponentTypeDef::Func(func)) = types.get(ty as usize) else {
             return Err(ComponentError::NoSuchType { index: ty });
         };
-        let has_record = func.params.iter().chain(func.result.iter()).any(|ty| {
-            matches!(
-                ty,
-                ComponentType::Record(_)
-                    | ComponentType::List(_)
-                    | ComponentType::Option(_)
-                    | ComponentType::Enum(_)
-                    | ComponentType::Flags(_)
-                    | ComponentType::Tuple(_)
-                    | ComponentType::Result(_)
-                    | ComponentType::Variant(_)
-            )
-        });
-        if has_record {
+        // A string or a list in an import would live in the caller's memory, which a lowered
+        // import cannot reach. Every other value type passes directly, so it is accepted here.
+        let has_memory_type = func
+            .params
+            .iter()
+            .chain(func.result.iter())
+            .any(|ty| holds_string(ty) || holds_list(ty));
+        if has_memory_type {
             return Err(ComponentError::UnsupportedImport {
-                what: "import with a record or list in its type",
+                what: "import with a string or a list in its type",
                 offset: at,
             });
         }
@@ -3446,22 +3258,27 @@ fn decode_canon(
                             offset: at,
                         });
                     }
-                    if func.params.iter().chain(func.result.iter()).any(|ty| {
-                        holds_string(ty)
-                            || holds_list(ty)
-                            || matches!(
-                                ty,
-                                ComponentType::Record(_)
-                                    | ComponentType::Option(_)
-                                    | ComponentType::Enum(_)
-                                    | ComponentType::Flags(_)
-                                    | ComponentType::Tuple(_)
-                                    | ComponentType::Result(_)
-                                    | ComponentType::Variant(_)
-                            )
-                    }) {
+                    // A string or a list lives in the caller's memory, which a lowered import has
+                    // no way to reach, and a result of more than one value is returned through
+                    // memory. Everything else passes directly.
+                    if func
+                        .params
+                        .iter()
+                        .chain(func.result.iter())
+                        .any(|ty| holds_string(ty) || holds_list(ty))
+                    {
                         return Err(ComponentError::UnsupportedCanon {
-                            what: "lowering a function with strings, lists, or records",
+                            what: "lowering a function with a string or a list",
+                            offset: at,
+                        });
+                    }
+                    if func
+                        .result
+                        .iter()
+                        .any(|ty| flat_of(ty, types).len() > MAX_FLAT_RESULTS)
+                    {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "lowering a function whose result is returned through memory",
                             offset: at,
                         });
                     }
@@ -3825,5 +3642,313 @@ fn widen(value: Value, to: ValueType) -> Result<Value, String> {
         (Value::F32(bits), ValueType::I64) => Value::I64(i64::from(bits)),
         (Value::F64(bits), ValueType::I64) => Value::I64(bits as i64),
         _ => return Err("a payload does not widen to the flat type of its variant".to_owned()),
+    })
+}
+
+/// Lower a value of type `ty` to the core values it flattens to, appending them, for the types
+/// that need no memory: scalars, enums, flags, tuples, records, options, results, and variants. A
+/// string or a list lives in memory, so it is refused here.
+fn lower_flats(
+    value: &ComponentValue,
+    ty: &ComponentType,
+    types: &[ComponentTypeDef],
+    out: &mut Vec<Value>,
+) -> Result<(), String> {
+    let mismatch = || format!("{value:?} does not match its type");
+    match (value, ty) {
+        (ComponentValue::String(_) | ComponentValue::List(_), _) => {
+            Err("a string or list is passed through memory".to_owned())
+        }
+        (value, ComponentType::Scalar(scalar)) => {
+            if value.scalar() != Some(*scalar) {
+                return Err(mismatch());
+            }
+            out.push(lower_scalar(value).ok_or_else(mismatch)?);
+            Ok(())
+        }
+        (ComponentValue::Tuple(items), ComponentType::Tuple(index)) => {
+            let Some(ComponentTypeDef::Tuple(scalars)) = types.get(*index as usize) else {
+                return Err("the tuple is not defined".to_owned());
+            };
+            if items.len() != scalars.len() {
+                return Err("the tuple has the wrong number of values".to_owned());
+            }
+            for (item, scalar) in items.iter().zip(scalars) {
+                if item.scalar() != Some(*scalar) {
+                    return Err("a tuple value does not match its type".to_owned());
+                }
+                out.push(lower_scalar(item).ok_or_else(mismatch)?);
+            }
+            Ok(())
+        }
+        (ComponentValue::Record(fields), ComponentType::Record(index)) => {
+            let Some(ComponentTypeDef::Record(defined)) = types.get(*index as usize) else {
+                return Err("the record is not defined".to_owned());
+            };
+            if fields.len() != defined.len() {
+                return Err("the record has the wrong number of fields".to_owned());
+            }
+            for ((_, value), field) in fields.iter().zip(defined) {
+                if value.scalar() != Some(field.ty) {
+                    return Err("a record field does not match its type".to_owned());
+                }
+                out.push(lower_scalar(value).ok_or_else(mismatch)?);
+            }
+            Ok(())
+        }
+        (ComponentValue::Flags(set), ComponentType::Flags(index)) => {
+            let Some(ComponentTypeDef::Flags(defined)) = types.get(*index as usize) else {
+                return Err("the flags are not defined".to_owned());
+            };
+            let mut bits: u32 = 0;
+            for label in set {
+                let position = defined
+                    .iter()
+                    .position(|candidate| candidate == label)
+                    .ok_or_else(|| format!("the flags have no label {label}"))?;
+                bits |= 1u32 << position;
+            }
+            out.push(Value::I32(bits as i32));
+            Ok(())
+        }
+        (ComponentValue::Enum(label), ComponentType::Enum(index)) => {
+            let Some(ComponentTypeDef::Enum(labels)) = types.get(*index as usize) else {
+                return Err("the enum is not defined".to_owned());
+            };
+            let case = labels
+                .iter()
+                .position(|candidate| candidate == label)
+                .ok_or_else(|| format!("the enum has no case {label}"))?;
+            out.push(Value::I32(case as i32));
+            Ok(())
+        }
+        (ComponentValue::Option(payload), ComponentType::Option(index)) => {
+            let Some(ComponentTypeDef::Option(element)) = types.get(*index as usize) else {
+                return Err("the option is not defined".to_owned());
+            };
+            match payload.as_deref() {
+                None => {
+                    out.push(Value::I32(0));
+                    out.extend(element.flat_params().into_iter().map(zero_value));
+                }
+                Some(value) => {
+                    if value.scalar() != Some(*element) {
+                        return Err("an option payload does not match its type".to_owned());
+                    }
+                    out.push(Value::I32(1));
+                    out.push(lower_scalar(value).ok_or_else(mismatch)?);
+                }
+            }
+            Ok(())
+        }
+        (ComponentValue::Result(outcome), ComponentType::Result(index)) => {
+            let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) else {
+                return Err("the result is not defined".to_owned());
+            };
+            let (discriminant, case_type, payload) = match outcome {
+                Ok(payload) => (0, *ok, payload.as_deref()),
+                Err(payload) => (1, *err, payload.as_deref()),
+            };
+            out.push(Value::I32(discriminant));
+            let joined = joined_flat([*ok, *err].into_iter().flatten());
+            lower_payload(case_type, payload, joined, out)
+        }
+        (ComponentValue::Variant(label, payload), ComponentType::Variant(index)) => {
+            let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) else {
+                return Err("the variant is not defined".to_owned());
+            };
+            let case = cases
+                .iter()
+                .position(|(name, _)| name == label)
+                .ok_or_else(|| format!("the variant has no case {label}"))?;
+            out.push(Value::I32(case as i32));
+            let joined = joined_flat(cases.iter().filter_map(|(_, p)| *p));
+            lower_payload(cases[case].1, payload.as_deref(), joined, out)
+        }
+        _ => Err(mismatch()),
+    }
+}
+
+/// Lower the payload slot of a result or a variant. A case with a value fills the slot with that
+/// value, widened to the joined flat type; a case without one fills it with zero. The slot exists
+/// only when some case has a payload, so nothing is pushed otherwise.
+fn lower_payload(
+    case_type: Option<Scalar>,
+    payload: Option<&ComponentValue>,
+    joined: Option<ValueType>,
+    out: &mut Vec<Value>,
+) -> Result<(), String> {
+    match (case_type, payload) {
+        (None, None) => {
+            if let Some(joined) = joined {
+                out.push(zero_value(joined));
+            }
+            Ok(())
+        }
+        (Some(scalar), Some(value)) => {
+            if value.scalar() != Some(scalar) {
+                return Err("a payload does not match its case".to_owned());
+            }
+            let lowered =
+                lower_scalar(value).ok_or_else(|| "a payload did not lower".to_owned())?;
+            if let Some(joined) = joined {
+                out.push(widen(lowered, joined)?);
+            }
+            Ok(())
+        }
+        _ => Err("a payload does not match its case".to_owned()),
+    }
+}
+
+/// Lift the core values of one parameter or result of type `ty` from `values`, consuming exactly
+/// the values it flattens to, in the canonical order. A payload of a result or a variant arrives
+/// as the joined flat type, and is narrowed to the type of its case first.
+fn lift_flats(
+    values: &mut std::slice::Iter<'_, Value>,
+    ty: &ComponentType,
+    types: &[ComponentTypeDef],
+) -> Result<ComponentValue, String> {
+    let mut take = || {
+        values
+            .next()
+            .cloned()
+            .ok_or_else(|| "the core function passed too few values".to_owned())
+    };
+    match ty {
+        ComponentType::Scalar(Scalar::String) | ComponentType::List(_) => {
+            Err("a string or list is passed through memory".to_owned())
+        }
+        ComponentType::Scalar(scalar) => lift(take()?, *scalar),
+        ComponentType::Enum(index) => {
+            let Some(ComponentTypeDef::Enum(labels)) = types.get(*index as usize) else {
+                return Err("the enum is not defined".to_owned());
+            };
+            let case = enum_case(&take()?, labels.len())?;
+            Ok(ComponentValue::Enum(labels[case].clone()))
+        }
+        ComponentType::Flags(index) => {
+            let Some(ComponentTypeDef::Flags(labels)) = types.get(*index as usize) else {
+                return Err("the flags are not defined".to_owned());
+            };
+            let Value::I32(bits) = take()? else {
+                return Err("a flags value is not an i32".to_owned());
+            };
+            let bits = bits as u32;
+            if labels.len() < 32 && bits >> labels.len() != 0 {
+                return Err(format!("{bits:#x} sets a bit that names no flag"));
+            }
+            let set = labels
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| bits & (1u32 << position) != 0)
+                .map(|(_, label)| label.clone())
+                .collect();
+            Ok(ComponentValue::Flags(set))
+        }
+        ComponentType::Tuple(index) => {
+            let Some(ComponentTypeDef::Tuple(scalars)) = types.get(*index as usize) else {
+                return Err("the tuple is not defined".to_owned());
+            };
+            let mut lifted = Vec::with_capacity(scalars.len());
+            for scalar in scalars {
+                lifted.push(lift(take()?, *scalar)?);
+            }
+            Ok(ComponentValue::Tuple(lifted))
+        }
+        ComponentType::Record(index) => {
+            let Some(ComponentTypeDef::Record(fields)) = types.get(*index as usize) else {
+                return Err("the record is not defined".to_owned());
+            };
+            let mut lifted = Vec::with_capacity(fields.len());
+            for field in fields {
+                lifted.push((field.name.clone(), lift(take()?, field.ty)?));
+            }
+            Ok(ComponentValue::Record(lifted))
+        }
+        ComponentType::Option(index) => {
+            let Some(ComponentTypeDef::Option(element)) = types.get(*index as usize) else {
+                return Err("the option is not defined".to_owned());
+            };
+            let discriminant = take()?;
+            // The payload slot is always present; its value is read only for the some case.
+            let payload = take()?;
+            match discriminant {
+                Value::I32(0) => Ok(ComponentValue::Option(None)),
+                Value::I32(1) => Ok(ComponentValue::Option(Some(Box::new(lift(
+                    payload, *element,
+                )?)))),
+                _ => Err("an option's discriminant is neither 0 nor 1".to_owned()),
+            }
+        }
+        ComponentType::Result(index) => {
+            let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) else {
+                return Err("the result is not defined".to_owned());
+            };
+            let discriminant = take()?;
+            let joined = joined_flat([*ok, *err].into_iter().flatten());
+            let slot = if joined.is_some() {
+                Some(take()?)
+            } else {
+                None
+            };
+            let (is_ok, case_type) = match discriminant {
+                Value::I32(0) => (true, *ok),
+                Value::I32(1) => (false, *err),
+                _ => return Err("a result's discriminant is neither 0 nor 1".to_owned()),
+            };
+            let payload = lift_payload(case_type, slot)?;
+            Ok(ComponentValue::Result(if is_ok {
+                Ok(payload)
+            } else {
+                Err(payload)
+            }))
+        }
+        ComponentType::Variant(index) => {
+            let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) else {
+                return Err("the variant is not defined".to_owned());
+            };
+            let discriminant = take()?;
+            let joined = joined_flat(cases.iter().filter_map(|(_, p)| *p));
+            let slot = if joined.is_some() {
+                Some(take()?)
+            } else {
+                None
+            };
+            let case = enum_case(&discriminant, cases.len())?;
+            let (label, case_type) = &cases[case];
+            let payload = lift_payload(*case_type, slot)?;
+            Ok(ComponentValue::Variant(label.clone(), payload))
+        }
+    }
+}
+
+/// Lift the payload of a case from its slot, narrowing the joined value to the case's type.
+fn lift_payload(
+    case_type: Option<Scalar>,
+    slot: Option<Value>,
+) -> Result<Option<Box<ComponentValue>>, String> {
+    match (case_type, slot) {
+        (None, _) => Ok(None),
+        (Some(scalar), Some(slot)) => {
+            let narrowed = narrow(slot, scalar.flat_params()[0])?;
+            Ok(Some(Box::new(lift(narrowed, scalar)?)))
+        }
+        (Some(_), None) => Err("a payload has no slot".to_owned()),
+    }
+}
+
+/// Narrow a joined core value to the flat type of its case, as the canonical ABI coerces it: an
+/// i64 wraps to an i32, and the bits of an integer reinterpret as a float.
+fn narrow(value: Value, want: ValueType) -> Result<Value, String> {
+    Ok(match (value, want) {
+        (same @ Value::I32(_), ValueType::I32)
+        | (same @ Value::I64(_), ValueType::I64)
+        | (same @ Value::F32(_), ValueType::F32)
+        | (same @ Value::F64(_), ValueType::F64) => same,
+        (Value::I64(bits), ValueType::I32) => Value::I32(bits as i32),
+        (Value::I32(bits), ValueType::F32) => Value::F32(bits as u32),
+        (Value::I64(bits), ValueType::F32) => Value::F32(bits as u32),
+        (Value::I64(bits), ValueType::F64) => Value::F64(bits as u64),
+        _ => return Err("a joined value does not narrow to the type of its case".to_owned()),
     })
 }

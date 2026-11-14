@@ -85,13 +85,19 @@ results against that type.
 Lowering a function the component defines, and lifting a lowered function, are refused,
 because they would need a component to call back into itself.
 
+A lowered import passes its parameters and its result directly, so the values of a record, a tuple, an
+option, an enum, flags, a result, or a variant of scalars cross it as their flat values, lifted for the
+embedder and lowered back. A string or a list would need the caller's memory, so it is refused, and so
+is a result that flattens to more than one value, which would be returned through a pointer. Imports
+themselves accept every value type except a string or a list.
+
 Records (`0x72`) of scalar fields are supported for lifted exports, as a parameter or a result.
 A record is a type-index entry, and a function refers to it by that index. Its fields are laid
 out by the canonical ABI: each at the next offset its alignment allows, and the record rounded
 up to its largest alignment. A record flattens to its fields, so a record of up to 16 flat
 values is a direct parameter, and a record result that flattens to more than one value is read
 from memory at the pointer the function returns, which needs the memory option. A record with a
-string or another record as a field, and a record in an import, are refused by name and offset.
+string or another record as a field, is refused by name and offset.
 
 Lists (`0x70`) of scalars are supported for lifted exports, as a parameter or a result. A list is
 its pointer and its length, as a string is: a parameter is copied into the callee's memory with
@@ -115,13 +121,13 @@ a list, or an option is refused.
 
 An enum (`0x6d`) is a list of distinct case labels, and a value of it is the label of one case.
 It flattens to its case index, so it is passed directly, and a result is read as the index it
-returns. An index outside the cases is a call error. An enum in a record, a list, an option, an
-import, or a lowered import is refused.
+returns. An index outside the cases is a call error. An enum in a record, a list, or an option is refused.
+Enums pass in an import as well, see the lowered imports paragraph.
 
 Flags (`0x6e`) are a set of at most 32 distinct labels, and a value is the set of labels that are
 set. A set flattens to one bitmask, one bit per label in definition order, so a flags value is
 passed directly in both directions. A bit beyond the labels names no flag, and is a call error.
-Flags in a record, a list, an option, an import, or a lowered import are refused.
+Flags in a record, a list, or an option are refused.
 
 Tuples (`0x6f`) of scalars are supported for lifted exports. A tuple is a record without labels: it
 flattens to its values in order, lays out in memory as a record does, and a tuple of scalars is
@@ -204,7 +210,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 `namespace:package/interface#function` is a plain string to this layer, so the WIT grammar is
 a separate stage, which will map each parsed function onto the same capability id.
 
-Not done: strings and records in lowered imports,
+Not done: strings and lists in lowered imports (which need the caller's memory),
 parsing WIT to
 derive the capability ids.
 
