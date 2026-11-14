@@ -1286,6 +1286,7 @@ fn no_truncation_or_corruption_of_a_component_panics() {
         record_component(&complete_rec_canon()),
         list_component(&complete_count_canon()),
         option_component(),
+        enum_component(),
     ];
     let mut decoded = 0usize;
     let mut instantiated = 0usize;
@@ -1980,5 +1981,124 @@ fn an_option_of_a_string_is_refused() {
             what: "an option of a string",
             ..
         })
+    ));
+}
+
+/// A core module with two functions over an enum's case index: `echo(i) -> i32` returns its
+/// argument, and `three() -> i32` returns 3, which is not a case of a three-case enum.
+fn enum_module() -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    bytes.extend(section(1, &[2, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 0, 1, 0x7f]));
+    bytes.extend(section(3, &[2, 0, 1]));
+    bytes.extend(section(
+        7,
+        &[
+            2, 4, b'e', b'c', b'h', b'o', 0, 0, 5, b't', b'h', b'r', b'e', b'e', 0, 1,
+        ],
+    ));
+    bytes.extend(section(10, &[2, 4, 0, 0x20, 0, 0x0b, 4, 0, 0x41, 3, 0x0b]));
+    bytes
+}
+
+/// A component over `enum_module`: an enum of the cases `red`, `green`, and `blue`; `echo` takes
+/// and returns it, and `three` returns it too.
+fn enum_component() -> Vec<u8> {
+    let types = section(
+        SECTION_TYPE,
+        &[
+            3, TYPE_ENUM, 3, 3, b'r', b'e', b'd', 5, b'g', b'r', b'e', b'e', b'n', 4, b'b', b'l',
+            b'u', b'e', TYPE_FUNC, 1, 1, b'c', 0x00, 0x00, 0x00, TYPE_FUNC, 0, 0x00, 0x00,
+        ],
+    );
+    let instances = section(SECTION_CORE_INSTANCE, &[1, INSTANTIATE, 0, 0]);
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            2, 0, 0, 1, 0, 4, b'e', b'c', b'h', b'o', 0, 0, 1, 0, 5, b't', b'h', b'r', b'e', b'e',
+        ],
+    );
+    let canon = section(
+        SECTION_CANON,
+        &[
+            2, CANON_LIFT, SORT_FUNC, 0, 0, 1, CANON_LIFT, SORT_FUNC, 1, 0, 2,
+        ],
+    );
+    let export = section(
+        SECTION_EXPORT,
+        &[
+            2,
+            0x00,
+            4,
+            b'e',
+            b'c',
+            b'h',
+            b'o',
+            COMPONENT_SORT_FUNC,
+            0,
+            0x00,
+            0x00,
+            5,
+            b't',
+            b'h',
+            b'r',
+            b'e',
+            b'e',
+            COMPONENT_SORT_FUNC,
+            1,
+            0x00,
+        ],
+    );
+    let mut bytes = with(&module_section(&enum_module()));
+    bytes.extend(types);
+    bytes.extend(instances);
+    bytes.extend(alias);
+    bytes.extend(canon);
+    bytes.extend(export);
+    bytes
+}
+
+#[test]
+fn an_enum_passes_its_case_index_in_both_directions() {
+    let mut instance = Component::decode(&enum_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("echo", vec![ComponentValue::Enum("green".to_owned())]),
+        Ok(vec![ComponentValue::Enum("green".to_owned())])
+    );
+}
+
+#[test]
+fn an_enum_result_outside_its_cases_is_a_call_error() {
+    let mut instance = Component::decode(&enum_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    // The module returns 3, which names no case of a three-case enum.
+    assert!(matches!(
+        instance.call_export("three", Vec::new()),
+        Err(ComponentError::Call { .. })
+    ));
+}
+
+#[test]
+fn an_enum_argument_that_is_not_a_case_is_refused() {
+    let mut instance = Component::decode(&enum_component())
+        .expect("decodes")
+        .instantiate(&engine())
+        .expect("instantiates");
+    assert!(matches!(
+        instance.call_export("echo", vec![ComponentValue::Enum("purple".to_owned())]),
+        Err(ComponentError::ArgumentMismatch { .. })
+    ));
+}
+
+#[test]
+fn an_enum_with_a_repeated_case_is_malformed() {
+    let bytes = with(&section(SECTION_TYPE, &[1, TYPE_ENUM, 2, 1, b'a', 1, b'a']));
+    assert!(matches!(
+        Component::decode(&bytes),
+        Err(ComponentError::Malformed { .. })
     ));
 }

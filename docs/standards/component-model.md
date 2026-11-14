@@ -1,6 +1,6 @@
 # Component Model
 
-**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and the remaining compound value types are not started.  
+**Status:** Partly done (M10). `crates/tpt-wasm-component` decodes the envelope, the type, canon, alias, core-instance, and export sections; instantiates core instances with imports bound to earlier instances or to inline exports; lifts exported functions over scalar types (including `bool`, the small integers, and `char`), UTF-8 strings, records of scalar fields, and lists of scalars; and takes imported functions from the embedder, lowering them so core code can call them, each import granted through the capability model. WIT parsing and the remaining compound value types (variants, results, tuples, flags) are not started.  
 **Specification:** https://component-model.bytecodealliance.org/  
 
 The Component Model is a higher-level layer over Core WebAssembly.
@@ -106,8 +106,13 @@ returned through memory, and is read back with the discriminant as one byte and 
 its alignment; a discriminant other than 0 or 1 is a call error. An option of a string, a record,
 a list, or an option is refused.
 
+An enum (`0x6d`) is a list of distinct case labels, and a value of it is the label of one case.
+It flattens to its case index, so it is passed directly, and a result is read as the index it
+returns. An index outside the cases is a call error. An enum in a record, a list, an option, an
+import, or a lowered import is refused.
+
 Refused, each by name and offset, until its own decoder exists: value types beyond the ones
-supported (variants, results, tuples, enums, flags, resources, and
+supported (variants, results, tuples, flags, resources, and
 the rest), extern types on exports, and exports of any sort other than function. Exports of
 imported functions are refused too.
 
@@ -152,7 +157,7 @@ The import's name is taken as the capability id without parsing it. A WIT name s
 a separate stage, which will map each parsed function onto the same capability id.
 
 Not done: strings and records in lowered imports, UTF-16 and Latin-1 encodings, `post-return`,
-records passed indirectly, variants, results, tuples, enums, flags, and parsing WIT to
+records passed indirectly, variants, results, tuples, flags, and parsing WIT to
 derive the capability ids.
 
 ## Design constraint

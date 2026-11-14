@@ -83,6 +83,7 @@ const TYPE_FUNC: u8 = 0x40;
 const TYPE_RECORD: u8 = 0x72;
 const TYPE_LIST: u8 = 0x70;
 const TYPE_OPTION: u8 = 0x6b;
+const TYPE_ENUM: u8 = 0x6d;
 /// The canon tag of a lift, and of a lower.
 const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
@@ -329,6 +330,8 @@ pub enum ComponentType {
     List(u32),
     /// An option of a scalar, by the index of its definition in the component's type table.
     Option(u32),
+    /// An enum, by the index of its definition in the component's type table.
+    Enum(u32),
 }
 
 /// One field of a record type.
@@ -351,6 +354,8 @@ pub enum ComponentTypeDef {
     List(Scalar),
     /// An option type, whose payload is of one scalar type.
     Option(Scalar),
+    /// An enum type: its case labels, in order. A value is the index of one of them.
+    Enum(Vec<String>),
 }
 
 /// A component function type: parameter types and at most one result type.
@@ -384,6 +389,8 @@ pub enum ComponentValue {
     List(Vec<ComponentValue>),
     /// An option: `None`, or the payload.
     Option(Option<Box<ComponentValue>>),
+    /// An enum value: the label of one of its cases.
+    Enum(String),
 }
 
 impl ComponentValue {
@@ -403,7 +410,10 @@ impl ComponentValue {
             ComponentValue::S16(_) => Some(Scalar::S16),
             ComponentValue::U16(_) => Some(Scalar::U16),
             ComponentValue::Char(_) => Some(Scalar::Char),
-            ComponentValue::Record(_) | ComponentValue::List(_) | ComponentValue::Option(_) => None,
+            ComponentValue::Record(_)
+            | ComponentValue::List(_)
+            | ComponentValue::Option(_)
+            | ComponentValue::Enum(_) => None,
         }
     }
 }
@@ -923,7 +933,8 @@ impl Component {
             ComponentTypeDef::Func(func) => Some(func),
             ComponentTypeDef::Record(_)
             | ComponentTypeDef::List(_)
-            | ComponentTypeDef::Option(_) => None,
+            | ComponentTypeDef::Option(_)
+            | ComponentTypeDef::Enum(_) => None,
         }
     }
 
@@ -947,11 +958,15 @@ impl Component {
                 ComponentType::Record(_) => Err(format!("the import {name} takes a record")),
                 ComponentType::List(_) => Err(format!("the import {name} takes a list")),
                 ComponentType::Option(_) => Err(format!("the import {name} takes an option")),
+                ComponentType::Enum(_) => Err(format!("the import {name} takes an enum")),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let result = match declared.result {
             None => None,
             Some(ComponentType::Scalar(scalar)) => Some(scalar),
+            Some(ComponentType::Enum(_)) => {
+                return Err(format!("the import {name} returns an enum"))
+            }
             Some(ComponentType::List(_)) => {
                 return Err(format!("the import {name} returns a list"))
             }
@@ -1010,6 +1025,8 @@ fn flat_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> Vec<ValueType> {
         },
         // A list is its pointer and its length, as a string is.
         ComponentType::List(_) => vec![ValueType::I32, ValueType::I32],
+        // An enum is its case index.
+        ComponentType::Enum(_) => vec![ValueType::I32],
         // An option is its discriminant, then its payload's flat values.
         ComponentType::Option(index) => {
             let mut flat = vec![ValueType::I32];
@@ -1345,6 +1362,21 @@ impl ComponentInstance {
         out: &mut Vec<Value>,
     ) -> Result<(), String> {
         match argument {
+            ComponentValue::Enum(label) => {
+                let ComponentType::Enum(index) = ty else {
+                    return Err("an enum argument is not an enum type".to_owned());
+                };
+                let labels = match self.types.get(*index as usize) {
+                    Some(ComponentTypeDef::Enum(labels)) => labels,
+                    _ => return Err("the enum is not defined".to_owned()),
+                };
+                let case = labels
+                    .iter()
+                    .position(|candidate| candidate == label)
+                    .ok_or_else(|| format!("the enum has no case {label}"))?;
+                out.push(Value::I32(case as i32));
+                Ok(())
+            }
             ComponentValue::Option(payload) => {
                 let ComponentType::Option(index) = ty else {
                     return Err("an option argument is not an option type".to_owned());
@@ -1499,6 +1531,13 @@ impl ComponentInstance {
         }
         match (ty, core_results) {
             (ComponentType::Scalar(scalar), [value]) => lift(value.clone(), *scalar),
+            (ComponentType::Enum(index), [value]) => {
+                let Some(ComponentTypeDef::Enum(labels)) = self.types.get(*index as usize) else {
+                    return Err("the result's enum is not defined".to_owned());
+                };
+                let case = enum_case(value, labels.len())?;
+                Ok(ComponentValue::Enum(labels[case].clone()))
+            }
             (ComponentType::Record(index), values) => {
                 let Some(ComponentTypeDef::Record(fields)) = self.types.get(*index as usize) else {
                     return Err("the result's record is not defined".to_owned());
@@ -1548,6 +1587,10 @@ impl ComponentInstance {
             }
             ComponentType::Scalar(scalar) => {
                 self.load_scalar(instance, memory, u64::from(pointer), *scalar)
+            }
+            ComponentType::Enum(_) => {
+                // An enum is only ever a direct value, so it is never read from memory.
+                Err("an enum is not read from memory".to_owned())
             }
             ComponentType::Option(index) => {
                 let Some(ComponentTypeDef::Option(payload)) = self.types.get(*index as usize)
@@ -1744,6 +1787,9 @@ fn value_matches(value: &ComponentValue, ty: &ComponentType, types: &[ComponentT
                     *name == field.name && value.scalar() == Some(field.ty)
                 })
         }
+        (ComponentValue::Enum(label), ComponentType::Enum(index)) => {
+            matches!(types.get(*index as usize), Some(ComponentTypeDef::Enum(labels)) if labels.contains(label))
+        }
         (ComponentValue::Option(payload), ComponentType::Option(index)) => {
             let Some(ComponentTypeDef::Option(element)) = types.get(*index as usize) else {
                 return false;
@@ -1799,7 +1845,18 @@ fn lower_scalar(value: &ComponentValue) -> Option<Value> {
         ComponentValue::String(_)
         | ComponentValue::Record(_)
         | ComponentValue::List(_)
-        | ComponentValue::Option(_) => None,
+        | ComponentValue::Option(_)
+        | ComponentValue::Enum(_) => None,
+    }
+}
+
+/// The case index an enum's core value names, which must be one of its `count` cases.
+fn enum_case(value: &Value, count: usize) -> Result<usize, String> {
+    match value {
+        Value::I32(index) if (*index as u32 as usize) < count => Ok(*index as u32 as usize),
+        other => Err(format!(
+            "{other:?} is not a case of an enum of {count} cases"
+        )),
     }
 }
 
@@ -2018,6 +2075,7 @@ fn value_type(
         Some(ComponentTypeDef::Record(_)) => Ok(ComponentType::Record(index)),
         Some(ComponentTypeDef::List(_)) => Ok(ComponentType::List(index)),
         Some(ComponentTypeDef::Option(_)) => Ok(ComponentType::Option(index)),
+        Some(ComponentTypeDef::Enum(_)) => Ok(ComponentType::Enum(index)),
         Some(ComponentTypeDef::Func(_)) => Err(ComponentError::UnsupportedType {
             what: "a function type used as a value",
             offset: at,
@@ -2075,9 +2133,9 @@ fn decode_types(
                             })
                         }
                         ComponentType::Scalar(ty) => fields.push(RecordField { name, ty }),
-                        ComponentType::Option(_) => {
+                        ComponentType::Option(_) | ComponentType::Enum(_) => {
                             return Err(ComponentError::UnsupportedType {
-                                what: "an option in a record",
+                                what: "an option or an enum in a record",
                                 offset: at_field,
                             })
                         }
@@ -2109,7 +2167,8 @@ fn decode_types(
                     ComponentType::Scalar(scalar) => scalar,
                     ComponentType::Record(_)
                     | ComponentType::List(_)
-                    | ComponentType::Option(_) => {
+                    | ComponentType::Option(_)
+                    | ComponentType::Enum(_) => {
                         return Err(ComponentError::UnsupportedType {
                             what: "an option of a record, list, or option",
                             offset: payload_at,
@@ -2117,6 +2176,22 @@ fn decode_types(
                     }
                 };
                 types.push(ComponentTypeDef::Option(payload));
+            }
+            TYPE_ENUM => {
+                let case_count = reader.u32()?;
+                if case_count == 0 {
+                    return Err(ComponentError::Malformed { offset: at });
+                }
+                let mut labels: Vec<String> = Vec::new();
+                for _ in 0..case_count {
+                    let at_label = reader.position();
+                    let label = reader.name()?;
+                    if labels.contains(&label) {
+                        return Err(ComponentError::Malformed { offset: at_label });
+                    }
+                    labels.push(label);
+                }
+                types.push(ComponentTypeDef::Enum(labels));
             }
             TYPE_LIST => {
                 let element_at = reader.position();
@@ -2130,7 +2205,8 @@ fn decode_types(
                     ComponentType::Scalar(scalar) => scalar,
                     ComponentType::Record(_)
                     | ComponentType::List(_)
-                    | ComponentType::Option(_) => {
+                    | ComponentType::Option(_)
+                    | ComponentType::Enum(_) => {
                         return Err(ComponentError::UnsupportedType {
                             what: "a list of records, lists, or options",
                             offset: element_at,
@@ -2186,7 +2262,10 @@ fn decode_imports(
         let has_record = func.params.iter().chain(func.result.iter()).any(|ty| {
             matches!(
                 ty,
-                ComponentType::Record(_) | ComponentType::List(_) | ComponentType::Option(_)
+                ComponentType::Record(_)
+                    | ComponentType::List(_)
+                    | ComponentType::Option(_)
+                    | ComponentType::Enum(_)
             )
         });
         if has_record {
@@ -2260,7 +2339,12 @@ fn decode_canon(
                     if func.params.iter().chain(func.result.iter()).any(|ty| {
                         holds_string(ty)
                             || holds_list(ty)
-                            || matches!(ty, ComponentType::Record(_) | ComponentType::Option(_))
+                            || matches!(
+                                ty,
+                                ComponentType::Record(_)
+                                    | ComponentType::Option(_)
+                                    | ComponentType::Enum(_)
+                            )
                     }) {
                         return Err(ComponentError::UnsupportedCanon {
                             what: "lowering a function with strings, lists, or records",
