@@ -215,10 +215,10 @@ impl ExecutableCode {
             )
         )
     ))]
-    pub(crate) fn call(&self, args: *const i64, context: *mut crate::Context) -> u64 {
-        type Entry = extern "C" fn(*const i64, *mut crate::Context) -> u64;
+    pub(crate) fn call(&self, args: *mut i64, context: *mut crate::Context) -> u64 {
+        type Entry = extern "C" fn(*mut i64, *mut crate::Context) -> u64;
         // SAFETY: `self.address` is the start of a read-execute mapping holding code that
-        // `x86::encode` generated for exactly this signature (`extern "C"`, an argument
+        // `mir_x86::encode` generated for exactly this signature (`extern "C"`, an argument
         // pointer and a context pointer, one `i64` result, on the host's convention). The
         // mapping lives as long as `self`, and `&self` keeps it alive for the whole call. The
         // generated code reads exactly `arity` values through `args`, which the caller has
@@ -240,7 +240,7 @@ impl ExecutableCode {
             )
         )
     )))]
-    pub(crate) fn call(&self, _args: *const i64, _context: *mut crate::Context) -> u64 {
+    pub(crate) fn call(&self, _args: *mut i64, _context: *mut crate::Context) -> u64 {
         unreachable!("no ExecutableCode exists on this target")
     }
 

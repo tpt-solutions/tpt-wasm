@@ -90,7 +90,9 @@ boundary does and does not guard against.
 
 ## Testing
 
-- The encoder's golden encodings and register tests run everywhere.
+- Each native encoder has a few golden tests (the context layout, the constant loads, and the
+  prologue and return words), which run on every host. Behaviour is checked by the differential
+  suites below, which run each target's generated code where that target can run.
 - `tests/differential.rs` generates straight-line functions, runs each through Micro and
   through the compiled code, and requires equal results.
 - `tests/control_flow.rs` does the same for loops, conditional branches, `select`,
@@ -108,10 +110,10 @@ boundary does and does not guard against.
 
 | Target | Calling convention | Code generator | Tested |
 |---|---|---|---|
-| x86-64 Windows | Win64 | `x86.rs` | natively |
-| x86-64 Unix | System V | `x86.rs` | natively under WSL |
-| AArch64 Unix | AAPCS64 | `aarch64.rs` | under `qemu-aarch64` |
-| RISC-V 64 Unix | LP64 | `riscv64.rs` | under `qemu-riscv64` |
+| x86-64 Windows | Win64 | `mir_x86.rs` | natively |
+| x86-64 Unix | System V | `mir_x86.rs` | natively under WSL |
+| AArch64 Unix | AAPCS64 | `mir_aarch64.rs` | under `qemu-aarch64` |
+| RISC-V 64 Unix | LP64 | `mir_riscv64.rs` | under `qemu-riscv64` |
 
 Every encoder is compiled on every host, so its golden tests run everywhere. Installing code
 needs the target.

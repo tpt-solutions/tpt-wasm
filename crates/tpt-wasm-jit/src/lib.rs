@@ -45,7 +45,7 @@
 //! and its result.
 //!
 //! Anything else is refused with [`JitError::Unsupported`] rather than compiled approximately: a
-//! function with more than one result, calls through an imported or exported table, a
+//! call through a table other than the module's own, a
 //! `memory.grow` of a memory that is not reserved, and a frame larger than the encoder's limit are
 //! left to the interpreter or the baseline. A call to a function that is not compiled refuses the
 //! caller too, so [`compile_module`] leaves that caller out as well.
@@ -73,23 +73,21 @@
 
 #![deny(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fmt;
 
-use tpt_wasm_ir::{
-    instruction_operands, instruction_results, terminator_operands, BlockId, IrFunction, IrInstr,
-    IrModule, Terminator, ValueId,
-};
+use tpt_wasm_ir::{IrFunction, IrInstr, IrModule};
 use tpt_wasm_types::{Trap, ValueType};
 
-mod aarch64;
 /// The machine IR, the stage between the verified IR and native code. See the module docs.
 pub mod mir;
-#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+mod mir_aarch64;
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+mod mir_riscv64;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod mir_x86;
-mod riscv64;
-mod x86;
+mod shared;
 
 #[allow(unsafe_code)]
 mod exec;
@@ -202,204 +200,9 @@ pub(crate) struct CallEnv {
     /// Whether `memory.grow` may be compiled: the module's memory has a maximum that the runtime
     /// reserves in full (see [`MAX_RESERVED_PAGES`]).
     pub(crate) memory_grow: bool,
-}
-
-/// Whether an instruction reads its operands and writes its result through the register or slot each value has,
-/// so that the value may be in a register. The rest read and write slots only.
-pub(crate) fn is_register_instruction(instruction: &IrInstr) -> bool {
-    matches!(
-        instruction,
-        IrInstr::ConstI32 { .. }
-            | IrInstr::ConstI64 { .. }
-            | IrInstr::LocalGet { .. }
-            | IrInstr::LocalSet { .. }
-            | IrInstr::I32Add { .. }
-            | IrInstr::I32Sub { .. }
-            | IrInstr::I32Mul { .. }
-            | IrInstr::I32And { .. }
-            | IrInstr::I32Or { .. }
-            | IrInstr::I32Xor { .. }
-            | IrInstr::I64Add { .. }
-            | IrInstr::I64Sub { .. }
-            | IrInstr::I64Mul { .. }
-            | IrInstr::I64And { .. }
-            | IrInstr::I64Or { .. }
-            | IrInstr::I64Xor { .. }
-    )
-}
-
-/// The registers for the values of a function that makes no call, drawn from `pool`. A value is given a register when a
-/// register instruction defines it and only register instructions in the same block read it, after its
-/// definition. Such a value lives only between its definition and its last read, so the registers are
-/// assigned in one pass per block, and a value that finds no free register stays in its slot.
-pub(crate) fn allocate_registers(
-    function: &IrFunction,
-    pool: &[u8],
-    terminators_in_registers: bool,
-    is_register: fn(&IrInstr) -> bool,
-) -> HashMap<ValueId, u8> {
-    // The (block, index) of the instruction that defines each value a register instruction defines.
-    let mut definitions: HashMap<ValueId, (usize, usize)> = HashMap::new();
-    // Every read of a value: (block, index, whether the reader is a register instruction). A terminator
-    // reads at index `usize::MAX`, which is not a register instruction, so a terminator read rules the
-    // value out.
-    let mut reads: HashMap<ValueId, Vec<(usize, usize, bool)>> = HashMap::new();
-    for (block_index, block) in function.blocks.iter().enumerate() {
-        for (index, instruction) in block.instrs.iter().enumerate() {
-            let register = is_register(instruction);
-            if register {
-                for result in instruction_results(instruction) {
-                    definitions.insert(result, (block_index, index));
-                }
-            }
-            for operand in instruction_operands(instruction) {
-                reads
-                    .entry(operand)
-                    .or_default()
-                    .push((block_index, index, register));
-            }
-        }
-        // A terminator reads after every instruction of its block. Its reads are register reads only if the
-        // encoder reads registers there.
-        for operand in terminator_operands(&block.terminator) {
-            reads.entry(operand).or_default().push((
-                block_index,
-                block.instrs.len(),
-                terminators_in_registers,
-            ));
-        }
-    }
-    // The live interval (definition, last read) of each value that qualifies, per block.
-    let mut intervals: Vec<Vec<(usize, usize, ValueId)>> = vec![Vec::new(); function.blocks.len()];
-    for (value, (block, definition)) in &definitions {
-        let Some(uses) = reads.get(value) else {
-            continue;
-        };
-        let mut last_read = None;
-        let qualifies = uses.iter().all(|(reader_block, index, register)| {
-            let inside = *register && *reader_block == *block && *index > *definition;
-            if inside {
-                last_read = Some(last_read.map_or(*index, |last: usize| last.max(*index)));
-            }
-            inside
-        });
-        if let (true, Some(last)) = (qualifies, last_read) {
-            intervals[*block].push((*definition, last, *value));
-        }
-    }
-    let mut registers = HashMap::new();
-    for block in &mut intervals {
-        // Sorting by definition makes the assignment, and so the code, the same on every run.
-        block.sort_by_key(|(definition, _, _)| *definition);
-        // Registers held by values still live, with the index of their last read.
-        let mut held: Vec<(usize, u8)> = Vec::new();
-        for &(definition, last, value) in block.iter() {
-            // A register whose value is last read at this definition is still needed by it, so only
-            // registers last read before the definition are free.
-            held.retain(|(last_read, _)| *last_read >= definition);
-            let free = pool.iter().copied().find(|register| {
-                held.iter()
-                    .all(|(_, held_register)| held_register != register)
-            });
-            if let Some(register) = free {
-                held.push((last, register));
-                registers.insert(value, register);
-            }
-        }
-    }
-    registers
-}
-
-/// The registers for the values that live across blocks in a function that makes no call: its parameters,
-/// its locals, and the parameters of its blocks. The most used take up to `locals` registers, so that values
-/// within a block keep the rest. Ties go to the lower value id, so the choice is the same on every run.
-///
-/// A value qualifies when no instruction outside the register instructions reads it, since such an instruction
-/// reads its operand from its slot, which a register value never fills. A terminator reads registers.
-pub(crate) fn allocate_local_registers(
-    function: &IrFunction,
-    pool: &[u8],
-    locals: usize,
-    is_register: fn(&IrInstr) -> bool,
-) -> HashMap<ValueId, u8> {
-    let mut uses: HashMap<ValueId, usize> = HashMap::new();
-    let mut slot_read: HashSet<ValueId> = HashSet::new();
-    for block in &function.blocks {
-        for instruction in &block.instrs {
-            if let IrInstr::LocalGet { local, .. }
-            | IrInstr::LocalSet { local, .. }
-            | IrInstr::LocalTee { local, .. } = instruction
-            {
-                *uses.entry(*local).or_default() += 1;
-            }
-            let register = is_register(instruction);
-            for operand in instruction_operands(instruction) {
-                *uses.entry(operand).or_default() += 1;
-                if !register {
-                    slot_read.insert(operand);
-                }
-            }
-        }
-        for operand in terminator_operands(&block.terminator) {
-            *uses.entry(operand).or_default() += 1;
-        }
-    }
-    // Each branch writes the parameters of its target, which counts as a use of them.
-    let parameters: HashMap<BlockId, &Vec<ValueId>> = function
-        .blocks
-        .iter()
-        .map(|block| (block.id, &block.params))
-        .collect();
-    for block in &function.blocks {
-        let branches: Vec<(&BlockId, &Vec<ValueId>)> = match &block.terminator {
-            Terminator::Branch { target, values } => vec![(target, values)],
-            Terminator::CondBranch {
-                then_target,
-                then_values,
-                else_target,
-                else_values,
-                ..
-            } => vec![(then_target, then_values), (else_target, else_values)],
-            _ => Vec::new(),
-        };
-        for (target, values) in branches {
-            if let Some(targets) = parameters.get(target) {
-                for (parameter, _) in targets.iter().zip(values) {
-                    *uses.entry(*parameter).or_default() += 1;
-                }
-            }
-        }
-    }
-    let mut seen = HashSet::new();
-    let mut candidates: Vec<(usize, u32, ValueId)> = function
-        .params
-        .iter()
-        .chain(&function.locals)
-        .chain(function.blocks.iter().flat_map(|block| &block.params))
-        .filter(|value| seen.insert(**value))
-        .filter(|value| !slot_read.contains(value))
-        .filter_map(|value| uses.get(value).map(|count| (*count, value.0, *value)))
-        .collect();
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    candidates
-        .into_iter()
-        .take(locals.min(pool.len()))
-        .zip(pool.iter().copied())
-        .map(|((_, _, value), register)| (value, register))
-        .collect()
-}
-
-/// The result of a call in the IR: its one result, or none for a call to a function that returns nothing.
-pub(crate) fn call_result(
-    results: &[tpt_wasm_ir::ValueId],
-) -> Result<Option<tpt_wasm_ir::ValueId>, JitError> {
-    match results {
-        [] => Ok(None),
-        [result] => Ok(Some(*result)),
-        _ => Err(JitError::Unsupported(
-            "a call with more than one result".into(),
-        )),
-    }
+    /// Whether the code may call the host: the caller's context carries the host trampoline. A
+    /// single-function compile has none, so this is false there.
+    pub(crate) host: bool,
 }
 
 /// The result of a call, given the return value and the status the code left in the context.
@@ -460,7 +263,9 @@ impl std::error::Error for JitError {}
 /// A function compiled to machine code, ready to call.
 pub struct CompiledFunction {
     params: Vec<ValueType>,
-    result: Option<ValueType>,
+    /// The result types, in order. A function with two or more results writes them to the argument
+    /// block it is called with, and returns nothing in the result register.
+    results: Vec<ValueType>,
     code: exec::ExecutableCode,
 }
 
@@ -534,22 +339,28 @@ impl CompiledFunction {
     }
 
     fn require_result(&self, expected: ValueType) -> Result<(), JitError> {
-        if self.result != Some(expected) {
+        if self.results.as_slice() != [expected] {
             return Err(JitError::Unsupported(format!(
                 "the function returns {:?}, not {expected:?}",
-                self.result
+                self.results
             )));
         }
         Ok(())
     }
 
-    /// Run the code and return the raw result register, or the trap it reported.
+    /// Run the code and return the raw result register, or the trap it reported. A function with
+    /// several results is refused here, since its results are not in the register.
     fn call_with_memory_bits(
         &self,
         args: &[i64],
         memory: *mut u8,
         memory_len: u64,
     ) -> Result<u64, JitError> {
+        if self.results.len() > 1 {
+            return Err(JitError::Unsupported(
+                "a function with several results; call it through its module".into(),
+            ));
+        }
         if args.len() != self.params.len() {
             return Err(JitError::ArityMismatch {
                 expected: self.params.len(),
@@ -557,7 +368,8 @@ impl CompiledFunction {
             });
         }
         let mut context = Context::without_calls(memory, memory_len);
-        let bits = self.code.call(args.as_ptr(), &mut context);
+        let mut block = args.to_vec();
+        let bits = self.code.call(block.as_mut_ptr(), &mut context);
         finish(bits, context.status)
     }
 
@@ -571,9 +383,15 @@ impl CompiledFunction {
         &self.params
     }
 
-    /// The result type, or `None` for a function that returns nothing.
+    /// The first result type, or `None` for a function that returns nothing. See
+    /// [`results`](Self::results) for a function with several.
     pub fn result(&self) -> Option<ValueType> {
-        self.result
+        self.results.first().copied()
+    }
+
+    /// The result types, in order.
+    pub fn results(&self) -> &[ValueType] {
+        &self.results
     }
 
     /// Install machine code that was generated earlier, for a function with this signature.
@@ -585,11 +403,11 @@ impl CompiledFunction {
     pub fn from_machine_code(
         code: &[u8],
         params: Vec<ValueType>,
-        result: Option<ValueType>,
+        results: Vec<ValueType>,
     ) -> Result<Self, JitError> {
         Ok(Self {
             params,
-            result,
+            results,
             code: exec::ExecutableCode::new(code)?,
         })
     }
@@ -604,7 +422,7 @@ impl fmt::Debug for CompiledFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompiledFunction")
             .field("params", &self.params)
-            .field("result", &self.result)
+            .field("results", &self.results)
             .field("code_len", &self.code.bytes().len())
             .finish()
     }
@@ -666,15 +484,54 @@ const HOST_CAN_RUN_CODE: bool = cfg!(any(
     )
 ));
 
+/// The module's environment as the machine-IR encoders read it.
+fn machine_environment(env: &CallEnv, sse41: bool) -> shared::Environment<'_> {
+    shared::Environment {
+        memory_grow: env.memory_grow,
+        callable: &env.callable,
+        indirect: env.indirect,
+        type_ids: &env.type_ids,
+        globals: env.globals,
+        host: env.host,
+        sse41,
+    }
+}
+
+/// Encode a function through the machine IR to x86-64 code, under the module's environment: the
+/// machine IR is the native path on x86-64. The encoder is pure, so it is compiled on every host, and
+/// its code is run only where it targets.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn encode_machine(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, JitError> {
+    let machine = mir::lower(function)?;
+    let environment = machine_environment(env, host_has_sse41());
+    mir_x86::encode(&machine, shared::Abi::host(), &environment)
+}
+
+/// Encode a function through the machine IR to AArch64 code. Rounding and truncation use the AArch64
+/// instructions, so the host's SSE4.1 does not apply here.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn encode_machine_aarch64(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, JitError> {
+    let machine = mir::lower(function)?;
+    mir_aarch64::encode(&machine, &machine_environment(env, true))
+}
+
+/// Encode a function through the machine IR to RV64 code. The RISC-V encoder has no SSE4.1 analogue, and
+/// rounds with its own sequence, so the host's SSE4.1 does not apply here.
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+fn encode_machine_riscv64(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, JitError> {
+    let machine = mir::lower(function)?;
+    mir_riscv64::encode(&machine, &machine_environment(env, true))
+}
+
 /// Generate the machine code for this host's architecture. `env` says which functions a call in
 /// `function` may name, and whether an indirect call may be compiled; anything else is refused.
 fn encode_for_host(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, JitError> {
     if cfg!(target_arch = "aarch64") {
-        aarch64::encode(function, env)
+        encode_machine_aarch64(function, env)
     } else if cfg!(target_arch = "riscv64") {
-        riscv64::encode(function, env)
+        encode_machine_riscv64(function, env)
     } else {
-        x86::encode(function, x86::Abi::host(), env, host_has_sse41())
+        encode_machine(function, env)
     }
 }
 
@@ -687,28 +544,98 @@ fn encode_for_host(function: &IrFunction, env: &CallEnv) -> Result<Vec<u8>, JitE
 /// This is the native path for the machine IR's `i32` slice. The result is run the same way as the
 /// output of [`compile`], and agrees with it and with Micro on that slice.
 ///
+/// A `memory.grow` is refused, since the code would have no reservation to grow into; use
+/// [`compile_machine_reserved`] for a function that grows its memory.
+///
 /// # Errors
 ///
 /// A function outside the slice is refused with [`JitError::Unsupported`], and a host that cannot
 /// run generated code gets [`JitError::UnsupportedTarget`].
 #[cfg(target_arch = "x86_64")]
 pub fn compile_machine(function: &IrFunction) -> Result<CompiledFunction, JitError> {
+    install_machine(function, false)
+}
+
+/// Compile a function through machine IR, allowing `memory.grow`.
+///
+/// The code grows its memory in place, up to the reservation it is called with, so it can only be
+/// run through [`ReservedFunction::call_with_reservation`].
+///
+/// # Errors
+///
+/// As [`compile_machine`].
+#[cfg(target_arch = "x86_64")]
+pub fn compile_machine_reserved(function: &IrFunction) -> Result<ReservedFunction, JitError> {
+    install_machine(function, true).map(ReservedFunction)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn install_machine(function: &IrFunction, memory_grow: bool) -> Result<CompiledFunction, JitError> {
+    refuse_several_results(function)?;
     let machine = mir::lower(function)?;
-    let code = mir_x86::encode(&machine, x86::Abi::host())?;
+    let environment = shared::Environment {
+        memory_grow,
+        callable: &[],
+        indirect: false,
+        type_ids: &[],
+        globals: false,
+        host: false,
+        sse41: host_has_sse41(),
+    };
+    let code = mir_x86::encode(&machine, shared::Abi::host(), &environment)?;
     if !HOST_CAN_RUN_CODE {
         return Err(JitError::UnsupportedTarget);
     }
     let executable = exec::ExecutableCode::new(&code)?;
     Ok(CompiledFunction {
         params: function.function_type.params.0.clone(),
-        result: function.function_type.results.0.first().copied(),
+        results: function.function_type.results.0.clone(),
         code: executable,
     })
 }
 
+/// Machine code that may grow its linear memory, installed by [`compile_machine_reserved`].
+#[cfg(target_arch = "x86_64")]
+pub struct ReservedFunction(CompiledFunction);
+
+#[cfg(target_arch = "x86_64")]
+impl ReservedFunction {
+    /// Run the function on `i32` arguments over `memory`, whose first `length` bytes are the live
+    /// memory. The whole slice is the reservation: `memory.grow` extends the live length in place,
+    /// up to the slice's length, and fails past it.
+    ///
+    /// Returns the outcome and the live length afterwards. The length is returned whether or not the
+    /// call trapped, since a grow that happened before a trap is still in effect.
+    pub fn call_with_reservation(
+        &self,
+        args: &[i32],
+        memory: &mut [u8],
+        length: usize,
+    ) -> (Result<i32, JitError>, usize) {
+        let function = &self.0;
+        if let Err(error) = function.require_i32_signature() {
+            return (Err(error), length);
+        }
+        if args.len() != function.params.len() {
+            let error = JitError::ArityMismatch {
+                expected: function.params.len(),
+                actual: args.len(),
+            };
+            return (Err(error), length);
+        }
+        let mut context = Context::without_calls(memory.as_mut_ptr(), length as u64);
+        context.memory_capacity = memory.len() as u64;
+        let mut block = widen(args);
+        let bits = function.code.call(block.as_mut_ptr(), &mut context);
+        let result = finish(bits, context.status).map(|bits| bits as u32 as i32);
+        (result, context.memory_len as usize)
+    }
+}
+
 pub fn compile(function: &IrFunction) -> Result<CompiledFunction, JitError> {
+    refuse_several_results(function)?;
     let params = function.function_type.params.0.clone();
-    let result = function.function_type.results.0.first().copied();
+    let results = function.function_type.results.0.clone();
     // Encoding is pure and runs everywhere, so a function outside the subset is refused the same
     // way on every target. Only installing the code needs the target. With no callable functions,
     // a call in this function is refused: a call needs the module it belongs to.
@@ -719,9 +646,21 @@ pub fn compile(function: &IrFunction) -> Result<CompiledFunction, JitError> {
     let executable = exec::ExecutableCode::new(&code)?;
     Ok(CompiledFunction {
         params,
-        result,
+        results,
         code: executable,
     })
+}
+
+/// Refuse a function with several results where it is compiled alone. Such a function writes its
+/// results to the argument block of a call, which a single call does not provide, so it is compiled
+/// only as part of a module, which does.
+fn refuse_several_results(function: &IrFunction) -> Result<(), JitError> {
+    if function.function_type.results.0.len() > 1 {
+        return Err(JitError::Unsupported(
+            "a function with several results is compiled through its module".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The native stack, in bytes, that a chain of nested calls may use. A thread's stack is one or
@@ -811,10 +750,24 @@ fn measured_frame_bytes(code: &[u8]) -> Option<usize> {
         let word = u32::from_le_bytes(code.get(8..12)?.try_into().ok()?);
         Some(SAVED + ((word >> 10) & 0xFFF) as usize)
     } else if cfg!(target_arch = "riscv64") {
-        // addi sp, sp, -16; sd s0; sd ra; addi s0, sp, 16; addi sp, sp, -size: the fifth word.
-        let word = u32::from_le_bytes(code.get(16..20)?.try_into().ok()?);
-        let immediate = (word as i32) >> 20;
-        Some(SAVED + usize::try_from(-immediate).ok()?)
+        // addi sp, sp, -16; sd s0; sd ra; addi s0, sp, 16; then one `addi sp, sp, -n` for each step of
+        // the frame, which the encoder takes in steps of at most 2032 bytes. The steps are summed.
+        let mut frame = 0;
+        let mut offset = 16;
+        while let Some(bytes) = code.get(offset..offset + 4) {
+            let word = u32::from_le_bytes(bytes.try_into().ok()?);
+            let is_frame_step = word & 0x7F == 0x13
+                && (word >> 12) & 7 == 0
+                && (word >> 7) & 0x1F == 2
+                && (word >> 15) & 0x1F == 2
+                && (word as i32) >> 20 < 0;
+            if !is_frame_step {
+                break;
+            }
+            frame += usize::try_from(-((word as i32) >> 20)).ok()?;
+            offset += 4;
+        }
+        Some(SAVED + frame)
     } else {
         // push rbp; mov rbp, rsp; sub rsp, imm32: the immediate is at byte 7.
         let size = i32::from_le_bytes(code.get(7..11)?.try_into().ok()?);
@@ -942,8 +895,8 @@ pub fn module_uses_memory_grow(module: &IrModule) -> bool {
 pub struct FunctionParts {
     /// The parameter types, in order.
     pub params: Vec<ValueType>,
-    /// The result type, or `None` for a function that returns nothing.
-    pub result: Option<ValueType>,
+    /// The result types, in order; empty for a function that returns nothing.
+    pub results: Vec<ValueType>,
     /// The machine code, which is installed exactly as it is. See [`CompiledModule::from_parts`].
     pub code: Vec<u8>,
 }
@@ -986,7 +939,7 @@ impl CompiledModule {
                 .map(|function| {
                     function.as_ref().map(|function| FunctionParts {
                         params: function.params.clone(),
-                        result: function.result,
+                        results: function.results.clone(),
                         code: function.code.bytes().to_vec(),
                     })
                 })
@@ -1029,7 +982,7 @@ impl CompiledModule {
                     entries[index] = code.address();
                     functions.push(Some(CompiledFunction {
                         params: function.params,
-                        result: function.result,
+                        results: function.results.clone(),
                         code,
                     }));
                 }
@@ -1174,20 +1127,37 @@ impl CompiledModule {
         self.call_inner(index, args, memory, globals, host)
     }
 
-    /// Whether compiled code of this module grows its memory, so the caller must reserve the memory's
-    /// maximum and use [`call_with_memory`](Self::call_with_memory).
-    pub fn memory_grows(&self) -> bool {
-        self.memory_grows
-    }
-
-    fn call_inner(
+    /// As [`call_with_host`](Self::call_with_host), for a function with any number of results: returns
+    /// every result word, in order. A function with several results writes them to the argument block,
+    /// which the call provides.
+    pub fn call_with_host_results(
         &self,
         index: usize,
         args: &[i64],
         memory: Option<&mut LinearMemory>,
         globals: &mut [u64],
         host: Option<&mut dyn HostCalls>,
-    ) -> Result<u64, JitError> {
+    ) -> Result<Vec<u64>, JitError> {
+        self.call_words(index, args, memory, globals, host)
+    }
+
+    /// Whether compiled code of this module grows its memory, so the caller must reserve the memory's
+    /// maximum and use [`call_with_memory`](Self::call_with_memory).
+    pub fn memory_grows(&self) -> bool {
+        self.memory_grows
+    }
+
+    /// Run function `index` and return its result words in order. The arguments are copied into an
+    /// argument block that is as long as the larger of the arguments and the results, because a
+    /// function with several results writes them there.
+    fn call_words(
+        &self,
+        index: usize,
+        args: &[i64],
+        memory: Option<&mut LinearMemory>,
+        globals: &mut [u64],
+        host: Option<&mut dyn HostCalls>,
+    ) -> Result<Vec<u64>, JitError> {
         let function = self
             .functions
             .get(index)
@@ -1199,6 +1169,8 @@ impl CompiledModule {
                 actual: args.len(),
             });
         }
+        let mut block = vec![0_i64; function.params.len().max(function.results.len())];
+        block[..args.len()].copy_from_slice(args);
         let mut memory = memory;
         let mut host = host;
         let host_pointer = match host.as_mut() {
@@ -1226,12 +1198,44 @@ impl CompiledModule {
             host_call: host_trampoline as *const () as usize,
             host: host_pointer,
         };
-        let bits = function.code.call(args.as_ptr(), &mut context);
+        let bits = function.code.call(block.as_mut_ptr(), &mut context);
         // A grow in the code updated the size in the context, so the caller sees it, trap or not.
         if let Some(memory) = memory {
             memory.len = context.memory_len;
         }
-        finish(bits, context.status)
+        let bits = finish(bits, context.status)?;
+        Ok(match function.results.len() {
+            0 => Vec::new(),
+            // A single result is in the return register.
+            1 => vec![bits],
+            // Several results are in the argument block, in order.
+            count => block[..count].iter().map(|word| *word as u64).collect(),
+        })
+    }
+
+    /// Run function `index` on the `i64` words of `args` and return its one result word, as
+    /// [`call_with_host`](Self::call_with_host) does. A function with several results is refused, since
+    /// its results do not fit one word; see [`call_with_host_results`](Self::call_with_host_results).
+    fn call_inner(
+        &self,
+        index: usize,
+        args: &[i64],
+        memory: Option<&mut LinearMemory>,
+        globals: &mut [u64],
+        host: Option<&mut dyn HostCalls>,
+    ) -> Result<u64, JitError> {
+        if self
+            .functions
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|function| function.results.len() > 1)
+        {
+            return Err(JitError::Unsupported(
+                "a function with several results; use call_with_host_results".into(),
+            ));
+        }
+        self.call_words(index, args, memory, globals, host)
+            .map(|words| words.first().copied().unwrap_or(0))
     }
 }
 
@@ -1248,6 +1252,15 @@ pub fn compile_module(
     max_call_depth: u64,
     table_private: bool,
 ) -> CompiledModule {
+    compile_module_with(module, max_call_depth, table_private, encode_for_host)
+}
+
+fn compile_module_with(
+    module: &IrModule,
+    max_call_depth: u64,
+    table_private: bool,
+    encode: fn(&IrFunction, &CallEnv) -> Result<Vec<u8>, JitError>,
+) -> CompiledModule {
     let functions = &module.functions;
     let mut callable = vec![HOST_CAN_RUN_CODE; functions.len()];
 
@@ -1258,31 +1271,11 @@ pub fn compile_module(
         .first()
         .filter(|table| table.import.is_none())
         .filter(|table| table.min <= 1 << 20);
-    let slots: Vec<Option<u32>> = match table {
-        Some(table) => {
-            let mut slots = vec![None; table.min as usize];
-            for (offset, element) in table.elements.iter().enumerate() {
-                if let Some(slot) = slots.get_mut(table.offset as usize + offset) {
-                    *slot = *element;
-                }
-            }
-            slots
-        }
-        None => Vec::new(),
-    };
+    // The layout is shared with the machine IR's interpreter, so both backends check the same table.
+    let slots: Vec<Option<u32>> = mir::table_slots(module);
     // A slot's signature id is the id of the first module type equal to its function's type. A
     // function whose type is not among the module's types matches no call.
-    let type_ids: Vec<u64> = module
-        .types
-        .iter()
-        .map(|kind| {
-            module
-                .types
-                .iter()
-                .position(|other| other == kind)
-                .unwrap_or(0) as u64
-        })
-        .collect();
+    let type_ids: Vec<u64> = mir::type_ids(module);
     // An indirect call is compiled only when no other instance can write the table, and every
     // slot it can select is a function compiled in this module.
     let memory_grow_env = memory_reservable(module);
@@ -1291,6 +1284,8 @@ pub fn compile_module(
         type_ids: type_ids.clone(),
         globals: !module.globals.is_empty(),
         memory_grow: memory_grow_env,
+        // A module's calls go through its context, which always carries the trampoline.
+        host: true,
         indirect: table.is_some()
             && table_private
             && slots.iter().all(|slot| match slot {
@@ -1318,7 +1313,7 @@ pub fn compile_module(
     loop {
         let mut changed = false;
         for (index, function) in functions.iter().enumerate() {
-            if callable[index] && encode_for_host(function, &env_for(&callable)).is_err() {
+            if callable[index] && encode(function, &env_for(&callable)).is_err() {
                 callable[index] = false;
                 changed = true;
             }
@@ -1338,7 +1333,7 @@ pub fn compile_module(
         }
         // Installation can fail where the encoder succeeded. A caller of this function was
         // compiled to call it, so a missing callee leaves the whole module without native code.
-        let installed = encode_for_host(function, &env_for(&callable))
+        let installed = encode(function, &env_for(&callable))
             .ok()
             .and_then(|code| exec::ExecutableCode::new(&code).ok());
         match installed {
@@ -1346,7 +1341,7 @@ pub fn compile_module(
                 entries[index] = code.address();
                 compiled.push(Some(CompiledFunction {
                     params: function.function_type.params.0.clone(),
-                    result: function.function_type.results.0.first().copied(),
+                    results: function.function_type.results.0.clone(),
                     code,
                 }));
             }
