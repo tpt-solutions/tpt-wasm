@@ -34,9 +34,11 @@
 //! | code | m | the machine code |
 //! | checksum | 8 | FNV-1a 64 over every byte before it |
 //!
-//! A module artifact ([`ModuleArtifact`]) has the magic `TPTAOT\0\x04` and holds a whole module:
+//! A module artifact ([`ModuleArtifact`]) has the magic `TPTAOT\0\x05` and holds a whole module:
 //! its target, the call-depth limit it was compiled against, whether its indirect calls are
-//! compiled, whether the module has globals, whether its code grows memory, then each function as a present byte and, when present, its signature and code, then
+//! compiled, whether the module has globals, whether its code grows memory, then each function as a present
+//! byte and, when present, its parameter kinds, its result count and kinds (a count of `u32`, then one kind
+//! byte per result), and its code, then
 //! the table as a count and one entry per slot: a function index (or `0xFFFFFFFF` for null) and
 //! the slot's signature id. Its checksum covers every byte before it, as above.
 
@@ -52,7 +54,7 @@ use tpt_wasm_types::ValueType;
 /// The magic bytes of a single-function artifact, ending with the format version.
 const MAGIC: [u8; 8] = *b"TPTAOT\0\x02";
 /// The magic bytes of a module artifact: the same family, with its own version.
-const MODULE_MAGIC: [u8; 8] = *b"TPTAOT\0\x04";
+const MODULE_MAGIC: [u8; 8] = *b"TPTAOT\0\x05";
 /// A one-byte flag in a module artifact: `0` or `1`, and anything else is refused.
 fn flag_byte(byte: u8, what: &str) -> Result<bool, AotError> {
     match byte {
@@ -297,8 +299,12 @@ impl Artifact {
                 host,
             });
         }
-        CompiledFunction::from_machine_code(&self.code, self.params.clone(), self.result)
-            .map_err(AotError::Load)
+        CompiledFunction::from_machine_code(
+            &self.code,
+            self.params.clone(),
+            self.result.into_iter().collect(),
+        )
+        .map_err(AotError::Load)
     }
 }
 
@@ -406,7 +412,14 @@ impl ModuleArtifact {
                             .iter()
                             .map(|value_type| kind_byte(*value_type)),
                     );
-                    out.push(result_byte(function.result));
+                    // The result count as a u32, then one kind byte per result, in order.
+                    out.extend_from_slice(&(function.results.len() as u32).to_le_bytes());
+                    out.extend(
+                        function
+                            .results
+                            .iter()
+                            .map(|value_type| kind_byte(*value_type)),
+                    );
                     out.extend_from_slice(&(function.code.len() as u32).to_le_bytes());
                     out.extend_from_slice(&function.code);
                 }
@@ -460,12 +473,18 @@ impl ModuleArtifact {
                         .iter()
                         .map(|byte| kind_from_byte(*byte))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let result = result_from_byte(cursor.byte()?)?;
+                    // Each result takes at least one byte, so a count past the rest of the bytes is refused.
+                    let result_count = cursor.count(1)?;
+                    let results = cursor
+                        .take(result_count)?
+                        .iter()
+                        .map(|byte| kind_from_byte(*byte))
+                        .collect::<Result<Vec<_>, _>>()?;
                     let code_length = cursor.u32()? as usize;
                     let code = cursor.take(code_length)?.to_vec();
                     functions.push(Some(FunctionParts {
                         params,
-                        result,
+                        results,
                         code,
                     }));
                 }

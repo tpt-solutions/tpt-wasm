@@ -243,3 +243,69 @@ fn a_float_function_keeps_its_types_through_the_artifact() {
         .expect("runs");
     assert_eq!(f64::from_bits(raw), -2.5);
 }
+
+#[test]
+fn a_module_with_several_results_keeps_them_through_the_artifact() {
+    // f0(a, b) = (a + b, a - b). f1(a) calls f0 with (a, 1) and returns both of its results.
+    let i32s = ValueType::I32;
+    let module = Module {
+        types: vec![
+            FunctionType {
+                params: ResultType(vec![i32s, i32s]),
+                results: ResultType(vec![i32s, i32s]),
+            },
+            FunctionType {
+                params: ResultType(vec![i32s]),
+                results: ResultType(vec![i32s, i32s]),
+            },
+        ],
+        functions: vec![
+            Function {
+                type_index: 0,
+                locals: Vec::new(),
+                body: vec![
+                    0x20, 0x00, 0x20, 0x01, 0x6A, 0x20, 0x00, 0x20, 0x01, 0x6B, 0x0B,
+                ],
+            },
+            Function {
+                type_index: 1,
+                locals: Vec::new(),
+                // local.get 0; i32.const 1; call 0; end
+                body: vec![0x20, 0x00, 0x41, 0x01, 0x10, 0x00, 0x0B],
+            },
+        ],
+        exports: vec![
+            Export {
+                name: "pair".into(),
+                desc: ExportDesc::Function(0),
+            },
+            Export {
+                name: "shifted".into(),
+                desc: ExportDesc::Function(1),
+            },
+        ],
+        ..Module::default()
+    };
+    let ir = lowered(module);
+    let artifact = compile_module_artifact(&ir, 1000, true).expect("compiles");
+    let bytes = artifact.to_bytes();
+    let restored = ModuleArtifact::from_bytes(&bytes).expect("reads back");
+    assert_eq!(
+        restored.to_bytes(),
+        bytes,
+        "the artifact is stable across a round trip"
+    );
+    let loaded = restored.load().expect("loads on this host");
+    assert!(
+        loaded.is_compiled(0) && loaded.is_compiled(1),
+        "both functions are native"
+    );
+    let pair = loaded
+        .call_with_host_results(0, &[7, 3], None, &mut [], None)
+        .expect("runs");
+    assert_eq!(pair, vec![10, 4]);
+    let shifted = loaded
+        .call_with_host_results(1, &[7], None, &mut [], None)
+        .expect("runs");
+    assert_eq!(shifted, vec![8, 6]);
+}
