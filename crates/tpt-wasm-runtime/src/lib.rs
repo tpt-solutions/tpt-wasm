@@ -34,12 +34,14 @@ mod native_cache;
 pub use native_cache::default_native_cache_dir;
 mod optimizing;
 mod provenance;
+mod source;
 
 pub use cache::{CacheStats, CompilationCache, CompilationKey};
 pub use debug::{DebugSession, FrameInfo, StopReason};
 pub use provenance::{
     hash_bytes, Configuration, ExecutionArtifact, ExecutionMetadata, Hash, Outcome, Reproduction,
 };
+pub use source::SourceLocation;
 use tpt_wasm_ir::IrModule;
 
 /// Which execution backend to use.
@@ -651,7 +653,9 @@ impl Engine {
             .map_err(RuntimeError::Validation)?;
         let ir = self.cached_ir(bytes, &validated)?;
         let key = native_cache::module_key(bytes);
-        self.instantiate_prepared(validated, ir, Some(&key), &self.linker)
+        let mut instance = self.instantiate_prepared(validated, ir, Some(&key), &self.linker)?;
+        instance.source = source::load(bytes);
+        Ok(instance)
     }
 
     /// Decode, validate, and instantiate a binary module against `linker`, rather than the
@@ -669,7 +673,9 @@ impl Engine {
             .validate(module)
             .map_err(RuntimeError::Validation)?;
         let ir = self.cached_ir(bytes, &validated)?;
-        self.instantiate_prepared(validated, ir, None, linker)
+        let mut instance = self.instantiate_prepared(validated, ir, None, linker)?;
+        instance.source = source::load(bytes);
+        Ok(instance)
     }
 
     /// Hit, miss, and entry counts for the compilation cache.
@@ -850,6 +856,10 @@ pub struct Instance {
     /// Shared with the baseline's host boundary, which counts its calls here, since
     /// the boundary is owned by the compiled module rather than by this instance.
     baseline_host_counts: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// The module's line tables, when it carries `.debug_line`. An error is kept rather than
+    /// refused, so a module with unreadable line information still runs; asking for a location
+    /// reports it.
+    source: Result<Option<Arc<source::SourceMap>>, String>,
     /// Every host call the most recent call made, in the order it was made.
     last_call_host_trace: Vec<HostCallRecord>,
     /// Shared with the baseline's host boundary, for the same reason as the counts.
@@ -1195,6 +1205,7 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
             baseline_host_counts: Arc::new(Mutex::new(BTreeMap::new())),
             last_call_host_trace: Vec::new(),
             baseline_host_trace: Arc::new(Mutex::new(Vec::new())),
+            source: Ok(None),
         };
         let arguments = args.clone();
         let result = instance.invoke_host_call(
@@ -1586,6 +1597,7 @@ fn instantiate_module(
         baseline_host_counts: Arc::new(Mutex::new(BTreeMap::new())),
         last_call_host_trace: Vec::new(),
         baseline_host_trace: Arc::new(Mutex::new(Vec::new())),
+        source: Ok(None),
     };
     // The baseline's host boundary needs the resolved callbacks, which only exist
     // once the import loop has run. It is installed here, before the start

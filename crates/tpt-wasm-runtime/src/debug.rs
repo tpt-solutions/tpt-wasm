@@ -185,6 +185,21 @@ impl DebugSession<'_> {
             .collect()
     }
 
+    /// The source location of frame `frame` of the call stack (`0` is the innermost), from the
+    /// module's line tables. `Ok(None)` means the module has no line information for that
+    /// instruction, or the frame does not exist. `Err` means the module's line information could
+    /// not be read, which is reported here rather than refusing the module.
+    pub fn source_location(&self, frame: usize) -> Result<Option<crate::SourceLocation>, String> {
+        let Some(info) = self.stack().into_iter().nth(frame) else {
+            return Ok(None);
+        };
+        match &self.instance.source {
+            Ok(Some(map)) => map.location(info.function, info.pc),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
     /// The operand stack, bottom first.
     pub fn operand_stack(&self) -> &[Value] {
         &self.machine.operand_stack
