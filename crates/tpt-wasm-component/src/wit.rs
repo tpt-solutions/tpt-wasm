@@ -16,6 +16,8 @@
 
 use std::fmt;
 
+use crate::{ComponentFuncType, ComponentType, Scalar};
+
 /// One parsed WIT document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WitDocument {
@@ -101,6 +103,12 @@ pub enum WitError {
     UnresolvedInterface { world: String, interface: String },
     /// An interface's functions need the package to name them, and the document has none.
     MissingPackage,
+    /// The document defines no interface of the name given.
+    NoSuchInterface(String),
+    /// The interface defines no function of the name given.
+    NoSuchFunction { interface: String, function: String },
+    /// A function's parameter or result is not a scalar type, which this mapping does not yet cover.
+    UnsupportedType { function: String, ty: String },
 }
 
 impl fmt::Display for WitError {
@@ -117,6 +125,20 @@ impl fmt::Display for WitError {
             WitError::MissingPackage => {
                 write!(f, "the interface's functions need a package declaration")
             }
+            WitError::NoSuchInterface(interface) => {
+                write!(f, "the document defines no interface {interface}")
+            }
+            WitError::NoSuchFunction {
+                interface,
+                function,
+            } => write!(
+                f,
+                "the interface {interface} defines no function {function}"
+            ),
+            WitError::UnsupportedType { function, ty } => write!(
+                f,
+                "the function {function} has the type {ty}, which is not a scalar"
+            ),
         }
     }
 }
@@ -158,6 +180,41 @@ impl WitDocument {
         capability_ids_across(std::slice::from_ref(self), 0, world)
     }
 
+    /// The component function type of `function` in `interface`, for a function whose parameters
+    /// and result are all scalars: `bool`, the integers of 8 to 64 bits, `f32`, `f64` and `char`.
+    /// A string, a list or any other compound type is refused by name, since the component's
+    /// type table for it is not built here.
+    pub fn function_type(
+        &self,
+        interface: &str,
+        function: &str,
+    ) -> Result<ComponentFuncType, WitError> {
+        let found = self
+            .interfaces
+            .iter()
+            .find(|candidate| candidate.name == interface)
+            .ok_or_else(|| WitError::NoSuchInterface(interface.to_owned()))?;
+        let definition = found
+            .functions
+            .iter()
+            .find(|candidate| candidate.name == function)
+            .ok_or_else(|| WitError::NoSuchFunction {
+                interface: interface.to_owned(),
+                function: function.to_owned(),
+            })?;
+        let params = definition
+            .params
+            .iter()
+            .map(|(_, ty)| scalar_type(ty, function))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = definition
+            .result
+            .as_deref()
+            .map(|ty| scalar_type(ty, function))
+            .transpose()?;
+        Ok(ComponentFuncType { params, result })
+    }
+
     /// The name a component import gives an interface of this document: `namespace:package/name`,
     /// with the version after the name when the package has one.
     fn interface_name(&self, name: &str) -> Result<String, WitError> {
@@ -169,6 +226,31 @@ impl WitDocument {
         }
         Ok(full)
     }
+}
+
+/// The component type of a WIT scalar type name, or a refusal naming the function that has it.
+fn scalar_type(ty: &str, function: &str) -> Result<ComponentType, WitError> {
+    let scalar = match ty.trim() {
+        "bool" => Scalar::Bool,
+        "s8" => Scalar::S8,
+        "u8" => Scalar::U8,
+        "s16" => Scalar::S16,
+        "u16" => Scalar::U16,
+        "s32" => Scalar::S32,
+        "u32" => Scalar::U32,
+        "s64" => Scalar::S64,
+        "u64" => Scalar::U64,
+        "f32" => Scalar::F32,
+        "f64" => Scalar::F64,
+        "char" => Scalar::Char,
+        other => {
+            return Err(WitError::UnsupportedType {
+                function: function.to_owned(),
+                ty: other.to_owned(),
+            })
+        }
+    };
+    Ok(ComponentType::Scalar(scalar))
 }
 
 /// The capability ids of the world named `world` in `documents[index]`. An interface the world
@@ -763,5 +845,63 @@ world imports {
             WitDocument::parse("package a:b;\npackage c:d;\n"),
             Err(WitError::Syntax { line: 2, .. })
         ));
+    }
+
+    const MATH: &str = "package demo:math@1.0.0;
+
+interface ops {
+    add: func(a: s32, b: s32) -> s32;
+    flag: func(on: bool) -> char;
+    greet: func(name: string);
+}
+
+world w {
+    import ops;
+}
+";
+
+    #[test]
+    fn a_scalar_signature_maps_to_a_component_function_type() {
+        let document = WitDocument::parse(MATH).expect("parses");
+        assert_eq!(
+            document.function_type("ops", "add"),
+            Ok(ComponentFuncType {
+                params: vec![
+                    ComponentType::Scalar(Scalar::S32),
+                    ComponentType::Scalar(Scalar::S32),
+                ],
+                result: Some(ComponentType::Scalar(Scalar::S32)),
+            })
+        );
+        assert_eq!(
+            document.function_type("ops", "flag"),
+            Ok(ComponentFuncType {
+                params: vec![ComponentType::Scalar(Scalar::Bool)],
+                result: Some(ComponentType::Scalar(Scalar::Char)),
+            })
+        );
+    }
+
+    #[test]
+    fn a_string_parameter_and_a_missing_name_are_refused_by_name() {
+        let document = WitDocument::parse(MATH).expect("parses");
+        assert_eq!(
+            document.function_type("ops", "greet"),
+            Err(WitError::UnsupportedType {
+                function: "greet".to_owned(),
+                ty: "string".to_owned(),
+            })
+        );
+        assert_eq!(
+            document.function_type("nope", "add"),
+            Err(WitError::NoSuchInterface("nope".to_owned()))
+        );
+        assert_eq!(
+            document.function_type("ops", "nope"),
+            Err(WitError::NoSuchFunction {
+                interface: "ops".to_owned(),
+                function: "nope".to_owned(),
+            })
+        );
     }
 }
