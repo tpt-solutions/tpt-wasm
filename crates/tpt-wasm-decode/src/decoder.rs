@@ -514,6 +514,44 @@ fn decode_code_section(reader: &mut Reader<'_>) -> Result<Vec<CodeEntry>, Decode
     })
 }
 
+/// The module byte offset of the first instruction of each defined function's body, in the order
+/// the code section lists them. The offset is taken past the body's size and its locals, so it is
+/// where the instructions the body's bytes hold begin.
+///
+/// This reads only the section framing, the entry counts and the locals, so it is meant for a
+/// module that has already decoded: it does not re-check the bodies. It returns an empty list when
+/// the module has no code section.
+pub fn function_body_offsets(bytes: &[u8]) -> Result<Vec<usize>, DecodeError> {
+    let mut reader = Reader::new(bytes);
+    reader.take(MAGIC.len() + VERSION.len())?;
+    while reader.remaining() > 0 {
+        let id = reader.byte()?;
+        let length = reader.u32()? as usize;
+        let payload_start = reader.position;
+        let payload = reader.take(length)?;
+        if id != 10 {
+            continue;
+        }
+        let mut section = Reader::new(payload);
+        let count = section.u32()?;
+        let mut offsets = Vec::new();
+        for _ in 0..count {
+            let body_length = section.u32()? as usize;
+            let body_start = section.position;
+            let body = section.take(body_length)?;
+            let mut body_reader = Reader::new(body);
+            let groups = body_reader.u32()?;
+            for _ in 0..groups {
+                body_reader.u32()?;
+                body_reader.byte()?;
+            }
+            offsets.push(payload_start + body_start + body_reader.position);
+        }
+        return Ok(offsets);
+    }
+    Ok(Vec::new())
+}
+
 pub fn decode(bytes: &[u8]) -> Result<Module, DecodeError> {
     let mut reader = Reader::new(bytes);
     if reader.take(4)? != MAGIC {

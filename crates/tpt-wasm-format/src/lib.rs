@@ -7,6 +7,8 @@
 //! This is NOT an execution representation - it is the structural view
 //! produced by decoding and consumed by validation.
 
+pub mod debug_line;
+
 use tpt_wasm_types::{
     FunctionType, GlobalType, MemoryType, RefType, TableType, TagType, ValueType,
 };

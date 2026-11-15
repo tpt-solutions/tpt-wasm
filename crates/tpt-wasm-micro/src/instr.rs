@@ -269,12 +269,21 @@ impl std::error::Error for InstrDecodeError {}
 /// This performs binary-immediate parsing only. Type and index validation belongs
 /// to `tpt-wasm-validate`, before a function is instantiated.
 pub fn decode_body(bytes: &[u8]) -> Result<Vec<Instr>, InstrDecodeError> {
+    decode_body_with_offsets(bytes).map(|(instructions, _)| instructions)
+}
+
+/// Decode a function body like [`decode_body`], and also return the byte offset, within `bytes`,
+/// at which each instruction starts. The two lists have the same length, and entry `i` is where
+/// instruction `i` begins, so a program counter names both.
+pub fn decode_body_with_offsets(bytes: &[u8]) -> Result<(Vec<Instr>, Vec<usize>), InstrDecodeError> {
     let mut reader = BodyReader::new(bytes);
     let mut instructions = Vec::new();
+    let mut offsets = Vec::new();
     while reader.remaining() > 0 {
+        offsets.push(reader.position);
         instructions.push(decode_instruction(&mut reader)?);
     }
-    Ok(instructions)
+    Ok((instructions, offsets))
 }
 
 struct BodyReader<'a> {

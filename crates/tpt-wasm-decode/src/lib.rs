@@ -14,7 +14,7 @@ pub use tpt_wasm_format::Module;
 #[cfg(test)]
 mod tests;
 
-pub use decoder::decode;
+pub use decoder::{decode, function_body_offsets};
 pub use encoder::encode;
 
 /// Errors produced during binary decoding.
