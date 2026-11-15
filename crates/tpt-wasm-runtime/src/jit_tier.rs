@@ -38,9 +38,9 @@ pub(crate) struct LinearMemory<'a> {
 pub(crate) struct JitTier {
     #[cfg(feature = "jit")]
     module: Option<tpt_wasm_jit::CompiledModule>,
-    /// The parameter types and result type of every function, by index, for checking arguments.
+    /// The parameter types and result types of every function, by index, for checking arguments.
     #[cfg(feature = "jit")]
-    signatures: Vec<(Vec<ValueType>, Option<ValueType>)>,
+    signatures: Vec<(Vec<ValueType>, Vec<ValueType>)>,
     /// The type and mutability of every global, by index, for moving its value in and out.
     #[cfg(feature = "jit")]
     globals: Vec<(ValueType, bool)>,
@@ -66,8 +66,8 @@ impl JitTier {
             .iter()
             .map(|function| {
                 let params = function.function_type.params.0.clone();
-                let result = function.function_type.results.0.first().copied();
-                (params, result)
+                let results = function.function_type.results.0.clone();
+                (params, results)
             })
             .collect();
         let globals = ir
@@ -213,7 +213,7 @@ impl JitTier {
             .ok_or(RuntimeError::UnsupportedFeature(
                 "a function without native code",
             ))?;
-        let (params, result) =
+        let (params, results) =
             self.signatures
                 .get(index)
                 .ok_or(RuntimeError::UnsupportedFeature(
@@ -236,8 +236,8 @@ impl JitTier {
                 }
             });
         }
-        let raw = module
-            .call_with_host(
+        let words = module
+            .call_with_host_results(
                 index,
                 &slots,
                 memory,
@@ -248,20 +248,21 @@ impl JitTier {
                 tpt_wasm_jit::JitError::Trap(trap) => RuntimeError::Trap(trap),
                 _ => RuntimeError::UnsupportedFeature("a native function that could not run"),
             })?;
-        // A function with no result returns nothing, whatever its compiled code left in the register.
-        let value = match result {
-            None => return Ok(Vec::new()),
-            Some(ValueType::I32) => Value::I32(raw as u32 as i32),
-            Some(ValueType::I64) => Value::I64(raw as i64),
-            Some(ValueType::F32) => Value::F32(raw as u32),
-            Some(ValueType::F64) => Value::F64(raw),
-            _ => {
-                return Err(RuntimeError::UnsupportedFeature(
+        // Each result word converts by its own type. A function with no result returns nothing, whatever
+        // its compiled code left behind.
+        results
+            .iter()
+            .zip(words)
+            .map(|(value_type, word)| match value_type {
+                ValueType::I32 => Ok(Value::I32(word as u32 as i32)),
+                ValueType::I64 => Ok(Value::I64(word as i64)),
+                ValueType::F32 => Ok(Value::F32(word as u32)),
+                ValueType::F64 => Ok(Value::F64(word)),
+                _ => Err(RuntimeError::UnsupportedFeature(
                     "a reference result from a native function",
-                ))
-            }
-        };
-        Ok(vec![value])
+                )),
+            })
+            .collect()
     }
 
     /// Whether compiled code grows the memory, so the memory must be reserved before a call.
