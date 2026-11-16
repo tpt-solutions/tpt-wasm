@@ -254,6 +254,9 @@ fn const_expr(reader: &mut Reader<'_>) -> Result<ConstExpr, DecodeError> {
             0xd2 => {
                 let _ = reader.u32()?;
             }
+            // The integer operations of the extended constant expressions: add, sub and mul on i32 and
+            // i64. They carry no immediates; whether they are well typed is the validator's to check.
+            0x6a..=0x6c | 0x7c..=0x7e => {}
             opcode => return Err(DecodeError::InvalidOpcode(u32::from(opcode))),
         }
     }

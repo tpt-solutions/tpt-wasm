@@ -13,6 +13,7 @@
 
 use tpt_wasm_types::{FunctionType, ReferenceType, Trap, Value, ValueType};
 
+mod const_expr;
 mod lower;
 #[cfg(test)]
 mod tests;
@@ -25,6 +26,7 @@ mod verify;
 /// in a later block; without a pre-pass, the backend accepts only the block order
 /// the lowering happened to produce, which is a constraint on layout rather than
 /// on semantics.
+pub use const_expr::{eval_const, reads_globals, ConstExprError};
 pub use verify::{instruction_operands, instruction_results, terminator_operands};
 
 pub use lower::{const_expr_i32, lower_module, LoweringError};
@@ -124,9 +126,9 @@ pub struct IrGlobal {
     /// in the exporting instance. There is deliberately no placeholder value, so
     /// a bug that reads it cannot look like a global legitimately holding zero.
     pub init: Option<Value>,
-    /// The global this one's initializer copies, when it is initialized by `global.get` of another
-    /// global. Its value is known only once the module's imports are installed, so it is resolved then.
-    pub init_from: Option<u32>,
+    /// The initializer's constant expression, when it reads a global. Its value is known only once the
+    /// module's imports are installed, so it is resolved then.
+    pub init_expr: Option<Vec<u8>>,
     /// Where this global is imported from, when it is imported rather than
     /// defined. `None` for a defined global, and the two are always exclusive.
     pub import: Option<IrImportSource>,
@@ -157,11 +159,11 @@ pub struct IrMemory {
 /// One active data segment: bytes written at `offset` when the module starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrDataSegment {
-    /// The byte offset in memory. Ignored when `offset_global` is set.
+    /// The byte offset in memory. Ignored when `offset_expr` is set.
     pub offset: u32,
-    /// The global whose value is the offset, when the segment's offset is `global.get` of one. Its value is
-    /// known only once the module's imports are installed, so the segment is applied then.
-    pub offset_global: Option<u32>,
+    /// The offset's constant expression, when it reads a global. Its value is known only once the module's
+    /// imports are installed, so the segment is applied then.
+    pub offset_expr: Option<Vec<u8>>,
     pub bytes: Vec<u8>,
 }
 

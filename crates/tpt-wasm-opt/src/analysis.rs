@@ -422,6 +422,23 @@ pub fn used_values(instruction: &IrInstr) -> Vec<ValueId> {
         Load { address, .. } => vec![*address],
         Store { address, value, .. } => vec![*address, *value],
         MemoryGrow { delta, .. } => vec![*delta],
+        MemoryInit {
+            destination,
+            source,
+            length,
+            ..
+        }
+        | MemoryCopy {
+            destination,
+            source,
+            length,
+        } => vec![*destination, *source, *length],
+        MemoryFill {
+            destination,
+            value,
+            length,
+        } => vec![*destination, *value, *length],
+        DataDrop { .. } => Vec::new(),
         GlobalSet { value, .. } => vec![*value],
         _ => binary_operands(instruction),
     }
@@ -533,6 +550,10 @@ pub fn has_side_effects(instruction: &IrInstr) -> bool {
         Store { .. }
         | GlobalSet { .. }
         | MemoryGrow { .. }
+        | MemoryInit { .. }
+        | DataDrop { .. }
+        | MemoryCopy { .. }
+        | MemoryFill { .. }
         | Call { .. }
         | CallHost { .. }
         | CallIndirect { .. }
@@ -837,6 +858,30 @@ pub fn map_operands(instruction: &mut IrInstr, mut f: impl FnMut(ValueId) -> Val
             *value = f(*value);
         }
         MemoryGrow { delta, .. } => *delta = f(*delta),
+        MemoryInit {
+            destination,
+            source,
+            length,
+            ..
+        }
+        | MemoryCopy {
+            destination,
+            source,
+            length,
+        } => {
+            *destination = f(*destination);
+            *source = f(*source);
+            *length = f(*length);
+        }
+        MemoryFill {
+            destination,
+            value,
+            length,
+        } => {
+            *destination = f(*destination);
+            *value = f(*value);
+            *length = f(*length);
+        }
         GlobalSet { value, .. } => *value = f(*value),
         I32Eqz { value, .. }
         | I64Eqz { value, .. }

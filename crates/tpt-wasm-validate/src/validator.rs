@@ -318,7 +318,47 @@ fn validate_const_expr(
     allow_global_get: bool,
 ) -> Result<(), ValidationError> {
     let mut reader = body::Reader::new(&expr.0);
-    let actual = match reader.byte()? {
+    let mut stack: Vec<ValueType> = Vec::new();
+    loop {
+        match reader.byte()? {
+            0x0b => break,
+            0x6a..=0x6c => integer_operation(&mut stack, ValueType::I32)?,
+            0x7c..=0x7e => integer_operation(&mut stack, ValueType::I64)?,
+            opcode => stack.push(const_leaf(opcode, &mut reader, context, allow_global_get)?),
+        }
+    }
+    if reader.remaining() != 0 {
+        return Err(ValidationError::InvalidConstantExpression);
+    }
+    match stack.as_slice() {
+        [actual] if *actual == expected => Ok(()),
+        [actual] => Err(ValidationError::TypeMismatch {
+            expected: format!("{expected:?}"),
+            actual: format!("{actual:?}"),
+        }),
+        _ => Err(ValidationError::InvalidConstantExpression),
+    }
+}
+
+/// An `add`, `sub` or `mul` of two values of `ty`, which leaves one value of `ty`.
+fn integer_operation(stack: &mut Vec<ValueType>, ty: ValueType) -> Result<(), ValidationError> {
+    for _ in 0..2 {
+        if stack.pop() != Some(ty) {
+            return Err(ValidationError::InvalidConstantExpression);
+        }
+    }
+    stack.push(ty);
+    Ok(())
+}
+
+/// One constant or global read, and the type it produces.
+fn const_leaf(
+    opcode: u8,
+    reader: &mut body::Reader<'_>,
+    context: &ModuleContext,
+    allow_global_get: bool,
+) -> Result<ValueType, ValidationError> {
+    Ok(match opcode {
         0x41 => {
             let _ = reader.i32()?;
             ValueType::I32
@@ -348,11 +388,8 @@ fn validate_const_expr(
             }
             global.value_type
         }
-        // The two reference-producing forms. `ref.null` carries the reference
-        // type it produces, so it must agree with the expected type rather than
-        // merely being well formed. `ref.func` names a function, which must
-        // exist in the index space; a `funcref` initializer that named an
-        // out-of-range index would otherwise produce a reference to nothing.
+        // The two reference-producing forms. `ref.null` carries the reference type it produces, and
+        // `ref.func` names a function, which must exist in the index space.
         0xd0 => {
             let actual = match reader.byte()? {
                 0x70 => RefType::FuncRef,
@@ -369,15 +406,5 @@ fn validate_const_expr(
             ValueType::Ref(RefType::FuncRef)
         }
         _ => return Err(ValidationError::InvalidConstantExpression),
-    };
-    if reader.byte()? != 0x0b || reader.remaining() != 0 {
-        return Err(ValidationError::InvalidConstantExpression);
-    }
-    if actual != expected {
-        return Err(ValidationError::TypeMismatch {
-            expected: format!("{expected:?}"),
-            actual: format!("{actual:?}"),
-        });
-    }
-    Ok(())
+    })
 }

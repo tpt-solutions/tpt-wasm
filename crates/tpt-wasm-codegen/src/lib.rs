@@ -1836,8 +1836,8 @@ pub struct BaselineModule {
     datas: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
     /// How many leading globals are imports, whose handles the embedder supplies.
     global_import_count: usize,
-    /// The globals whose initializer copies another global, as `(index, source)`, in index order.
-    deferred_globals: Vec<(usize, usize)>,
+    /// The globals whose initializer reads a global, as `(index, expression)`, in index order.
+    deferred_globals: Vec<(usize, Vec<u8>)>,
     /// The imported functions, in declaration order, that a `CallHost` names.
     imports: Vec<tpt_wasm_ir::IrImport>,
     /// The installed host boundary, absent until an embedder provides one.
@@ -2110,7 +2110,7 @@ impl BaselineModule {
                 declaration
                     .segments
                     .iter()
-                    .any(|segment| segment.offset_global.is_some())
+                    .any(|segment| segment.offset_expr.is_some())
             })
             .map(|declaration| declaration.segments.clone());
         let (memory, pending_imported_memory) = match module.memory.as_ref() {
@@ -2162,11 +2162,11 @@ impl BaselineModule {
             .collect();
         let datas = Arc::new(Mutex::new(module.passive_data.clone()));
         let global_import_count = module.globals.iter().filter(|g| g.import.is_some()).count();
-        let deferred_globals: Vec<(usize, usize)> = module
+        let deferred_globals: Vec<(usize, Vec<u8>)> = module
             .globals
             .iter()
             .enumerate()
-            .filter_map(|(index, global)| global.init_from.map(|source| (index, source as usize)))
+            .filter_map(|(index, global)| global.init_expr.clone().map(|expr| (index, expr)))
             .collect();
         Ok(Self {
             functions,
@@ -2386,36 +2386,44 @@ impl BaselineModule {
     /// copy is exact because the source is immutable. Sources are taken in index order, so a source that
     /// is itself deferred already has its value when it is copied.
     pub fn resolve_deferred_globals(&mut self) -> Result<(), CodegenError> {
-        for (index, source) in self.deferred_globals.clone() {
-            let handle = self.globals.get(source).cloned().flatten().ok_or(
-                CodegenError::UnsupportedMemory(
-                    "a global initializer copies a global that has no value yet",
-                ),
-            )?;
-            let value = lock_shared(&handle)
-                .map_err(|_| CodegenError::UnsupportedMemory("a copied global is locked"))?
-                .clone();
+        for (index, expr) in self.deferred_globals.clone() {
+            let value = {
+                let globals = &self.globals;
+                tpt_wasm_ir::eval_const(&expr, &|global| {
+                    globals
+                        .get(global as usize)
+                        .and_then(|slot| slot.as_ref())
+                        .and_then(|handle| lock_shared(handle).ok().map(|guard| (*guard).clone()))
+                })
+                .map_err(|_| {
+                    CodegenError::UnsupportedMemory("a global initializer could not be evaluated")
+                })?
+            };
             self.globals[index] = Some(Arc::new(Mutex::new(value)));
         }
-        // The deferred data segments, now that every global they may name has its value. The offsets are
-        // resolved to plain ones, so the same bounds check and write apply as for any other segment.
+        // The deferred data segments, now that every global they may name has its value. Each offset is
+        // resolved to a plain one, so the same bounds check and write apply as for any other segment.
         if let Some(segments) = self.pending_segments.take() {
             let memory = self.memory.clone().ok_or(CodegenError::UnsupportedMemory(
                 "a data segment is deferred but the module has no memory",
             ))?;
             let mut resolved = Vec::with_capacity(segments.len());
             for segment in &segments {
-                let offset = match segment.offset_global {
+                let offset = match segment.offset_expr.as_ref() {
                     None => segment.offset,
-                    Some(global) => {
-                        let handle = self.globals.get(global as usize).cloned().flatten().ok_or(
-                            CodegenError::UnsupportedMemory(
-                                "a data offset names a global with no value",
-                            ),
-                        )?;
-                        let value = lock_shared(&handle)
-                            .map_err(|_| CodegenError::UnsupportedMemory("a global is locked"))?
-                            .clone();
+                    Some(expr) => {
+                        let globals = &self.globals;
+                        let value = tpt_wasm_ir::eval_const(expr, &|global| {
+                            globals
+                                .get(global as usize)
+                                .and_then(|slot| slot.as_ref())
+                                .and_then(|handle| {
+                                    lock_shared(handle).ok().map(|guard| (*guard).clone())
+                                })
+                        })
+                        .map_err(|_| {
+                            CodegenError::UnsupportedMemory("a data offset could not be evaluated")
+                        })?;
                         match value {
                             Value::I32(offset) => offset as u32,
                             _ => {
@@ -2428,7 +2436,7 @@ impl BaselineModule {
                 };
                 resolved.push(tpt_wasm_ir::IrDataSegment {
                     offset,
-                    offset_global: None,
+                    offset_expr: None,
                     bytes: segment.bytes.clone(),
                 });
             }

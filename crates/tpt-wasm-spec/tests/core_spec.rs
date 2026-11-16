@@ -82,6 +82,19 @@ struct Suite {
 }
 
 const SUITES: &[Suite] = &[
+    // Passive and active data segments, `memory.init`, data-segment bounds, and constant offsets, which
+    // include extended constant expressions. The harness skips the `assert_invalid` directives.
+    Suite {
+        name: "data.wast",
+        source: include_str!("../testdata/data.wast"),
+        directives: &[
+            ("module", 32),
+            ("assert_return", 1),
+            ("assert_trap", 14),
+            ("assert_invalid", 20),
+            ("invoke", 1),
+        ],
+    },
     // Text-format tokenization: `assert_malformed` on text modules, and modules that must decode. The
     // harness skips the malformed text and checks the rest.
     Suite {

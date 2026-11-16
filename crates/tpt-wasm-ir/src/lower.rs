@@ -92,7 +92,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
                 value_type: global_type.value_type,
                 mutable: global_type.mutable,
                 init: None,
-                init_from: None,
+                init_expr: None,
                 import: Some(super::IrImportSource {
                     module: import.module.clone(),
                     name: import.name.clone(),
@@ -101,18 +101,22 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         }
     }
     for global in &module.globals {
-        let copied = global_copied_by(&global.init);
-        globals.push(IrGlobal {
-            value_type: global.global_type.value_type,
-            mutable: global.global_type.mutable,
-            init: match copied {
-                Some(_) => None,
-                None => Some(read_const_expr(
+        let (init, init_expr) = if crate::const_expr::reads_globals(&global.init.0) {
+            (None, Some(global.init.0.clone()))
+        } else {
+            (
+                Some(read_const_expr(
                     &global.init,
                     global.global_type.value_type,
                 )?),
-            },
-            init_from: copied,
+                None,
+            )
+        };
+        globals.push(IrGlobal {
+            value_type: global.global_type.value_type,
+            mutable: global.global_type.mutable,
+            init,
+            init_expr,
             import: None,
         });
     }
@@ -133,13 +137,14 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         if *memory_index != 0 {
             return Err(LoweringError::UnsupportedFeature("non-zero memory index"));
         }
-        let (offset_value, offset_global) = match global_copied_by(offset) {
-            Some(global) => (0, Some(global)),
-            None => (element_segment_offset(offset)?, None),
+        let (offset_value, offset_expr) = if crate::const_expr::reads_globals(&offset.0) {
+            (0, Some(offset.0.clone()))
+        } else {
+            (element_segment_offset(offset)?, None)
         };
         segments.push(IrDataSegment {
             offset: offset_value,
-            offset_global,
+            offset_expr,
             bytes: segment.data.clone(),
         });
     }
@@ -1567,33 +1572,20 @@ pub(crate) fn read_const_expr(
     expr: &tpt_wasm_format::ConstExpr,
     value_type: ValueType,
 ) -> Result<Value, LoweringError> {
-    let mut reader = BodyReader::new(&expr.0);
-    // The initializer is `t.const <immediate> end`, so the opcode comes first and
-    // must agree with the declared type.
-    let value = match (reader.byte()?, value_type) {
-        (0x41, ValueType::I32) => Value::I32(reader.i32()?),
-        (0x42, ValueType::I64) => Value::I64(reader.i64()?),
-        (0x43, ValueType::F32) => Value::F32(reader.f32()?),
-        (0x44, ValueType::F64) => Value::F64(reader.f64()?),
-        _ => return Err(LoweringError::UnsupportedFeature("global initializer")),
-    };
-    if reader.byte()? != 0x0b || reader.remaining() != 0 {
+    // A constant that reads a global has no value here, so it is refused; the callers defer those.
+    let value = crate::const_expr::eval_const(&expr.0, &|_| None)
+        .map_err(|_| LoweringError::UnsupportedFeature("global initializer"))?;
+    let matches = matches!(
+        (&value, value_type),
+        (Value::I32(_), ValueType::I32)
+            | (Value::I64(_), ValueType::I64)
+            | (Value::F32(_), ValueType::F32)
+            | (Value::F64(_), ValueType::F64)
+    );
+    if !matches {
         return Err(LoweringError::UnsupportedFeature("global initializer"));
     }
     Ok(value)
-}
-
-/// The global a constant expression copies, when it is exactly `global.get` of one global.
-fn global_copied_by(expr: &tpt_wasm_format::ConstExpr) -> Option<u32> {
-    let mut reader = BodyReader::new(&expr.0);
-    if reader.byte().ok()? != 0x23 {
-        return None;
-    }
-    let index = reader.u32().ok()?;
-    if reader.byte().ok()? != 0x0b || reader.remaining() != 0 {
-        return None;
-    }
-    Some(index)
 }
 
 /// Lower an element segment's entries into the IR's table representation.

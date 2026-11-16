@@ -951,27 +951,13 @@ fn const_value(
     store: &Store,
     global_addrs: &[u32],
 ) -> Result<Value, RuntimeError> {
-    let instructions = decode_body(&expr.0)
-        .map_err(|_| RuntimeError::InvalidConstantExpression("invalid constant expression"))?;
-    match instructions.as_slice() {
-        [Instr::I32Const(value), Instr::End] => Ok(Value::I32(*value)),
-        [Instr::I64Const(value), Instr::End] => Ok(Value::I64(*value)),
-        [Instr::F32Const(value), Instr::End] => Ok(Value::F32(*value)),
-        [Instr::F64Const(value), Instr::End] => Ok(Value::F64(*value)),
-        [Instr::GlobalGet(index), Instr::End] => {
-            let address = global_addrs
-                .get(*index as usize)
-                .copied()
-                .ok_or(RuntimeError::InvalidConstantExpression("unknown global"))?;
-            store
-                .global(address)
-                .map(|global| global.value.clone())
-                .map_err(|_| RuntimeError::InvalidConstantExpression("unknown global"))
-        }
-        _ => Err(RuntimeError::InvalidConstantExpression(
-            "unsupported constant expression",
-        )),
-    }
+    tpt_wasm_ir::eval_const(&expr.0, &|index| {
+        global_addrs
+            .get(index as usize)
+            .and_then(|address| store.global(*address).ok())
+            .map(|global| global.value.clone())
+    })
+    .map_err(|_| RuntimeError::InvalidConstantExpression("unsupported constant expression"))
 }
 
 /// Read one element segment initializer as a module-level function index.

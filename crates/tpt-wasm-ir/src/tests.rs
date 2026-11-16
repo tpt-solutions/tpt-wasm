@@ -3451,12 +3451,12 @@ fn an_active_data_segment_becomes_part_of_the_memory_declaration() {
         vec![
             super::IrDataSegment {
                 offset: 0,
-                offset_global: None,
+                offset_expr: None,
                 bytes: vec![1, 2],
             },
             super::IrDataSegment {
                 offset: 4,
-                offset_global: None,
+                offset_expr: None,
                 bytes: vec![9],
             },
         ]
