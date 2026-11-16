@@ -152,6 +152,9 @@ pub struct Config {
     /// entries that open under it, so a cache written without the key is recompiled rather than used.
     /// `None`, the default, keeps the ownership and permission checks as the only protection.
     pub native_cache_key: Option<Vec<u8>>,
+    /// The most work, in verifier units, that one module's verification may do before it is refused
+    /// with `WorkBudgetExceeded`. The default bounds the time a hostile module can take to verify.
+    pub max_verification_work: u64,
 }
 
 impl Default for Config {
@@ -165,6 +168,7 @@ impl Default for Config {
             profiling: false,
             native_cache_dir: None,
             native_cache_key: None,
+            max_verification_work: tpt_wasm_ir::DEFAULT_VERIFICATION_WORK,
         }
     }
 }
@@ -1089,25 +1093,28 @@ fn compile_ir(
     // Lower and verify once, then optimize only if this mode asks for it. Doing
     // the lowering in one place means the two modes cannot drift apart in how
     // they interpret a module, which is what the differential comparison assumes.
-    let verified = tpt_wasm_ir::lower_and_verify(validated).map_err(|error| {
-        // The reason is carried through, not replaced by a stage name: a module
-        // refused here is otherwise reported as a bare "baseline lowering", which
-        // says nothing about *what* is unsupported and makes every such refusal a
-        // guessing game. `Display` for these errors is the debug form, which names
-        // the variant and its payload -- and naming the payload is what turned
-        // "baseline lowering" into the two actual causes while this was written.
-        let reason = match error {
-            tpt_wasm_ir::LowerAndVerifyError::Lowering(error) => format!("lowering: {error}"),
-            tpt_wasm_ir::LowerAndVerifyError::Verification(error) => {
-                format!("verification: {error}")
-            }
-        };
-        // Leaked because the error variant holds a `&'static str` and the message
-        // is assembled here. These are one-off instantiation failures, not a hot
-        // path, and the alternative is widening a public error type to own a
-        // `String` for every caller.
-        RuntimeError::UnsupportedFeature(Box::leak(format!("baseline {reason}").into_boxed_str()))
-    })?;
+    let verified = tpt_wasm_ir::lower_and_verify_within(validated, config.max_verification_work)
+        .map_err(|error| {
+            // The reason is carried through, not replaced by a stage name: a module
+            // refused here is otherwise reported as a bare "baseline lowering", which
+            // says nothing about *what* is unsupported and makes every such refusal a
+            // guessing game. `Display` for these errors is the debug form, which names
+            // the variant and its payload -- and naming the payload is what turned
+            // "baseline lowering" into the two actual causes while this was written.
+            let reason = match error {
+                tpt_wasm_ir::LowerAndVerifyError::Lowering(error) => format!("lowering: {error}"),
+                tpt_wasm_ir::LowerAndVerifyError::Verification(error) => {
+                    format!("verification: {error}")
+                }
+            };
+            // Leaked because the error variant holds a `&'static str` and the message
+            // is assembled here. These are one-off instantiation failures, not a hot
+            // path, and the alternative is widening a public error type to own a
+            // `String` for every caller.
+            RuntimeError::UnsupportedFeature(Box::leak(
+                format!("baseline {reason}").into_boxed_str(),
+            ))
+        })?;
 
     let ir = match optimizing::compile(validated, config)? {
         Some(optimized) => optimized,
