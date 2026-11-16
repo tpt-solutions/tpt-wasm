@@ -60,6 +60,10 @@ pub enum CodegenError {
     UnsupportedTerminator(&'static str),
     /// A memory declaration this backend cannot represent.
     UnsupportedMemory(&'static str),
+    /// A data segment that does not fit its memory. Instantiation traps on it, as the specification has it.
+    DataSegmentOutOfBounds,
+    /// An element segment that does not fit its table. Instantiation traps on it, as the specification has it.
+    ElementSegmentOutOfBounds,
 }
 
 impl fmt::Display for CodegenError {
@@ -1853,9 +1857,7 @@ fn apply_element_segment(
         let cell = table
             .elements
             .get_mut(slot)
-            .ok_or(CodegenError::UnsupportedMemory(
-                "element segment does not fit the table",
-            ))?;
+            .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
         *cell = *entry;
     }
     Ok(())
@@ -2003,9 +2005,7 @@ fn apply_segments(
         let start = segment.offset as usize;
         let end = start + segment.bytes.len();
         if end > memory.len {
-            return Err(CodegenError::UnsupportedMemory(
-                "data segment does not fit the memory",
-            ));
+            return Err(CodegenError::DataSegmentOutOfBounds);
         }
         memory.data[start..end].copy_from_slice(&segment.bytes);
     }

@@ -77,18 +77,10 @@ struct KnownGap {
 }
 
 const KNOWN_GAPS: &[KnownGap] = &[
-    // The single remaining gap is a missing feature rather than a misdecoding: the
-    // module is valid and this implementation refuses it. Nothing undecodable
-    // slips through, and the two files' gaps are two assertions of the same
-    // feature.
+    // The remaining gap is a missing feature rather than a misdecoding: the module is valid and this
+    // implementation refuses it. Nothing undecodable slips through.
     //
-    // --- bulk memory: the `fc` prefixed instructions and the data count section ---
-    KnownGap {
-        file: "binary.wast",
-        line: 296,
-        missing: "the data count section (id 12) is rejected; it belongs with the \
-                  bulk-memory instructions, which are not implemented",
-    },
+    // --- bulk memory: the `fc` prefixed instructions ---
     KnownGap {
         file: "binary-leb128.wast",
         line: 964,

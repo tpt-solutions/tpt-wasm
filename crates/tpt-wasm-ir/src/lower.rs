@@ -115,12 +115,14 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
     // later segment overwrites an earlier one at the same address.
     let mut segments = Vec::with_capacity(module.data.len());
     for segment in &module.data {
+        // A passive segment is only read by the instructions that name it, which the lowering does not
+        // yet have, so it has no effect here and is not carried into the IR.
         let tpt_wasm_format::DataMode::Active {
             memory_index,
             offset,
         } = &segment.mode
         else {
-            return Err(LoweringError::UnsupportedFeature("passive data segments"));
+            continue;
         };
         if *memory_index != 0 {
             return Err(LoweringError::UnsupportedFeature("non-zero memory index"));
@@ -268,8 +270,9 @@ pub fn const_expr_i32(expr: &tpt_wasm_format::ConstExpr) -> Option<u32> {
 fn element_segment_offset(expr: &tpt_wasm_format::ConstExpr) -> Result<u32, LoweringError> {
     let value = read_const_expr(expr, ValueType::I32)?;
     match value {
-        Value::I32(offset) => u32::try_from(offset)
-            .map_err(|_| LoweringError::UnsupportedFeature("negative element segment offset")),
+        // The offset is an unsigned address, so a negative value is a very large one, which falls outside
+        // the table and traps at instantiation rather than being refused here.
+        Value::I32(offset) => Ok(offset as u32),
         _ => Err(LoweringError::UnsupportedFeature("element segment offset")),
     }
 }

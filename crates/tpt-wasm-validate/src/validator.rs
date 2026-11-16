@@ -212,6 +212,16 @@ fn validate_start(module: &Module, context: &ModuleContext) -> Result<(), Valida
 }
 
 fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), ValidationError> {
+    // A declared data count must be the number of data segments, since the count is what an instruction
+    // that names a segment is checked against.
+    if let Some(declared) = module.data_count {
+        if declared as usize != module.data.len() {
+            return Err(ValidationError::DataCountMismatch {
+                declared,
+                found: module.data.len(),
+            });
+        }
+    }
     for global in &module.globals {
         validate_const_expr(&global.init, global.global_type.value_type, context, true)?;
     }
@@ -277,12 +287,13 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
         }
     }
     for segment in &module.data {
+        // A passive segment has no offset or memory to check, and writes nothing at instantiation.
         let tpt_wasm_format::DataMode::Active {
             memory_index,
             offset,
         } = &segment.mode
         else {
-            return Err(ValidationError::UnsupportedFeature("passive data segments"));
+            continue;
         };
         if *memory_index != 0 || context.memory_count == 0 {
             return Err(ValidationError::UnknownMemory(*memory_index));

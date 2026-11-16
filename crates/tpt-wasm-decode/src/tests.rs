@@ -94,6 +94,7 @@ fn sample_module() -> Module {
             data: vec![1, 2, 3],
         }],
         tags: vec![],
+        data_count: Some(1),
         custom_sections: vec![CustomSection {
             name: "producers".into(),
             data: vec![1, 2, 3],

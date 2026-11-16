@@ -247,18 +247,19 @@ fn write_element(element: &Element, output: &mut Vec<u8>) -> Result<(), EncodeEr
 }
 
 fn write_data(data: &DataSegment, output: &mut Vec<u8>) -> Result<(), EncodeError> {
-    let (memory_index, offset) = match &data.mode {
+    match &data.mode {
+        DataMode::Passive => output.push(0x01),
         DataMode::Active {
             memory_index,
             offset,
-        } => (*memory_index, offset),
-        DataMode::Passive => return Err(EncodeError::UnsupportedFeature("passive data segments")),
-    };
-    if memory_index != 0 {
-        return Err(EncodeError::UnsupportedFeature("multiple memories"));
+        } => {
+            if *memory_index != 0 {
+                return Err(EncodeError::UnsupportedFeature("multiple memories"));
+            }
+            output.push(0x00);
+            write_const_expr(offset, output)?;
+        }
     }
-    output.push(0x00);
-    write_const_expr(offset, output)?;
     write_vector(&data.data, output, |bytes, out| {
         out.push(*bytes);
         Ok(())
@@ -390,6 +391,11 @@ pub fn encode(module: &Module) -> Result<Vec<u8>, EncodeError> {
     }
     if !module.elements.is_empty() {
         write_elements(&module.elements, &mut output)?;
+    }
+    if let Some(count) = module.data_count {
+        let mut payload = Vec::new();
+        write_u32(count, &mut payload);
+        write_section(12, payload, &mut output)?;
     }
     if !module.functions.is_empty() {
         write_code(&module.functions, &mut output)?;

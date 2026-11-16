@@ -26,6 +26,9 @@ pub struct Module {
     pub start: Option<u32>,
     pub elements: Vec<Element>,
     pub data: Vec<DataSegment>,
+    /// The data count section: how many data segments the module declares, if it declares any. Some
+    /// instructions name a data segment, and a module that uses them must declare the count.
+    pub data_count: Option<u32>,
     pub tags: Vec<Tag>,
     pub custom_sections: Vec<CustomSection>,
 }

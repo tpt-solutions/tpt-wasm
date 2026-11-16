@@ -441,6 +441,17 @@ fn element_kind(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
     Ok(())
 }
 
+/// The position of a section in the required order. The data count section (12) comes after the element
+/// section (9) and before the code section (10), and the data section (11) comes last.
+fn section_rank(id: u8) -> u8 {
+    match id {
+        10 => 11,
+        11 => 12,
+        12 => 10,
+        other => other,
+    }
+}
+
 fn decode_data_section(reader: &mut Reader<'_>) -> Result<Vec<DataSegment>, DecodeError> {
     reader.vector(|reader| {
         // A data segment begins with a kind byte, and all three forms are part of
@@ -573,13 +584,16 @@ pub fn decode(bytes: &[u8]) -> Result<Module, DecodeError> {
         let length = reader.u32()? as usize;
         let payload = reader.take(length)?;
         if id != 0 {
-            if id > 11 {
+            if id > 12 {
                 return Err(DecodeError::InvalidSectionId(id));
             }
-            if id <= previous_section {
+            // The data count section sits between the element and code sections, so the order of
+            // sections is by rank rather than by id.
+            let rank = section_rank(id);
+            if rank <= previous_section {
                 return Err(DecodeError::DuplicateSection(id));
             }
-            previous_section = id;
+            previous_section = rank;
         }
         let custom = if id == 0 {
             Some(decode_custom_section(payload)?)
@@ -608,6 +622,7 @@ pub fn decode(bytes: &[u8]) -> Result<Module, DecodeError> {
             9 => module.elements = decode_element_section(&mut section)?,
             10 => code_entries = decode_code_section(&mut section)?,
             11 => module.data = decode_data_section(&mut section)?,
+            12 => module.data_count = Some(section.u32()?),
             _ => return Err(DecodeError::InvalidSectionId(id)),
         }
         if id != 0 {

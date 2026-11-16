@@ -247,6 +247,7 @@ fn module_with(ty: &FunctionType, body: Vec<u8>) -> Module {
         }],
         elements: Vec::new(),
         data: Vec::new(),
+        data_count: None,
         start: None,
         tags: Vec::new(),
         custom_sections: Vec::new(),

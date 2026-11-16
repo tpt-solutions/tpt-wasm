@@ -18,7 +18,15 @@ use tpt_wasm_format::Module;
 /// Errors produced during validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
-    TypeMismatch { expected: String, actual: String },
+    /// The data count section declares a different number of data segments than the module has.
+    DataCountMismatch {
+        declared: u32,
+        found: usize,
+    },
+    TypeMismatch {
+        expected: String,
+        actual: String,
+    },
     UnknownFunction(u32),
     UnknownGlobal(u32),
     UnknownMemory(u32),

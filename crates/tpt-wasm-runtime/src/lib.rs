@@ -1193,9 +1193,22 @@ fn compile_ir(
 /// Kept apart from `compile_ir` so the optimized IR can be cached: a cache hit
 /// skips the optimizer and still builds a fresh backend module, because the
 /// backend owns each instance's memory, table, and global handles.
+/// The runtime error for a baseline code generation failure. A segment that does not fit its memory or
+/// table is a trap at instantiation, which the specification requires, and anything else is a refusal.
+fn codegen_error(error: tpt_wasm_codegen::CodegenError) -> RuntimeError {
+    match error {
+        tpt_wasm_codegen::CodegenError::DataSegmentOutOfBounds => {
+            RuntimeError::Trap(Trap::MemoryOutOfBounds)
+        }
+        tpt_wasm_codegen::CodegenError::ElementSegmentOutOfBounds => {
+            RuntimeError::Trap(Trap::TableOutOfBounds)
+        }
+        other => RuntimeError::Refused(format!("baseline code generation: {other:?}")),
+    }
+}
+
 fn lower_baseline(ir: &IrModule) -> Result<tpt_wasm_codegen::BaselineModule, RuntimeError> {
-    let compiled = tpt_wasm_codegen::BaselineModule::lower(ir)
-        .map_err(|error| RuntimeError::Refused(format!("baseline code generation: {error:?}")))?;
+    let compiled = tpt_wasm_codegen::BaselineModule::lower(ir).map_err(codegen_error)?;
     // The host boundary is installed by `instantiate_module`, once the imports
     // have been resolved to callbacks. Until then a `CallHost` traps, so a
     // compiled module cannot reach outside itself by accident.
@@ -1580,12 +1593,14 @@ fn instantiate_module(
         }
     }
     for segment in &module.data {
+        // A passive segment writes nothing at instantiation; it is only read by the instructions that
+        // name it, which are not yet implemented.
         let DataMode::Active {
             memory_index,
             offset,
         } = &segment.mode
         else {
-            return Err(RuntimeError::UnsupportedFeature("passive data segment"));
+            continue;
         };
         let memory_address =
             *memory_addrs
@@ -1723,9 +1738,7 @@ fn instantiate_module(
                     .ok_or(RuntimeError::UnsupportedFeature(
                         "a memory imported in baseline mode that no instance in this store exports",
                     ))?;
-                module.set_memory(shared).map_err(|_| {
-                    RuntimeError::UnsupportedFeature("an imported memory in baseline mode")
-                })?;
+                module.set_memory(shared).map_err(codegen_error)?;
             }
         } else if module.memory_handle().is_some() {
             return Err(RuntimeError::UnsupportedFeature(

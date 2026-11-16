@@ -82,6 +82,13 @@ struct Suite {
 }
 
 const SUITES: &[Suite] = &[
+    // Text-format tokenization: `assert_malformed` on text modules, and modules that must decode. The
+    // harness skips the malformed text and checks the rest.
+    Suite {
+        name: "token.wast",
+        source: include_str!("../testdata/token.wast"),
+        directives: &[("module", 35), ("assert_malformed", 26)],
+    },
     Suite {
         name: "i32.wast",
         source: include_str!("../testdata/i32.wast"),
