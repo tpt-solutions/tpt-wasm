@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 
 use tpt_wasm_capability::{CapabilityId, CapabilitySet, Operation};
 use tpt_wasm_format::{ExportDesc, ImportDesc};
-use tpt_wasm_runtime::{Engine, HostFunction, Instance, Linker};
-use tpt_wasm_types::{FunctionType, ResultType, Value, ValueType};
+use tpt_wasm_runtime::{Engine, HostFunction, Instance, Linker, MemoryView};
+use tpt_wasm_types::{FunctionType, GuestMemory, ResultType, Value, ValueType};
 
 /// The component preamble: the magic, then version `0x0d` and layer `0x01`.
 pub const PREAMBLE: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
@@ -513,8 +513,9 @@ pub enum ComponentFunction {
 pub enum CoreFunction {
     /// An export of a core instance, named by an alias.
     Alias { instance: u32, export: String },
-    /// A component import, lowered so that core code can call it.
-    Lowered { function: u32 },
+    /// A component import, lowered so that core code can call it. A lower may name a memory, which
+    /// the host function reads the strings and lists it is given from.
+    Lowered { function: u32, memory: Option<u32> },
 }
 
 /// One entry of the core memory index space: an export of a core instance, named by an alias.
@@ -853,13 +854,32 @@ impl Component {
                                     export: source_export.clone(),
                                 }
                             }
-                            CoreFunction::Lowered { function } => {
-                                Target::Host(self.lowered(*function, imports).map_err(
-                                    |message| ComponentError::Instantiate {
-                                        instance: index,
-                                        message,
-                                    },
-                                )?)
+                            CoreFunction::Lowered { function, memory } => {
+                                let instantiate = |message: String| ComponentError::Instantiate {
+                                    instance: index,
+                                    message,
+                                };
+                                let mut host =
+                                    self.lowered(*function, imports).map_err(instantiate)?;
+                                if let Some(memory) = memory {
+                                    // The memory belongs to an instance created before this one,
+                                    // so it is already in the slots.
+                                    let named = &self.core_memories[*memory as usize];
+                                    let Some(Slot::Runtime(provider)) =
+                                        slots.get(named.instance as usize)
+                                    else {
+                                        return Err(instantiate(
+                                            "the memory a lower names is not an instance created before it"
+                                                .to_owned(),
+                                        ));
+                                    };
+                                    host.memory = Some(
+                                        provider
+                                            .memory_view(&named.export)
+                                            .map_err(|error| instantiate(error.to_string()))?,
+                                    );
+                                }
+                                Target::Host(host)
                             }
                         };
                         bound.push(BoundExport {
@@ -1066,18 +1086,15 @@ impl Component {
         let declared = self
             .func_type(*ty)
             .ok_or_else(|| format!("the import {name} is not a function"))?;
-        // A parameter or a result that holds a string or a list lives in memory, which a lowered
-        // import has no caller memory for, so it is refused here. A result that flattens to more
-        // than one value is returned through memory, and is refused for the same reason.
+        // A result that holds a string or a list, or that flattens to more than one value, is
+        // returned through memory, which a lowered import cannot write. Strings and lists among the
+        // parameters are read through the memory the lower names, which the caller attaches.
         if declared
-            .params
+            .result
             .iter()
-            .chain(declared.result.iter())
             .any(|ty| holds_string(ty) || holds_list(ty))
         {
-            return Err(format!(
-                "the import {name} takes or returns a string or a list"
-            ));
+            return Err(format!("the import {name} returns a string or a list"));
         }
         if let Some(result) = &declared.result {
             if flat_of(result, &self.types).len() > MAX_FLAT_RESULTS {
@@ -1091,6 +1108,7 @@ impl Component {
             result: declared.result,
             types: self.types.clone(),
             capabilities: imports.capabilities.clone(),
+            memory: None,
         })
     }
 }
@@ -1596,6 +1614,70 @@ struct LoweredHost {
     result: Option<ComponentType>,
     types: Vec<ComponentTypeDef>,
     capabilities: Option<Arc<Mutex<CapabilitySet>>>,
+    /// The memory the lower names, which the strings and lists of the arguments are read from.
+    memory: Option<MemoryView>,
+}
+
+/// The two core words a string or a list takes as an argument: its pointer and its length.
+fn two_words(values: &mut std::slice::Iter<'_, Value>) -> Result<(u32, u32), String> {
+    let mut word = || match values.next() {
+        Some(Value::I32(word)) => Ok(*word as u32),
+        _ => Err("a string or list argument is not two i32 values".to_owned()),
+    };
+    Ok((word()?, word()?))
+}
+
+impl LoweredHost {
+    /// The bytes of `length` at `pointer` in the named memory. A range outside the memory, or a
+    /// memory no view was given, is an error that says which.
+    fn read_guest(&self, pointer: u32, length: u64) -> Result<Vec<u8>, String> {
+        let memory = self.memory.as_ref().ok_or_else(|| {
+            format!(
+                "the import {} takes a string or a list, so its lower needs a memory option",
+                self.name
+            )
+        })?;
+        memory.read(u64::from(pointer), length).ok_or_else(|| {
+            format!(
+                "the import {} was given bytes outside its memory, or the memory is in use by a running call",
+                self.name
+            )
+        })
+    }
+
+    /// A UTF-8 string argument, read from the named memory.
+    fn read_text(&self, pointer: u32, length: u32) -> Result<String, String> {
+        if u64::from(length) > MAX_STRING_BYTE_LENGTH as u64 {
+            return Err("a string argument is too long for the canonical ABI".to_owned());
+        }
+        let bytes = self.read_guest(pointer, u64::from(length))?;
+        String::from_utf8(bytes).map_err(|_| "a string argument is not valid UTF-8".to_owned())
+    }
+
+    /// A list of scalars, read element by element from the named memory.
+    fn read_list(
+        &self,
+        index: u32,
+        pointer: u32,
+        count: u32,
+    ) -> Result<Vec<ComponentValue>, String> {
+        let Some(ComponentTypeDef::List(scalar)) = self.types.get(index as usize) else {
+            return Err("the list is not defined".to_owned());
+        };
+        let (size, align) = scalar.size_and_align();
+        if !(pointer as usize).is_multiple_of(align) {
+            return Err("a list argument is not aligned for its element".to_owned());
+        }
+        let length = u64::from(count) * size as u64;
+        if length > MAX_STRING_BYTE_LENGTH as u64 {
+            return Err("a list argument is too long for the canonical ABI".to_owned());
+        }
+        let bytes = self.read_guest(pointer, length)?;
+        bytes
+            .chunks_exact(size)
+            .map(|element| scalar_from_bytes(*scalar, element))
+            .collect()
+    }
 }
 
 impl fmt::Debug for LoweredHost {
@@ -1614,7 +1696,19 @@ impl LoweredHost {
         let mut remaining = args.iter();
         let mut values = Vec::with_capacity(self.params.len());
         for ty in &self.params {
-            values.push(lift_flats(&mut remaining, ty, &self.types)?);
+            match ty {
+                ComponentType::Scalar(Scalar::String) => {
+                    let (pointer, length) = two_words(&mut remaining)?;
+                    values.push(ComponentValue::String(self.read_text(pointer, length)?));
+                }
+                ComponentType::List(index) => {
+                    let (pointer, count) = two_words(&mut remaining)?;
+                    values.push(ComponentValue::List(
+                        self.read_list(*index, pointer, count)?,
+                    ));
+                }
+                _ => values.push(lift_flats(&mut remaining, ty, &self.types)?),
+            }
         }
         if remaining.next().is_some() {
             return Err(format!(
@@ -3177,16 +3271,15 @@ fn decode_imports(
         let Some(ComponentTypeDef::Func(func)) = types.get(ty as usize) else {
             return Err(ComponentError::NoSuchType { index: ty });
         };
-        // A string or a list in an import would live in the caller's memory, which a lowered
-        // import cannot reach. Every other value type passes directly, so it is accepted here.
+        // A string or a list in an import's parameters is read through the memory a lower names,
+        // and that lower is checked where it is decoded. A result that holds one is refused there too.
         let has_memory_type = func
-            .params
+            .result
             .iter()
-            .chain(func.result.iter())
             .any(|ty| holds_string(ty) || holds_list(ty));
         if has_memory_type {
             return Err(ComponentError::UnsupportedImport {
-                what: "import with a string or a list in its type",
+                what: "import with a string or a list as its result",
                 offset: at,
             });
         }
@@ -3233,12 +3326,37 @@ fn decode_canon(
         }
         let index = reader.u32()?;
         if form == CANON_LOWER {
-            let options = reader.u32()?;
-            if options != 0 {
-                return Err(ComponentError::UnsupportedCanon {
-                    what: "canonical options on a lower",
-                    offset: at,
-                });
+            // A lower takes at most one memory, and a string encoding of UTF-8, which is the default.
+            // A realloc or post-return option has no meaning on a lower.
+            let option_count = reader.u32()?;
+            let mut memory = None;
+            for _ in 0..option_count {
+                let option_at = reader.position();
+                match reader.byte()? {
+                    OPTION_UTF8 => {}
+                    OPTION_UTF16 | OPTION_LATIN1_UTF16 => {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "a string encoding other than UTF-8 on a lower",
+                            offset: option_at,
+                        })
+                    }
+                    OPTION_MEMORY => {
+                        let memory_index = reader.u32()?;
+                        if core_memories.get(memory_index as usize).is_none() {
+                            return Err(ComponentError::NoSuchMemory {
+                                memory: memory_index,
+                            });
+                        }
+                        if memory.replace(memory_index).is_some() {
+                            return Err(ComponentError::Malformed { offset: option_at });
+                        }
+                    }
+                    _ => return Err(ComponentError::UnsupportedCanon {
+                        what:
+                            "a canonical option on a lower other than a memory or a string encoding",
+                        offset: option_at,
+                    }),
+                }
             }
             match functions.get(index as usize) {
                 None => return Err(ComponentError::NoSuchComponentFunction { function: index }),
@@ -3258,17 +3376,27 @@ fn decode_canon(
                             offset: at,
                         });
                     }
-                    // A string or a list lives in the caller's memory, which a lowered import has
-                    // no way to reach, and a result of more than one value is returned through
-                    // memory. Everything else passes directly.
+                    // Strings and lists among the parameters are read through the memory the lower
+                    // names, so such a lower needs one. A string or list result would be written into
+                    // memory the host cannot reach, so it is refused.
                     if func
                         .params
                         .iter()
-                        .chain(func.result.iter())
+                        .any(|ty| holds_string(ty) || holds_list(ty))
+                        && memory.is_none()
+                    {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "a string or list parameter of a lowered import without a memory option",
+                            offset: at,
+                        });
+                    }
+                    if func
+                        .result
+                        .iter()
                         .any(|ty| holds_string(ty) || holds_list(ty))
                     {
                         return Err(ComponentError::UnsupportedCanon {
-                            what: "lowering a function with a string or a list",
+                            what: "lowering a function that returns a string or a list",
                             offset: at,
                         });
                     }
@@ -3282,7 +3410,10 @@ fn decode_canon(
                             offset: at,
                         });
                     }
-                    core_functions.push(CoreFunction::Lowered { function: index });
+                    core_functions.push(CoreFunction::Lowered {
+                        function: index,
+                        memory,
+                    });
                 }
             }
             continue;

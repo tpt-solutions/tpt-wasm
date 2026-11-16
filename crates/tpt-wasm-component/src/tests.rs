@@ -3647,55 +3647,6 @@ fn a_lowered_import_takes_a_record_and_returns_an_enum() {
 }
 
 #[test]
-fn a_record_import_decodes_but_a_list_import_is_refused() {
-    let record_types = section(
-        SECTION_TYPE,
-        &[
-            2,
-            TYPE_RECORD,
-            1,
-            1,
-            b'x',
-            VALTYPE_U32,
-            TYPE_FUNC,
-            1,
-            1,
-            b'r',
-            0x00,
-            0x00,
-            VALTYPE_U32,
-        ],
-    );
-    let import = section(
-        SECTION_IMPORT,
-        &[1, 0x00, 3, b'a', b'd', b'd', EXTERN_FUNC, 1],
-    );
-    assert!(Component::decode(&with(&[record_types, import.clone()].concat())).is_ok());
-    let list_types = section(
-        SECTION_TYPE,
-        &[
-            2,
-            TYPE_LIST,
-            VALTYPE_U8,
-            TYPE_FUNC,
-            1,
-            1,
-            b'r',
-            0x00,
-            0x00,
-            VALTYPE_U32,
-        ],
-    );
-    assert!(matches!(
-        Component::decode(&with(&[list_types, import].concat())),
-        Err(ComponentError::UnsupportedImport {
-            what: "import with a string or a list in its type",
-            ..
-        })
-    ));
-}
-
-#[test]
 fn a_lowered_import_returning_more_than_one_value_is_refused() {
     // `pick` returns the two-field record, which flattens to two core values: it needs memory.
     let types = section(
@@ -3728,4 +3679,336 @@ fn a_lowered_import_returning_more_than_one_value_is_refused() {
             ..
         })
     ));
+}
+
+#[test]
+fn a_list_import_decodes_and_a_lower_of_it_without_memory_is_refused() {
+    let list_types = section(
+        SECTION_TYPE,
+        &[
+            2,
+            TYPE_LIST,
+            VALTYPE_U8,
+            TYPE_FUNC,
+            1,
+            1,
+            b'r',
+            0x00,
+            0x00,
+            VALTYPE_U32,
+        ],
+    );
+    let import = section(
+        SECTION_IMPORT,
+        &[1, 0x00, 3, b'a', b'd', b'd', EXTERN_FUNC, 1],
+    );
+    // An import of a list decodes, since a lower that names a memory can read it.
+    assert!(Component::decode(&with(&[list_types.clone(), import.clone()].concat())).is_ok());
+    // A lower of it with no memory option is refused, since nothing says where the list is.
+    let lower = section(SECTION_CANON, &[1, CANON_LOWER, SORT_FUNC, 0, 0]);
+    assert!(matches!(
+        Component::decode(&with(&[list_types, import, lower].concat())),
+        Err(ComponentError::UnsupportedCanon {
+            what: "a string or list parameter of a lowered import without a memory option",
+            ..
+        })
+    ));
+}
+
+/// The core module that owns the memory a lowered import reads: one page, with `hi` at offset 0
+/// and the bytes 1, 2, 3 at offset 16. It exports the memory and imports nothing.
+fn memory_provider() -> Vec<u8> {
+    let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    module.extend(section(5, &[1, 0x00, 1]));
+    module.extend(section(
+        7,
+        &[1, 6, b'm', b'e', b'm', b'o', b'r', b'y', 0x02, 0],
+    ));
+    module.extend(section(
+        11,
+        &[
+            2, 0, 0x41, 0, 0x0b, 2, b'h', b'i', 0, 0x41, 16, 0x0b, 3, 1, 2, 3,
+        ],
+    ));
+    module
+}
+
+/// The core module that calls the lowered import `count` with the pointer and length given, and
+/// exports `run: () -> i32`, which returns that call's result.
+fn consumer_module(pointer: u8, length: u8) -> Vec<u8> {
+    let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    module.extend(section(
+        1,
+        &[2, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 1, 0x7f],
+    ));
+    module.extend(section(
+        2,
+        &[
+            1, 3, b'e', b'n', b'v', 5, b'c', b'o', b'u', b'n', b't', 0, 0,
+        ],
+    ));
+    module.extend(section(3, &[1, 1]));
+    module.extend(section(7, &[1, 3, b'r', b'u', b'n', 0, 1]));
+    module.extend(section(
+        10,
+        &[1, 8, 0, 0x41, pointer, 0x41, length, 0x10, 0, 0x0b],
+    ));
+    module
+}
+
+/// A component that imports `count` with the type `import_type` of `types`, lowers it with a
+/// memory option naming the provider's memory, gives the lowered function to the consumer, and
+/// exports `run` with the type `run_type` of `types`. The consumer calls `count` with the pointer
+/// and length given.
+fn lowered_memory_component(
+    types: &[u8],
+    import_type: u8,
+    run_type: u8,
+    pointer: u8,
+    length: u8,
+) -> Vec<u8> {
+    let types = section(SECTION_TYPE, types);
+    let import = section(
+        SECTION_IMPORT,
+        &[
+            1,
+            0x00,
+            5,
+            b'c',
+            b'o',
+            b'u',
+            b'n',
+            b't',
+            EXTERN_FUNC,
+            import_type,
+        ],
+    );
+    // Instance 0 is the provider, which exists before the lower names its memory.
+    let provider = section(SECTION_CORE_INSTANCE, &[1, 0x00, 0, 0]);
+    let memory = section(
+        SECTION_ALIAS,
+        &[
+            1,
+            0x00,
+            SORT_CORE_MEMORY,
+            ALIAS_CORE_EXPORT,
+            0,
+            6,
+            b'm',
+            b'e',
+            b'm',
+            b'o',
+            b'r',
+            b'y',
+        ],
+    );
+    let lower = section(
+        SECTION_CANON,
+        &[1, CANON_LOWER, SORT_FUNC, 0, 1, OPTION_MEMORY, 0],
+    );
+    // Instance 1 is the inline `env`, which binds `count` to the lowered function (core function
+    // 0). Instance 2 is the consumer, instantiated with `env`.
+    let consumer = section(
+        SECTION_CORE_INSTANCE,
+        &[
+            2,
+            0x01,
+            1,
+            5,
+            b'c',
+            b'o',
+            b'u',
+            b'n',
+            b't',
+            SORT_FUNC,
+            0,
+            0x00,
+            1,
+            1,
+            3,
+            b'e',
+            b'n',
+            b'v',
+            SORT_CORE_INSTANCE,
+            1,
+        ],
+    );
+    let alias = section(
+        SECTION_ALIAS,
+        &[
+            1,
+            0x00,
+            SORT_FUNC,
+            ALIAS_CORE_EXPORT,
+            2,
+            3,
+            b'r',
+            b'u',
+            b'n',
+        ],
+    );
+    let lift = section(SECTION_CANON, &[1, CANON_LIFT, SORT_FUNC, 1, 0, run_type]);
+    let export = section(
+        SECTION_EXPORT,
+        &[1, 0x00, 3, b'r', b'u', b'n', COMPONENT_SORT_FUNC, 1, 0x00],
+    );
+    let mut bytes = with(&module_section(&memory_provider()));
+    bytes.extend(module_section(&consumer_module(pointer, length)));
+    bytes.extend(types);
+    bytes.extend(import);
+    bytes.extend(provider);
+    bytes.extend(memory);
+    bytes.extend(lower);
+    bytes.extend(consumer);
+    bytes.extend(alias);
+    bytes.extend(lift);
+    bytes.extend(export);
+    bytes
+}
+
+#[test]
+fn a_string_argument_is_read_from_the_memory_the_lower_names() {
+    // count: (string) -> u32 is type 0, and run: () -> u32 is type 1.
+    let types = [
+        2,
+        TYPE_FUNC,
+        1,
+        1,
+        b's',
+        VALTYPE_STRING,
+        0x00,
+        VALTYPE_U32,
+        TYPE_FUNC,
+        0,
+        0x00,
+        VALTYPE_U32,
+    ];
+    let bytes = lowered_memory_component(&types, 0, 1, 0, 2);
+    let (mut imports, _) = granted("count");
+    imports.define_function(
+        "count",
+        ComponentFuncType {
+            params: vec![ComponentType::Scalar(Scalar::String)],
+            result: Some(ComponentType::Scalar(Scalar::U32)),
+        },
+        |args| match args {
+            [ComponentValue::String(text)] if text == "hi" => {
+                Ok(vec![ComponentValue::U32(text.len() as u32)])
+            }
+            _ => Err(format!("count was given {args:?}")),
+        },
+    );
+    let mut instance = Component::decode(&bytes)
+        .expect("decodes")
+        .instantiate_with(&engine(), &imports)
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("run", Vec::new()),
+        Ok(vec![ComponentValue::U32(2)]),
+        "the consumer's call read `hi` from the provider's memory"
+    );
+}
+
+#[test]
+fn a_list_argument_is_read_element_by_element_from_the_memory_the_lower_names() {
+    // list<u8> is type 0, count: (xs: list<u8>) -> u32 is type 1, and run: () -> u32 is type 2.
+    let types = [
+        3,
+        TYPE_LIST,
+        VALTYPE_U8,
+        TYPE_FUNC,
+        1,
+        2,
+        b'x',
+        b's',
+        0x00,
+        0x00,
+        VALTYPE_U32,
+        TYPE_FUNC,
+        0,
+        0x00,
+        VALTYPE_U32,
+    ];
+    let bytes = lowered_memory_component(&types, 1, 2, 16, 3);
+    let (mut imports, _) = granted("count");
+    imports.define_function(
+        "count",
+        ComponentFuncType {
+            params: vec![ComponentType::List(0)],
+            result: Some(ComponentType::Scalar(Scalar::U32)),
+        },
+        |args| match args {
+            [ComponentValue::List(items)] => {
+                let total: u32 = items
+                    .iter()
+                    .map(|item| match item {
+                        ComponentValue::U8(byte) => u32::from(*byte),
+                        _ => 0,
+                    })
+                    .sum();
+                Ok(vec![ComponentValue::U32(total)])
+            }
+            _ => Err(format!("count was given {args:?}")),
+        },
+    );
+    let mut instance = Component::decode(&bytes)
+        .expect("decodes")
+        .instantiate_with(&engine(), &imports)
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("run", Vec::new()),
+        Ok(vec![ComponentValue::U32(6)]),
+        "the list 1, 2, 3 was read from the provider's memory"
+    );
+}
+
+#[test]
+fn a_string_parameter_without_a_memory_option_is_refused_and_a_string_result_is_too() {
+    let types = section(
+        SECTION_TYPE,
+        &[1, TYPE_FUNC, 1, 1, b's', VALTYPE_STRING, 0x00, VALTYPE_U32],
+    );
+    let import = section(
+        SECTION_IMPORT,
+        &[1, 0x00, 5, b'c', b'o', b'u', b'n', b't', EXTERN_FUNC, 0],
+    );
+    let lower = section(SECTION_CANON, &[1, CANON_LOWER, SORT_FUNC, 0, 0]);
+    assert!(matches!(
+        Component::decode(&with(&[types, import, lower].concat())),
+        Err(ComponentError::UnsupportedCanon {
+            what: "a string or list parameter of a lowered import without a memory option",
+            ..
+        })
+    ));
+    let result_types = section(SECTION_TYPE, &[1, TYPE_FUNC, 0, 0x00, VALTYPE_STRING]);
+    let result_import = section(
+        SECTION_IMPORT,
+        &[1, 0x00, 5, b'c', b'o', b'u', b'n', b't', EXTERN_FUNC, 0],
+    );
+    let result_lower = section(SECTION_CANON, &[1, CANON_LOWER, SORT_FUNC, 0, 0]);
+    // The import itself refuses a string result, before any lower is read.
+    assert!(matches!(
+        Component::decode(&with(&[result_types, result_import, result_lower].concat())),
+        Err(ComponentError::UnsupportedImport {
+            what: "import with a string or a list as its result",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_lower_naming_a_memory_that_does_not_exist_is_refused() {
+    let types = section(SECTION_TYPE, &[1, TYPE_FUNC, 0, 0x00, VALTYPE_U32]);
+    let import = section(
+        SECTION_IMPORT,
+        &[1, 0x00, 5, b'c', b'o', b'u', b'n', b't', EXTERN_FUNC, 0],
+    );
+    let lower = section(
+        SECTION_CANON,
+        &[1, CANON_LOWER, SORT_FUNC, 0, 1, OPTION_MEMORY, 7],
+    );
+    assert_eq!(
+        Component::decode(&with(&[types, import, lower].concat())),
+        Err(ComponentError::NoSuchMemory { memory: 7 })
+    );
 }

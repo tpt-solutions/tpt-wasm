@@ -28,6 +28,7 @@ use tpt_wasm_validate::{ValidatedModule, ValidationError, Validator};
 
 mod cache;
 mod debug;
+mod memory_view;
 mod jit_tier;
 mod native_cache;
 
@@ -38,6 +39,7 @@ mod source;
 
 pub use cache::{CacheStats, CompilationCache, CompilationKey};
 pub use debug::{DebugSession, FrameInfo, StopReason};
+pub use memory_view::MemoryView;
 pub use provenance::{
     hash_bytes, Configuration, ExecutionArtifact, ExecutionMetadata, Hash, Outcome, Reproduction,
 };
