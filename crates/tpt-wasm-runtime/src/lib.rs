@@ -300,6 +300,34 @@ pub trait HostFunction: Send + Sync {
         let _ = memory;
         self.call(args)
     }
+
+    /// As [`call_with_memory`](Self::call_with_memory), with the calling instance itself available
+    /// through a [`Caller`]: its memory, and its exports run as nested calls. The default uses only
+    /// the memory, so an implementation that needs the instance overrides this.
+    fn call_with_caller(
+        &self,
+        caller: &mut dyn Caller,
+        args: &[Value],
+    ) -> Result<Vec<Value>, String> {
+        self.call_with_memory(caller.memory(), args)
+    }
+}
+
+/// The instance that called a host function, as the function sees it.
+///
+/// A `Caller` is only available on the interpreter. A nested call runs on a copy of the store that
+/// replaces the store when the call returns, whether it returns normally or traps, so the store is
+/// left as the nested call left it.
+pub trait Caller {
+    /// The calling instance's memory, if it has one.
+    fn memory(&mut self) -> Option<&mut dyn GuestMemory>;
+
+    /// The store address of the calling instance's function export named `name`, if it has one.
+    fn export_function(&self, name: &str) -> Option<u32>;
+
+    /// Run the function at `address` on the same store, with `args`, and return its results. Nested
+    /// calls may nest only so deep; past that they are refused.
+    fn call(&mut self, address: u32, args: Vec<Value>) -> Result<Vec<Value>, String>;
 }
 
 #[derive(Clone)]
@@ -319,6 +347,9 @@ impl fmt::Debug for HostFunctionDefinition {
 #[derive(Clone)]
 struct RuntimeContext {
     store: Arc<Mutex<Store>>,
+    /// The exports of every instance on this engine, by store instance index, so a host function can
+    /// call one of its caller's exports by name.
+    export_names: Arc<Mutex<HashMap<u32, HashMap<String, ExportDesc>>>>,
     call_gate: Arc<Mutex<()>>,
     /// Set while a debug session owns the store. Every call and instantiation on the
     /// engine checks it under the call gate and refuses while it is set.
@@ -351,6 +382,7 @@ impl RuntimeContext {
     fn new(limits: ResourceLimits) -> Self {
         Self {
             store: Arc::new(Mutex::new(Store::new(limits))),
+            export_names: Arc::new(Mutex::new(HashMap::new())),
             call_gate: Arc::new(Mutex::new(())),
             debug_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host_functions: Arc::new(Mutex::new(HashMap::new())),
@@ -380,12 +412,6 @@ impl fmt::Debug for RuntimeContext {
 ///
 /// A host call does not push a frame, so the frame on top is the caller's: its
 /// instance's first memory is the one the host function may read and write.
-fn caller_memory_address(machine: &Machine) -> Option<u32> {
-    let caller = machine.frames.last()?.instance_idx;
-    let instance = machine.store.instance(caller).ok()?;
-    instance.memory_addrs.first().copied()
-}
-
 /// The import's own `module::name` for a host callback's store name.
 ///
 /// The store names each host callback `tpt-host:<slot>:<module>::<name>`, where the slot
@@ -1595,7 +1621,7 @@ fn instantiate_module(
     };
     let allocated_index = store.add_instance(store_instance)?;
     debug_assert_eq!(allocated_index, instance_index);
-    let exports = module
+    let exports: HashMap<String, ExportDesc> = module
         .exports
         .into_iter()
         .map(|export| (export.name, export.desc))
@@ -1625,6 +1651,11 @@ fn instantiate_module(
         ),
         _ => jit_tier::JitTier::default(),
     };
+    context
+        .export_names
+        .lock()
+        .map_err(|_| RuntimeError::StorePoisoned)?
+        .insert(allocated_index, exports.clone());
     let mut instance = Instance {
         index: allocated_index,
         exports,
@@ -2318,14 +2349,16 @@ impl Instance {
                         .entry(capability_name(&call.func_name).to_owned())
                         .or_insert(0) += 1;
                     let arguments = call.args.clone();
-                    let outcome = match caller_memory_address(&machine)
-                        .and_then(|address| machine.store.memory_mut(address).ok())
-                    {
-                        Some(memory) => {
-                            let memory: &mut dyn GuestMemory = memory;
-                            self.invoke_host_call(&call, Some(memory))
-                        }
-                        None => self.invoke_host_call(&call, None),
+                    let instance = machine.frames.last().map(|frame| frame.instance_idx);
+                    let outcome = {
+                        let mut caller = MicroCaller {
+                            store: &mut machine.store,
+                            instance,
+                            context: &self.context,
+                            execution: self.execution,
+                            depth: 0,
+                        };
+                        invoke_with_caller(&self.context, &call, &mut caller)
                     };
                     self.record_host_call(&call.func_name, arguments, &outcome);
                     let results = match outcome {
@@ -2402,6 +2435,168 @@ impl Instance {
         check_values("result", &function_type.results.0, &results)?;
         Ok(results)
     }
+}
+
+/// How deep host functions may call back into Wasm on the interpreter. Each level is a host frame and a
+/// nested interpreter run on the host stack, so the depth stays small.
+const MAX_REENTRANT_DEPTH: usize = 32;
+
+/// The interpreter's calling instance, as a [`Caller`].
+struct MicroCaller<'a> {
+    store: &'a mut Store,
+    instance: Option<u32>,
+    context: &'a RuntimeContext,
+    execution: ExecutionConfig,
+    depth: usize,
+}
+
+impl Caller for MicroCaller<'_> {
+    fn memory(&mut self) -> Option<&mut dyn GuestMemory> {
+        let instance = self.instance?;
+        let address = *self.store.instance(instance).ok()?.memory_addrs.first()?;
+        let memory = self.store.memory_mut(address).ok()?;
+        Some(memory as &mut dyn GuestMemory)
+    }
+
+    fn export_function(&self, name: &str) -> Option<u32> {
+        let instance = self.instance?;
+        let names = self.context.export_names.lock().ok()?;
+        let ExportDesc::Function(index) = names.get(&instance)?.get(name)? else {
+            return None;
+        };
+        self.store
+            .instance(instance)
+            .ok()?
+            .func_addrs
+            .get(*index as usize)
+            .copied()
+    }
+
+    fn call(&mut self, address: u32, args: Vec<Value>) -> Result<Vec<Value>, String> {
+        if self.depth >= MAX_REENTRANT_DEPTH {
+            return Err(format!(
+                "host calls nest deeper than {MAX_REENTRANT_DEPTH} levels"
+            ));
+        }
+        let (store, outcome) = run_nested(
+            self.context,
+            self.execution,
+            self.store.clone(),
+            address,
+            args,
+            self.depth + 1,
+        );
+        *self.store = store;
+        outcome.map_err(|error| error.to_string())
+    }
+}
+
+/// Run a host callback with the checks the host boundary makes on its arguments and results.
+fn invoke_with_caller(
+    context: &RuntimeContext,
+    call: &tpt_wasm_micro::machine::HostCall,
+    caller: &mut dyn Caller,
+) -> Result<Vec<Value>, RuntimeError> {
+    let implementation = {
+        let callbacks = lock_host_functions(&context.host_functions)?;
+        callbacks
+            .get(&call.func_name)
+            .cloned()
+            .ok_or_else(|| RuntimeError::HostFunction {
+                name: call.func_name.clone(),
+                message: "callback is not registered".into(),
+            })?
+    };
+    let function_type = implementation.function_type();
+    check_values("argument", &function_type.params.0, &call.args)?;
+    let results = implementation
+        .call_with_caller(caller, &call.args)
+        .map_err(|message| RuntimeError::HostFunction {
+            name: call.func_name.clone(),
+            message,
+        })?;
+    check_values("result", &function_type.results.0, &results)?;
+    Ok(results)
+}
+
+/// Run the function at `address` on `store`, as a nested call from a host function at `depth`. The store
+/// comes back whether the call returned or trapped.
+fn run_nested(
+    context: &RuntimeContext,
+    execution: ExecutionConfig,
+    store: Store,
+    address: u32,
+    args: Vec<Value>,
+    depth: usize,
+) -> (Store, Result<Vec<Value>, RuntimeError>) {
+    let function = match store.function(address).cloned() {
+        Ok(function) => function,
+        Err(error) => return (store, Err(RuntimeError::Store(error))),
+    };
+    let tpt_wasm_micro::store::FuncInstance::Wasm(function) = function else {
+        return (
+            store,
+            Err(RuntimeError::UnsupportedFeature(
+                "a host function that calls a host function",
+            )),
+        );
+    };
+    if let Err(error) = check_arguments(&function.func_type, &args) {
+        return (store, Err(error));
+    }
+    let mut locals = args;
+    locals.extend(
+        function
+            .local_types
+            .iter()
+            .skip(function.func_type.params.0.len())
+            .copied()
+            .map(default_value),
+    );
+    let frame = Frame::new(
+        function.instance_idx,
+        function.func_idx,
+        locals,
+        function.instrs.clone(),
+        function.func_type.results.0.len(),
+    );
+    let mut machine = Machine::with_execution(store, execution);
+    if let Err(trap) = machine.push_frame(frame) {
+        return (machine.store, Err(RuntimeError::Trap(trap)));
+    }
+    let outcome = loop {
+        match machine.run() {
+            Step::Return(values) => break Ok(values),
+            Step::Trap(trap) => break Err(RuntimeError::Trap(trap)),
+            Step::HostCall(call) => {
+                let instance = machine.frames.last().map(|frame| frame.instance_idx);
+                let outcome = {
+                    let mut caller = MicroCaller {
+                        store: &mut machine.store,
+                        instance,
+                        context,
+                        execution,
+                        depth,
+                    };
+                    invoke_with_caller(context, &call, &mut caller)
+                };
+                match outcome {
+                    Ok(results) => {
+                        if let Err(trap) = machine.resume_host_call(results) {
+                            break Err(RuntimeError::Trap(trap));
+                        }
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+            Step::Continue => {
+                break Err(RuntimeError::InvalidBody(
+                    "machine stopped without return".into(),
+                ))
+            }
+        }
+    };
+    (machine.store, outcome)
 }
 
 #[cfg(test)]
@@ -4611,7 +4806,10 @@ mod tests {
     /// 100,000 levels did not finish in minutes. A host stack overflow aborts the
     /// process, so the test passing at all is part of the claim.
     #[test]
-    #[cfg_attr(miri, ignore = "100,000 nested blocks take minutes under Miri; the native run covers it")]
+    #[cfg_attr(
+        miri,
+        ignore = "100,000 nested blocks take minutes under Miri; the native run covers it"
+    )]
     fn deeply_nested_blocks_do_not_exhaust_the_host_stack() {
         for mode in [
             EngineMode::Micro,

@@ -268,14 +268,16 @@ impl DebugSession<'_> {
                     return Ok(Some(StopReason::Trapped(trap)));
                 }
                 Step::HostCall(call) => {
-                    let memory = super::caller_memory_address(&self.machine)
-                        .and_then(|address| self.machine.store.memory_mut(address).ok());
-                    let invoked = match memory {
-                        Some(memory) => {
-                            let memory: &mut dyn tpt_wasm_types::GuestMemory = memory;
-                            self.instance.invoke_host_call(&call, Some(memory))
-                        }
-                        None => self.instance.invoke_host_call(&call, None),
+                    let instance = self.machine.frames.last().map(|frame| frame.instance_idx);
+                    let invoked = {
+                        let mut caller = crate::MicroCaller {
+                            store: &mut self.machine.store,
+                            instance,
+                            context: &self.instance.context,
+                            execution: self.instance.execution,
+                            depth: 0,
+                        };
+                        crate::invoke_with_caller(&self.instance.context, &call, &mut caller)
                     };
                     let results = match invoked {
                         Ok(results) => results,
