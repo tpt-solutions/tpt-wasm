@@ -31,9 +31,8 @@
 //! Several Core suite modules import from `spectest`, the host module the
 //! reference interpreter's own test runner supplies. Its print functions are
 //! defined as no-ops, since what the suite checks about them is that a module
-//! importing one links and runs, never what the call prints. Its memory is
-//! defined as the runner defines it, one page with a maximum of two. Its globals
-//! and table are not defined yet.
+//! importing one links and runs, never what the call prints. Its memory, globals
+//! and table are defined as the runner defines them.
 
 use std::collections::HashMap;
 
@@ -108,8 +107,23 @@ fn define_spectest(engine: &mut Engine) -> Result<(), String> {
             .define_export("spectest", name, &globals, name)
             .map_err(|error| error.to_string())?;
     }
+    // The runner's `funcref` table, from ten to twenty elements, exported as `table`.
+    let table = engine
+        .instantiate_bytes(SPECTEST_TABLE)
+        .map_err(|error| error.to_string())?;
+    engine
+        .linker_mut()
+        .define_export("spectest", "table", &table, "table")
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
+
+/// A module that exports one `funcref` table of ten elements, with a maximum of twenty, as `table`.
+const SPECTEST_TABLE: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+    0x04, 0x05, 0x01, 0x70, 0x01, 0x0a, 0x14, // table section: funcref, min 10, max 20
+    0x07, 0x09, 0x01, 0x05, b't', b'a', b'b', b'l', b'e', 0x01, 0x00, // export "table"
+];
 
 /// A module that exports the runner's four immutable globals: `global_i32` and `global_i64` are 666,
 /// `global_f32` is 666.6 and `global_f64` is 666.6, as their IEEE bit patterns.
