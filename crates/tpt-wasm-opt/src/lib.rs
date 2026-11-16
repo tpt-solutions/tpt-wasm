@@ -125,6 +125,9 @@ pub struct PassReport {
 /// Something the optimizer could not do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OptimizationError {
+    /// The optimizer would have done more work than its budget allows. The work is charged per pass
+    /// and per re-verification, in proportion to the module's size.
+    WorkBudgetExceeded { limit: u64 },
     /// A pass produced IR the structural verifier rejects.
     ///
     /// This is a compiler bug, not a user error: the input was verified, and
@@ -142,6 +145,12 @@ impl fmt::Display for OptimizationError {
         match self {
             Self::Verification { pass, error } => {
                 write!(f, "the {pass} pass produced unverifiable IR: {error}")
+            }
+            Self::WorkBudgetExceeded { limit } => {
+                write!(
+                    f,
+                    "the optimizer would exceed its work budget of {limit} units"
+                )
             }
         }
     }
@@ -176,6 +185,20 @@ pub fn optimize(
     module: &IrModule,
     level: OptimizationLevel,
 ) -> Result<OptimizationOutcome, OptimizationError> {
+    optimize_within(module, level, DEFAULT_OPTIMIZATION_WORK)
+}
+
+/// Optimize a module, refusing it if the optimizer would do more than `limit` units of work.
+///
+/// A unit is one instruction or block of the module, charged for each pass and for each
+/// re-verification the pass is followed by, so the total is bounded by the rounds times the passes
+/// times the module's size. The verifier's own work is bounded separately, by its own budget.
+pub fn optimize_within(
+    module: &IrModule,
+    level: OptimizationLevel,
+    limit: u64,
+) -> Result<OptimizationOutcome, OptimizationError> {
+    let mut spent: u64 = 0;
     let (instructions_before, blocks_before) = size_of(module);
     if level == OptimizationLevel::None {
         return Ok(OptimizationOutcome {
@@ -213,6 +236,8 @@ pub fn optimize(
     for round in 0..MAX_ROUNDS {
         let mut changed_this_round = false;
         for (name, pass) in &schedule {
+            // The pass and the verification after it each walk the module once.
+            charge(&mut spent, limit, &working, 2)?;
             let outcome = pass(&mut working);
 
             // Every pass that removes an instruction orphans the value
@@ -263,6 +288,7 @@ pub fn optimize(
     //
     // So the rule is: run every pass, then prune once, then verify. The verifier
     // then sees exactly the module a backend will be handed.
+    charge(&mut spent, limit, &working, 2)?;
     let mut pruned = 0;
     for function in &mut working.functions {
         pruned += analysis::prune_declarations(function);
@@ -302,6 +328,26 @@ type ScheduledPass = (&'static str, PassFn);
 /// rounds. This is a backstop against a future pass that is not, and hitting it
 /// costs optimization rather than correctness.
 const MAX_ROUNDS: usize = 8;
+
+/// The default work budget of the optimizer, in units: one per instruction or block, per walk.
+pub const DEFAULT_OPTIMIZATION_WORK: u64 = 200_000_000;
+
+/// Charge `walks` walks of `module` against the budget, refusing once the total exceeds `limit`.
+fn charge(
+    spent: &mut u64,
+    limit: u64,
+    module: &IrModule,
+    walks: u64,
+) -> Result<(), OptimizationError> {
+    let (instructions, blocks) = size_of(module);
+    let units = walks.saturating_mul(instructions as u64 + blocks as u64 + 1);
+    *spent = spent.saturating_add(units);
+    if *spent > limit {
+        Err(OptimizationError::WorkBudgetExceeded { limit })
+    } else {
+        Ok(())
+    }
+}
 
 /// The pass pipeline for a level, in order.
 ///
