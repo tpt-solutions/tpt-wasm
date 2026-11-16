@@ -15,6 +15,7 @@
 //! Comments are `//` and nested `/* */`, as WIT has them.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use crate::{ComponentFuncType, ComponentType, Scalar};
 
@@ -226,6 +227,89 @@ impl WitDocument {
         }
         Ok(full)
     }
+}
+
+/// A failure to read a WIT package directory from disk.
+#[derive(Debug)]
+pub enum WitLoadError {
+    /// A file or directory could not be read.
+    Io { path: PathBuf, message: String },
+    /// A file was read but is not a WIT document this parser reads.
+    Parse { path: PathBuf, error: WitError },
+}
+
+impl fmt::Display for WitLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WitLoadError::Io { path, message } => {
+                write!(f, "{}: {message}", path.display())
+            }
+            WitLoadError::Parse { path, error } => write!(f, "{}: {error}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for WitLoadError {}
+
+/// Read a WIT package directory the way the WIT tooling lays one out: every `.wit` file directly
+/// in `root`, then the packages under `root/deps`. A dependency is a directory of `.wit` files or a
+/// single `.wit` file, and a dependency's own `deps` directory is read the same way.
+///
+/// Nothing is fetched. A package that is not on disk is not found, and a world that imports it is
+/// refused by [`capability_ids_across`]. Entries are read in name order, so the result is the same
+/// on every machine. The root's documents come first, then each dependency's, in that order.
+pub fn load_directory(root: &Path) -> Result<Vec<WitDocument>, WitLoadError> {
+    let mut documents = Vec::new();
+    read_package_dir(root, &mut documents)?;
+    Ok(documents)
+}
+
+fn read_package_dir(dir: &Path, out: &mut Vec<WitDocument>) -> Result<(), WitLoadError> {
+    for entry in sorted_entries(dir)? {
+        if entry.is_file() && is_wit_file(&entry) {
+            out.push(parse_file(&entry)?);
+        }
+    }
+    let deps = dir.join("deps");
+    if deps.is_dir() {
+        for entry in sorted_entries(&deps)? {
+            if entry.is_dir() {
+                read_package_dir(&entry, out)?;
+            } else if entry.is_file() && is_wit_file(&entry) {
+                out.push(parse_file(&entry)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sorted_entries(dir: &Path) -> Result<Vec<PathBuf>, WitLoadError> {
+    let io = |message: String| WitLoadError::Io {
+        path: dir.to_path_buf(),
+        message,
+    };
+    let read = std::fs::read_dir(dir).map_err(|e| io(e.to_string()))?;
+    let mut paths = Vec::new();
+    for entry in read {
+        paths.push(entry.map_err(|e| io(e.to_string()))?.path());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn is_wit_file(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "wit")
+}
+
+fn parse_file(path: &Path) -> Result<WitDocument, WitLoadError> {
+    let text = std::fs::read_to_string(path).map_err(|e| WitLoadError::Io {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    WitDocument::parse(&text).map_err(|error| WitLoadError::Parse {
+        path: path.to_path_buf(),
+        error,
+    })
 }
 
 /// The component type of a WIT scalar type name, or a refusal naming the function that has it.
@@ -903,5 +987,78 @@ world w {
                 function: "nope".to_owned(),
             })
         );
+    }
+
+    /// A scratch directory for one test, cleared before use.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tpt-wit-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+        std::fs::write(path, text).expect("a file");
+    }
+
+    #[test]
+    fn a_package_directory_resolves_its_dependencies_from_deps() {
+        let root = scratch("deps");
+        write(
+            &root.join("app.wit"),
+            "package local:app;
+world w { import wasi:io/poll@0.2.0; }
+",
+        );
+        write(
+            &root.join("deps/wasi-io/poll.wit"),
+            "package wasi:io@0.2.0;
+interface poll { ready: func() -> bool; }
+",
+        );
+        let documents = load_directory(&root).expect("loads");
+        assert_eq!(documents.len(), 2, "the root's file, then the dependency");
+        assert_eq!(
+            capability_ids_across(&documents, 0, "w"),
+            Ok(vec!["wasi:io/poll@0.2.0#ready".to_owned()])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_dependency_is_not_fetched_and_is_refused_by_name() {
+        let root = scratch("missing");
+        write(
+            &root.join("app.wit"),
+            "package local:app;
+world w { import wasi:io/poll@0.2.0; }
+",
+        );
+        let documents = load_directory(&root).expect("loads");
+        assert!(matches!(
+            capability_ids_across(&documents, 0, "w"),
+            Err(WitError::UnresolvedInterface { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_malformed_file_is_reported_with_its_path() {
+        let root = scratch("malformed");
+        write(
+            &root.join("bad.wit"),
+            "package a:b;
+package c:d;
+",
+        );
+        match load_directory(&root) {
+            Err(WitLoadError::Parse { path, error }) => {
+                assert!(path.ends_with("bad.wit"));
+                assert!(matches!(error, WitError::Syntax { line: 2, .. }));
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
