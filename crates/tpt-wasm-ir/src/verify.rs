@@ -58,6 +58,8 @@ pub enum VerificationError {
     UseBeforeDefinition(ValueId),
     /// A memory or global index with no corresponding declaration.
     UnknownGlobal(u32),
+    /// A bulk memory instruction names a data segment the module does not have.
+    UnknownDataSegment(u32),
     /// A table index with no corresponding declaration.
     UnknownTable(u32),
     /// `call_indirect` through a table that does not hold function references.
@@ -978,6 +980,23 @@ pub fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
         // `memory.size` reads nothing; `memory.grow` reads the page delta.
         MemorySize { .. } => Vec::new(),
         MemoryGrow { delta, .. } => vec![*delta],
+        MemoryInit {
+            destination,
+            source,
+            length,
+            ..
+        }
+        | MemoryCopy {
+            destination,
+            source,
+            length,
+        } => vec![*destination, *source, *length],
+        MemoryFill {
+            destination,
+            value,
+            length,
+        } => vec![*destination, *value, *length],
+        DataDrop { .. } => Vec::new(),
         // A global index is not a value; a set reads the value it stores.
         GlobalGet { .. } => Vec::new(),
         GlobalSet { value, .. } => vec![*value],
@@ -1052,9 +1071,15 @@ pub fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
         CallHost { results, .. } => results.clone(),
         CallIndirect { results, .. } => results.clone(),
         // Neither a drop, a store, nor a `global.set` produces a new value.
-        Drop { .. } | LocalSet { .. } | Store { .. } | GlobalSet { .. } | TableSet { .. } => {
-            Vec::new()
-        }
+        Drop { .. }
+        | LocalSet { .. }
+        | Store { .. }
+        | GlobalSet { .. }
+        | TableSet { .. }
+        | MemoryInit { .. }
+        | DataDrop { .. }
+        | MemoryCopy { .. }
+        | MemoryFill { .. } => Vec::new(),
         LocalGet { result, .. } | LocalTee { result, .. } | Select { result, .. } => {
             vec![*result]
         }
@@ -1754,6 +1779,55 @@ fn verify_instruction(
                 return Err(VerificationError::NoMemory);
             }
             define_value(*result, ValueType::I32, function_index, values, defined)
+        }
+        super::IrInstr::MemoryInit {
+            data,
+            destination,
+            source,
+            length,
+        } => {
+            if module.memory.is_none() {
+                return Err(VerificationError::NoMemory);
+            }
+            if *data as usize >= module.passive_data.len() {
+                return Err(VerificationError::UnknownDataSegment(*data));
+            }
+            for value in [*destination, *source, *length] {
+                expect_defined_type(value, ValueType::I32, function_index, values, defined)?;
+            }
+            Ok(())
+        }
+        super::IrInstr::DataDrop { data } => {
+            if *data as usize >= module.passive_data.len() {
+                return Err(VerificationError::UnknownDataSegment(*data));
+            }
+            Ok(())
+        }
+        super::IrInstr::MemoryCopy {
+            destination,
+            source,
+            length,
+        } => {
+            if module.memory.is_none() {
+                return Err(VerificationError::NoMemory);
+            }
+            for value in [*destination, *source, *length] {
+                expect_defined_type(value, ValueType::I32, function_index, values, defined)?;
+            }
+            Ok(())
+        }
+        super::IrInstr::MemoryFill {
+            destination,
+            value,
+            length,
+        } => {
+            if module.memory.is_none() {
+                return Err(VerificationError::NoMemory);
+            }
+            for operand in [*destination, *value, *length] {
+                expect_defined_type(operand, ValueType::I32, function_index, values, defined)?;
+            }
+            Ok(())
         }
         super::IrInstr::MemoryGrow { result, delta } => {
             if module.memory.is_none() {

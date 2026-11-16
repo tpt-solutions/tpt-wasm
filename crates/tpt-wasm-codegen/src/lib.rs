@@ -141,6 +141,30 @@ pub enum F64BinaryOp {
 /// A deterministic portable baseline operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaselineOp {
+    /// `memory.init` of passive data segment `data`: copy `length` bytes from `source` into memory at
+    /// `destination`. The operands are slots.
+    MemoryInit {
+        data: u32,
+        destination: u32,
+        source: u32,
+        length: u32,
+    },
+    /// `data.drop` of data segment `data`.
+    DataDrop {
+        data: u32,
+    },
+    /// `memory.copy` within the module's memory.
+    MemoryCopy {
+        destination: u32,
+        source: u32,
+        length: u32,
+    },
+    /// `memory.fill` within the module's memory.
+    MemoryFill {
+        destination: u32,
+        value: u32,
+        length: u32,
+    },
     ConstI32 {
         slot: u32,
         value: i32,
@@ -1336,6 +1360,53 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     let result = state.define(*result)?;
                     ops.push(BaselineOp::MemorySize { result });
                 }
+                IrInstr::MemoryInit {
+                    data,
+                    destination,
+                    source,
+                    length,
+                } => {
+                    let destination = state.expect(*destination, ValueType::I32)?;
+                    let source = state.expect(*source, ValueType::I32)?;
+                    let length = state.expect(*length, ValueType::I32)?;
+                    ops.push(BaselineOp::MemoryInit {
+                        data: *data,
+                        destination,
+                        source,
+                        length,
+                    });
+                }
+                IrInstr::DataDrop { data } => {
+                    ops.push(BaselineOp::DataDrop { data: *data });
+                }
+                IrInstr::MemoryCopy {
+                    destination,
+                    source,
+                    length,
+                } => {
+                    let destination = state.expect(*destination, ValueType::I32)?;
+                    let source = state.expect(*source, ValueType::I32)?;
+                    let length = state.expect(*length, ValueType::I32)?;
+                    ops.push(BaselineOp::MemoryCopy {
+                        destination,
+                        source,
+                        length,
+                    });
+                }
+                IrInstr::MemoryFill {
+                    destination,
+                    value,
+                    length,
+                } => {
+                    let destination = state.expect(*destination, ValueType::I32)?;
+                    let value = state.expect(*value, ValueType::I32)?;
+                    let length = state.expect(*length, ValueType::I32)?;
+                    ops.push(BaselineOp::MemoryFill {
+                        destination,
+                        value,
+                        length,
+                    });
+                }
                 IrInstr::MemoryGrow { result, delta } => {
                     let delta = state.expect(*delta, ValueType::I32)?;
                     let result = state.define(*result)?;
@@ -1761,6 +1832,8 @@ pub struct BaselineModule {
     /// function runs; a defined one is created here from its initializer. The
     /// list is in Wasm order, so a `global.get`/`global.set` needs no rebasing.
     globals: SharedGlobals,
+    /// The module's data segments by data index, `None` once dropped. Passive segments start populated.
+    datas: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
     /// How many leading globals are imports, whose handles the embedder supplies.
     global_import_count: usize,
     /// The globals whose initializer copies another global, as `(index, source)`, in index order.
@@ -2087,6 +2160,7 @@ impl BaselineModule {
                     .map(|initial| Arc::new(Mutex::new(initial)))
             })
             .collect();
+        let datas = Arc::new(Mutex::new(module.passive_data.clone()));
         let global_import_count = module.globals.iter().filter(|g| g.import.is_some()).count();
         let deferred_globals: Vec<(usize, usize)> = module
             .globals
@@ -2102,6 +2176,7 @@ impl BaselineModule {
             globals,
             global_import_count,
             deferred_globals,
+            datas,
             pending_imported_table,
             imports: module.imports.clone(),
             host: None,
@@ -2461,6 +2536,7 @@ impl BaselineModule {
         // same reason the memory is, and for the same reason they are shared with
         // the store at all: a reader outside this call must not see half of a
         // `global.set`, and a `table.set` must not be split across observers.
+        let mut datas = lock_shared(&self.datas)?;
         let globals = self.globals.clone();
         let mut table = match self.table.as_ref() {
             Some(shared) => Some(lock_shared(shared)?),
@@ -2472,6 +2548,7 @@ impl BaselineModule {
             table: table.as_deref_mut(),
             types: &self.types,
             memory: memory.as_deref_mut(),
+            datas: &mut datas,
             globals: &globals,
             host: self.host.as_deref_mut(),
             // The entry call is itself a frame, exactly as Micro counts the
@@ -2494,6 +2571,8 @@ struct ExecState<'a> {
     /// Module types, so an indirect call can check its target's signature.
     types: &'a [FunctionType],
     memory: Option<&'a mut BaselineMemory>,
+    /// The module's data segments, `None` once dropped, locked for the whole execution like the memory.
+    datas: &'a mut Vec<Option<Vec<u8>>>,
     globals: &'a [Option<SharedGlobal>],
     /// The installed host boundary, absent when the embedder granted none.
     ///
@@ -2601,6 +2680,7 @@ impl BaselineFunction {
             table: None,
             types: &[],
             memory: None,
+            datas: &mut Vec::new(),
             globals: &mut Vec::new(),
             host: None,
             // The entry call counts as a frame, as it does in `call`.
@@ -2989,6 +3069,70 @@ fn exec_op(
         BaselineOp::MemorySize { result } => {
             let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
             slots[*result as usize] = Some(Value::I32(memory.pages() as i32));
+        }
+        BaselineOp::MemoryInit {
+            data,
+            destination,
+            source,
+            length,
+        } => {
+            let destination = i32_slot(slots, *destination)? as u32 as usize;
+            let source = i32_slot(slots, *source)? as u32 as usize;
+            let length = i32_slot(slots, *length)? as u32 as usize;
+            let segment: &[u8] = state
+                .datas
+                .get(*data as usize)
+                .and_then(|segment| segment.as_deref())
+                .unwrap_or(&[]);
+            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let source_end = source
+                .checked_add(length)
+                .filter(|end| *end <= segment.len())
+                .ok_or(Trap::MemoryOutOfBounds)?;
+            let destination_end = destination
+                .checked_add(length)
+                .filter(|end| *end <= memory.len)
+                .ok_or(Trap::MemoryOutOfBounds)?;
+            memory.data[destination..destination_end].copy_from_slice(&segment[source..source_end]);
+        }
+        BaselineOp::DataDrop { data } => {
+            if let Some(segment) = state.datas.get_mut(*data as usize) {
+                *segment = None;
+            }
+        }
+        BaselineOp::MemoryCopy {
+            destination,
+            source,
+            length,
+        } => {
+            let destination = i32_slot(slots, *destination)? as u32 as usize;
+            let source = i32_slot(slots, *source)? as u32 as usize;
+            let length = i32_slot(slots, *length)? as u32 as usize;
+            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let source_end = source
+                .checked_add(length)
+                .filter(|end| *end <= memory.len)
+                .ok_or(Trap::MemoryOutOfBounds)?;
+            destination
+                .checked_add(length)
+                .filter(|end| *end <= memory.len)
+                .ok_or(Trap::MemoryOutOfBounds)?;
+            memory.data.copy_within(source..source_end, destination);
+        }
+        BaselineOp::MemoryFill {
+            destination,
+            value,
+            length,
+        } => {
+            let destination = i32_slot(slots, *destination)? as u32 as usize;
+            let value = i32_slot(slots, *value)? as u8;
+            let length = i32_slot(slots, *length)? as u32 as usize;
+            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let end = destination
+                .checked_add(length)
+                .filter(|end| *end <= memory.len)
+                .ok_or(Trap::MemoryOutOfBounds)?;
+            memory.data[destination..end].fill(value);
         }
         BaselineOp::MemoryGrow { result, delta } => {
             let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;

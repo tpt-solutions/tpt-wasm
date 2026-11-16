@@ -79,6 +79,8 @@ pub enum Effect {
     MemoryGrow,
     /// `memory.size`.
     MemorySize,
+    /// A bulk memory write or drop: `memory.init`, `memory.copy`, `memory.fill`, or `data.drop`.
+    MemoryBulk,
     /// A call to an imported function: the host boundary, crossed by index.
     HostCall(u32),
     /// A call to another function in the module.
@@ -486,6 +488,10 @@ fn effect_of(instruction: &IrInstr, constants: &HashMap<ValueId, i64>) -> Option
         IrInstr::GlobalGet { global, .. } => Effect::GlobalGet(*global),
         IrInstr::MemoryGrow { .. } => Effect::MemoryGrow,
         IrInstr::MemorySize { .. } => Effect::MemorySize,
+        IrInstr::MemoryInit { .. }
+        | IrInstr::DataDrop { .. }
+        | IrInstr::MemoryCopy { .. }
+        | IrInstr::MemoryFill { .. } => Effect::MemoryBulk,
         IrInstr::CallHost { import, .. } => Effect::HostCall(*import),
         IrInstr::Call { function, .. } => Effect::Call(*function),
         IrInstr::CallIndirect {

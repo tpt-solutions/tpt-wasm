@@ -74,17 +74,26 @@ fn bulk_module() -> Vec<u8> {
     module
 }
 
-fn engine() -> Engine {
+fn engine(mode: EngineMode) -> Engine {
     Engine::new(Config {
-        engine_mode: EngineMode::Micro,
+        engine_mode: mode,
         ..Config::default()
     })
     .expect("engine")
 }
 
 #[test]
-fn the_bulk_operations_write_what_they_name_and_a_dropped_segment_traps() {
-    let mut instance = engine()
+fn the_bulk_operations_write_what_they_name_and_a_dropped_segment_traps_on_the_interpreter() {
+    check(EngineMode::Micro);
+}
+
+#[test]
+fn the_bulk_operations_write_what_they_name_and_a_dropped_segment_traps_on_the_baseline() {
+    check(EngineMode::Baseline);
+}
+
+fn check(mode: EngineMode) {
+    let mut instance = engine(mode)
         .instantiate_bytes(&bulk_module())
         .expect("instantiates");
     assert_eq!(

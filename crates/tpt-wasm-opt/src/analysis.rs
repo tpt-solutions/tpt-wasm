@@ -280,6 +280,8 @@ use IrInstr::*;
 
 pub fn defines(instruction: &IrInstr) -> Option<ValueId> {
     Some(match instruction {
+        // The bulk memory instructions define no value.
+        MemoryInit { .. } | DataDrop { .. } | MemoryCopy { .. } | MemoryFill { .. } => return None,
         ConstI32 { result, .. }
         | ConstI64 { result, .. }
         | ConstF32 { result, .. }
@@ -609,6 +611,10 @@ pub fn writes_mutable_state(instruction: &IrInstr) -> bool {
         IrInstr::Store { .. }
             | IrInstr::GlobalSet { .. }
             | IrInstr::MemoryGrow { .. }
+            | IrInstr::MemoryInit { .. }
+            | IrInstr::DataDrop { .. }
+            | IrInstr::MemoryCopy { .. }
+            | IrInstr::MemoryFill { .. }
             | IrInstr::Call { .. }
             | IrInstr::CallHost { .. }
             | IrInstr::CallIndirect { .. }

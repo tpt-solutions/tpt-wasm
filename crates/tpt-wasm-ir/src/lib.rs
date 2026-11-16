@@ -52,6 +52,9 @@ pub struct IrModule {
     /// The single linear memory, if the module declares one. MVP allows at most
     /// one memory, and every memory instruction addresses memory 0.
     pub memory: Option<IrMemory>,
+    /// Each data segment's bytes, in data-index order: `Some` for a passive segment, which the bulk memory
+    /// instructions read, and `None` for an active one, which is applied at instantiation.
+    pub passive_data: Vec<Option<Vec<u8>>>,
     /// Tables, in index order. MVP allows at most one table.
     ///
     /// An *imported* table occupies its own Wasm index here, before any defined
@@ -583,6 +586,30 @@ pub enum IrInstr {
     MemoryGrow {
         result: ValueId,
         delta: ValueId,
+    },
+    /// `memory.init`: copy `length` bytes from offset `source` of passive data segment `data` to
+    /// `destination` in memory 0.
+    MemoryInit {
+        data: u32,
+        destination: ValueId,
+        source: ValueId,
+        length: ValueId,
+    },
+    /// `data.drop`: discard a passive data segment, which is empty from then on.
+    DataDrop {
+        data: u32,
+    },
+    /// `memory.copy` within memory 0.
+    MemoryCopy {
+        destination: ValueId,
+        source: ValueId,
+        length: ValueId,
+    },
+    /// `memory.fill` within memory 0.
+    MemoryFill {
+        destination: ValueId,
+        value: ValueId,
+        length: ValueId,
     },
     GlobalGet {
         result: ValueId,

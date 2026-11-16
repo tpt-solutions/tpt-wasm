@@ -255,8 +255,17 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             import: None,
         });
     }
+    let passive_data: Vec<Option<Vec<u8>>> = module
+        .data
+        .iter()
+        .map(|segment| match segment.mode {
+            tpt_wasm_format::DataMode::Passive => Some(segment.data.clone()),
+            tpt_wasm_format::DataMode::Active { .. } => None,
+        })
+        .collect();
     Ok(IrModule {
         functions,
+        passive_data,
         imports,
         globals,
         memory,
@@ -1183,6 +1192,58 @@ fn lower_body(
                 let result = state.allocate(ValueType::I32)?;
                 builder.push(IrInstr::MemoryGrow { result, delta });
                 state.push(result, ValueType::I32);
+            }
+            0xfc => {
+                // The bulk memory instructions. Each names memory 0, and the operands are popped last
+                // first, so the length is on top of the stack.
+                match reader.u32()? {
+                    8 => {
+                        let data = reader.u32()?;
+                        if reader.byte()? != 0 {
+                            return Err(LoweringError::UnsupportedFeature("multi-memory"));
+                        }
+                        let length = state.pop(ValueType::I32)?;
+                        let source = state.pop(ValueType::I32)?;
+                        let destination = state.pop(ValueType::I32)?;
+                        builder.push(IrInstr::MemoryInit {
+                            data,
+                            destination,
+                            source,
+                            length,
+                        });
+                    }
+                    9 => {
+                        let data = reader.u32()?;
+                        builder.push(IrInstr::DataDrop { data });
+                    }
+                    10 => {
+                        if reader.byte()? != 0 || reader.byte()? != 0 {
+                            return Err(LoweringError::UnsupportedFeature("multi-memory"));
+                        }
+                        let length = state.pop(ValueType::I32)?;
+                        let source = state.pop(ValueType::I32)?;
+                        let destination = state.pop(ValueType::I32)?;
+                        builder.push(IrInstr::MemoryCopy {
+                            destination,
+                            source,
+                            length,
+                        });
+                    }
+                    11 => {
+                        if reader.byte()? != 0 {
+                            return Err(LoweringError::UnsupportedFeature("multi-memory"));
+                        }
+                        let length = state.pop(ValueType::I32)?;
+                        let value = state.pop(ValueType::I32)?;
+                        let destination = state.pop(ValueType::I32)?;
+                        builder.push(IrInstr::MemoryFill {
+                            destination,
+                            value,
+                            length,
+                        });
+                    }
+                    _ => return Err(LoweringError::UnsupportedInstruction(0xfc)),
+                }
             }
             0x41 => {
                 let value = reader.i32()?;

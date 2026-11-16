@@ -236,6 +236,12 @@ pub fn project_function_to_model(
             IrInstr::MemoryGrow { .. } => {
                 return Err(IrProjectionError::UnsupportedInstruction("memory.grow"))
             }
+            IrInstr::MemoryInit { .. }
+            | IrInstr::DataDrop { .. }
+            | IrInstr::MemoryCopy { .. }
+            | IrInstr::MemoryFill { .. } => {
+                return Err(IrProjectionError::UnsupportedInstruction("bulk memory"))
+            }
             IrInstr::GlobalGet { .. } | IrInstr::GlobalSet { .. } => {
                 return Err(IrProjectionError::UnsupportedInstruction("global"))
             }

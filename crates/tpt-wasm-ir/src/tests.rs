@@ -532,6 +532,14 @@ fn execute_ir_function(
                 IrInstr::MemorySize { result } => {
                     values.insert(*result, Value::I32(state.pages as i32));
                 }
+                IrInstr::MemoryInit { .. }
+                | IrInstr::DataDrop { .. }
+                | IrInstr::MemoryCopy { .. }
+                | IrInstr::MemoryFill { .. } => {
+                    return Err(Trap::HostFailure(
+                        "bulk memory is not in the test interpreter".into(),
+                    ));
+                }
                 IrInstr::MemoryGrow { result, delta } => {
                     let delta = match values.get(delta) {
                         Some(Value::I32(value)) => *value as u32 as u64,
