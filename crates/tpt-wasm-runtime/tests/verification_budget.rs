@@ -101,3 +101,39 @@ fn the_interpreter_does_not_verify_so_the_budget_does_not_apply_to_it() {
         vec![Value::I32(0)]
     );
 }
+
+#[test]
+fn an_optimization_over_its_budget_is_refused_and_the_budget_is_named() {
+    let module = nested_blocks(200);
+    let error = Engine::new(Config {
+        engine_mode: EngineMode::Optimizing,
+        max_optimization_work: 10,
+        ..Config::default()
+    })
+    .expect("engine")
+    .instantiate_bytes(&module)
+    .expect_err("the optimizer's budget is smaller than one pass over the module");
+    match error {
+        RuntimeError::Refused(message) => assert!(
+            message.contains("work budget of 10"),
+            "the refusal names the budget: {message}"
+        ),
+        other => panic!("expected a refusal naming the budget, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_default_optimization_budget_accepts_the_module_and_it_runs() {
+    let module = nested_blocks(200);
+    let mut instance = Engine::new(Config {
+        engine_mode: EngineMode::Optimizing,
+        ..Config::default()
+    })
+    .expect("engine")
+    .instantiate_bytes(&module)
+    .expect("within the default optimization budget");
+    assert_eq!(
+        instance.call("f", Vec::new()).expect("runs"),
+        vec![Value::I32(0)]
+    );
+}

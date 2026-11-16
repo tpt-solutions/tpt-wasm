@@ -64,14 +64,16 @@ pub fn compile(
     })?;
 
     let level = level_for(config);
-    let outcome = tpt_wasm_opt::optimize(verified.module(), level).map_err(|error| {
-        // An `OptimizationError::Verification` is a compiler bug, not a user
-        // error: the input verified and every pass preserves what the verifier
-        // checks. It is surfaced with its detail rather than collapsed, because
-        // "the optimizer produced bad IR" is the single most important thing an
-        // embedder running this mode could learn.
-        RuntimeError::Refused(format!("optimizing: {error}"))
-    })?;
+    let outcome =
+        tpt_wasm_opt::optimize_within(verified.module(), level, config.max_optimization_work)
+            .map_err(|error| {
+                // An `OptimizationError::Verification` is a compiler bug, not a user
+                // error: the input verified and every pass preserves what the verifier
+                // checks. It is surfaced with its detail rather than collapsed, because
+                // "the optimizer produced bad IR" is the single most important thing an
+                // embedder running this mode could learn.
+                RuntimeError::Refused(format!("optimizing: {error}"))
+            })?;
 
     // The optimization contract is checked on every compilation, not only in
     // tests. It is a linear scan over each function's effects, which is cheap

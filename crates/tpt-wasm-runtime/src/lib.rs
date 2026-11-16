@@ -155,6 +155,13 @@ pub struct Config {
     /// The most work, in verifier units, that one module's verification may do before it is refused
     /// with `WorkBudgetExceeded`. The default bounds the time a hostile module can take to verify.
     pub max_verification_work: u64,
+    /// The most work, in optimizer units, that one module's optimization may do before it is refused.
+    pub max_optimization_work: u64,
+    /// The size of the host stack the embedder runs the engine on, in bytes, or `None` if the
+    /// embedder does not say. The recursive tiers (baseline, optimizing, native) use host stack for
+    /// each level of Wasm call. When this is given, `Engine::new` refuses a configuration whose call
+    /// depth could not fit in it. When it is not, the depth limit is not checked against any stack.
+    pub host_stack_bytes: Option<usize>,
 }
 
 impl Default for Config {
@@ -169,6 +176,8 @@ impl Default for Config {
             native_cache_dir: None,
             native_cache_key: None,
             max_verification_work: tpt_wasm_ir::DEFAULT_VERIFICATION_WORK,
+            max_optimization_work: tpt_wasm_opt::DEFAULT_OPTIMIZATION_WORK,
+            host_stack_bytes: None,
         }
     }
 }
@@ -641,6 +650,9 @@ impl Engine {
                 "the jit engine mode needs the `jit` feature",
             ));
         }
+        if let Some(stack) = config.host_stack_bytes {
+            check_host_stack(&config, stack)?;
+        }
         let native_cache = config
             .native_cache_dir
             .as_deref()
@@ -1086,6 +1098,27 @@ fn same_context(context: &RuntimeContext, export: &ExternalExport) -> Result<(),
 /// `EngineMode::Baseline` and `EngineMode::Optimizing` is therefore a difference
 /// in optimization and nothing else -- which is the property the differential
 /// tests rely on.
+/// The host stack one level of Wasm call takes on the recursive tiers. Measured on the baseline:
+/// a debug build takes about 1.3 KiB per level and a release build about 0.75 KiB, so 4 KiB leaves a
+/// margin for the native tier's frames and for either profile.
+pub const HOST_STACK_BYTES_PER_CALL: usize = 4096;
+
+/// Refuse a configuration whose call depth cannot fit in a host stack of `stack` bytes. The
+/// interpreter keeps its frames on the heap, so it has no such limit.
+fn check_host_stack(config: &Config, stack: usize) -> Result<(), RuntimeError> {
+    if config.engine_mode == EngineMode::Micro {
+        return Ok(());
+    }
+    let depth = config.limits.max_call_depth;
+    let needed = depth.saturating_mul(HOST_STACK_BYTES_PER_CALL);
+    if needed > stack {
+        return Err(RuntimeError::Refused(format!(
+            "a host stack of {stack} bytes cannot hold the call depth of {depth}, which needs about {needed} bytes on this engine"
+        )));
+    }
+    Ok(())
+}
+
 fn compile_ir(
     validated: &ValidatedModule,
     config: &Config,
