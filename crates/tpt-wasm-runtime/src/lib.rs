@@ -960,19 +960,40 @@ fn const_value(
     .map_err(|_| RuntimeError::InvalidConstantExpression("unsupported constant expression"))
 }
 
-/// Read one element segment initializer as a module-level function index.
-///
-/// An inner `None` means a `ref.null`, which leaves the table slot null; an
-/// outer `None` means the expression was neither reference form and the caller
-/// must refuse it. The expression is read with Micro's own body decoder rather
-/// than a hand-rolled scan, so the index is decoded under the same rules as
-/// everywhere else, including a non-minimal encoding.
-fn element_entry(expr: &ConstExpr) -> Option<Option<u32>> {
-    let instructions = decode_body(&expr.0).ok()?;
+/// A constant expression that is `ref.null` or `ref.func`. Those need the module's function addresses, so
+/// they are read here; `None` means the expression is some other form, which the caller evaluates.
+fn const_reference(expr: &ConstExpr, func_addrs: &[u32]) -> Result<Option<Value>, RuntimeError> {
+    let Ok(instructions) = decode_body(&expr.0) else {
+        return Ok(None);
+    };
     match instructions.as_slice() {
-        [Instr::RefNull(_), Instr::End] => Some(None),
-        [Instr::RefFunc(index), Instr::End] => Some(Some(*index)),
-        _ => None,
+        [Instr::RefNull(kind), Instr::End] => Ok(Some(Value::Ref(RefValue::Null(*kind)))),
+        [Instr::RefFunc(index), Instr::End] => {
+            let address = func_addrs
+                .get(*index as usize)
+                .ok_or(RuntimeError::Store(StoreError::UnknownFunction(*index)))?;
+            Ok(Some(Value::Ref(RefValue::FuncRef(*address))))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// One element segment entry, which must be a reference.
+fn element_reference(
+    expr: &ConstExpr,
+    store: &Store,
+    global_addrs: &[u32],
+    func_addrs: &[u32],
+) -> Result<RefValue, RuntimeError> {
+    let value = match const_reference(expr, func_addrs)? {
+        Some(value) => value,
+        None => const_value(expr, store, global_addrs)?,
+    };
+    match value {
+        Value::Ref(reference) => Ok(reference),
+        _ => Err(RuntimeError::InvalidConstantExpression(
+            "element initializer is not a reference",
+        )),
     }
 }
 
@@ -1017,9 +1038,9 @@ fn external_table_type(store: &Store, address: u32) -> Result<TableType, Runtime
     Ok(TableType {
         element_type: table.element_type,
         limits: Limits {
-            // A table's length is fixed for its lifetime -- there is no `table.grow`
-            // in MVP -- so its declared minimum is its current size.
-            min: u64::from(table.min_elements),
+            // The current size is the minimum an importer can rely on, so a table that has grown
+            // reports its grown size rather than the size it was declared with.
+            min: table.elements.len() as u64,
             max: table.declared_max_elements.map(u64::from),
         },
     })
@@ -1492,12 +1513,6 @@ fn instantiate_module(
             store.allocate_memory(memory.memory_type.limits.min, memory.memory_type.limits.max)?,
         );
     }
-    for global in &module.globals {
-        let value = const_value(&global.init, &store, &global_addrs)?;
-        let address = store.add_global(global.global_type, value)?;
-        global_addrs.push(address);
-    }
-
     let instance_index = u32::try_from(store.instances.len())
         .map_err(|_| RuntimeError::Store(StoreError::LimitExceeded("too many instances")))?;
     if store.instances.len() >= store.limits.max_instances as usize {
@@ -1532,56 +1547,78 @@ fn instantiate_module(
         func_addrs.push(address);
     }
 
-    for element in &module.elements {
-        let ElementMode::Active {
-            table_index,
-            offset,
-        } = &element.mode
-        else {
-            return Err(RuntimeError::UnsupportedFeature(
-                "non-active element segment",
-            ));
+    // Globals come after the functions, so that a `ref.func` in an initializer has an address to name.
+    for global in &module.globals {
+        let value = match const_reference(&global.init, &func_addrs)? {
+            Some(value) => value,
+            None => const_value(&global.init, &store, &global_addrs)?,
         };
-        let table_address = *table_addrs
-            .get(*table_index as usize)
-            .ok_or(RuntimeError::Store(StoreError::UnknownTable(*table_index)))?;
-        let start = const_i32(offset, &store, &global_addrs)? as u32;
-        // The two families converge on the same slot writes, except that a
-        // `ref.null` entry leaves the slot null rather than naming a function.
-        let entries: Vec<Option<u32>> = match &element.init {
-            ElementInit::FuncIndices(indices) => indices.iter().map(|index| Some(*index)).collect(),
-            ElementInit::Expressions(expressions) => expressions
+        let address = store.add_global(global.global_type, value)?;
+        global_addrs.push(address);
+    }
+
+    let imported_tables = module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Table(_)))
+        .count();
+    for (index, table) in module.tables.iter().enumerate() {
+        let Some(init) = &table.init else {
+            continue;
+        };
+        let value = element_reference(init, &store, &global_addrs, &func_addrs)?;
+        let address = *table_addrs
+            .get(imported_tables + index)
+            .ok_or(RuntimeError::Store(StoreError::UnknownTable(
+                (imported_tables + index) as u32,
+            )))?;
+        let length = store.table(address)?.elements.len();
+        for slot in 0..length {
+            store.table_mut(address)?.set(slot as u32, value.clone())?;
+        }
+    }
+
+    let mut elem_addrs = Vec::new();
+    for element in &module.elements {
+        let entries: Vec<RefValue> = match &element.init {
+            ElementInit::FuncIndices(indices) => indices
                 .iter()
-                .map(|expression| {
-                    element_entry(expression)
-                        .ok_or(RuntimeError::UnsupportedFeature("element initializer"))
+                .map(|index| {
+                    func_addrs
+                        .get(*index as usize)
+                        .map(|address| RefValue::FuncRef(*address))
+                        .ok_or(RuntimeError::Store(StoreError::UnknownFunction(*index)))
                 })
                 .collect::<Result<_, _>>()?,
+            ElementInit::Expressions(expressions) => expressions
+                .iter()
+                .map(|expression| element_reference(expression, &store, &global_addrs, &func_addrs))
+                .collect::<Result<_, _>>()?,
         };
-        // The whole segment must fit before any slot is written, as the specification's table
-        // initialization has it: an overflowing segment traps without writing part of itself.
-        let table_length = store.table_mut(table_address)?.elements.len() as u64;
-        if u64::from(start) + entries.len() as u64 > table_length {
-            return Err(RuntimeError::Trap(Trap::TableOutOfBounds));
-        }
-        for (delta, function_index) in entries.into_iter().enumerate() {
-            let value = match function_index {
-                // `ref.null`: the slot is left null, of the segment's element type.
-                None => RefValue::Null(element.element_type),
-                Some(function_index) => {
-                    let address =
-                        *func_addrs
-                            .get(function_index as usize)
-                            .ok_or(RuntimeError::Store(StoreError::UnknownFunction(
-                                function_index,
-                            )))?;
-                    RefValue::FuncRef(address)
+        match &element.mode {
+            ElementMode::Active {
+                table_index,
+                offset,
+            } => {
+                let table_address = *table_addrs
+                    .get(*table_index as usize)
+                    .ok_or(RuntimeError::Store(StoreError::UnknownTable(*table_index)))?;
+                let start = const_i32(offset, &store, &global_addrs)? as u32 as u64;
+                // The whole segment must fit before any slot is written, as table initialization has it.
+                let length = store.table_mut(table_address)?.elements.len() as u64;
+                if start + entries.len() as u64 > length {
+                    return Err(RuntimeError::Trap(Trap::TableOutOfBounds));
                 }
-            };
-            let index = start
-                .checked_add(delta as u32)
-                .ok_or(StoreError::TableOutOfBounds)?;
-            store.table_mut(table_address)?.set(index, value)?;
+                for (delta, value) in entries.into_iter().enumerate() {
+                    store
+                        .table_mut(table_address)?
+                        .set(start as u32 + delta as u32, value)?;
+                }
+                // An active segment is dropped once it has been applied.
+                elem_addrs.push(store.add_elem(None));
+            }
+            ElementMode::Passive => elem_addrs.push(store.add_elem(Some(entries))),
+            ElementMode::Declarative => elem_addrs.push(store.add_elem(None)),
         }
     }
     for segment in &module.data {
@@ -1643,6 +1680,7 @@ fn instantiate_module(
         memory_addrs,
         global_addrs,
         data_addrs,
+        elem_addrs,
     };
     let allocated_index = store.add_instance(store_instance)?;
     debug_assert_eq!(allocated_index, instance_index);

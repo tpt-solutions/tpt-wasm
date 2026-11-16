@@ -598,6 +598,83 @@ fn variable_instruction(
     Ok(())
 }
 
+/// The `0xFC`-prefixed table instructions, 12 to 17. Each names a table, and the ones that read an element
+/// segment name it too. A reference operand, and the two tables of a copy, must agree on the element type.
+fn table_bulk_instruction(
+    sub: u32,
+    reader: &mut Reader<'_>,
+    stack: &mut Vec<Option<ValueType>>,
+    controls: &[ControlFrame],
+    module: &ModuleContext,
+) -> Result<(), ValidationError> {
+    match sub {
+        12 => {
+            let elem = reader.u32()?;
+            let table = reader.u32()?;
+            require_same_kind(segment_type(module, elem)?, table_type(module, table)?)?;
+            for _ in 0..3 {
+                pop_value(stack, controls, Some(ValueType::I32))?;
+            }
+        }
+        13 => {
+            segment_type(module, reader.u32()?)?;
+        }
+        14 => {
+            let dst = reader.u32()?;
+            let src = reader.u32()?;
+            require_same_kind(table_type(module, src)?, table_type(module, dst)?)?;
+            for _ in 0..3 {
+                pop_value(stack, controls, Some(ValueType::I32))?;
+            }
+        }
+        15 => {
+            let element = ValueType::Ref(table_type(module, reader.u32()?)?);
+            pop_value(stack, controls, Some(ValueType::I32))?;
+            pop_value(stack, controls, Some(element))?;
+            push_value(stack, ValueType::I32);
+        }
+        16 => {
+            table_type(module, reader.u32()?)?;
+            push_value(stack, ValueType::I32);
+        }
+        17 => {
+            let element = ValueType::Ref(table_type(module, reader.u32()?)?);
+            pop_value(stack, controls, Some(ValueType::I32))?;
+            pop_value(stack, controls, Some(element))?;
+            pop_value(stack, controls, Some(ValueType::I32))?;
+        }
+        _ => return Err(ValidationError::InvalidInstruction(0xfc)),
+    }
+    Ok(())
+}
+
+fn segment_type(module: &ModuleContext, index: u32) -> Result<RefType, ValidationError> {
+    module
+        .elem_types
+        .get(index as usize)
+        .copied()
+        .ok_or(ValidationError::UnknownElementSegment(index))
+}
+
+fn table_type(module: &ModuleContext, index: u32) -> Result<RefType, ValidationError> {
+    module
+        .table_types
+        .get(index as usize)
+        .map(|table| table.element_type)
+        .ok_or(ValidationError::UnknownTable(index))
+}
+
+fn require_same_kind(expected: RefType, actual: RefType) -> Result<(), ValidationError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(ValidationError::TypeMismatch {
+            expected: format!("{expected:?}"),
+            actual: format!("{actual:?}"),
+        })
+    }
+}
+
 /// The `0xFC`-prefixed bulk memory instructions. Each names memory 0, and `memory.init` and `data.drop`
 /// name a data segment, which must be below the declared count.
 fn bulk_memory_instruction(
@@ -607,6 +684,9 @@ fn bulk_memory_instruction(
     module: &ModuleContext,
 ) -> Result<(), ValidationError> {
     let sub = reader.u32()?;
+    if (12..=17).contains(&sub) {
+        return table_bulk_instruction(sub, reader, stack, controls, module);
+    }
     if sub == 8 || sub == 9 {
         let data = reader.u32()?;
         match module.data_count {

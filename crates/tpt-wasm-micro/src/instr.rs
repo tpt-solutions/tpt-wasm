@@ -82,6 +82,25 @@ pub enum Instr {
     MemoryCopy,
     /// `memory.fill` within memory 0.
     MemoryFill,
+    /// `table.init`: copy from element segment `elem` into table `table`.
+    TableInit {
+        elem: u32,
+        table: u32,
+    },
+    /// `elem.drop`: discard an element segment, after which it is empty.
+    ElemDrop(u32),
+    /// `table.copy`: copy between tables `dst` and `src`, which may be the same table.
+    TableCopy {
+        dst: u32,
+        src: u32,
+    },
+    /// `table.grow`: grow a table by a delta taken from the stack, filling the new slots with a reference
+    /// taken from the stack too. The result is the old size, or -1 when the table cannot grow.
+    TableGrow(u32),
+    /// `table.size`: push the number of elements in a table.
+    TableSize(u32),
+    /// `table.fill`: write a reference taken from the stack over a range of a table.
+    TableFill(u32),
 
     // Numeric constants
     I32Const(i32),
@@ -395,10 +414,24 @@ impl<'a> BodyReader<'a> {
     }
 }
 
-/// The `0xFC`-prefixed bulk memory instructions. Only the four operations that need no float conversion
-/// are here; the saturating truncations keep their decode error.
+/// The `0xFC`-prefixed bulk memory and table instructions. The saturating truncations keep their decode
+/// error.
 fn decode_bulk(reader: &mut BodyReader<'_>) -> Result<Instr, InstrDecodeError> {
     match reader.u32()? {
+        12 => {
+            let elem = reader.u32()?;
+            let table = reader.u32()?;
+            Ok(Instr::TableInit { elem, table })
+        }
+        13 => Ok(Instr::ElemDrop(reader.u32()?)),
+        14 => {
+            let dst = reader.u32()?;
+            let src = reader.u32()?;
+            Ok(Instr::TableCopy { dst, src })
+        }
+        15 => Ok(Instr::TableGrow(reader.u32()?)),
+        16 => Ok(Instr::TableSize(reader.u32()?)),
+        17 => Ok(Instr::TableFill(reader.u32()?)),
         8 => {
             let data = reader.u32()?;
             expect_memory_zero(reader)?;

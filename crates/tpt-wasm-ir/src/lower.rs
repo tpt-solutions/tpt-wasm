@@ -246,6 +246,9 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         });
     }
     for table in &module.tables {
+        if table.init.is_some() {
+            return Err(LoweringError::UnsupportedFeature("table initializer"));
+        }
         if table.table_type.element_type != tpt_wasm_types::ReferenceType::FuncRef {
             return Err(LoweringError::UnsupportedFeature("non-funcref table"));
         }

@@ -171,15 +171,54 @@ fn value_type(reader: &mut Reader<'_>) -> Result<ValueType, DecodeError> {
         // though the validator has accepted these types since M6.
         0x70 => Ok(ValueType::Ref(RefType::FuncRef)),
         0x6f => Ok(ValueType::Ref(RefType::ExternRef)),
+        0x63 | 0x64 => Ok(ValueType::Ref(heap_reference(reader)?)),
         byte => Err(DecodeError::UnsupportedValueType(byte)),
     }
 }
 
 fn reference_type(reader: &mut Reader<'_>) -> Result<RefType, DecodeError> {
-    match reader.byte()? {
+    let byte = reader.byte()?;
+    reference_type_after(byte, reader)
+}
+
+/// A reference type whose first byte has already been read.
+fn reference_type_after(byte: u8, reader: &mut Reader<'_>) -> Result<RefType, DecodeError> {
+    match byte {
         0x70 => Ok(RefType::FuncRef),
         0x6f => Ok(RefType::ExternRef),
+        0x63 | 0x64 => heap_reference(reader),
         byte => Err(DecodeError::UnsupportedReferenceType(byte)),
+    }
+}
+
+/// The heap type of a typed reference, `(ref null ht)` or `(ref ht)`, after its marker byte. A heap type
+/// is a signed LEB128: -16 is `func` and -17 is `extern`, and a non-negative value is a concrete type
+/// index. A concrete reference is erased to `funcref`, which is the only concrete kind in this revision;
+/// the index is not checked against the type section, and nullability is not enforced.
+fn heap_reference(reader: &mut Reader<'_>) -> Result<RefType, DecodeError> {
+    let mut value: i64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = reader.byte()?;
+        if shift < 64 {
+            value |= i64::from(byte & 0x7f) << shift;
+        }
+        shift += 7;
+        if byte & 0x80 == 0 {
+            if shift < 64 && byte & 0x40 != 0 {
+                value |= -1i64 << shift;
+            }
+            break;
+        }
+        if shift >= 70 {
+            return Err(DecodeError::InvalidLeb128);
+        }
+    }
+    match value {
+        -16 => Ok(RefType::FuncRef),
+        -17 => Ok(RefType::ExternRef),
+        index if index >= 0 => Ok(RefType::FuncRef),
+        other => Err(DecodeError::UnsupportedReferenceType(other as u8)),
     }
 }
 
@@ -195,8 +234,14 @@ fn limits(reader: &mut Reader<'_>) -> Result<Limits, DecodeError> {
 }
 
 fn table_type(reader: &mut Reader<'_>) -> Result<TableType, DecodeError> {
+    let byte = reader.byte()?;
+    table_type_after(byte, reader)
+}
+
+/// A table type whose first byte has already been read.
+fn table_type_after(byte: u8, reader: &mut Reader<'_>) -> Result<TableType, DecodeError> {
     Ok(TableType {
-        element_type: reference_type(reader)?,
+        element_type: reference_type_after(byte, reader)?,
         limits: limits(reader)?,
     })
 }
@@ -290,8 +335,22 @@ fn decode_function_section(reader: &mut Reader<'_>) -> Result<Vec<u32>, DecodeEr
 
 fn decode_table_section(reader: &mut Reader<'_>) -> Result<Vec<Table>, DecodeError> {
     reader.vector(|reader| {
+        let byte = reader.byte()?;
+        // A table with an initializer is spelled `0x40 0x00`, then its type, then the initializer. A
+        // table type begins with a reference type, which is never `0x40`, so the two cannot be confused.
+        if byte == 0x40 {
+            if reader.byte()? != 0x00 {
+                return Err(DecodeError::InvalidTypeForm);
+            }
+            let table_type = table_type(reader)?;
+            let init = const_expr(reader)?;
+            return Ok(Table {
+                table_type,
+                init: Some(init),
+            });
+        }
         Ok(Table {
-            table_type: table_type(reader)?,
+            table_type: table_type_after(byte, reader)?,
             init: None,
         })
     })

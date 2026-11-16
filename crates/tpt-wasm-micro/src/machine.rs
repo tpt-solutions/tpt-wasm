@@ -252,6 +252,12 @@ fn execute_instruction(machine: &mut Machine, instruction: crate::instr::Instr) 
         crate::instr::Instr::DataDrop(data) => data_drop(machine, data),
         crate::instr::Instr::MemoryCopy => memory_copy(machine),
         crate::instr::Instr::MemoryFill => memory_fill(machine),
+        crate::instr::Instr::TableInit { elem, table } => table_init(machine, elem, table),
+        crate::instr::Instr::ElemDrop(elem) => elem_drop(machine, elem),
+        crate::instr::Instr::TableCopy { dst, src } => table_copy(machine, dst, src),
+        crate::instr::Instr::TableGrow(table) => table_grow(machine, table),
+        crate::instr::Instr::TableSize(table) => table_size(machine, table),
+        crate::instr::Instr::TableFill(table) => table_fill(machine, table),
         crate::instr::Instr::I32Eqz => unary_i32(machine, |value| (value == 0) as i32),
         crate::instr::Instr::I32Eq => compare_i32(machine, |left, right| left == right),
         crate::instr::Instr::I32Ne => compare_i32(machine, |left, right| left != right),
@@ -1208,6 +1214,218 @@ fn data_drop(machine: &mut Machine, data: u32) -> Step {
     }
 }
 
+fn elem_address(machine: &Machine, index: u32) -> Result<u32, Step> {
+    machine
+        .frames
+        .last()
+        .and_then(|frame| machine.store.instance(frame.instance_idx).ok())
+        .and_then(|instance| instance.elem_addrs.get(index as usize).copied())
+        .ok_or(Step::Trap(Trap::HostFailure(
+            "unknown element segment".into(),
+        )))
+}
+
+/// The three operands of a table bulk instruction, popped in the order the specification names them:
+/// destination, source, then length.
+fn pop_table_operands(machine: &mut Machine) -> Result<(u64, u64, u64), Step> {
+    match (
+        pop_typed_i32(machine),
+        pop_typed_i32(machine),
+        pop_typed_i32(machine),
+    ) {
+        (Ok(len), Ok(src), Ok(dst)) => {
+            Ok((dst as u32 as u64, src as u32 as u64, len as u32 as u64))
+        }
+        (Err(step), _, _) | (_, Err(step), _) | (_, _, Err(step)) => Err(step),
+    }
+}
+
+/// Whether `count` entries starting at `start` fit in a table of `length` entries.
+fn fits(start: u64, count: u64, length: usize) -> bool {
+    start
+        .checked_add(count)
+        .is_some_and(|end| end <= length as u64)
+}
+
+/// `table.init`: copy `len` entries from offset `src` of element segment `elem` to `dst` in `table`. The
+/// whole range is checked before anything is written, and a dropped segment is empty.
+fn table_init(machine: &mut Machine, elem: u32, table: u32) -> Step {
+    let (dst, src, len) = match pop_table_operands(machine) {
+        Ok(operands) => operands,
+        Err(step) => return step,
+    };
+    let elem_address = match elem_address(machine, elem) {
+        Ok(address) => address,
+        Err(step) => return step,
+    };
+    let table_address = match table_address(machine, table) {
+        Ok(address) => address,
+        Err(trap) => return Step::Trap(trap),
+    };
+    let segment = machine
+        .store
+        .elem(elem_address)
+        .cloned()
+        .unwrap_or_default();
+    if !fits(src, len, segment.len()) {
+        return Step::Trap(Trap::TableOutOfBounds);
+    }
+    let target = match machine.store.table_mut(table_address) {
+        Ok(target) => target,
+        Err(_) => return Step::Trap(Trap::HostFailure("unknown table".into())),
+    };
+    if !fits(dst, len, target.elements.len()) {
+        return Step::Trap(Trap::TableOutOfBounds);
+    }
+    for offset in 0..len {
+        let reference = segment[(src + offset) as usize].clone();
+        if target.set((dst + offset) as u32, reference).is_err() {
+            return Step::Trap(Trap::TableOutOfBounds);
+        }
+    }
+    Step::Continue
+}
+
+/// `elem.drop`: discard an element segment, so that it is empty from now on.
+fn elem_drop(machine: &mut Machine, elem: u32) -> Step {
+    match elem_address(machine, elem) {
+        Ok(address) => {
+            machine.store.drop_elem(address);
+            Step::Continue
+        }
+        Err(step) => step,
+    }
+}
+
+/// `table.copy`: copy `len` entries from `src` in table `src_table` to `dst` in table `dst_table`. The
+/// two may overlap, and either range leaving its table traps before anything is written.
+fn table_copy(machine: &mut Machine, dst_table: u32, src_table: u32) -> Step {
+    let (dst, src, len) = match pop_table_operands(machine) {
+        Ok(operands) => operands,
+        Err(step) => return step,
+    };
+    let dst_address = match table_address(machine, dst_table) {
+        Ok(address) => address,
+        Err(trap) => return Step::Trap(trap),
+    };
+    let src_address = match table_address(machine, src_table) {
+        Ok(address) => address,
+        Err(trap) => return Step::Trap(trap),
+    };
+    let source = match machine.store.table(src_address) {
+        Ok(table) => table,
+        Err(_) => return Step::Trap(Trap::HostFailure("unknown table".into())),
+    };
+    if !fits(src, len, source.elements.len()) {
+        return Step::Trap(Trap::TableOutOfBounds);
+    }
+    // The source is read in full before the destination is written, so overlapping ranges copy the
+    // values that were there before the instruction ran.
+    let mut values = Vec::with_capacity(len as usize);
+    for index in src..src + len {
+        match source.get(index as u32) {
+            Ok(Some(reference)) => values.push(reference),
+            Ok(None) => values.push(RefValue::Null(source.element_type)),
+            Err(_) => return Step::Trap(Trap::TableOutOfBounds),
+        }
+    }
+    let target = match machine.store.table_mut(dst_address) {
+        Ok(target) => target,
+        Err(_) => return Step::Trap(Trap::HostFailure("unknown table".into())),
+    };
+    if !fits(dst, len, target.elements.len()) {
+        return Step::Trap(Trap::TableOutOfBounds);
+    }
+    for (offset, reference) in values.into_iter().enumerate() {
+        if target.set((dst + offset as u64) as u32, reference).is_err() {
+            return Step::Trap(Trap::TableOutOfBounds);
+        }
+    }
+    Step::Continue
+}
+
+/// `table.fill`: pop a count, a reference, then an index, and write the reference over `count` entries
+/// from the index. The range is checked before anything is written.
+fn table_fill(machine: &mut Machine, table: u32) -> Step {
+    let len = match pop_typed_i32(machine) {
+        Ok(value) => value as u32 as u64,
+        Err(step) => return step,
+    };
+    let reference = match pop_value(machine) {
+        Ok(Value::Ref(reference)) => reference,
+        Ok(_) => return Step::Trap(Trap::HostFailure("expected a reference operand".into())),
+        Err(step) => return step,
+    };
+    let dst = match pop_typed_i32(machine) {
+        Ok(value) => value as u32 as u64,
+        Err(step) => return step,
+    };
+    let address = match table_address(machine, table) {
+        Ok(address) => address,
+        Err(trap) => return Step::Trap(trap),
+    };
+    let target = match machine.store.table_mut(address) {
+        Ok(target) => target,
+        Err(_) => return Step::Trap(Trap::HostFailure("unknown table".into())),
+    };
+    if !fits(dst, len, target.elements.len()) {
+        return Step::Trap(Trap::TableOutOfBounds);
+    }
+    for offset in 0..len {
+        if target
+            .set((dst + offset) as u32, reference.clone())
+            .is_err()
+        {
+            return Step::Trap(Trap::TableOutOfBounds);
+        }
+    }
+    Step::Continue
+}
+
+/// `table.grow`: pop a delta, then the reference to fill the new slots with. The result is the old size,
+/// or -1 when the table cannot grow.
+fn table_grow(machine: &mut Machine, table: u32) -> Step {
+    let delta = match pop_typed_i32(machine) {
+        Ok(value) => value as u32,
+        Err(step) => return step,
+    };
+    let reference = match pop_value(machine) {
+        Ok(Value::Ref(reference)) => reference,
+        Ok(_) => return Step::Trap(Trap::HostFailure("expected a reference operand".into())),
+        Err(step) => return step,
+    };
+    let limit = machine.store.limits.max_table_elements;
+    let address = match table_address(machine, table) {
+        Ok(address) => address,
+        Err(trap) => return Step::Trap(trap),
+    };
+    let target = match machine.store.table_mut(address) {
+        Ok(target) => target,
+        Err(_) => return Step::Trap(Trap::HostFailure("unknown table".into())),
+    };
+    match target.grow(delta, limit) {
+        Ok(old_len) => {
+            for index in old_len as usize..old_len as usize + delta as usize {
+                target.elements[index] = Some(reference.clone());
+            }
+            push_value(machine, Value::I32(old_len as i32))
+        }
+        Err(_) => push_value(machine, Value::I32(-1)),
+    }
+}
+
+/// `table.size`: push the number of elements in a table.
+fn table_size(machine: &mut Machine, table: u32) -> Step {
+    let address = match table_address(machine, table) {
+        Ok(address) => address,
+        Err(trap) => return Step::Trap(trap),
+    };
+    match machine.store.table(address) {
+        Ok(target) => push_value(machine, Value::I32(target.elements.len() as i32)),
+        Err(_) => Step::Trap(Trap::HostFailure("unknown table".into())),
+    }
+}
+
 /// `memory.copy`: copy `len` bytes from `src` to `dst` in memory 0, where the two may overlap. Either
 /// range leaving the memory traps before anything is written.
 fn memory_copy(machine: &mut Machine) -> Step {
@@ -2141,6 +2359,7 @@ mod tests {
                 memory_addrs: Vec::new(),
                 global_addrs: vec![global],
                 data_addrs: Vec::new(),
+                elem_addrs: Vec::new(),
             })
             .unwrap();
         let mut machine = Machine::with_store(store);
@@ -2259,6 +2478,7 @@ mod tests {
                 memory_addrs: vec![memory],
                 global_addrs: Vec::new(),
                 data_addrs: Vec::new(),
+                elem_addrs: Vec::new(),
             })
             .unwrap();
         let mut machine = Machine::with_store(store);
@@ -2326,6 +2546,7 @@ mod tests {
                 memory_addrs: vec![memory],
                 global_addrs: Vec::new(),
                 data_addrs: Vec::new(),
+                elem_addrs: Vec::new(),
             })
             .unwrap();
         let mut machine = Machine::with_store(store);
@@ -2448,6 +2669,7 @@ mod tests {
                 memory_addrs: vec![],
                 global_addrs: vec![],
                 data_addrs: Vec::new(),
+                elem_addrs: Vec::new(),
             })
             .unwrap();
         let table = store.allocate_table(RefType::FuncRef, 1, None).unwrap();
@@ -2501,6 +2723,7 @@ mod tests {
                 memory_addrs: vec![],
                 global_addrs: vec![],
                 data_addrs: Vec::new(),
+                elem_addrs: Vec::new(),
             })
             .unwrap();
         let mut machine = Machine::with_store(store);

@@ -5625,6 +5625,7 @@ mod tests {
                 memory_addrs,
                 global_addrs,
                 data_addrs: Vec::new(),
+                elem_addrs: Vec::new(),
             })
             .expect("test instance must install");
         let entry_function = &module.functions[entry];

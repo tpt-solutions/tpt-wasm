@@ -494,6 +494,50 @@ fn core_spec_suite_on_the_optimizing_engine() {
     assert_suite_passes(EngineMode::Optimizing);
 }
 
+/// The five reference-type files, on the interpreter. The baseline and optimizing tiers do not yet lower
+/// `externref` tables, several tables, or the table instructions, so these files are kept out of `SUITES`
+/// until they do. Each file's directive count is pinned, so a directive cannot drop out unnoticed.
+#[test]
+fn reference_type_files_pass_on_the_interpreter() {
+    let files: &[(&str, &str, usize)] = &[
+        ("elem.wast", include_str!("../testdata/elem.wast"), 154),
+        ("table.wast", include_str!("../testdata/table.wast"), 46),
+        (
+            "ref_func.wast",
+            include_str!("../testdata/ref_func.wast"),
+            17,
+        ),
+        (
+            "table_grow.wast",
+            include_str!("../testdata/table_grow.wast"),
+            58,
+        ),
+        (
+            "table_size.wast",
+            include_str!("../testdata/table_size.wast"),
+            39,
+        ),
+    ];
+    for (name, source, expected) in files {
+        let cases = run_core_suite_with(source, EngineMode::Micro)
+            .unwrap_or_else(|error| panic!("{name}: could not parse: {error}"));
+        assert_eq!(cases.len(), *expected, "{name}: directive count changed");
+        let failures: Vec<String> = cases
+            .iter()
+            .filter_map(|case| match &case.outcome {
+                CoreOutcome::Failed(reason) => Some(format!("line {}: {reason}", case.line)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{name}: {} directive(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}
+
 fn assert_suite_passes(mode: EngineMode) {
     let mut failures: Vec<String> = Vec::new();
     let mut miscounted: Vec<String> = Vec::new();

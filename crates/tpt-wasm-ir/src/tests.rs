@@ -1573,6 +1573,7 @@ fn execute_micro_at(
             memory_addrs,
             global_addrs,
             data_addrs: Vec::new(),
+            elem_addrs: Vec::new(),
         })
         .expect("test instance should fit in store");
 

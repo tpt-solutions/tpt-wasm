@@ -20,6 +20,7 @@ use tpt_wasm_format::Module;
 pub enum ValidationError {
     /// A bulk memory instruction names a data segment the declared count does not include.
     UnknownDataSegment(u32),
+    UnknownElementSegment(u32),
     /// The data count section declares a different number of data segments than the module has.
     DataCountMismatch {
         declared: u32,

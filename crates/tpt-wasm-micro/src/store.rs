@@ -45,6 +45,10 @@ pub struct Store {
     /// Each data segment's bytes, by store address, or `None` once it has been dropped. An active segment
     /// is dropped when it is applied at instantiation, as the specification has it.
     pub datas: Vec<Option<Vec<u8>>>,
+    /// Each element segment's entries, by store address, or `None` once it has been dropped. A
+    /// passive segment keeps its entries until `elem.drop`; an active or declarative one is dropped
+    /// at instantiation, as the specification has it.
+    pub elems: Vec<Option<Vec<RefValue>>>,
     pub memories: Vec<MemoryInstance>,
     pub tables: Vec<TableInstance>,
     pub globals: Vec<GlobalInstance>,
@@ -63,6 +67,7 @@ impl Store {
     pub fn new(limits: ResourceLimits) -> Self {
         Self {
             datas: Vec::new(),
+            elems: Vec::new(),
             memories: Vec::new(),
             tables: Vec::new(),
             globals: Vec::new(),
@@ -175,6 +180,24 @@ impl Store {
     /// The bytes of a data segment, or `None` if it is dropped or the address names no segment.
     pub fn data(&self, address: u32) -> Option<&Vec<u8>> {
         self.datas.get(address as usize).and_then(Option::as_ref)
+    }
+
+    /// Add an element segment's entries, or `None` for a segment that is already dropped.
+    pub fn add_elem(&mut self, entries: Option<Vec<RefValue>>) -> u32 {
+        self.elems.push(entries);
+        (self.elems.len() - 1) as u32
+    }
+
+    /// The entries of an element segment, or `None` if it is dropped or the address names no segment.
+    pub fn elem(&self, address: u32) -> Option<&Vec<RefValue>> {
+        self.elems.get(address as usize).and_then(Option::as_ref)
+    }
+
+    /// Drop an element segment, so that it is empty from now on.
+    pub fn drop_elem(&mut self, address: u32) {
+        if let Some(slot) = self.elems.get_mut(address as usize) {
+            *slot = None;
+        }
     }
 
     /// Drop a data segment, so that it is empty from now on.
@@ -303,6 +326,7 @@ mod tests {
             memory_addrs: Vec::new(),
             global_addrs: Vec::new(),
             data_addrs: Vec::new(),
+            elem_addrs: Vec::new(),
         }
     }
 
@@ -590,4 +614,6 @@ pub struct Instance {
     pub global_addrs: Vec<u32>,
     /// The data segments of the module, by store address, in module order.
     pub data_addrs: Vec<u32>,
+    /// The element segments of the module, by store address, in module order.
+    pub elem_addrs: Vec<u32>,
 }

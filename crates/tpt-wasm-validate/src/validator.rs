@@ -19,6 +19,8 @@ pub(crate) struct ModuleContext {
     pub global_types: Vec<GlobalType>,
     /// The data count section's value, if the module declares one.
     pub data_count: Option<u32>,
+    /// The element type of each element segment, in segment order.
+    pub elem_types: Vec<RefType>,
 }
 
 pub(crate) fn validate_module(module: &Module) -> Result<(), ValidationError> {
@@ -99,9 +101,6 @@ fn build_context(module: &Module) -> Result<ModuleContext, ValidationError> {
     }
     for table in &module.tables {
         validate_table_type(&table.table_type)?;
-        if table.init.is_some() {
-            return Err(ValidationError::UnsupportedFeature("table initializers"));
-        }
         table_types.push(table.table_type);
     }
     for memory in &module.memories {
@@ -120,8 +119,14 @@ fn build_context(module: &Module) -> Result<ModuleContext, ValidationError> {
             "MVP modules may contain at most one memory".into(),
         ));
     }
+    let elem_types = module
+        .elements
+        .iter()
+        .map(|element| element.element_type)
+        .collect();
     Ok(ModuleContext {
         data_count: module.data_count,
+        elem_types,
         types: module.types.clone(),
         function_types,
         table_types,
@@ -215,6 +220,16 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
                 declared,
                 found: module.data.len(),
             });
+        }
+    }
+    for table in &module.tables {
+        if let Some(init) = &table.init {
+            validate_const_expr(
+                init,
+                ValueType::Ref(table.table_type.element_type),
+                context,
+                true,
+            )?;
         }
     }
     for global in &module.globals {
