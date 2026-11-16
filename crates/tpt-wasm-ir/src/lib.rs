@@ -154,7 +154,11 @@ pub struct IrMemory {
 /// One active data segment: bytes written at `offset` when the module starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrDataSegment {
+    /// The byte offset in memory. Ignored when `offset_global` is set.
     pub offset: u32,
+    /// The global whose value is the offset, when the segment's offset is `global.get` of one. Its value is
+    /// known only once the module's imports are installed, so the segment is applied then.
+    pub offset_global: Option<u32>,
     pub bytes: Vec<u8>,
 }
 

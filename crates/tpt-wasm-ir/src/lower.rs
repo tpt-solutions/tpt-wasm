@@ -133,8 +133,13 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         if *memory_index != 0 {
             return Err(LoweringError::UnsupportedFeature("non-zero memory index"));
         }
+        let (offset_value, offset_global) = match global_copied_by(offset) {
+            Some(global) => (0, Some(global)),
+            None => (element_segment_offset(offset)?, None),
+        };
         segments.push(IrDataSegment {
-            offset: element_segment_offset(offset)?,
+            offset: offset_value,
+            offset_global,
             bytes: segment.data.clone(),
         });
     }

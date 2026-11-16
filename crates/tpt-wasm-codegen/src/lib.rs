@@ -1745,6 +1745,9 @@ pub struct BaselineModule {
     /// segments write into the memory it imports, and they have to land after the
     /// exporter's own segments and before any function runs.
     pending_imported_memory: Option<tpt_wasm_ir::IrMemory>,
+    /// The memory's data segments, kept whole when any of them takes its offset from a global. They are
+    /// applied, in order, once the imports are installed; until then none of them is written.
+    pending_segments: Option<Vec<tpt_wasm_ir::IrDataSegment>>,
     /// A table this module imports, awaiting the table the embedder shares.
     ///
     /// Held rather than discarded so its element segment can be applied the
@@ -2027,12 +2030,24 @@ impl BaselineModule {
         // that later imports it can be given the same memory. An imported memory
         // is not allocated at all: the embedder supplies it, and the declaration
         // is kept so its data segments can be applied on arrival.
+        let pending_segments = module
+            .memory
+            .as_ref()
+            .filter(|declaration| {
+                declaration
+                    .segments
+                    .iter()
+                    .any(|segment| segment.offset_global.is_some())
+            })
+            .map(|declaration| declaration.segments.clone());
         let (memory, pending_imported_memory) = match module.memory.as_ref() {
             Some(declaration) if declaration.imported => (None, Some(declaration.clone())),
             Some(declaration) => {
                 let mut allocated =
                     BaselineMemory::new(declaration.min_pages, declaration.max_pages)?;
-                apply_segments(&mut allocated, &declaration.segments)?;
+                if pending_segments.is_none() {
+                    apply_segments(&mut allocated, &declaration.segments)?;
+                }
                 (Some(Arc::new(Mutex::new(allocated))), None)
             }
             None => (None, None),
@@ -2091,6 +2106,7 @@ impl BaselineModule {
             imports: module.imports.clone(),
             host: None,
             pending_imported_memory,
+            pending_segments,
             // The same default Micro starts from, so a module that recurses until
             // it traps does so at the same depth on either backend.
             max_call_depth: ResourceLimits::default().max_call_depth,
@@ -2139,7 +2155,9 @@ impl BaselineModule {
         if let Some(declaration) = self.pending_imported_memory.take() {
             let mut guard = lock_shared(&memory)
                 .map_err(|_| CodegenError::UnsupportedMemory("shared memory is locked"))?;
-            apply_segments(&mut guard, &declaration.segments)?;
+            if self.pending_segments.is_none() {
+                apply_segments(&mut guard, &declaration.segments)?;
+            }
         }
         self.memory = Some(memory);
         Ok(())
@@ -2303,6 +2321,45 @@ impl BaselineModule {
                 .map_err(|_| CodegenError::UnsupportedMemory("a copied global is locked"))?
                 .clone();
             self.globals[index] = Some(Arc::new(Mutex::new(value)));
+        }
+        // The deferred data segments, now that every global they may name has its value. The offsets are
+        // resolved to plain ones, so the same bounds check and write apply as for any other segment.
+        if let Some(segments) = self.pending_segments.take() {
+            let memory = self.memory.clone().ok_or(CodegenError::UnsupportedMemory(
+                "a data segment is deferred but the module has no memory",
+            ))?;
+            let mut resolved = Vec::with_capacity(segments.len());
+            for segment in &segments {
+                let offset = match segment.offset_global {
+                    None => segment.offset,
+                    Some(global) => {
+                        let handle = self.globals.get(global as usize).cloned().flatten().ok_or(
+                            CodegenError::UnsupportedMemory(
+                                "a data offset names a global with no value",
+                            ),
+                        )?;
+                        let value = lock_shared(&handle)
+                            .map_err(|_| CodegenError::UnsupportedMemory("a global is locked"))?
+                            .clone();
+                        match value {
+                            Value::I32(offset) => offset as u32,
+                            _ => {
+                                return Err(CodegenError::UnsupportedMemory(
+                                    "a data offset is not an i32",
+                                ))
+                            }
+                        }
+                    }
+                };
+                resolved.push(tpt_wasm_ir::IrDataSegment {
+                    offset,
+                    offset_global: None,
+                    bytes: segment.bytes.clone(),
+                });
+            }
+            let mut guard = lock_shared(&memory)
+                .map_err(|_| CodegenError::UnsupportedMemory("shared memory is locked"))?;
+            apply_segments(&mut guard, &resolved)?;
         }
         Ok(())
     }
