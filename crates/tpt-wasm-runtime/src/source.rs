@@ -4,11 +4,12 @@
 //! Source locations for debug sessions, from a module's DWARF line tables.
 //!
 //! A module that carries a `.debug_line` custom section (and optionally `.debug_line_str`) names
-//! the source line of each instruction. The address a line row names is the byte offset of the
-//! instruction in the module, counted from the first byte of the file, which is how WebAssembly
-//! DWARF is written. A frame's program counter is an instruction index, so its location is found by
-//! decoding the function's body with each instruction's byte offset, adding the body's place in the
-//! module, and looking that address up.
+//! the source line of each instruction. The address a line row names is a byte offset counted from
+//! the start of the module's code section contents, which is how WebAssembly DWARF is written (and
+//! what clang and LLVM emit, checked against real output in `tests/source_real.rs`). A frame's
+//! program counter is an instruction index, so its location is found by decoding the function's body
+//! with each instruction's byte offset, adding the body's offset within the code section, and looking
+//! that address up.
 //!
 //! A module with no line information has no source map at all. A module whose line information is
 //! present but cannot be read is reported as an error at the point a location is asked for, rather
@@ -42,7 +43,7 @@ pub(crate) struct SourceMap {
 
 #[derive(Debug)]
 struct Body {
-    /// The module byte offset of the body's first instruction.
+    /// The offset, from the start of the code section's contents, of the body's first instruction.
     start: usize,
     /// The body's bytes, from its first instruction to its final `end`.
     bytes: Vec<u8>,
