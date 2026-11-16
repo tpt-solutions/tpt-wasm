@@ -120,11 +120,6 @@ fn build_context(module: &Module) -> Result<ModuleContext, ValidationError> {
             "MVP modules may contain at most one memory".into(),
         ));
     }
-    if table_types.len() > 1 {
-        return Err(ValidationError::InvalidLimits(
-            "MVP modules may contain at most one table".into(),
-        ));
-    }
     Ok(ModuleContext {
         data_count: module.data_count,
         types: module.types.clone(),
@@ -256,9 +251,6 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
             }
         };
         if let Some(table_index) = table_index {
-            if table_index != 0 {
-                return Err(ValidationError::UnsupportedFeature("multiple tables"));
-            }
             if table_index as usize >= context.table_types.len() {
                 return Err(ValidationError::UnknownTable(table_index));
             }

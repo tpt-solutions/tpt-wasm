@@ -710,7 +710,7 @@ fn call_instruction(
         0x11 => {
             let type_index = reader.u32()?;
             let table_index = reader.u32()?;
-            if table_index != 0 || module.table_types.is_empty() {
+            if table_index as usize >= module.table_types.len() {
                 return Err(ValidationError::UnknownTable(table_index));
             }
             let signature = module
