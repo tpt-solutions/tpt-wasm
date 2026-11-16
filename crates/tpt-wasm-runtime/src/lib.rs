@@ -4611,6 +4611,7 @@ mod tests {
     /// 100,000 levels did not finish in minutes. A host stack overflow aborts the
     /// process, so the test passing at all is part of the claim.
     #[test]
+    #[cfg_attr(miri, ignore = "100,000 nested blocks take minutes under Miri; the native run covers it")]
     fn deeply_nested_blocks_do_not_exhaust_the_host_stack() {
         for mode in [
             EngineMode::Micro,
