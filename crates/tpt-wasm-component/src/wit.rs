@@ -14,10 +14,11 @@
 //! whose package has the path's name and version. An interface found in none is refused by name.
 //! Comments are `//` and nested `/* */`, as WIT has them.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::{ComponentFuncType, ComponentType, Scalar};
+use crate::{ComponentFuncType, ComponentType, ComponentTypeDef, RecordField, Scalar};
 
 /// One parsed WIT document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,20 @@ pub struct WitInterface {
     pub name: String,
     /// The functions the interface declares, in order.
     pub functions: Vec<WitFunction>,
+    /// The records and enums the interface declares, in declaration order.
+    pub types: Vec<WitTypeDef>,
+}
+
+/// A record or an enum an interface declares. Its fields and cases are written as WIT has them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitTypeDef {
+    /// `record name { field: type, ... }`, as `(field, type)` pairs.
+    Record {
+        name: String,
+        fields: Vec<(String, String)>,
+    },
+    /// `enum name { case, ... }`, as case names.
+    Enum { name: String, cases: Vec<String> },
 }
 
 /// A function: its name, its named parameters, and its result, each type written as WIT has it.
@@ -179,6 +194,50 @@ impl WitDocument {
     /// import gives its own name. An interface import gives one id for each of its functions.
     pub fn capability_ids(&self, world: &str) -> Result<Vec<String>, WitError> {
         capability_ids_across(std::slice::from_ref(self), 0, world)
+    }
+
+    /// The component types of `function` in `interface`, as a type table and a function type whose
+    /// indices name that table. The table holds the interface's records and enums, in declaration
+    /// order, followed by each list, option, tuple and result the signature uses. A string is allowed
+    /// as a parameter or a result, but not inside a list, an option, a tuple, a result, or a record,
+    /// which the component layer does not lay out. Anything else is refused by name.
+    pub fn function_signature(
+        &self,
+        interface: &str,
+        function: &str,
+    ) -> Result<(Vec<ComponentTypeDef>, ComponentFuncType), WitError> {
+        let found = self
+            .interfaces
+            .iter()
+            .find(|candidate| candidate.name == interface)
+            .ok_or_else(|| WitError::NoSuchInterface(interface.to_owned()))?;
+        let definition = found
+            .functions
+            .iter()
+            .find(|candidate| candidate.name == function)
+            .ok_or_else(|| WitError::NoSuchFunction {
+                interface: interface.to_owned(),
+                function: function.to_owned(),
+            })?;
+        let mut table = SignatureTable {
+            defs: Vec::new(),
+            named: HashMap::new(),
+            function,
+        };
+        for declared in &found.types {
+            table.declare(declared)?;
+        }
+        let params = definition
+            .params
+            .iter()
+            .map(|(_, ty)| table.value_type(ty))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = definition
+            .result
+            .as_deref()
+            .map(|ty| table.value_type(ty))
+            .transpose()?;
+        Ok((table.defs, ComponentFuncType { params, result }))
     }
 
     /// The component function type of `function` in `interface`, for a function whose parameters
@@ -310,6 +369,170 @@ fn parse_file(path: &Path) -> Result<WitDocument, WitLoadError> {
         path: path.to_path_buf(),
         error,
     })
+}
+
+/// The type table a signature is built into, with the declared types by name.
+struct SignatureTable<'a> {
+    defs: Vec<ComponentTypeDef>,
+    /// A declared record or enum, by name, as the index of its definition and whether it is a record.
+    named: HashMap<String, (u32, bool)>,
+    function: &'a str,
+}
+
+impl SignatureTable<'_> {
+    fn refuse(&self, ty: &str) -> WitError {
+        WitError::UnsupportedType {
+            function: self.function.to_owned(),
+            ty: ty.to_owned(),
+        }
+    }
+
+    fn push(&mut self, def: ComponentTypeDef) -> u32 {
+        self.defs.push(def);
+        (self.defs.len() - 1) as u32
+    }
+
+    /// Add a declared record or enum. A record's fields must be scalars other than a string.
+    fn declare(&mut self, declared: &WitTypeDef) -> Result<(), WitError> {
+        match declared {
+            WitTypeDef::Record { name, fields } => {
+                let mut record = Vec::with_capacity(fields.len());
+                for (field, ty) in fields {
+                    let scalar = match scalar_name(ty) {
+                        Some(Scalar::String) | None => return Err(self.refuse(ty)),
+                        Some(scalar) => scalar,
+                    };
+                    record.push(RecordField {
+                        name: field.clone(),
+                        ty: scalar,
+                    });
+                }
+                let index = self.push(ComponentTypeDef::Record(record));
+                self.named.insert(name.clone(), (index, true));
+            }
+            WitTypeDef::Enum { name, cases } => {
+                let index = self.push(ComponentTypeDef::Enum(cases.clone()));
+                self.named.insert(name.clone(), (index, false));
+            }
+        }
+        Ok(())
+    }
+
+    /// The component type a WIT value type names, adding any list, option, tuple or result it needs.
+    fn value_type(&mut self, text: &str) -> Result<ComponentType, WitError> {
+        let text = text.trim();
+        if let Some(scalar) = scalar_name(text) {
+            return Ok(ComponentType::Scalar(scalar));
+        }
+        if let Some((index, is_record)) = self.named.get(text).copied() {
+            return Ok(if is_record {
+                ComponentType::Record(index)
+            } else {
+                ComponentType::Enum(index)
+            });
+        }
+        let Some((head, arguments)) = split_arguments(text) else {
+            return Err(self.refuse(text));
+        };
+        match (head, arguments.as_slice()) {
+            ("list", [element]) => {
+                let element = self.payload(element)?;
+                let index = self.push(ComponentTypeDef::List(element));
+                Ok(ComponentType::List(index))
+            }
+            ("option", [payload]) => {
+                let payload = self.payload(payload)?;
+                let index = self.push(ComponentTypeDef::Option(payload));
+                Ok(ComponentType::Option(index))
+            }
+            ("tuple", elements) if !elements.is_empty() => {
+                let scalars = elements
+                    .iter()
+                    .map(|element| self.payload(element))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let index = self.push(ComponentTypeDef::Tuple(scalars));
+                Ok(ComponentType::Tuple(index))
+            }
+            ("result", [ok]) => {
+                let ok = self.optional_payload(ok)?;
+                let index = self.push(ComponentTypeDef::Result { ok, err: None });
+                Ok(ComponentType::Result(index))
+            }
+            ("result", [ok, err]) => {
+                let ok = self.optional_payload(ok)?;
+                let err = self.optional_payload(err)?;
+                let index = self.push(ComponentTypeDef::Result { ok, err });
+                Ok(ComponentType::Result(index))
+            }
+            _ => Err(self.refuse(text)),
+        }
+    }
+
+    /// A scalar that a list, option, tuple or result holds: any scalar but a string.
+    fn payload(&self, text: &str) -> Result<Scalar, WitError> {
+        match scalar_name(text.trim()) {
+            Some(Scalar::String) | None => Err(self.refuse(text)),
+            Some(scalar) => Ok(scalar),
+        }
+    }
+
+    /// A result's payload, where `_` means the case has none.
+    fn optional_payload(&self, text: &str) -> Result<Option<Scalar>, WitError> {
+        if text.trim() == "_" {
+            return Ok(None);
+        }
+        self.payload(text).map(Some)
+    }
+}
+
+/// The scalar a WIT type name is, including `string`, or `None` if it names something else.
+fn scalar_name(text: &str) -> Option<Scalar> {
+    Some(match text.trim() {
+        "bool" => Scalar::Bool,
+        "s8" => Scalar::S8,
+        "u8" => Scalar::U8,
+        "s16" => Scalar::S16,
+        "u16" => Scalar::U16,
+        "s32" => Scalar::S32,
+        "u32" => Scalar::U32,
+        "s64" => Scalar::S64,
+        "u64" => Scalar::U64,
+        "f32" => Scalar::F32,
+        "f64" => Scalar::F64,
+        "char" => Scalar::Char,
+        "string" => Scalar::String,
+        _ => return None,
+    })
+}
+
+/// Split `head<a, b<c>, d>` into its head and its top-level arguments. `None` if the text is not a
+/// name followed by a bracketed list.
+fn split_arguments(text: &str) -> Option<(&str, Vec<&str>)> {
+    let open = text.find('<')?;
+    if !text.ends_with('>') {
+        return None;
+    }
+    let head = text[..open].trim();
+    let inner = &text[open + 1..text.len() - 1];
+    let mut arguments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (position, character) in inner.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                arguments.push(inner[start..position].trim());
+                start = position + 1;
+            }
+            _ => {}
+        }
+    }
+    arguments.push(inner[start..].trim());
+    if depth != 0 || arguments.iter().any(|argument| argument.is_empty()) {
+        return None;
+    }
+    Some((head, arguments))
 }
 
 /// The component type of a WIT scalar type name, or a refusal naming the function that has it.
@@ -589,12 +812,17 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect_symbol('{')?;
         let mut functions = Vec::new();
+        let mut types = Vec::new();
         loop {
             match self.peek().cloned() {
                 Some(Token::Symbol('}')) => {
                     self.next();
                     break;
                 }
+                Some(Token::Ident(word)) if word == "record" => {
+                    types.push(self.record_definition()?)
+                }
+                Some(Token::Ident(word)) if word == "enum" => types.push(self.enum_definition()?),
                 Some(Token::Ident(word))
                     if matches!(
                         word.as_str(),
@@ -609,7 +837,60 @@ impl Parser {
                 _ => return Err(self.error("a function, a type, a use, or '}'")),
             }
         }
-        Ok(WitInterface { name, functions })
+        Ok(WitInterface {
+            name,
+            functions,
+            types,
+        })
+    }
+
+    /// `record name { field: type, ... }`, with an optional comma after each field.
+    fn record_definition(&mut self) -> Result<WitTypeDef, WitError> {
+        self.next();
+        let name = self.expect_ident()?;
+        self.expect_symbol('{')?;
+        let mut fields = Vec::new();
+        loop {
+            if self.peek() == Some(&Token::Symbol('}')) {
+                self.next();
+                break;
+            }
+            let field = self.expect_ident()?;
+            self.expect_symbol(':')?;
+            let ty = self.type_text()?;
+            fields.push((field, ty));
+            match self.peek() {
+                Some(Token::Symbol(',')) => {
+                    self.next();
+                }
+                Some(Token::Symbol('}')) => {}
+                _ => return Err(self.error("',' or '}' in a record")),
+            }
+        }
+        Ok(WitTypeDef::Record { name, fields })
+    }
+
+    /// `enum name { case, ... }`, with an optional comma after each case.
+    fn enum_definition(&mut self) -> Result<WitTypeDef, WitError> {
+        self.next();
+        let name = self.expect_ident()?;
+        self.expect_symbol('{')?;
+        let mut cases = Vec::new();
+        loop {
+            if self.peek() == Some(&Token::Symbol('}')) {
+                self.next();
+                break;
+            }
+            cases.push(self.expect_ident()?);
+            match self.peek() {
+                Some(Token::Symbol(',')) => {
+                    self.next();
+                }
+                Some(Token::Symbol('}')) => {}
+                _ => return Err(self.error("',' or '}' in an enum")),
+            }
+        }
+        Ok(WitTypeDef::Enum { name, cases })
     }
 
     fn world(&mut self) -> Result<WitWorld, WitError> {
@@ -1060,5 +1341,171 @@ package c:d;
             other => panic!("expected a parse error, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const SHAPES: &str = "\
+package demo:shapes@1.0.0;
+
+interface geometry {
+    record point {
+        x: s32,
+        y: s32,
+    }
+
+    enum color { red, green, blue }
+
+    area: func(p: point, c: color) -> u64;
+    points: func(xs: list<u8>, label: string) -> tuple<u8, bool>;
+    maybe: func(v: u32) -> option<u32>;
+    checked: func(v: u32) -> result<u32, u8>;
+    empty: func() -> result<_, u8>;
+    corners: func(p: point) -> list<point>;
+    named: func(s: string) -> list<string>;
+}
+
+world w {
+    import geometry;
+}
+";
+
+    #[test]
+    fn a_record_and_an_enum_map_to_their_own_definitions() {
+        let document = WitDocument::parse(SHAPES).expect("parses");
+        let (table, signature) = document
+            .function_signature("geometry", "area")
+            .expect("maps");
+        assert_eq!(
+            table,
+            vec![
+                ComponentTypeDef::Record(vec![
+                    RecordField {
+                        name: "x".to_owned(),
+                        ty: Scalar::S32,
+                    },
+                    RecordField {
+                        name: "y".to_owned(),
+                        ty: Scalar::S32,
+                    },
+                ]),
+                ComponentTypeDef::Enum(vec![
+                    "red".to_owned(),
+                    "green".to_owned(),
+                    "blue".to_owned(),
+                ]),
+            ]
+        );
+        assert_eq!(
+            signature,
+            ComponentFuncType {
+                params: vec![ComponentType::Record(0), ComponentType::Enum(1)],
+                result: Some(ComponentType::Scalar(Scalar::U64)),
+            }
+        );
+    }
+
+    #[test]
+    fn lists_options_tuples_and_results_are_added_to_the_table_after_the_declarations() {
+        let document = WitDocument::parse(SHAPES).expect("parses");
+        let (table, signature) = document
+            .function_signature("geometry", "points")
+            .expect("maps");
+        assert_eq!(table[2], ComponentTypeDef::List(Scalar::U8));
+        assert_eq!(
+            table[3],
+            ComponentTypeDef::Tuple(vec![Scalar::U8, Scalar::Bool])
+        );
+        assert_eq!(
+            signature,
+            ComponentFuncType {
+                params: vec![
+                    ComponentType::List(2),
+                    ComponentType::Scalar(Scalar::String)
+                ],
+                result: Some(ComponentType::Tuple(3)),
+            }
+        );
+
+        let (table, signature) = document
+            .function_signature("geometry", "maybe")
+            .expect("maps");
+        assert_eq!(
+            table,
+            vec![
+                ComponentTypeDef::Record(vec![
+                    RecordField {
+                        name: "x".to_owned(),
+                        ty: Scalar::S32
+                    },
+                    RecordField {
+                        name: "y".to_owned(),
+                        ty: Scalar::S32
+                    },
+                ]),
+                ComponentTypeDef::Enum(vec![
+                    "red".to_owned(),
+                    "green".to_owned(),
+                    "blue".to_owned()
+                ]),
+                ComponentTypeDef::Option(Scalar::U32),
+            ]
+        );
+        assert_eq!(signature.result, Some(ComponentType::Option(2)));
+
+        let (table, signature) = document
+            .function_signature("geometry", "checked")
+            .expect("maps");
+        assert_eq!(
+            table[2],
+            ComponentTypeDef::Result {
+                ok: Some(Scalar::U32),
+                err: Some(Scalar::U8),
+            }
+        );
+        assert_eq!(signature.result, Some(ComponentType::Result(2)));
+
+        let (table, signature) = document
+            .function_signature("geometry", "empty")
+            .expect("maps");
+        assert_eq!(
+            table[2],
+            ComponentTypeDef::Result {
+                ok: None,
+                err: Some(Scalar::U8),
+            }
+        );
+        assert!(signature.params.is_empty());
+    }
+
+    #[test]
+    fn compound_shapes_the_component_layer_does_not_lay_out_are_refused_by_name() {
+        let document = WitDocument::parse(SHAPES).expect("parses");
+        assert_eq!(
+            document.function_signature("geometry", "corners"),
+            Err(WitError::UnsupportedType {
+                function: "corners".to_owned(),
+                ty: "point".to_owned(),
+            }),
+            "a list of records is not laid out"
+        );
+        assert_eq!(
+            document.function_signature("geometry", "named"),
+            Err(WitError::UnsupportedType {
+                function: "named".to_owned(),
+                ty: "string".to_owned(),
+            }),
+            "a list of strings is not laid out"
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_string_field_is_refused_at_its_declaration() {
+        let document = WitDocument::parse(
+            "package a:b;\ninterface i {\n  record r { name: string }\n  f: func(x: r);\n}\n",
+        )
+        .expect("parses");
+        assert!(matches!(
+            document.function_signature("i", "f"),
+            Err(WitError::UnsupportedType { ty, .. }) if ty == "string"
+        ));
     }
 }
