@@ -551,8 +551,18 @@ pub struct InstanceArgument {
 pub struct InlineExport {
     /// The export name.
     pub name: String,
-    /// The index of the core function, in the core function index space.
-    pub function: u32,
+    /// What the export names: a core function, or a core memory.
+    pub target: InlineTarget,
+}
+
+/// What an inline export of a core instance names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineTarget {
+    /// A core function, by its index in the core function index space.
+    Function(u32),
+    /// A core memory, by its index in the core memory index space. A consumer that imports it shares
+    /// the memory the named instance exports, rather than receiving a copy.
+    Memory(u32),
 }
 
 /// One core instance a component declares.
@@ -673,6 +683,7 @@ impl Component {
                 SECTION_CORE_INSTANCE => decode_instances(
                     &mut section,
                     &component.core_functions,
+                    &component.core_memories,
                     &mut component.core_instances,
                 )?,
                 SECTION_TYPE => decode_types(&mut section, &mut component.types)?,
@@ -829,58 +840,88 @@ impl Component {
                 CoreInstance::FromExports { exports } => {
                     let mut bound = Vec::with_capacity(exports.len());
                     for export in exports {
-                        let target = match &self.core_functions[export.function as usize] {
-                            CoreFunction::Alias {
-                                instance: source,
-                                export: source_export,
-                            } => {
-                                let Slot::Runtime(runtime) = &slots[*source as usize] else {
+                        let target = match &export.target {
+                            InlineTarget::Memory(memory) => {
+                                // The memory belongs to an instance created before this one, so it is
+                                // already in the slots, and it must be exported under the name given.
+                                let named = &self.core_memories[*memory as usize];
+                                let Some(Slot::Runtime(provider)) =
+                                    slots.get(named.instance as usize)
+                                else {
                                     return Err(ComponentError::Instantiate {
                                         instance: index,
-                                        message: "an alias names an inline-exports instance"
-                                            .to_owned(),
+                                        message:
+                                            "an inline export names a memory of a later instance"
+                                                .to_owned(),
                                     });
                                 };
-                                // Check now that the export exists, so a missing one is an
-                                // error here and not at the first call.
-                                runtime.get_function(source_export).map_err(|error| {
+                                provider.memory_view(&named.export).map_err(|error| {
                                     ComponentError::Instantiate {
                                         instance: index,
                                         message: error.to_string(),
                                     }
                                 })?;
                                 Target::Alias {
-                                    source: *source as usize,
-                                    export: source_export.clone(),
+                                    source: named.instance as usize,
+                                    export: named.export.clone(),
                                 }
                             }
-                            CoreFunction::Lowered { function, memory } => {
-                                let instantiate = |message: String| ComponentError::Instantiate {
-                                    instance: index,
-                                    message,
-                                };
-                                let mut host =
-                                    self.lowered(*function, imports).map_err(instantiate)?;
-                                if let Some(memory) = memory {
-                                    // The memory belongs to an instance created before this one,
-                                    // so it is already in the slots.
-                                    let named = &self.core_memories[*memory as usize];
-                                    let Some(Slot::Runtime(provider)) =
-                                        slots.get(named.instance as usize)
-                                    else {
-                                        return Err(instantiate(
+                            InlineTarget::Function(function) => match &self.core_functions
+                                [*function as usize]
+                            {
+                                CoreFunction::Alias {
+                                    instance: source,
+                                    export: source_export,
+                                } => {
+                                    let Slot::Runtime(runtime) = &slots[*source as usize] else {
+                                        return Err(ComponentError::Instantiate {
+                                            instance: index,
+                                            message: "an alias names an inline-exports instance"
+                                                .to_owned(),
+                                        });
+                                    };
+                                    // Check now that the export exists, so a missing one is an
+                                    // error here and not at the first call.
+                                    runtime.get_function(source_export).map_err(|error| {
+                                        ComponentError::Instantiate {
+                                            instance: index,
+                                            message: error.to_string(),
+                                        }
+                                    })?;
+                                    Target::Alias {
+                                        source: *source as usize,
+                                        export: source_export.clone(),
+                                    }
+                                }
+                                CoreFunction::Lowered { function, memory } => {
+                                    let instantiate =
+                                        |message: String| ComponentError::Instantiate {
+                                            instance: index,
+                                            message,
+                                        };
+                                    let mut host =
+                                        self.lowered(*function, imports).map_err(instantiate)?;
+                                    if let Some(memory) = memory {
+                                        // The memory belongs to an instance created before this one,
+                                        // so it is already in the slots.
+                                        let named = &self.core_memories[*memory as usize];
+                                        let Some(Slot::Runtime(provider)) =
+                                            slots.get(named.instance as usize)
+                                        else {
+                                            return Err(instantiate(
                                             "the memory a lower names is not an instance created before it"
                                                 .to_owned(),
                                         ));
-                                    };
-                                    host.memory = Some(
-                                        provider
-                                            .memory_view(&named.export)
-                                            .map_err(|error| instantiate(error.to_string()))?,
-                                    );
+                                        };
+                                        host.memory = Some(
+                                            provider
+                                                .memory_view(&named.export)
+                                                .map_err(|error| instantiate(error.to_string()))?,
+                                        );
+                                    }
+                                    Target::Host(host)
                                 }
-                                Target::Host(host)
-                            }
+                            },
                         };
                         bound.push(BoundExport {
                             name: export.name.clone(),
@@ -2849,6 +2890,7 @@ fn decode_aliases(
 fn decode_instances(
     reader: &mut Reader<'_>,
     functions: &[CoreFunction],
+    memories: &[CoreMemory],
     instances: &mut Vec<CoreInstance>,
 ) -> Result<(), ComponentError> {
     let count = reader.u32()?;
@@ -2884,20 +2926,32 @@ fn decode_instances(
                 for _ in 0..export_count {
                     let name = reader.name()?;
                     let sort_at = reader.position();
-                    if reader.byte()? != SORT_FUNC {
-                        return Err(ComponentError::UnsupportedInstance {
-                            what: "inline export of a sort other than function",
-                            offset: sort_at,
-                        });
-                    }
-                    let function = reader.u32()?;
-                    if function as usize >= functions.len() {
-                        return Err(ComponentError::NoSuchFunction { function });
-                    }
+                    let sort = reader.byte()?;
+                    let index = reader.u32()?;
+                    let target = match sort {
+                        SORT_FUNC => {
+                            if index as usize >= functions.len() {
+                                return Err(ComponentError::NoSuchFunction { function: index });
+                            }
+                            InlineTarget::Function(index)
+                        }
+                        SORT_CORE_MEMORY => {
+                            if index as usize >= memories.len() {
+                                return Err(ComponentError::NoSuchMemory { memory: index });
+                            }
+                            InlineTarget::Memory(index)
+                        }
+                        _ => {
+                            return Err(ComponentError::UnsupportedInstance {
+                                what: "inline export of a sort other than a function or a memory",
+                                offset: sort_at,
+                            })
+                        }
+                    };
                     if exports.iter().any(|export| export.name == name) {
                         return Err(ComponentError::Malformed { offset: sort_at });
                     }
-                    exports.push(InlineExport { name, function });
+                    exports.push(InlineExport { name, target });
                 }
                 instances.push(CoreInstance::FromExports { exports });
             }

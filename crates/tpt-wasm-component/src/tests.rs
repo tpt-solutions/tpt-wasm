@@ -3744,7 +3744,8 @@ fn consumer_module(pointer: u8, length: u8) -> Vec<u8> {
     module.extend(section(
         2,
         &[
-            1, 3, b'e', b'n', b'v', 5, b'c', b'o', b'u', b'n', b't', 0, 0,
+            2, 3, b'e', b'n', b'v', 5, b'c', b'o', b'u', b'n', b't', 0, 0, 3, b'e', b'n', b'v', 6,
+            b'm', b'e', b'm', b'o', b'r', b'y', 2, 0, 1,
         ],
     ));
     module.extend(section(3, &[1, 1]));
@@ -3813,7 +3814,7 @@ fn lowered_memory_component(
         &[
             2,
             0x01,
-            1,
+            2,
             5,
             b'c',
             b'o',
@@ -3821,6 +3822,15 @@ fn lowered_memory_component(
             b'n',
             b't',
             SORT_FUNC,
+            0,
+            6,
+            b'm',
+            b'e',
+            b'm',
+            b'o',
+            b'r',
+            b'y',
+            SORT_CORE_MEMORY,
             0,
             0x00,
             1,
@@ -4010,5 +4020,30 @@ fn a_lower_naming_a_memory_that_does_not_exist_is_refused() {
     assert_eq!(
         Component::decode(&with(&[types, import, lower].concat())),
         Err(ComponentError::NoSuchMemory { memory: 7 })
+    );
+}
+
+#[test]
+fn an_inline_export_of_a_memory_that_does_not_exist_is_refused() {
+    let inline = section(
+        SECTION_CORE_INSTANCE,
+        &[
+            1,
+            0x01,
+            1,
+            6,
+            b'm',
+            b'e',
+            b'm',
+            b'o',
+            b'r',
+            b'y',
+            SORT_CORE_MEMORY,
+            3,
+        ],
+    );
+    assert_eq!(
+        Component::decode(&with(&inline)),
+        Err(ComponentError::NoSuchMemory { memory: 3 })
     );
 }
