@@ -27,6 +27,11 @@ These files are copied unmodified from the WebAssembly specification repository:
 | `endianness.wast` | Core suite: the little-endian byte order of every load and store width. |
 | `load.wast`, `store.wast` | Core suite: the full MVP load and store instruction set, including zero- and sign-extension. |
 | `memory.wast` | Core suite: `memory.size`, `memory.grow`, and the active data segment forms, including the inline `(memory (data ...))` abbreviation. |
+| `elem.wast` | Element segments: active, passive and declarative forms, `table.init`, `elem.drop`, and reference-typed tables. Vendored at the pinned revision and not registered as a suite: reference types, not yet implemented. |
+| `table.wast` | Tables with typed and `externref` elements, multiple tables, and `table.get` and `table.set`. Vendored and not registered. |
+| `ref_func.wast` | `ref.func`, `ref.is_null` and reference-typed globals. Vendored and not registered. |
+| `table_grow.wast` | `table.grow`, with `externref` elements and named modules. Vendored and not registered. |
+| `table_size.wast` | `table.size`. Vendored and not registered. |
 | `data.wast` | Passive and active data segments, `memory.init`, data-segment bounds, and constant offsets. Vendored at the pinned revision and not yet registered as a suite: 54 directives fail on the interpreter, measured in the tracker. |
 | `token.wast` | Text-format tokenization: `assert_malformed` on text modules, and modules that must decode. Vendored at the pinned revision and not yet registered as a suite. |
 | `memory_size.wast` | Core suite: `memory.size` against declared minimum and maximum. |
