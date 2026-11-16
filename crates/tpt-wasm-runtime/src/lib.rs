@@ -1594,9 +1594,15 @@ fn instantiate_module(
                     *memory_index,
                 )))?;
         let address = const_i32(offset, &store, &global_addrs)? as u32;
+        // A segment that falls outside its memory traps at instantiation, as the specification has it.
+        // The segments before it have already been written, so they stay.
         store
             .memory_mut(memory_address)?
-            .write(address as u64, &segment.data)?;
+            .write(address as u64, &segment.data)
+            .map_err(|error| match error {
+                StoreError::MemoryOutOfBounds => RuntimeError::Trap(Trap::MemoryOutOfBounds),
+                other => RuntimeError::Store(other),
+            })?;
     }
 
     // Captured before `memory_addrs` moves into the store instance, because the

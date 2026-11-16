@@ -17,7 +17,6 @@ pub(crate) struct ModuleContext {
     pub table_types: Vec<TableType>,
     pub memory_count: usize,
     pub global_types: Vec<GlobalType>,
-    pub imported_globals: usize,
 }
 
 pub(crate) fn validate_module(module: &Module) -> Result<(), ValidationError> {
@@ -62,7 +61,6 @@ fn build_context(module: &Module) -> Result<ModuleContext, ValidationError> {
     let mut table_types = Vec::new();
     let mut memory_count = 0usize;
     let mut global_types = Vec::new();
-    let mut imported_globals = 0usize;
     for import in &module.imports {
         match &import.desc {
             ImportDesc::Function(index) => {
@@ -86,7 +84,6 @@ fn build_context(module: &Module) -> Result<ModuleContext, ValidationError> {
             ImportDesc::Global(global_type) => {
                 validate_global_type(*global_type)?;
                 global_types.push(*global_type);
-                imported_globals += 1;
             }
             ImportDesc::Tag(_) => return Err(ValidationError::UnsupportedFeature("tags")),
         }
@@ -132,7 +129,6 @@ fn build_context(module: &Module) -> Result<ModuleContext, ValidationError> {
         table_types,
         memory_count,
         global_types,
-        imported_globals,
     })
 }
 
@@ -255,7 +251,7 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
             }
         }
         if let Some(offset) = offset {
-            validate_const_expr(offset, ValueType::I32, context, false)?;
+            validate_const_expr(offset, ValueType::I32, context, true)?;
         }
         // The two families are validated differently. A plain index is checked
         // against the function index space; an expression is a constant
@@ -274,7 +270,7 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
                         expression,
                         ValueType::Ref(element.element_type),
                         context,
-                        false,
+                        true,
                     )?;
                 }
             }
@@ -291,7 +287,7 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
         if *memory_index != 0 || context.memory_count == 0 {
             return Err(ValidationError::UnknownMemory(*memory_index));
         }
-        validate_const_expr(offset, ValueType::I32, context, false)?;
+        validate_const_expr(offset, ValueType::I32, context, true)?;
     }
     Ok(())
 }
@@ -331,7 +327,9 @@ fn validate_const_expr(
                 .global_types
                 .get(index as usize)
                 .ok_or(ValidationError::UnknownGlobal(index))?;
-            if index as usize >= context.imported_globals || global.mutable {
+            // A constant expression may read any immutable global, imported or defined, as the
+            // pinned spec revision has it. A mutable one is not a constant.
+            if global.mutable {
                 return Err(ValidationError::InvalidConstantExpression);
             }
             global.value_type

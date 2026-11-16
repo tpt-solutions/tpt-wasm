@@ -29,12 +29,11 @@
 //! a disagreement between the two is a disagreement about execution.
 //!
 //! Several Core suite modules import from `spectest`, the host module the
-//! reference interpreter's own test runner supplies. Only its *functions* are
-//! defined here; its globals, table, and memory are not, because this project
-//! cannot yet import those. The print functions are the ones that exist purely
-//! to be called and to discard, so they are defined as no-ops: what the suite
-//! checks about them is that a module importing one links and runs, never what
-//! the call prints.
+//! reference interpreter's own test runner supplies. Its print functions are
+//! defined as no-ops, since what the suite checks about them is that a module
+//! importing one links and runs, never what the call prints. Its memory is
+//! defined as the runner defines it, one page with a maximum of two. Its globals
+//! and table are not defined yet.
 
 use std::collections::HashMap;
 
@@ -89,8 +88,51 @@ fn define_spectest(engine: &mut Engine) -> Result<(), String> {
             .linker_mut()
             .define_function("spectest", *name, SpectestPrint { parameters });
     }
+    // The reference runner's `spectest.memory`: one page, with a maximum of two, exported as `memory`.
+    // It is exported from a module of its own, so the memory is shared with any module that imports it.
+    let holder = engine
+        .instantiate_bytes(SPECTEST_MEMORY)
+        .map_err(|error| error.to_string())?;
+    engine
+        .linker_mut()
+        .define_export("spectest", "memory", &holder, "memory")
+        .map_err(|error| error.to_string())?;
+    // The runner's four immutable globals: `global_i32` and `global_i64` are 666, and `global_f32` and
+    // `global_f64` are 666.6, each exported under its own name from one module.
+    let globals = engine
+        .instantiate_bytes(SPECTEST_GLOBALS)
+        .map_err(|error| error.to_string())?;
+    for name in ["global_i32", "global_i64", "global_f32", "global_f64"] {
+        engine
+            .linker_mut()
+            .define_export("spectest", name, &globals, name)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
+
+/// A module that exports the runner's four immutable globals: `global_i32` and `global_i64` are 666,
+/// `global_f32` is 666.6 and `global_f64` is 666.6, as their IEEE bit patterns.
+const SPECTEST_GLOBALS: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+    0x06, 0x21, 0x04, // global section: four globals
+    0x7f, 0x00, 0x41, 0x9a, 0x05, 0x0b, // i32 = 666
+    0x7e, 0x00, 0x42, 0x9a, 0x05, 0x0b, // i64 = 666
+    0x7d, 0x00, 0x43, 0x66, 0xa6, 0x26, 0x44, 0x0b, // f32 = 666.6
+    0x7c, 0x00, 0x44, 0xcd, 0xcc, 0xcc, 0xcc, 0xcc, 0xd4, 0x84, 0x40, 0x0b, // f64 = 666.6
+    0x07, 0x35, 0x04, // export section: four exports
+    0x0a, b'g', b'l', b'o', b'b', b'a', b'l', b'_', b'i', b'3', b'2', 0x03, 0x00, 0x0a, b'g', b'l',
+    b'o', b'b', b'a', b'l', b'_', b'i', b'6', b'4', 0x03, 0x01, 0x0a, b'g', b'l', b'o', b'b', b'a',
+    b'l', b'_', b'f', b'3', b'2', 0x03, 0x02, 0x0a, b'g', b'l', b'o', b'b', b'a', b'l', b'_', b'f',
+    b'6', b'4', 0x03, 0x03,
+];
+
+/// A module that exports one memory of one page, maximum two, as `memory`, and nothing else.
+const SPECTEST_MEMORY: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+    0x05, 0x04, 0x01, 0x01, 0x01, 0x02, // memory section: one memory, min 1, max 2
+    0x07, 0x0a, 0x01, 0x06, b'm', b'e', b'm', b'o', b'r', b'y', 0x02, 0x00, // export "memory"
+];
 
 use wast::core::{NanPattern, WastArgCore, WastRetCore};
 use wast::parser::ParseBuffer;
