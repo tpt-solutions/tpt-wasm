@@ -74,6 +74,14 @@ pub enum Instr {
     I64Store32(MemArg),
     MemorySize(u32),
     MemoryGrow(u32),
+    /// `memory.init`: copy from a passive data segment into memory 0.
+    MemoryInit(u32),
+    /// `data.drop`: discard a data segment, after which it is empty.
+    DataDrop(u32),
+    /// `memory.copy` within memory 0.
+    MemoryCopy,
+    /// `memory.fill` within memory 0.
+    MemoryFill,
 
     // Numeric constants
     I32Const(i32),
@@ -387,6 +395,37 @@ impl<'a> BodyReader<'a> {
     }
 }
 
+/// The `0xFC`-prefixed bulk memory instructions. Only the four operations that need no float conversion
+/// are here; the saturating truncations keep their decode error.
+fn decode_bulk(reader: &mut BodyReader<'_>) -> Result<Instr, InstrDecodeError> {
+    match reader.u32()? {
+        8 => {
+            let data = reader.u32()?;
+            expect_memory_zero(reader)?;
+            Ok(Instr::MemoryInit(data))
+        }
+        9 => Ok(Instr::DataDrop(reader.u32()?)),
+        10 => {
+            expect_memory_zero(reader)?;
+            expect_memory_zero(reader)?;
+            Ok(Instr::MemoryCopy)
+        }
+        11 => {
+            expect_memory_zero(reader)?;
+            Ok(Instr::MemoryFill)
+        }
+        _ => Err(InstrDecodeError::InvalidOpcode(0xfc)),
+    }
+}
+
+fn expect_memory_zero(reader: &mut BodyReader<'_>) -> Result<(), InstrDecodeError> {
+    let index = reader.byte()?;
+    if index != 0 {
+        return Err(InstrDecodeError::InvalidMemoryIndex(index));
+    }
+    Ok(())
+}
+
 fn decode_instruction(reader: &mut BodyReader<'_>) -> Result<Instr, InstrDecodeError> {
     let opcode = reader.byte()?;
     let instruction = match opcode {
@@ -444,6 +483,7 @@ fn decode_instruction(reader: &mut BodyReader<'_>) -> Result<Instr, InstrDecodeE
             }
             Instr::MemoryGrow(0)
         }
+        0xfc => decode_bulk(reader)?,
         0x41 => Instr::I32Const(reader.i32()?),
         0x42 => Instr::I64Const(reader.i64()?),
         0x43 => {

@@ -17,6 +17,8 @@ pub(crate) struct ModuleContext {
     pub table_types: Vec<TableType>,
     pub memory_count: usize,
     pub global_types: Vec<GlobalType>,
+    /// The data count section's value, if the module declares one.
+    pub data_count: Option<u32>,
 }
 
 pub(crate) fn validate_module(module: &Module) -> Result<(), ValidationError> {
@@ -124,6 +126,7 @@ fn build_context(module: &Module) -> Result<ModuleContext, ValidationError> {
         ));
     }
     Ok(ModuleContext {
+        data_count: module.data_count,
         types: module.types.clone(),
         function_types,
         table_types,

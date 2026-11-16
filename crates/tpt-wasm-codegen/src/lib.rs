@@ -5472,6 +5472,7 @@ mod tests {
                 table_addrs,
                 memory_addrs,
                 global_addrs,
+                data_addrs: Vec::new(),
             })
             .expect("test instance must install");
         let entry_function = &module.functions[entry];

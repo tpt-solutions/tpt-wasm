@@ -42,6 +42,9 @@ impl std::error::Error for StoreError {}
 /// The global mutable state of a running program.
 #[derive(Debug, Clone)]
 pub struct Store {
+    /// Each data segment's bytes, by store address, or `None` once it has been dropped. An active segment
+    /// is dropped when it is applied at instantiation, as the specification has it.
+    pub datas: Vec<Option<Vec<u8>>>,
     pub memories: Vec<MemoryInstance>,
     pub tables: Vec<TableInstance>,
     pub globals: Vec<GlobalInstance>,
@@ -59,6 +62,7 @@ impl Default for Store {
 impl Store {
     pub fn new(limits: ResourceLimits) -> Self {
         Self {
+            datas: Vec::new(),
             memories: Vec::new(),
             tables: Vec::new(),
             globals: Vec::new(),
@@ -160,6 +164,24 @@ impl Store {
         self.memories
             .get(index as usize)
             .ok_or(StoreError::UnknownMemory(index))
+    }
+
+    /// Add a data segment, with its bytes or `None` if it is already dropped, and return its address.
+    pub fn add_data(&mut self, bytes: Option<Vec<u8>>) -> u32 {
+        self.datas.push(bytes);
+        (self.datas.len() - 1) as u32
+    }
+
+    /// The bytes of a data segment, or `None` if it is dropped or the address names no segment.
+    pub fn data(&self, address: u32) -> Option<&Vec<u8>> {
+        self.datas.get(address as usize).and_then(Option::as_ref)
+    }
+
+    /// Drop a data segment, so that it is empty from now on.
+    pub fn drop_data(&mut self, address: u32) {
+        if let Some(slot) = self.datas.get_mut(address as usize) {
+            *slot = None;
+        }
     }
 
     pub fn memory_mut(&mut self, index: u32) -> Result<&mut MemoryInstance, StoreError> {
@@ -280,6 +302,7 @@ mod tests {
             table_addrs: Vec::new(),
             memory_addrs: Vec::new(),
             global_addrs: Vec::new(),
+            data_addrs: Vec::new(),
         }
     }
 
@@ -565,4 +588,6 @@ pub struct Instance {
     pub table_addrs: Vec<u32>,
     pub memory_addrs: Vec<u32>,
     pub global_addrs: Vec<u32>,
+    /// The data segments of the module, by store address, in module order.
+    pub data_addrs: Vec<u32>,
 }

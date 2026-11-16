@@ -1633,12 +1633,24 @@ fn instantiate_module(
     // handle under the store address that table was allocated at.
     let baseline_table_address = table_addrs.first().copied();
 
+    let data_addrs: Vec<u32> = module
+        .data
+        .iter()
+        .map(|segment| {
+            let bytes = match segment.mode {
+                DataMode::Passive => Some(segment.data.clone()),
+                DataMode::Active { .. } => None,
+            };
+            store.add_data(bytes)
+        })
+        .collect();
     let store_instance = StoreInstance {
         module_types: module.types.clone(),
         func_addrs,
         table_addrs,
         memory_addrs,
         global_addrs,
+        data_addrs,
     };
     let allocated_index = store.add_instance(store_instance)?;
     debug_assert_eq!(allocated_index, instance_index);

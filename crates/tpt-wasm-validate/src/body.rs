@@ -598,6 +598,45 @@ fn variable_instruction(
     Ok(())
 }
 
+/// The `0xFC`-prefixed bulk memory instructions. Each names memory 0, and `memory.init` and `data.drop`
+/// name a data segment, which must be below the declared count.
+fn bulk_memory_instruction(
+    reader: &mut Reader<'_>,
+    stack: &mut Vec<Option<ValueType>>,
+    controls: &[ControlFrame],
+    module: &ModuleContext,
+) -> Result<(), ValidationError> {
+    let sub = reader.u32()?;
+    if sub == 8 || sub == 9 {
+        let data = reader.u32()?;
+        match module.data_count {
+            Some(count) if data < count => {}
+            _ => return Err(ValidationError::UnknownDataSegment(data)),
+        }
+    }
+    match sub {
+        8 | 10 => {
+            if reader.byte()? != 0 || (sub == 10 && reader.byte()? != 0) {
+                return Err(ValidationError::InvalidMemoryIndex(0));
+            }
+        }
+        11 => {
+            if reader.byte()? != 0 {
+                return Err(ValidationError::InvalidMemoryIndex(0));
+            }
+        }
+        9 => return Ok(()),
+        _ => return Err(ValidationError::InvalidInstruction(0xfc)),
+    }
+    if module.memory_count == 0 {
+        return Err(ValidationError::UnknownMemory(0));
+    }
+    for _ in 0..3 {
+        pop_value(stack, controls, Some(ValueType::I32))?;
+    }
+    Ok(())
+}
+
 fn memory_instruction(
     opcode: u8,
     reader: &mut Reader<'_>,
@@ -863,6 +902,7 @@ pub(crate) fn validate_instruction(
             variable_instruction(opcode, reader, stack, controls, locals, module)
         }
         0x28..=0x40 => memory_instruction(opcode, reader, stack, controls, module),
+        0xfc => bulk_memory_instruction(reader, stack, controls, module),
         0x41..=0x44 => constant_instruction(opcode, reader, stack),
         0xd0..=0xd2 => reference_instruction(opcode, reader, stack, controls, module),
         0x25 | 0x26 => table_instruction(opcode, reader, stack, controls, module),

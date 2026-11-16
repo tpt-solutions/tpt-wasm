@@ -248,6 +248,10 @@ fn execute_instruction(machine: &mut Machine, instruction: crate::instr::Instr) 
         crate::instr::Instr::I64Store32(arg) => store_i64(machine, arg, 4),
         crate::instr::Instr::MemorySize(index) => memory_size(machine, index),
         crate::instr::Instr::MemoryGrow(index) => memory_grow(machine, index),
+        crate::instr::Instr::MemoryInit(data) => memory_init(machine, data),
+        crate::instr::Instr::DataDrop(data) => data_drop(machine, data),
+        crate::instr::Instr::MemoryCopy => memory_copy(machine),
+        crate::instr::Instr::MemoryFill => memory_fill(machine),
         crate::instr::Instr::I32Eqz => unary_i32(machine, |value| (value == 0) as i32),
         crate::instr::Instr::I32Eq => compare_i32(machine, |left, right| left == right),
         crate::instr::Instr::I32Ne => compare_i32(machine, |left, right| left != right),
@@ -1138,6 +1142,129 @@ fn memory_size(machine: &mut Machine, index: u32) -> Step {
     }
 }
 
+/// The store address of memory 0 of the running instance.
+fn memory_zero(machine: &Machine) -> Result<u32, Step> {
+    instance_address(machine, &memory_addresses(machine), 0, "memory")
+}
+
+/// The store address of data segment `index` of the running instance.
+fn data_address(machine: &Machine, index: u32) -> Result<u32, Step> {
+    machine
+        .frames
+        .last()
+        .and_then(|frame| machine.store.instance(frame.instance_idx).ok())
+        .and_then(|instance| instance.data_addrs.get(index as usize).copied())
+        .ok_or(Step::Trap(Trap::MemoryOutOfBounds))
+}
+
+/// `memory.init`: copy `len` bytes from offset `src` of data segment `data` to `dst` in memory 0. A
+/// dropped segment is empty, so any copy from it past zero bytes traps.
+fn memory_init(machine: &mut Machine, data: u32) -> Step {
+    let (dst, src, len) = match (
+        pop_typed_i32(machine),
+        pop_typed_i32(machine),
+        pop_typed_i32(machine),
+    ) {
+        (Ok(len), Ok(src), Ok(dst)) => (dst as u32 as u64, src as u32 as u64, len as u32 as u64),
+        (Err(step), _, _) | (_, Err(step), _) | (_, _, Err(step)) => return step,
+    };
+    let data_address = match data_address(machine, data) {
+        Ok(address) => address,
+        Err(step) => return step,
+    };
+    let memory_address = match memory_zero(machine) {
+        Ok(address) => address,
+        Err(step) => return step,
+    };
+    let segment = machine
+        .store
+        .data(data_address)
+        .cloned()
+        .unwrap_or_default();
+    let Some(end) = src
+        .checked_add(len)
+        .filter(|end| *end <= segment.len() as u64)
+    else {
+        return Step::Trap(Trap::MemoryOutOfBounds);
+    };
+    let bytes = &segment[src as usize..end as usize];
+    match machine.store.memory_mut(memory_address) {
+        Ok(memory) => match memory.write(dst, bytes) {
+            Ok(()) => Step::Continue,
+            Err(_) => Step::Trap(Trap::MemoryOutOfBounds),
+        },
+        Err(_) => Step::Trap(Trap::MemoryOutOfBounds),
+    }
+}
+
+/// `data.drop`: the segment is empty from now on.
+fn data_drop(machine: &mut Machine, data: u32) -> Step {
+    match data_address(machine, data) {
+        Ok(address) => {
+            machine.store.drop_data(address);
+            Step::Continue
+        }
+        Err(step) => step,
+    }
+}
+
+/// `memory.copy`: copy `len` bytes from `src` to `dst` in memory 0, where the two may overlap. Either
+/// range leaving the memory traps before anything is written.
+fn memory_copy(machine: &mut Machine) -> Step {
+    let (dst, src, len) = match (
+        pop_typed_i32(machine),
+        pop_typed_i32(machine),
+        pop_typed_i32(machine),
+    ) {
+        (Ok(len), Ok(src), Ok(dst)) => (dst as u32 as u64, src as u32 as u64, len as u32 as usize),
+        (Err(step), _, _) | (_, Err(step), _) | (_, _, Err(step)) => return step,
+    };
+    let memory_address = match memory_zero(machine) {
+        Ok(address) => address,
+        Err(step) => return step,
+    };
+    let memory = match machine.store.memory_mut(memory_address) {
+        Ok(memory) => memory,
+        Err(_) => return Step::Trap(Trap::MemoryOutOfBounds),
+    };
+    let bytes = match memory.read(src, len) {
+        Ok(bytes) => bytes.to_vec(),
+        Err(_) => return Step::Trap(Trap::MemoryOutOfBounds),
+    };
+    match memory.write(dst, &bytes) {
+        Ok(()) => Step::Continue,
+        Err(_) => Step::Trap(Trap::MemoryOutOfBounds),
+    }
+}
+
+/// `memory.fill`: set `len` bytes at `dst` in memory 0 to the low byte of `value`. The range is checked
+/// before anything is written.
+fn memory_fill(machine: &mut Machine) -> Step {
+    let (dst, value, len) = match (
+        pop_typed_i32(machine),
+        pop_typed_i32(machine),
+        pop_typed_i32(machine),
+    ) {
+        (Ok(len), Ok(value), Ok(dst)) => (dst as u32 as u64, value as u8, len as u32 as usize),
+        (Err(step), _, _) | (_, Err(step), _) | (_, _, Err(step)) => return step,
+    };
+    let memory_address = match memory_zero(machine) {
+        Ok(address) => address,
+        Err(step) => return step,
+    };
+    let memory = match machine.store.memory_mut(memory_address) {
+        Ok(memory) => memory,
+        Err(_) => return Step::Trap(Trap::MemoryOutOfBounds),
+    };
+    if memory.read(dst, len).is_err() {
+        return Step::Trap(Trap::MemoryOutOfBounds);
+    }
+    match memory.write(dst, &vec![value; len]) {
+        Ok(()) => Step::Continue,
+        Err(_) => Step::Trap(Trap::MemoryOutOfBounds),
+    }
+}
+
 fn memory_grow(machine: &mut Machine, index: u32) -> Step {
     let delta = match pop_typed_i32(machine) {
         Ok(value) => value as u32,
@@ -2013,6 +2140,7 @@ mod tests {
                 table_addrs: Vec::new(),
                 memory_addrs: Vec::new(),
                 global_addrs: vec![global],
+                data_addrs: Vec::new(),
             })
             .unwrap();
         let mut machine = Machine::with_store(store);
@@ -2130,6 +2258,7 @@ mod tests {
                 table_addrs: Vec::new(),
                 memory_addrs: vec![memory],
                 global_addrs: Vec::new(),
+                data_addrs: Vec::new(),
             })
             .unwrap();
         let mut machine = Machine::with_store(store);
@@ -2196,6 +2325,7 @@ mod tests {
                 table_addrs: Vec::new(),
                 memory_addrs: vec![memory],
                 global_addrs: Vec::new(),
+                data_addrs: Vec::new(),
             })
             .unwrap();
         let mut machine = Machine::with_store(store);
@@ -2317,6 +2447,7 @@ mod tests {
                 table_addrs: vec![],
                 memory_addrs: vec![],
                 global_addrs: vec![],
+                data_addrs: Vec::new(),
             })
             .unwrap();
         let table = store.allocate_table(RefType::FuncRef, 1, None).unwrap();
@@ -2369,6 +2500,7 @@ mod tests {
                 table_addrs: vec![],
                 memory_addrs: vec![],
                 global_addrs: vec![],
+                data_addrs: Vec::new(),
             })
             .unwrap();
         let mut machine = Machine::with_store(store);
