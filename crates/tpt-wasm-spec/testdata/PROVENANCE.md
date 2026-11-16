@@ -27,6 +27,8 @@ These files are copied unmodified from the WebAssembly specification repository:
 | `endianness.wast` | Core suite: the little-endian byte order of every load and store width. |
 | `load.wast`, `store.wast` | Core suite: the full MVP load and store instruction set, including zero- and sign-extension. |
 | `memory.wast` | Core suite: `memory.size`, `memory.grow`, and the active data segment forms, including the inline `(memory (data ...))` abbreviation. |
+| `data.wast` | Passive and active data segments, `memory.init`, data-segment bounds, and constant offsets. Vendored at the pinned revision and not yet registered as a suite: 54 directives fail on the interpreter, measured in the tracker. |
+| `token.wast` | Text-format tokenization: `assert_malformed` on text modules, and modules that must decode. Vendored at the pinned revision and not yet registered as a suite. |
 | `memory_size.wast` | Core suite: `memory.size` against declared minimum and maximum. |
 | `memory_trap.wast` | Core suite: out-of-bounds loads and stores at and around the memory limit. |
 | `memory_redundancy.wast` | Core suite: that a store is visible to the next load rather than to a stale copy. |
