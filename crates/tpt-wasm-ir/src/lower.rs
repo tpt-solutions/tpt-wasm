@@ -92,6 +92,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
                 value_type: global_type.value_type,
                 mutable: global_type.mutable,
                 init: None,
+                init_from: None,
                 import: Some(super::IrImportSource {
                     module: import.module.clone(),
                     name: import.name.clone(),
@@ -100,13 +101,18 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         }
     }
     for global in &module.globals {
+        let copied = global_copied_by(&global.init);
         globals.push(IrGlobal {
             value_type: global.global_type.value_type,
             mutable: global.global_type.mutable,
-            init: Some(read_const_expr(
-                &global.init,
-                global.global_type.value_type,
-            )?),
+            init: match copied {
+                Some(_) => None,
+                None => Some(read_const_expr(
+                    &global.init,
+                    global.global_type.value_type,
+                )?),
+            },
+            init_from: copied,
             import: None,
         });
     }
@@ -1509,6 +1515,19 @@ pub(crate) fn read_const_expr(
         return Err(LoweringError::UnsupportedFeature("global initializer"));
     }
     Ok(value)
+}
+
+/// The global a constant expression copies, when it is exactly `global.get` of one global.
+fn global_copied_by(expr: &tpt_wasm_format::ConstExpr) -> Option<u32> {
+    let mut reader = BodyReader::new(&expr.0);
+    if reader.byte().ok()? != 0x23 {
+        return None;
+    }
+    let index = reader.u32().ok()?;
+    if reader.byte().ok()? != 0x0b || reader.remaining() != 0 {
+        return None;
+    }
+    Some(index)
 }
 
 /// Lower an element segment's entries into the IR's table representation.

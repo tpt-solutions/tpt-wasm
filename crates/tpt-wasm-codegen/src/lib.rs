@@ -1758,6 +1758,10 @@ pub struct BaselineModule {
     /// function runs; a defined one is created here from its initializer. The
     /// list is in Wasm order, so a `global.get`/`global.set` needs no rebasing.
     globals: SharedGlobals,
+    /// How many leading globals are imports, whose handles the embedder supplies.
+    global_import_count: usize,
+    /// The globals whose initializer copies another global, as `(index, source)`, in index order.
+    deferred_globals: Vec<(usize, usize)>,
     /// The imported functions, in declaration order, that a `CallHost` names.
     imports: Vec<tpt_wasm_ir::IrImport>,
     /// The installed host boundary, absent until an embedder provides one.
@@ -2068,12 +2072,21 @@ impl BaselineModule {
                     .map(|initial| Arc::new(Mutex::new(initial)))
             })
             .collect();
+        let global_import_count = module.globals.iter().filter(|g| g.import.is_some()).count();
+        let deferred_globals: Vec<(usize, usize)> = module
+            .globals
+            .iter()
+            .enumerate()
+            .filter_map(|(index, global)| global.init_from.map(|source| (index, source as usize)))
+            .collect();
         Ok(Self {
             functions,
             table,
             types: module.types.clone(),
             memory,
             globals,
+            global_import_count,
+            deferred_globals,
             pending_imported_table,
             imports: module.imports.clone(),
             host: None,
@@ -2250,11 +2263,7 @@ impl BaselineModule {
     /// declared would otherwise leave a global silently reading nobody's value,
     /// or install the wrong global's handle.
     pub fn set_global_imports(&mut self, handles: Vec<SharedGlobal>) -> Result<(), CodegenError> {
-        let expected = self
-            .globals
-            .iter()
-            .take_while(|slot| slot.is_none())
-            .count();
+        let expected = self.global_import_count;
         if handles.len() != expected {
             return Err(CodegenError::UnsupportedMemory(
                 "the number of installed global imports does not match the module's",
@@ -2263,11 +2272,37 @@ impl BaselineModule {
         for (slot, handle) in self.globals.iter_mut().zip(handles) {
             *slot = Some(handle);
         }
-        // No `None` may survive: that would be a global whose value is nobody's.
-        if self.globals.iter().any(Option::is_none) {
-            return Err(CodegenError::UnsupportedMemory(
-                "a global import was declared but not installed",
-            ));
+        Ok(())
+    }
+
+    /// How many leading globals this module imports.
+    pub fn global_import_count(&self) -> usize {
+        self.global_import_count
+    }
+
+    /// The indices of the globals whose initializer copies another global. Their handles are created by
+    /// `resolve_deferred_globals`, once the imports are installed.
+    pub fn deferred_global_indices(&self) -> Vec<usize> {
+        self.deferred_globals
+            .iter()
+            .map(|(index, _)| *index)
+            .collect()
+    }
+
+    /// Give each deferred global its value: a copy of the value of the global its initializer names. The
+    /// copy is exact because the source is immutable. Sources are taken in index order, so a source that
+    /// is itself deferred already has its value when it is copied.
+    pub fn resolve_deferred_globals(&mut self) -> Result<(), CodegenError> {
+        for (index, source) in self.deferred_globals.clone() {
+            let handle = self.globals.get(source).cloned().flatten().ok_or(
+                CodegenError::UnsupportedMemory(
+                    "a global initializer copies a global that has no value yet",
+                ),
+            )?;
+            let value = lock_shared(&handle)
+                .map_err(|_| CodegenError::UnsupportedMemory("a copied global is locked"))?
+                .clone();
+            self.globals[index] = Some(Arc::new(Mutex::new(value)));
         }
         Ok(())
     }

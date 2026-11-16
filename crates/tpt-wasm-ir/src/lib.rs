@@ -121,6 +121,9 @@ pub struct IrGlobal {
     /// in the exporting instance. There is deliberately no placeholder value, so
     /// a bug that reads it cannot look like a global legitimately holding zero.
     pub init: Option<Value>,
+    /// The global this one's initializer copies, when it is initialized by `global.get` of another
+    /// global. Its value is known only once the module's imports are installed, so it is resolved then.
+    pub init_from: Option<u32>,
     /// Where this global is imported from, when it is imported rather than
     /// defined. `None` for a defined global, and the two are always exclusive.
     pub import: Option<IrImportSource>,

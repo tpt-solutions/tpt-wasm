@@ -1781,7 +1781,16 @@ fn instantiate_module(
             let handles = module.globals_handles();
             let mut registry = lock_baseline_globals(&context.baseline_globals)?;
             let mut installed = Vec::with_capacity(handles.len());
-            for (slot, address) in handles.into_iter().zip(baseline_global_addresses) {
+            let deferred = module.deferred_global_indices();
+            for (index, (slot, address)) in handles
+                .into_iter()
+                .zip(baseline_global_addresses.iter().copied())
+                .enumerate()
+            {
+                // A global initialized from another is created once the imports are in, below.
+                if deferred.contains(&index) {
+                    continue;
+                }
                 match slot {
                     Some(owned) => {
                         // A defined global: publish it so a reader or a later
@@ -1811,6 +1820,14 @@ fn instantiate_module(
             module.set_global_imports(installed).map_err(|_| {
                 RuntimeError::UnsupportedFeature("a global import in baseline mode")
             })?;
+            module.resolve_deferred_globals().map_err(codegen_error)?;
+            let resolved = module.globals_handles();
+            let mut registry = lock_baseline_globals(&context.baseline_globals)?;
+            for index in module.deferred_global_indices() {
+                if let Some(Some(owned)) = resolved.get(index) {
+                    registry.insert(baseline_global_addresses[index], Arc::clone(owned));
+                }
+            }
         }
     }
     if let Some(start) = start {
