@@ -1558,6 +1558,12 @@ fn instantiate_module(
                 })
                 .collect::<Result<_, _>>()?,
         };
+        // The whole segment must fit before any slot is written, as the specification's table
+        // initialization has it: an overflowing segment traps without writing part of itself.
+        let table_length = store.table_mut(table_address)?.elements.len() as u64;
+        if u64::from(start) + entries.len() as u64 > table_length {
+            return Err(RuntimeError::Trap(Trap::TableOutOfBounds));
+        }
         for (delta, function_index) in entries.into_iter().enumerate() {
             let value = match function_index {
                 // `ref.null`: the slot is left null, of the segment's element type.

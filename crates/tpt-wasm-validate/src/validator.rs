@@ -147,9 +147,6 @@ fn validate_limits(limits: &Limits, maximum: u64, kind: &str) -> Result<(), Vali
 }
 
 fn validate_table_type(table_type: &TableType) -> Result<(), ValidationError> {
-    if table_type.element_type != RefType::FuncRef {
-        return Err(ValidationError::UnsupportedFeature("non-funcref table"));
-    }
     validate_limits(&table_type.limits, u64::from(u32::MAX), "table")
 }
 
@@ -224,8 +221,15 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
         validate_const_expr(&global.init, global.global_type.value_type, context, true)?;
     }
     for element in &module.elements {
-        if element.element_type != RefType::FuncRef {
-            return Err(ValidationError::UnsupportedFeature("non-funcref element"));
+        // A plain index list spells only function references, so it cannot initialize an
+        // `externref` segment; that segment's entries are constant expressions.
+        if element.element_type == RefType::ExternRef
+            && matches!(element.init, ElementInit::FuncIndices(_))
+        {
+            return Err(ValidationError::TypeMismatch {
+                expected: "externref entries".into(),
+                actual: "function indices".into(),
+            });
         }
         let ElementModeDetails {
             table_index,
@@ -251,8 +255,15 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
             }
         };
         if let Some(table_index) = table_index {
-            if table_index as usize >= context.table_types.len() {
-                return Err(ValidationError::UnknownTable(table_index));
+            let table_type = context
+                .table_types
+                .get(table_index as usize)
+                .ok_or(ValidationError::UnknownTable(table_index))?;
+            if table_type.element_type != element.element_type {
+                return Err(ValidationError::TypeMismatch {
+                    expected: format!("{:?} table", table_type.element_type),
+                    actual: format!("{:?} segment", element.element_type),
+                });
             }
         }
         if let Some(offset) = offset {

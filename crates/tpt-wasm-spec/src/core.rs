@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 
 use tpt_wasm_runtime::{Config, Engine, EngineMode, HostFunction, Instance, RuntimeError};
-use tpt_wasm_types::{FunctionType, ResultType, Trap, Value, ValueType};
+use tpt_wasm_types::{FunctionType, RefValue, ReferenceType, ResultType, Trap, Value, ValueType};
 
 /// The `spectest` print functions, as `(name, parameter types)`.
 ///
@@ -148,7 +148,7 @@ const SPECTEST_MEMORY: &[u8] = &[
     0x07, 0x0a, 0x01, 0x06, b'm', b'e', b'm', b'o', b'r', b'y', 0x02, 0x00, // export "memory"
 ];
 
-use wast::core::{NanPattern, WastArgCore, WastRetCore};
+use wast::core::{AbstractHeapType, HeapType, NanPattern, WastArgCore, WastRetCore};
 use wast::parser::ParseBuffer;
 use wast::token::{F32, F64};
 use wast::{Wast, WastArg, WastDirective, WastExecute, WastRet};
@@ -477,6 +477,8 @@ fn to_value(arg: &WastArg<'_>) -> Result<Value, String> {
         WastArgCore::I64(value) => Ok(Value::I64(*value)),
         WastArgCore::F32(value) => Ok(Value::F32(value.bits)),
         WastArgCore::F64(value) => Ok(Value::F64(value.bits)),
+        WastArgCore::RefNull(heap) => Ok(Value::Ref(RefValue::Null(reference_type(heap)?))),
+        WastArgCore::RefExtern(value) => Ok(Value::Ref(RefValue::ExternRef(u64::from(*value)))),
         other => Err(format!("unsupported argument value: {other:?}")),
     }
 }
@@ -518,6 +520,29 @@ fn check_one(value: &Value, expected: &WastRetCore<'_>) -> Result<(), String> {
             Value::F64(bits) => check_f64(*bits, pattern),
             _ => Err(format!("expected an f64 result, got {value:?}")),
         },
+        WastRetCore::RefNull(heap) => match (value, heap) {
+            (Value::Ref(RefValue::Null(actual)), Some(heap)) => {
+                let want = reference_type(heap).map_err(|reason| reason.to_string())?;
+                if *actual == want {
+                    Ok(())
+                } else {
+                    Err(format!("expected a null {want:?}, got {value:?}"))
+                }
+            }
+            (Value::Ref(RefValue::Null(_)), None) => Ok(()),
+            _ => Err(format!("expected a null reference, got {value:?}")),
+        },
+        WastRetCore::RefExtern(expected) => match (value, expected) {
+            (Value::Ref(RefValue::ExternRef(got)), Some(want)) if *got == u64::from(*want) => {
+                Ok(())
+            }
+            (Value::Ref(RefValue::ExternRef(_)), None) => Ok(()),
+            _ => Err(format!("expected an extern reference, got {value:?}")),
+        },
+        WastRetCore::RefFunc(None) => match value {
+            Value::Ref(RefValue::FuncRef(_)) => Ok(()),
+            _ => Err(format!("expected a non-null funcref, got {value:?}")),
+        },
         WastRetCore::Either(alternatives) => {
             for alternative in alternatives {
                 if check_one(value, alternative).is_ok() {
@@ -530,6 +555,22 @@ fn check_one(value: &Value, expected: &WastRetCore<'_>) -> Result<(), String> {
             ))
         }
         other => Err(format!("unsupported expected result: {other:?}")),
+    }
+}
+
+/// The reference type a heap type names. Only the two abstract heap types of the
+/// reference-types proposal are supported here.
+fn reference_type(heap: &HeapType<'_>) -> Result<ReferenceType, String> {
+    match heap {
+        HeapType::Abstract {
+            ty: AbstractHeapType::Func,
+            ..
+        } => Ok(ReferenceType::FuncRef),
+        HeapType::Abstract {
+            ty: AbstractHeapType::Extern,
+            ..
+        } => Ok(ReferenceType::ExternRef),
+        other => Err(format!("unsupported heap type: {other:?}")),
     }
 }
 
