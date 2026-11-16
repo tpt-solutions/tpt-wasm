@@ -3,6 +3,7 @@
 
 //! Structural and type verification for the current TPT IR slice.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -14,6 +15,11 @@ use crate::{lower_module, LoweringError};
 /// Errors found while verifying a lowered IR module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationError {
+    /// The verifier would have done more work than its budget allows. Verification time is bounded
+    /// by this limit, not by the shape of the module.
+    WorkBudgetExceeded {
+        limit: u64,
+    },
     DuplicateValue(ValueId),
     MissingBlock(super::BlockId),
     DuplicateBlock(super::BlockId),
@@ -152,18 +158,59 @@ impl std::error::Error for LowerAndVerifyError {}
 pub fn lower_and_verify(
     validated: &tpt_wasm_validate::ValidatedModule,
 ) -> Result<VerifiedIrModule, LowerAndVerifyError> {
+    lower_and_verify_within(validated, DEFAULT_VERIFICATION_WORK)
+}
+
+/// Lower and verify a module, refusing it if verification would do more than `limit` units of work.
+pub fn lower_and_verify_within(
+    validated: &tpt_wasm_validate::ValidatedModule,
+    limit: u64,
+) -> Result<VerifiedIrModule, LowerAndVerifyError> {
     let module = lower_module(validated).map_err(LowerAndVerifyError::Lowering)?;
-    let certificate = verify_module(&module).map_err(LowerAndVerifyError::Verification)?;
+    let certificate =
+        verify_module_within(&module, limit).map_err(LowerAndVerifyError::Verification)?;
     Ok(VerifiedIrModule {
         module,
         certificate,
     })
 }
 
-/// Verify value definitions, instruction types, control flow, and returns.
+/// The default work budget of the verifier, in units. A unit is one step of the dominator fixpoint
+/// or of an intersection, one definition a block is checked against, or one dominance query.
+pub const DEFAULT_VERIFICATION_WORK: u64 = 50_000_000;
+
+/// The verifier's running count of work, against its limit.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    limit: u64,
+    spent: u64,
+}
+
+impl Budget {
+    fn spend(&mut self, units: u64) -> Result<(), VerificationError> {
+        self.spent = self.spent.saturating_add(units);
+        if self.spent > self.limit {
+            Err(VerificationError::WorkBudgetExceeded { limit: self.limit })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Verify value definitions, instruction types, control flow, and returns, within
+/// [`DEFAULT_VERIFICATION_WORK`].
 pub fn verify_module(module: &IrModule) -> Result<IrVerificationCertificate, VerificationError> {
+    verify_module_within(module, DEFAULT_VERIFICATION_WORK)
+}
+
+/// Verify a module, refusing it if the verifier would do more than `limit` units of work.
+pub fn verify_module_within(
+    module: &IrModule,
+    limit: u64,
+) -> Result<IrVerificationCertificate, VerificationError> {
+    let mut budget = Budget { limit, spent: 0 };
     for (function_index, function) in module.functions.iter().enumerate() {
-        verify_function(function, function_index, module)?;
+        verify_function(function, function_index, module, &mut budget)?;
     }
     Ok(IrVerificationCertificate { _private: () })
 }
@@ -172,11 +219,12 @@ fn verify_function(
     function: &super::IrFunction,
     function_index: usize,
     module: &IrModule,
+    budget: &mut Budget,
 ) -> Result<(), VerificationError> {
     let values = value_types(&function.values)?;
     let order = verify_blocks(function, function_index)?;
     verify_parameters(function, function_index, &values)?;
-    let scope = verify_dominance(function, function_index, &order)?;
+    let scope = verify_dominance(function, function_index, &order, budget)?;
 
     // Within a block, operands must already be defined. Cross-block visibility
     // comes from dominance: a block sees every value defined in a block that
@@ -188,6 +236,30 @@ fn verify_function(
     // storage that `local.set` re-assigns, so "the constant this value held at
     // its definition" is not a property the value still has. A constant is
     // immutable by construction, so the claim stays true wherever it is read.
+    let entry_block = function
+        .blocks
+        .iter()
+        .position(|block| block.id == function.entry)
+        .ok_or(VerificationError::MissingBlock(function.entry))?;
+    let mut defs_in_block: Vec<Vec<ValueId>> = vec![Vec::new(); function.blocks.len()];
+    for (id, defining) in &scope.def_block {
+        defs_in_block[*defining].push(*id);
+    }
+    // For each block, the nearest strict dominator that defines a value. Walking these links visits
+    // only the dominators that contribute to the block's visible values, so a deep run of blocks that
+    // define nothing costs a constant amount per block. Parents come before children in `order`.
+    let mut nearest_defining_ancestor = vec![usize::MAX; function.blocks.len()];
+    for &block in &order {
+        let parent = scope.dominators.idom[block];
+        if block == entry_block || parent == usize::MAX {
+            continue;
+        }
+        nearest_defining_ancestor[block] = if defs_in_block[parent].is_empty() {
+            nearest_defining_ancestor[parent]
+        } else {
+            parent
+        };
+    }
     let mut constants: HashMap<ValueId, i32> = HashMap::new();
     for block in &function.blocks {
         for instruction in &block.instrs {
@@ -214,10 +286,16 @@ fn verify_function(
         // by the time control reaches this one. The block's own results are not
         // pre-seeded, so using one before the instruction that defines it in this
         // same block is still caught below.
-        for (id, defining) in &scope.def_block {
-            if *defining != block_index && scope.dominators.dominates(*defining, block_index) {
-                defined.insert(*id);
-            }
+        // Those are the definitions of the blocks on the immediate-dominator chain above this one,
+        // which is what `dominates` would say for each of them, reached directly. The walk is as
+        // long as the tree is deep, not as long as the function has definitions, so a deep nest
+        // costs what its depth costs and no more.
+        let mut ancestor = nearest_defining_ancestor[block_index];
+        while ancestor != usize::MAX {
+            let inherited = &defs_in_block[ancestor];
+            budget.spend(1 + inherited.len() as u64)?;
+            defined.extend(inherited.iter().copied());
+            ancestor = nearest_defining_ancestor[ancestor];
         }
         for instruction in &block.instrs {
             verify_instruction(
@@ -236,6 +314,7 @@ fn verify_function(
             &defined,
             &function.function_type.results.0,
         )?;
+        budget.spend(scope.dominators.steps.take())?;
     }
 
     // Every edge in the function must name values that exist, whether or not the
@@ -467,6 +546,8 @@ fn incoming_arity(terminator: &super::Terminator, target_id: super::BlockId) -> 
 struct Dominators {
     idom: Vec<usize>,
     depth: Vec<usize>,
+    /// Steps taken by [`Dominators::dominates`] since the last charge to the budget.
+    steps: Cell<u64>,
 }
 
 impl Dominators {
@@ -477,6 +558,7 @@ impl Dominators {
     fn dominates(&self, ancestor: usize, node: usize) -> bool {
         let mut current = node;
         for _ in 0..=self.depth.len() {
+            self.steps.set(self.steps.get().saturating_add(1));
             if current == ancestor {
                 return true;
             }
@@ -503,7 +585,9 @@ fn compute_dominators(
     entry: usize,
     order: &[usize],
     predecessors: &[Vec<usize>],
-) -> Dominators {
+    budget: &mut Budget,
+) -> Result<Dominators, VerificationError> {
+    let edges: u64 = predecessors.iter().map(|list| list.len() as u64).sum();
     let count = function.blocks.len();
     let mut position = vec![usize::MAX; count];
     for (rank, index) in order.iter().enumerate() {
@@ -515,6 +599,7 @@ fn compute_dominators(
     // backstop so a malformed graph can never spin here.
     for _ in 0..=count {
         let mut changed = false;
+        let mut steps = 0u64;
         for &block in order {
             if block == entry {
                 continue;
@@ -526,7 +611,7 @@ fn compute_dominators(
                 }
                 candidate = match candidate {
                     usize::MAX => predecessor,
-                    current => intersect(&idom, &position, current, predecessor),
+                    current => intersect(&idom, &position, current, predecessor, &mut steps),
                 };
             }
             if candidate != usize::MAX && idom[block] != candidate {
@@ -534,6 +619,7 @@ fn compute_dominators(
                 changed = true;
             }
         }
+        budget.spend(edges + order.len() as u64 + steps)?;
         if !changed {
             break;
         }
@@ -546,7 +632,11 @@ fn compute_dominators(
             depth[block] = depth[idom[block]] + 1;
         }
     }
-    Dominators { idom, depth }
+    Ok(Dominators {
+        idom,
+        depth,
+        steps: Cell::new(0),
+    })
 }
 
 /// Intersect two dominator paths, walking whichever is later in postorder up
@@ -554,9 +644,16 @@ fn compute_dominators(
 ///
 /// Both walks are bounded by the number of blocks. The entry dominates itself,
 /// so a cycle through it must stop there rather than follow `idom` forever.
-fn intersect(idom: &[usize], position: &[usize], mut a: usize, mut b: usize) -> usize {
+fn intersect(
+    idom: &[usize],
+    position: &[usize],
+    mut a: usize,
+    mut b: usize,
+    steps: &mut u64,
+) -> usize {
     for _ in 0..=idom.len() {
         while a != b && position[a] > position[b] {
+            *steps += 1;
             let next = idom[a];
             if next == usize::MAX || next == a {
                 return b;
@@ -564,6 +661,7 @@ fn intersect(idom: &[usize], position: &[usize], mut a: usize, mut b: usize) -> 
             a = next;
         }
         while a != b && position[b] > position[a] {
+            *steps += 1;
             let next = idom[b];
             if next == usize::MAX || next == b {
                 return a;
@@ -591,6 +689,7 @@ fn verify_dominance(
     function: &super::IrFunction,
     function_index: usize,
     order: &[usize],
+    budget: &mut Budget,
 ) -> Result<Scope, VerificationError> {
     let values = value_types(&function.values)?;
     let entry = function
@@ -599,7 +698,13 @@ fn verify_dominance(
         .position(|block| block.id == function.entry)
         .ok_or(VerificationError::MissingBlock(function.entry))?;
     let successors = resolve_successors(function)?;
-    let dominators = compute_dominators(function, entry, order, &predecessor_lists(&successors));
+    let dominators = compute_dominators(
+        function,
+        entry,
+        order,
+        &predecessor_lists(&successors),
+        budget,
+    )?;
 
     // Record the defining block of every value. Parameters and locals are
     // entry-block values; block parameters and instruction results are defined
@@ -642,6 +747,7 @@ fn verify_dominance(
         }
         used_here.extend(terminator_operands(&block.terminator));
         for used in used_here {
+            budget.spend(1)?;
             let defining = *def_block
                 .get(&used)
                 .ok_or(VerificationError::UndefinedValue(used))?;

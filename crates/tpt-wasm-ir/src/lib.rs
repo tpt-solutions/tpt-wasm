@@ -29,8 +29,9 @@ pub use verify::{instruction_operands, instruction_results, terminator_operands}
 
 pub use lower::{const_expr_i32, lower_module, LoweringError};
 pub use verify::{
-    lower_and_verify, verify_module, IrVerificationCertificate, LowerAndVerifyError,
-    VerificationError, VerifiedIrModule,
+    lower_and_verify, lower_and_verify_within, verify_module, verify_module_within,
+    IrVerificationCertificate, LowerAndVerifyError, VerificationError, VerifiedIrModule,
+    DEFAULT_VERIFICATION_WORK,
 };
 
 /// A lowered module.
