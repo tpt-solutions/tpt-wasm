@@ -60,7 +60,7 @@ pub fn compile(
                 format!("verification: {error}")
             }
         };
-        RuntimeError::UnsupportedFeature(Box::leak(format!("optimizing {reason}").into_boxed_str()))
+        RuntimeError::Refused(format!("optimizing {reason}"))
     })?;
 
     let level = level_for(config);
@@ -70,7 +70,7 @@ pub fn compile(
         // checks. It is surfaced with its detail rather than collapsed, because
         // "the optimizer produced bad IR" is the single most important thing an
         // embedder running this mode could learn.
-        RuntimeError::UnsupportedFeature(Box::leak(format!("optimizing: {error}").into_boxed_str()))
+        RuntimeError::Refused(format!("optimizing: {error}"))
     })?;
 
     // The optimization contract is checked on every compilation, not only in
@@ -79,11 +79,7 @@ pub fn compile(
     // reordered a host call fails at instantiation rather than at the call that
     // happened to notice.
     tpt_wasm_opt::contract::verify_contract(verified.module(), outcome.module()).map_err(
-        |violation| {
-            RuntimeError::UnsupportedFeature(Box::leak(
-                format!("optimization contract: {violation}").into_boxed_str(),
-            ))
-        },
+        |violation| RuntimeError::Refused(format!("optimization contract: {violation}")),
     )?;
 
     Ok(Some(outcome.into_parts().0))

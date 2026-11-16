@@ -181,6 +181,9 @@ pub enum RuntimeError {
     /// A debug session has returned or trapped, so it takes no further steps.
     DebugSessionFinished,
     UnsupportedFeature(&'static str),
+    /// A module the engine refuses in this mode, with the reason. The reason is built at the point of
+    /// refusal, so it is owned rather than a static string.
+    Refused(String),
     Validation(ValidationError),
     Decode(DecodeError),
     Io(std::io::Error),
@@ -220,6 +223,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedFeature(feature) => write!(f, "unsupported feature: {feature}"),
+            Self::Refused(reason) => write!(f, "refused: {reason}"),
             Self::Validation(error) => write!(f, "validation error: {error}"),
             Self::Decode(error) => write!(f, "decode error: {error}"),
             Self::Io(error) => write!(f, "I/O error: {error}"),
@@ -1107,13 +1111,8 @@ fn compile_ir(
                     format!("verification: {error}")
                 }
             };
-            // Leaked because the error variant holds a `&'static str` and the message
-            // is assembled here. These are one-off instantiation failures, not a hot
-            // path, and the alternative is widening a public error type to own a
             // `String` for every caller.
-            RuntimeError::UnsupportedFeature(Box::leak(
-                format!("baseline {reason}").into_boxed_str(),
-            ))
+            RuntimeError::Refused(format!("baseline {reason}"))
         })?;
 
     let ir = match optimizing::compile(validated, config)? {
@@ -1136,11 +1135,8 @@ fn compile_ir(
 /// skips the optimizer and still builds a fresh backend module, because the
 /// backend owns each instance's memory, table, and global handles.
 fn lower_baseline(ir: &IrModule) -> Result<tpt_wasm_codegen::BaselineModule, RuntimeError> {
-    let compiled = tpt_wasm_codegen::BaselineModule::lower(ir).map_err(|error| {
-        RuntimeError::UnsupportedFeature(Box::leak(
-            format!("baseline code generation: {error:?}").into_boxed_str(),
-        ))
-    })?;
+    let compiled = tpt_wasm_codegen::BaselineModule::lower(ir)
+        .map_err(|error| RuntimeError::Refused(format!("baseline code generation: {error:?}")))?;
     // The host boundary is installed by `instantiate_module`, once the imports
     // have been resolved to callbacks. Until then a `CallHost` traps, so a
     // compiled module cannot reach outside itself by accident.

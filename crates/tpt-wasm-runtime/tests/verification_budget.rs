@@ -67,7 +67,7 @@ fn a_module_over_the_budget_is_refused_by_the_compiled_tier_with_the_budget_name
         .instantiate_bytes(&module)
         .expect_err("the verifier's budget is smaller than the module's work");
     match error {
-        RuntimeError::UnsupportedFeature(message) => assert!(
+        RuntimeError::Refused(message) => assert!(
             message.contains("WorkBudgetExceeded") && message.contains("1000"),
             "the refusal names the budget: {message}"
         ),
