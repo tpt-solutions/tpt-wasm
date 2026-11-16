@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use tpt_wasm_capability::{CapabilityId, CapabilitySet, Operation};
 use tpt_wasm_format::{ExportDesc, ImportDesc};
-use tpt_wasm_runtime::{Engine, HostFunction, Instance, Linker, MemoryView};
+use tpt_wasm_runtime::{Caller, Engine, HostFunction, Instance, Linker, MemoryView};
 use tpt_wasm_types::{FunctionType, GuestMemory, ResultType, Value, ValueType};
 
 /// The component preamble: the magic, then version `0x0d` and layer `0x01`.
@@ -515,7 +515,13 @@ pub enum CoreFunction {
     Alias { instance: u32, export: String },
     /// A component import, lowered so that core code can call it. A lower may name a memory, which
     /// the host function reads the strings and lists it is given from.
-    Lowered { function: u32, memory: Option<u32> },
+    Lowered {
+        function: u32,
+        memory: Option<u32>,
+        /// The export name of the `realloc` a string or list result is allocated through, in the instance
+        /// that the memory belongs to.
+        realloc: Option<String>,
+    },
 }
 
 /// One entry of the core memory index space: an export of a core instance, named by an alias.
@@ -893,7 +899,11 @@ impl Component {
                                         export: source_export.clone(),
                                     }
                                 }
-                                CoreFunction::Lowered { function, memory } => {
+                                CoreFunction::Lowered {
+                                    function,
+                                    memory,
+                                    realloc,
+                                } => {
                                     let instantiate =
                                         |message: String| ComponentError::Instantiate {
                                             instance: index,
@@ -918,6 +928,12 @@ impl Component {
                                                 .memory_view(&named.export)
                                                 .map_err(|error| instantiate(error.to_string()))?,
                                         );
+                                        if let Some(name) = realloc {
+                                            host.realloc =
+                                                Some(provider.get_function(name).map_err(
+                                                    |error| instantiate(error.to_string()),
+                                                )?);
+                                        }
                                     }
                                     Target::Host(host)
                                 }
@@ -1127,18 +1143,12 @@ impl Component {
         let declared = self
             .func_type(*ty)
             .ok_or_else(|| format!("the import {name} is not a function"))?;
-        // A result that holds a string or a list, or that flattens to more than one value, is
-        // returned through memory, which a lowered import cannot write. Strings and lists among the
-        // parameters are read through the memory the lower names, which the caller attaches.
-        if declared
-            .result
-            .iter()
-            .any(|ty| holds_string(ty) || holds_list(ty))
-        {
-            return Err(format!("the import {name} returns a string or a list"));
-        }
+        // A result that flattens to more than one value, and is not a string or list, is returned
+        // through memory in a form this host does not write.
         if let Some(result) = &declared.result {
-            if flat_of(result, &self.types).len() > MAX_FLAT_RESULTS {
+            if !(holds_string(result) || holds_list(result))
+                && flat_of(result, &self.types).len() > MAX_FLAT_RESULTS
+            {
                 return Err(format!("the import {name} returns a value through memory"));
             }
         }
@@ -1150,6 +1160,7 @@ impl Component {
             types: self.types.clone(),
             capabilities: imports.capabilities.clone(),
             memory: None,
+            realloc: None,
         })
     }
 }
@@ -1655,8 +1666,11 @@ struct LoweredHost {
     result: Option<ComponentType>,
     types: Vec<ComponentTypeDef>,
     capabilities: Option<Arc<Mutex<CapabilitySet>>>,
-    /// The memory the lower names, which the strings and lists of the arguments are read from.
+    /// The memory the lower names, which the strings and lists of the arguments are read from when no
+    /// instance is running.
     memory: Option<MemoryView>,
+    /// The store address of the `realloc` a string or list result is allocated through.
+    realloc: Option<u32>,
 }
 
 /// The two core words a string or a list takes as an argument: its pointer and its length.
@@ -1668,17 +1682,39 @@ fn two_words(values: &mut std::slice::Iter<'_, Value>) -> Result<(u32, u32), Str
     Ok((word()?, word()?))
 }
 
+/// Whether a result is returned through memory: a string or a list is, as two words the caller
+/// names a pointer for, rather than as flat values.
+fn returns_through_memory(ty: &ComponentType) -> bool {
+    holds_string(ty) || holds_list(ty)
+}
+
 impl LoweredHost {
-    /// The bytes of `length` at `pointer` in the named memory. A range outside the memory, or a
-    /// memory no view was given, is an error that says which.
-    fn read_guest(&self, pointer: u32, length: u64) -> Result<Vec<u8>, String> {
-        let memory = self.memory.as_ref().ok_or_else(|| {
-            format!(
-                "the import {} takes a string or a list, so its lower needs a memory option",
-                self.name
-            )
-        })?;
-        memory.read(u64::from(pointer), length).ok_or_else(|| {
+    fn no_memory(&self) -> String {
+        format!(
+            "the import {} needs a memory, which its lower does not name",
+            self.name
+        )
+    }
+
+    /// The bytes at `pointer`, from the calling instance's memory during a call, or from the named
+    /// memory when no instance is running.
+    fn read_guest(
+        &self,
+        caller: &mut Option<&mut dyn Caller>,
+        pointer: u32,
+        length: u64,
+    ) -> Result<Vec<u8>, String> {
+        let bytes = match caller.as_mut() {
+            Some(caller) => {
+                let memory = caller.memory().ok_or_else(|| self.no_memory())?;
+                GuestMemory::read(memory, u64::from(pointer), length)
+            }
+            None => {
+                let memory = self.memory.as_ref().ok_or_else(|| self.no_memory())?;
+                GuestMemory::read(memory, u64::from(pointer), length)
+            }
+        };
+        bytes.ok_or_else(|| {
             format!(
                 "the import {} was given bytes outside its memory, or the memory is in use by a running call",
                 self.name
@@ -1686,18 +1722,47 @@ impl LoweredHost {
         })
     }
 
-    /// A UTF-8 string argument, read from the named memory.
-    fn read_text(&self, pointer: u32, length: u32) -> Result<String, String> {
+    /// Write `bytes` at `pointer`, to the same memory `read_guest` reads.
+    fn write_guest(
+        &self,
+        caller: &mut Option<&mut dyn Caller>,
+        pointer: u32,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let written = match caller.as_mut() {
+            Some(caller) => {
+                let memory = caller.memory().ok_or_else(|| self.no_memory())?;
+                GuestMemory::write(memory, u64::from(pointer), bytes)
+            }
+            None => {
+                let mut memory = self.memory.clone().ok_or_else(|| self.no_memory())?;
+                GuestMemory::write(&mut memory, u64::from(pointer), bytes)
+            }
+        };
+        if written {
+            Ok(())
+        } else {
+            Err(format!("the import {} wrote outside its memory", self.name))
+        }
+    }
+
+    fn read_text(
+        &self,
+        caller: &mut Option<&mut dyn Caller>,
+        pointer: u32,
+        length: u32,
+    ) -> Result<String, String> {
         if u64::from(length) > MAX_STRING_BYTE_LENGTH as u64 {
             return Err("a string argument is too long for the canonical ABI".to_owned());
         }
-        let bytes = self.read_guest(pointer, u64::from(length))?;
+        let bytes = self.read_guest(caller, pointer, u64::from(length))?;
         String::from_utf8(bytes).map_err(|_| "a string argument is not valid UTF-8".to_owned())
     }
 
-    /// A list of scalars, read element by element from the named memory.
+    /// A list of scalars, read element by element.
     fn read_list(
         &self,
+        caller: &mut Option<&mut dyn Caller>,
         index: u32,
         pointer: u32,
         count: u32,
@@ -1713,25 +1778,103 @@ impl LoweredHost {
         if length > MAX_STRING_BYTE_LENGTH as u64 {
             return Err("a list argument is too long for the canonical ABI".to_owned());
         }
-        let bytes = self.read_guest(pointer, length)?;
+        let bytes = self.read_guest(caller, pointer, length)?;
         bytes
             .chunks_exact(size)
             .map(|element| scalar_from_bytes(*scalar, element))
             .collect()
     }
-}
 
-impl fmt::Debug for LoweredHost {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LoweredHost({})", self.name)
+    /// Allocate `size` bytes aligned to `align` in the calling instance, through its `realloc`. A
+    /// string or list result cannot be lowered without a calling instance, so this fails without one.
+    fn allocate(
+        &self,
+        caller: &mut Option<&mut dyn Caller>,
+        size: u32,
+        align: u32,
+    ) -> Result<u32, String> {
+        let realloc = self.realloc.ok_or_else(|| {
+            format!(
+                "the import {} returns a string or a list, so its lower needs a realloc option",
+                self.name
+            )
+        })?;
+        let caller = caller.as_mut().ok_or_else(|| {
+            format!(
+                "the import {} returns a string or a list, which needs a calling instance",
+                self.name
+            )
+        })?;
+        let results = caller.call(
+            realloc,
+            vec![
+                Value::I32(0),
+                Value::I32(0),
+                Value::I32(align as i32),
+                Value::I32(size as i32),
+            ],
+        )?;
+        match results.as_slice() {
+            [Value::I32(pointer)] => Ok(*pointer as u32),
+            _ => Err("realloc did not return one i32".to_owned()),
+        }
     }
-}
 
-impl LoweredHost {
-    /// Lift the core values into the parameters, run the embedder's function, and lower its
-    /// result back to core values. Parameters and results pass directly, so none of them needs
-    /// memory.
-    fn invoke(&self, args: &[Value]) -> Result<Vec<Value>, String> {
+    /// Lower a result to its flat values. A string or list is written into memory allocated for it,
+    /// and lowers to its pointer and length.
+    fn lower_result(
+        &self,
+        caller: &mut Option<&mut dyn Caller>,
+        value: &ComponentValue,
+        ty: &ComponentType,
+    ) -> Result<Vec<Value>, String> {
+        match (value, ty) {
+            (ComponentValue::String(text), _) => {
+                let bytes = text.as_bytes();
+                let pointer = self.allocate(caller, bytes.len() as u32, 1)?;
+                self.write_guest(caller, pointer, bytes)?;
+                Ok(vec![
+                    Value::I32(pointer as i32),
+                    Value::I32(bytes.len() as i32),
+                ])
+            }
+            (ComponentValue::List(items), ComponentType::List(index)) => {
+                let Some(ComponentTypeDef::List(scalar)) = self.types.get(*index as usize) else {
+                    return Err("the list is not defined".to_owned());
+                };
+                let (size, align) = scalar.size_and_align();
+                let mut bytes = vec![0u8; items.len() * size];
+                for (position, item) in items.iter().enumerate() {
+                    store(
+                        item,
+                        &ComponentType::Scalar(*scalar),
+                        &self.types,
+                        &mut bytes,
+                        position * size,
+                    )?;
+                }
+                let pointer = self.allocate(caller, bytes.len() as u32, align as u32)?;
+                self.write_guest(caller, pointer, &bytes)?;
+                Ok(vec![
+                    Value::I32(pointer as i32),
+                    Value::I32(items.len() as i32),
+                ])
+            }
+            _ => {
+                let mut lowered = Vec::new();
+                lower_flats(value, ty, &self.types, &mut lowered)?;
+                Ok(lowered)
+            }
+        }
+    }
+
+    /// Lift the core values into the parameters, run the embedder's function, and lower its result.
+    /// A string or list result is written through the return pointer the caller passes last.
+    fn invoke(
+        &self,
+        args: &[Value],
+        mut caller: Option<&mut dyn Caller>,
+    ) -> Result<Vec<Value>, String> {
         // The grant is checked on every call, so a revoked import stops working at once.
         authorize_call(self.capabilities.as_ref(), &self.name)?;
         let mut remaining = args.iter();
@@ -1740,17 +1883,36 @@ impl LoweredHost {
             match ty {
                 ComponentType::Scalar(Scalar::String) => {
                     let (pointer, length) = two_words(&mut remaining)?;
-                    values.push(ComponentValue::String(self.read_text(pointer, length)?));
+                    values.push(ComponentValue::String(self.read_text(
+                        &mut caller,
+                        pointer,
+                        length,
+                    )?));
                 }
                 ComponentType::List(index) => {
                     let (pointer, count) = two_words(&mut remaining)?;
-                    values.push(ComponentValue::List(
-                        self.read_list(*index, pointer, count)?,
-                    ));
+                    values.push(ComponentValue::List(self.read_list(
+                        &mut caller,
+                        *index,
+                        pointer,
+                        count,
+                    )?));
                 }
                 _ => values.push(lift_flats(&mut remaining, ty, &self.types)?),
             }
         }
+        let return_pointer = match self.result.as_ref() {
+            Some(ty) if returns_through_memory(ty) => match remaining.next() {
+                Some(Value::I32(pointer)) => Some(*pointer as u32),
+                _ => {
+                    return Err(format!(
+                        "the import {} was not given its return pointer",
+                        self.name
+                    ))
+                }
+            },
+            _ => None,
+        };
         if remaining.next().is_some() {
             return Err(format!(
                 "the import {} was given more core values than its type has",
@@ -1761,9 +1923,21 @@ impl LoweredHost {
         match (self.result.as_ref(), results.as_slice()) {
             (None, []) => Ok(Vec::new()),
             (Some(ty), [value]) if value_matches(value, ty, &self.types) => {
-                let mut lowered = Vec::new();
-                lower_flats(value, ty, &self.types, &mut lowered)?;
-                Ok(lowered)
+                let lowered = self.lower_result(&mut caller, value, ty)?;
+                match return_pointer {
+                    Some(pointer) => {
+                        let [Value::I32(ptr), Value::I32(len)] = lowered.as_slice() else {
+                            return Err("a result through memory lowered to other than two words"
+                                .to_owned());
+                        };
+                        let mut words = Vec::with_capacity(8);
+                        words.extend_from_slice(&(*ptr as u32).to_le_bytes());
+                        words.extend_from_slice(&(*len as u32).to_le_bytes());
+                        self.write_guest(&mut caller, pointer, &words)?;
+                        Ok(Vec::new())
+                    }
+                    None => Ok(lowered),
+                }
             }
             _ => Err(format!(
                 "the import {} returned values that do not match its type",
@@ -1773,26 +1947,43 @@ impl LoweredHost {
     }
 }
 
+impl fmt::Debug for LoweredHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LoweredHost({})", self.name)
+    }
+}
+
 impl HostFunction for LoweredHost {
     fn function_type(&self) -> FunctionType {
+        let mut params: Vec<ValueType> = self
+            .params
+            .iter()
+            .flat_map(|ty| flat_of(ty, &self.types))
+            .collect();
+        let results = match self.result.as_ref() {
+            Some(ty) if returns_through_memory(ty) => {
+                params.push(ValueType::I32);
+                Vec::new()
+            }
+            Some(ty) => flat_of(ty, &self.types),
+            None => Vec::new(),
+        };
         FunctionType {
-            params: ResultType(
-                self.params
-                    .iter()
-                    .flat_map(|ty| flat_of(ty, &self.types))
-                    .collect(),
-            ),
-            results: ResultType(
-                self.result
-                    .as_ref()
-                    .map(|ty| flat_of(ty, &self.types))
-                    .unwrap_or_default(),
-            ),
+            params: ResultType(params),
+            results: ResultType(results),
         }
     }
 
     fn call(&self, args: &[Value]) -> Result<Vec<Value>, String> {
-        self.invoke(args)
+        self.invoke(args, None)
+    }
+
+    fn call_with_caller(
+        &self,
+        caller: &mut dyn Caller,
+        args: &[Value],
+    ) -> Result<Vec<Value>, String> {
+        self.invoke(args, Some(caller))
     }
 }
 
@@ -2631,7 +2822,7 @@ impl ComponentInstance {
                     })
             }
             Target::Host(host) => host
-                .invoke(&args)
+                .invoke(&args, None)
                 .map_err(|message| ComponentError::Call { instance, message }),
         }
     }
@@ -3322,21 +3513,9 @@ fn decode_imports(
             });
         }
         let ty = reader.u32()?;
-        let Some(ComponentTypeDef::Func(func)) = types.get(ty as usize) else {
+        let Some(ComponentTypeDef::Func(_)) = types.get(ty as usize) else {
             return Err(ComponentError::NoSuchType { index: ty });
         };
-        // A string or a list in an import's parameters is read through the memory a lower names,
-        // and that lower is checked where it is decoded. A result that holds one is refused there too.
-        let has_memory_type = func
-            .result
-            .iter()
-            .any(|ty| holds_string(ty) || holds_list(ty));
-        if has_memory_type {
-            return Err(ComponentError::UnsupportedImport {
-                what: "import with a string or a list as its result",
-                offset: at,
-            });
-        }
         let duplicate = functions.iter().any(|function| {
             matches!(function, ComponentFunction::Import { name: existing, .. } if *existing == name)
         });
@@ -3384,6 +3563,7 @@ fn decode_canon(
             // A realloc or post-return option has no meaning on a lower.
             let option_count = reader.u32()?;
             let mut memory = None;
+            let mut realloc_alias: Option<(u32, String)> = None;
             for _ in 0..option_count {
                 let option_at = reader.position();
                 match reader.byte()? {
@@ -3405,13 +3585,48 @@ fn decode_canon(
                             return Err(ComponentError::Malformed { offset: option_at });
                         }
                     }
+                    OPTION_REALLOC => {
+                        let function = reader.u32()?;
+                        let Some(core) = core_functions.get(function as usize) else {
+                            return Err(ComponentError::NoSuchFunction { function });
+                        };
+                        let CoreFunction::Alias { instance, export } = core else {
+                            return Err(ComponentError::UnsupportedCanon {
+                                what: "a realloc that is not an export of an instance",
+                                offset: option_at,
+                            });
+                        };
+                        if realloc_alias.replace((*instance, export.clone())).is_some() {
+                            return Err(ComponentError::Malformed { offset: option_at });
+                        }
+                    }
                     _ => return Err(ComponentError::UnsupportedCanon {
                         what:
-                            "a canonical option on a lower other than a memory or a string encoding",
+                            "a canonical option on a lower other than a memory, realloc, or a string encoding",
                         offset: option_at,
                     }),
                 }
             }
+            // A result is allocated in the memory the lower names, so its realloc must be an export of the
+            // instance that memory belongs to.
+            let realloc = match (realloc_alias, memory) {
+                (None, _) => None,
+                (Some(_), None) => {
+                    return Err(ComponentError::UnsupportedCanon {
+                        what: "a realloc without a memory option",
+                        offset: at,
+                    })
+                }
+                (Some((instance, export)), Some(memory_index)) => {
+                    if core_memories[memory_index as usize].instance != instance {
+                        return Err(ComponentError::UnsupportedCanon {
+                            what: "a realloc of another instance than the memory",
+                            offset: at,
+                        });
+                    }
+                    Some(export)
+                }
+            };
             match functions.get(index as usize) {
                 None => return Err(ComponentError::NoSuchComponentFunction { function: index }),
                 Some(ComponentFunction::Lift { .. }) => {
@@ -3444,21 +3659,23 @@ fn decode_canon(
                             offset: at,
                         });
                     }
+                    // A string or list result is written through the realloc and the memory, which both need the
+                    // options. It is returned through a pointer, so it does not count as flat values here.
                     if func
                         .result
                         .iter()
                         .any(|ty| holds_string(ty) || holds_list(ty))
+                        && (memory.is_none() || realloc.is_none())
                     {
                         return Err(ComponentError::UnsupportedCanon {
-                            what: "lowering a function that returns a string or a list",
+                            what: "a string or list result of a lowered import without a memory and a realloc option",
                             offset: at,
                         });
                     }
-                    if func
-                        .result
-                        .iter()
-                        .any(|ty| flat_of(ty, types).len() > MAX_FLAT_RESULTS)
-                    {
+                    if func.result.iter().any(|ty| {
+                        !(holds_string(ty) || holds_list(ty))
+                            && flat_of(ty, types).len() > MAX_FLAT_RESULTS
+                    }) {
                         return Err(ComponentError::UnsupportedCanon {
                             what: "lowering a function whose result is returned through memory",
                             offset: at,
@@ -3467,6 +3684,7 @@ fn decode_canon(
                     core_functions.push(CoreFunction::Lowered {
                         function: index,
                         memory,
+                        realloc,
                     });
                 }
             }

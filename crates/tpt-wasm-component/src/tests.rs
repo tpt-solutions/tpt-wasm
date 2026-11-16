@@ -3996,11 +3996,12 @@ fn a_string_parameter_without_a_memory_option_is_refused_and_a_string_result_is_
         &[1, 0x00, 5, b'c', b'o', b'u', b'n', b't', EXTERN_FUNC, 0],
     );
     let result_lower = section(SECTION_CANON, &[1, CANON_LOWER, SORT_FUNC, 0, 0]);
-    // The import itself refuses a string result, before any lower is read.
+    // The import decodes; the lower without a memory and a realloc option refuses the string result.
     assert!(matches!(
         Component::decode(&with(&[result_types, result_import, result_lower].concat())),
-        Err(ComponentError::UnsupportedImport {
-            what: "import with a string or a list as its result",
+        Err(ComponentError::UnsupportedCanon {
+            what:
+                "a string or list result of a lowered import without a memory and a realloc option",
             ..
         })
     ));
@@ -4045,5 +4046,208 @@ fn an_inline_export_of_a_memory_that_does_not_exist_is_refused() {
     assert_eq!(
         Component::decode(&with(&inline)),
         Err(ComponentError::NoSuchMemory { memory: 3 })
+    );
+}
+
+/// A core module that exports its memory and a `realloc` which always returns address 512.
+fn provider_with_realloc() -> Vec<u8> {
+    let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    module.extend(section(1, &[1, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f]));
+    module.extend(section(3, &[1, 0]));
+    module.extend(section(5, &[1, 0, 1]));
+    module.extend(section(
+        7,
+        &[
+            2, 6, b'm', b'e', b'm', b'o', b'r', b'y', 2, 0, 7, b'r', b'e', b'a', b'l', b'l', b'o',
+            b'c', 0, 0,
+        ],
+    ));
+    module.extend(section(10, &[1, 5, 0x00, 0x41, 0x80, 0x04, 0x0b]));
+    module.extend(section(11, &[1, 0, 0x41, 0, 0x0b, 2, b'h', b'i']));
+    module
+}
+
+/// A core module that imports `greet(ptr, len, retptr)` and the shared `memory`. It calls `greet` with
+/// the bytes `hi` at address 0 and the return pointer 600, then returns the byte at the returned
+/// pointer plus two, which is the third byte of the string the host returned.
+fn greeting_consumer() -> Vec<u8> {
+    let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    module.extend(section(
+        1,
+        &[2, 0x60, 3, 0x7f, 0x7f, 0x7f, 0, 0x60, 0, 1, 0x7f],
+    ));
+    module.extend(section(
+        2,
+        &[
+            2, 3, b'e', b'n', b'v', 5, b'g', b'r', b'e', b'e', b't', 0x00, 0, 3, b'e', b'n', b'v',
+            6, b'm', b'e', b'm', b'o', b'r', b'y', 0x02, 0x00, 1,
+        ],
+    ));
+    module.extend(section(3, &[1, 1]));
+    module.extend(section(7, &[1, 3, b'r', b'u', b'n', 0x00, 1]));
+    module.extend(section(
+        10,
+        &[
+            1, 23, 0x00, //
+            0x41, 0x00, 0x41, 0x02, 0x41, 0xd8, 0x04, 0x10, 0x00, // greet(0, 2, 600)
+            0x41, 0xd8, 0x04, 0x28, 0x02, 0x00, // the pointer the host wrote at 600
+            0x41, 0x02, 0x6a, 0x2d, 0x00, 0x00, // the byte two past it
+            0x0b,
+        ],
+    ));
+    module
+}
+
+#[test]
+fn a_string_result_is_written_through_the_callers_realloc_and_its_return_pointer() {
+    // greet: (string) -> string is type 0, and run: () -> u32 is type 1.
+    let types = section(
+        SECTION_TYPE,
+        &[
+            2,
+            TYPE_FUNC,
+            1,
+            1,
+            b's',
+            VALTYPE_STRING,
+            0x00,
+            VALTYPE_STRING,
+            TYPE_FUNC,
+            0,
+            0x00,
+            VALTYPE_U32,
+        ],
+    );
+    let import = section(
+        SECTION_IMPORT,
+        &[1, 0x00, 5, b'g', b'r', b'e', b'e', b't', EXTERN_FUNC, 0],
+    );
+    let mut bytes = with(&module_section(&provider_with_realloc()));
+    bytes.extend(module_section(&greeting_consumer()));
+    bytes.extend(types);
+    bytes.extend(import);
+    bytes.extend(section(SECTION_CORE_INSTANCE, &[1, 0x00, 0, 0]));
+    // Core functions 0 and core memory 0 come from the provider; the lower names both.
+    bytes.extend(section(
+        SECTION_ALIAS,
+        &[
+            2,
+            0x00,
+            SORT_CORE_MEMORY,
+            ALIAS_CORE_EXPORT,
+            0,
+            6,
+            b'm',
+            b'e',
+            b'm',
+            b'o',
+            b'r',
+            b'y',
+            0x00,
+            SORT_FUNC,
+            ALIAS_CORE_EXPORT,
+            0,
+            7,
+            b'r',
+            b'e',
+            b'a',
+            b'l',
+            b'l',
+            b'o',
+            b'c',
+        ],
+    ));
+    // Core function 1 is the lowered greet.
+    bytes.extend(section(
+        SECTION_CANON,
+        &[
+            1,
+            CANON_LOWER,
+            SORT_FUNC,
+            0,
+            2,
+            OPTION_MEMORY,
+            0,
+            OPTION_REALLOC,
+            0,
+        ],
+    ));
+    // Instance 1 is the inline `env`, instance 2 the consumer, which imports env.greet and env.memory.
+    bytes.extend(section(
+        SECTION_CORE_INSTANCE,
+        &[
+            2,
+            0x01,
+            2,
+            5,
+            b'g',
+            b'r',
+            b'e',
+            b'e',
+            b't',
+            SORT_FUNC,
+            1,
+            6,
+            b'm',
+            b'e',
+            b'm',
+            b'o',
+            b'r',
+            b'y',
+            SORT_CORE_MEMORY,
+            0,
+            0x00,
+            1,
+            1,
+            3,
+            b'e',
+            b'n',
+            b'v',
+            SORT_CORE_INSTANCE,
+            1,
+        ],
+    ));
+    bytes.extend(section(
+        SECTION_ALIAS,
+        &[
+            1,
+            0x00,
+            SORT_FUNC,
+            ALIAS_CORE_EXPORT,
+            2,
+            3,
+            b'r',
+            b'u',
+            b'n',
+        ],
+    ));
+    bytes.extend(section(SECTION_CANON, &[1, CANON_LIFT, SORT_FUNC, 2, 0, 1]));
+    bytes.extend(section(
+        SECTION_EXPORT,
+        &[1, 0x00, 3, b'r', b'u', b'n', COMPONENT_SORT_FUNC, 1, 0x00],
+    ));
+
+    let (mut imports, _) = granted("greet");
+    imports.define_function(
+        "greet",
+        ComponentFuncType {
+            params: vec![ComponentType::Scalar(Scalar::String)],
+            result: Some(ComponentType::Scalar(Scalar::String)),
+        },
+        |args| match args {
+            [ComponentValue::String(text)] if text == "hi" => {
+                Ok(vec![ComponentValue::String("hey".to_owned())])
+            }
+            _ => Err(format!("greet was given {args:?}")),
+        },
+    );
+    let mut instance = Component::decode(&bytes)
+        .expect("decodes")
+        .instantiate_with(&engine(), &imports)
+        .expect("instantiates");
+    assert_eq!(
+        instance.call_export("run", Vec::new()),
+        Ok(vec![ComponentValue::U32(u32::from(b'y'))]),
+        "the host's string was written at the realloc's address, where the consumer reads its third byte"
     );
 }
