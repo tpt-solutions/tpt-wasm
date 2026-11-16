@@ -49,14 +49,26 @@ pub(crate) struct NativeCache {
     /// The user the directory belongs to, and so the owner of every entry that may be loaded.
     owner: platform::Owner,
     hits: std::sync::atomic::AtomicU64,
+    /// When set, every entry is sealed under this key on the way in and must open under it on the
+    /// way out. An entry that does not open is a miss, so a cache written without the key is not used.
+    seal_key: Option<Vec<u8>>,
 }
 
 #[cfg(all(feature = "jit", any(unix, windows)))]
 impl NativeCache {
     /// Open the cache in `dir`, creating it if needed, after checking that the current user owns it
     /// and that no other user can change it.
-    pub(crate) fn open(dir: &Path) -> Result<Self, RuntimeError> {
+    pub(crate) fn open(dir: &Path, seal_key: Option<&[u8]>) -> Result<Self, RuntimeError> {
         use std::io;
+
+        if let Some(key) = seal_key {
+            if key.len() < tpt_wasm_aot::seal::MIN_KEY_LEN {
+                return Err(RuntimeError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the native cache key is shorter than the minimum",
+                )));
+            }
+        }
 
         std::fs::create_dir_all(dir).map_err(RuntimeError::Io)?;
         let meta = std::fs::symlink_metadata(dir).map_err(RuntimeError::Io)?;
@@ -71,6 +83,7 @@ impl NativeCache {
             dir: dir.to_path_buf(),
             owner,
             hits: std::sync::atomic::AtomicU64::new(0),
+            seal_key: seal_key.map(<[u8]>::to_vec),
         })
     }
 
@@ -99,8 +112,12 @@ impl NativeCache {
         if !platform::entry_is_trusted(&path, &self.owner) {
             return None;
         }
-        let artifact =
-            tpt_wasm_aot::ModuleArtifact::from_bytes(&std::fs::read(&path).ok()?).ok()?;
+        let bytes = std::fs::read(&path).ok()?;
+        let plain = match &self.seal_key {
+            Some(key) => tpt_wasm_aot::seal::open(&bytes, key).ok()?.to_vec(),
+            None => bytes,
+        };
+        let artifact = tpt_wasm_aot::ModuleArtifact::from_bytes(&plain).ok()?;
         if artifact.max_call_depth() != max_call_depth
             || artifact.functions().len() != function_count
         {
@@ -123,7 +140,12 @@ impl NativeCache {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static TEMPORARY: AtomicU64 = AtomicU64::new(0);
-        let bytes = tpt_wasm_aot::ModuleArtifact::from_module(module).to_bytes();
+        let plain = tpt_wasm_aot::ModuleArtifact::from_module(module).to_bytes();
+        let bytes = match &self.seal_key {
+            Some(key) => tpt_wasm_aot::seal::seal(&plain, key)
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+            None => plain,
+        };
         let temporary = self.dir.join(format!(
             ".tmp-{}-{}",
             std::process::id(),
@@ -146,7 +168,7 @@ pub(crate) struct NativeCache;
 impl NativeCache {
     /// Refused: the cache needs the `jit` feature, and on this platform ownership and access cannot
     /// be checked.
-    pub(crate) fn open(_dir: &Path) -> Result<Self, RuntimeError> {
+    pub(crate) fn open(_dir: &Path, _seal_key: Option<&[u8]>) -> Result<Self, RuntimeError> {
         Err(RuntimeError::UnsupportedFeature(if cfg!(feature = "jit") {
             "the native cache needs Unix or Windows ownership and access checks"
         } else {

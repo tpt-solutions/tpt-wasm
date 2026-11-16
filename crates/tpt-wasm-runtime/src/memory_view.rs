@@ -29,7 +29,10 @@ pub struct MemoryView {
 #[derive(Clone)]
 enum Target {
     /// A memory of the store the interpreter runs on, by its address.
-    Store { store: Arc<Mutex<Store>>, address: u32 },
+    Store {
+        store: Arc<Mutex<Store>>,
+        address: u32,
+    },
     /// The memory of a module compiled to the baseline.
     Baseline(SharedMemory),
 }

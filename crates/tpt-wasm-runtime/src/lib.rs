@@ -28,8 +28,8 @@ use tpt_wasm_validate::{ValidatedModule, ValidationError, Validator};
 
 mod cache;
 mod debug;
-mod memory_view;
 mod jit_tier;
+mod memory_view;
 mod native_cache;
 
 pub use native_cache::default_native_cache_dir;
@@ -148,6 +148,10 @@ pub struct Config {
     /// must belong to the current user and be writable by no one else; see `default_native_cache_dir`.
     /// Only the native tier uses it, so it needs the `jit` feature, and it works on Unix and Windows only.
     pub native_cache_dir: Option<std::path::PathBuf>,
+    /// When set, the native cache seals every entry under this key (at least 32 bytes) and loads only
+    /// entries that open under it, so a cache written without the key is recompiled rather than used.
+    /// `None`, the default, keeps the ownership and permission checks as the only protection.
+    pub native_cache_key: Option<Vec<u8>>,
 }
 
 impl Default for Config {
@@ -160,6 +164,7 @@ impl Default for Config {
             debugging: false,
             profiling: false,
             native_cache_dir: None,
+            native_cache_key: None,
         }
     }
 }
@@ -631,7 +636,7 @@ impl Engine {
         let native_cache = config
             .native_cache_dir
             .as_deref()
-            .map(native_cache::NativeCache::open)
+            .map(|dir| native_cache::NativeCache::open(dir, config.native_cache_key.as_deref()))
             .transpose()?;
         Ok(Self {
             native_cache,
