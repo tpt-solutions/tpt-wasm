@@ -3768,6 +3768,21 @@ fn lowered_memory_component(
     pointer: u8,
     length: u8,
 ) -> Vec<u8> {
+    lowered_memory_component_with(
+        &consumer_module(pointer, length),
+        types,
+        import_type,
+        run_type,
+    )
+}
+
+/// As [`lowered_memory_component`], with the consumer module given.
+fn lowered_memory_component_with(
+    consumer_bytes: &[u8],
+    types: &[u8],
+    import_type: u8,
+    run_type: u8,
+) -> Vec<u8> {
     let types = section(SECTION_TYPE, types);
     let import = section(
         SECTION_IMPORT,
@@ -3863,7 +3878,7 @@ fn lowered_memory_component(
         &[1, 0x00, 3, b'r', b'u', b'n', COMPONENT_SORT_FUNC, 1, 0x00],
     );
     let mut bytes = with(&module_section(&memory_provider()));
-    bytes.extend(module_section(&consumer_module(pointer, length)));
+    bytes.extend(module_section(consumer_bytes));
     bytes.extend(types);
     bytes.extend(import);
     bytes.extend(provider);
@@ -4249,5 +4264,62 @@ fn a_string_result_is_written_through_the_callers_realloc_and_its_return_pointer
         instance.call_export("run", Vec::new()),
         Ok(vec![ComponentValue::U32(u32::from(b'y'))]),
         "the host's string was written at the realloc's address, where the consumer reads its third byte"
+    );
+}
+
+/// A consumer that imports only `env.count`, and so has no memory of its own to share with the provider.
+fn consumer_without_memory() -> Vec<u8> {
+    let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    module.extend(section(
+        1,
+        &[2, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 1, 0x7f],
+    ));
+    module.extend(section(
+        2,
+        &[
+            1, 3, b'e', b'n', b'v', 5, b'c', b'o', b'u', b'n', b't', 0, 0,
+        ],
+    ));
+    module.extend(section(3, &[1, 1]));
+    module.extend(section(7, &[1, 3, b'r', b'u', b'n', 0, 1]));
+    module.extend(section(10, &[1, 8, 0, 0x41, 0, 0x41, 2, 0x10, 0, 0x0b]));
+    module
+}
+
+#[test]
+fn a_consumer_that_does_not_share_the_named_memory_is_refused_at_instantiation() {
+    let types = [
+        2,
+        TYPE_FUNC,
+        1,
+        1,
+        b's',
+        VALTYPE_STRING,
+        0x00,
+        VALTYPE_U32,
+        TYPE_FUNC,
+        0,
+        0x00,
+        VALTYPE_U32,
+    ];
+    let bytes = lowered_memory_component_with(&consumer_without_memory(), &types, 0, 1);
+    let (mut imports, _) = granted("count");
+    imports.define_function(
+        "count",
+        ComponentFuncType {
+            params: vec![ComponentType::Scalar(Scalar::String)],
+            result: Some(ComponentType::Scalar(Scalar::U32)),
+        },
+        |_| Ok(vec![ComponentValue::U32(0)]),
+    );
+    let refused = Component::decode(&bytes)
+        .expect("decodes")
+        .instantiate_with(&engine(), &imports);
+    assert!(
+        matches!(
+            &refused,
+            Err(ComponentError::Instantiate { message, .. }) if message.contains("does not share")
+        ),
+        "the consumer's pointers would not address the named memory: {refused:?}"
     );
 }

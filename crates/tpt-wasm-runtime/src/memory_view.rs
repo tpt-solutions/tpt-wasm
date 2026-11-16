@@ -141,3 +141,54 @@ impl Instance {
         })
     }
 }
+
+impl MemoryView {
+    /// Whether two views are the same memory: the same address in the same store, or the same compiled
+    /// memory.
+    pub fn is_same(&self, other: &MemoryView) -> bool {
+        match (&self.target, &other.target) {
+            (
+                Target::Store {
+                    store: a,
+                    address: x,
+                },
+                Target::Store {
+                    store: b,
+                    address: y,
+                },
+            ) => Arc::ptr_eq(a, b) && x == y,
+            (Target::Baseline(a), Target::Baseline(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Instance {
+    /// A view of memory 0 of this instance, whether it defines the memory or imports it. Fails if the
+    /// instance has no memory.
+    pub fn own_memory(&self) -> Result<MemoryView, RuntimeError> {
+        if let Some(module) = self.baseline.as_ref() {
+            let handle = module
+                .memory_handle()
+                .ok_or(RuntimeError::UnsupportedFeature("module has no memory"))?;
+            return Ok(MemoryView {
+                target: Target::Baseline(handle),
+            });
+        }
+        let address = {
+            let store = crate::lock_store(&self.context.store)?;
+            *store
+                .instance(self.index)
+                .map_err(RuntimeError::Store)?
+                .memory_addrs
+                .first()
+                .ok_or(RuntimeError::UnsupportedFeature("module has no memory"))?
+        };
+        Ok(MemoryView {
+            target: Target::Store {
+                store: Arc::clone(&self.context.store),
+                address,
+            },
+        })
+    }
+}

@@ -841,6 +841,31 @@ impl Component {
                             instance: index,
                             message: error.to_string(),
                         })?;
+                    // A lowered import that names a memory is only meaningful to a consumer that shares that
+                    // memory, since its pointers are into it. Refuse one that does not.
+                    for argument in arguments {
+                        let Slot::Exports(bound) = &slots[argument.instance as usize] else {
+                            continue;
+                        };
+                        for export in bound {
+                            let Target::Host(host) = &export.target else {
+                                continue;
+                            };
+                            let Some(named) = host.memory.as_ref() else {
+                                continue;
+                            };
+                            let shares = runtime.own_memory().is_ok_and(|own| own.is_same(named));
+                            if !shares {
+                                return Err(ComponentError::Instantiate {
+                                    instance: index,
+                                    message: format!(
+                                        "the import {} names a memory this instance does not share",
+                                        export.name
+                                    ),
+                                });
+                            }
+                        }
+                    }
                     Slot::Runtime(Box::new(runtime))
                 }
                 CoreInstance::FromExports { exports } => {
