@@ -1518,7 +1518,7 @@ pub fn table_slots(module: &IrModule) -> Vec<Option<u32>> {
         .tables
         .first()
         .filter(|_| module.tables.len() == 1)
-        .filter(|table| table.import.is_none())
+        .filter(|table| table.import.is_none() && table.init.is_none())
         .filter(|table| table.min <= 1 << 20);
     match table {
         Some(table) => {

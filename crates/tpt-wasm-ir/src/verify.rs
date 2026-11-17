@@ -60,6 +60,13 @@ pub enum VerificationError {
     UnknownGlobal(u32),
     /// A bulk memory instruction names a data segment the module does not have.
     UnknownDataSegment(u32),
+    /// An element segment index that names no segment of the module.
+    UnknownElementSegment(u32),
+    /// Two table or segment operands of one instruction hold different reference types.
+    MismatchedElementTypes {
+        first: u32,
+        second: u32,
+    },
     /// A table index with no corresponding declaration.
     UnknownTable(u32),
     /// `call_indirect` through a table that does not hold function references.
@@ -951,6 +958,14 @@ pub fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
         // A table get reads its index; a table set reads the index and the reference.
         TableGet { index, .. } => vec![*index],
         TableSet { index, value, .. } => vec![*index, *value],
+        TableInit { dst, src, len, .. } => vec![*dst, *src, *len],
+        ElemDrop { .. } => Vec::new(),
+        TableCopy { dst, src, len, .. } => vec![*dst, *src, *len],
+        TableGrow { value, delta, .. } => vec![*value, *delta],
+        TableSize { .. } => Vec::new(),
+        TableFill {
+            index, value, len, ..
+        } => vec![*index, *value, *len],
         // A get names its local; a set and tee read the stored value, and the
         // local they name is a pre-allocated slot rather than an operand.
         LocalGet { local, .. } => vec![*local],
@@ -1079,7 +1094,11 @@ pub fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
         | MemoryInit { .. }
         | DataDrop { .. }
         | MemoryCopy { .. }
-        | MemoryFill { .. } => Vec::new(),
+        | MemoryFill { .. }
+        | TableInit { .. }
+        | ElemDrop { .. }
+        | TableCopy { .. }
+        | TableFill { .. } => Vec::new(),
         LocalGet { result, .. } | LocalTee { result, .. } | Select { result, .. } => {
             vec![*result]
         }
@@ -1092,6 +1111,8 @@ pub fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
         | RefFunc { result, .. }
         | RefIsNull { result, .. }
         | TableGet { result, .. }
+        | TableGrow { result, .. }
+        | TableSize { result, .. }
         | ConstI32 { result, .. }
         | ConstI64 { result, .. }
         | ConstF32 { result, .. }
@@ -1958,6 +1979,95 @@ fn verify_instruction(
         } => {
             let declaration = table_declaration(module, *table)?;
             expect_defined_type(*index, ValueType::I32, function_index, values, defined)?;
+            expect_defined_type(
+                *value,
+                ValueType::Ref(declaration.element_type),
+                function_index,
+                values,
+                defined,
+            )
+        }
+        super::IrInstr::TableInit {
+            table,
+            elem,
+            dst,
+            src,
+            len,
+        } => {
+            let declaration = table_declaration(module, *table)?;
+            let segment = module
+                .passive_elements
+                .get(*elem as usize)
+                .ok_or(VerificationError::UnknownElementSegment(*elem))?;
+            if let Some(init) = segment {
+                if init.element_type != declaration.element_type {
+                    return Err(VerificationError::MismatchedElementTypes {
+                        first: *table,
+                        second: *elem,
+                    });
+                }
+            }
+            for value in [*dst, *src, *len] {
+                expect_defined_type(value, ValueType::I32, function_index, values, defined)?;
+            }
+            Ok(())
+        }
+        super::IrInstr::ElemDrop { elem } => {
+            if *elem as usize >= module.passive_elements.len() {
+                return Err(VerificationError::UnknownElementSegment(*elem));
+            }
+            Ok(())
+        }
+        super::IrInstr::TableCopy {
+            dst_table,
+            src_table,
+            dst,
+            src,
+            len,
+        } => {
+            let destination = table_declaration(module, *dst_table)?;
+            let source = table_declaration(module, *src_table)?;
+            if destination.element_type != source.element_type {
+                return Err(VerificationError::MismatchedElementTypes {
+                    first: *dst_table,
+                    second: *src_table,
+                });
+            }
+            for value in [*dst, *src, *len] {
+                expect_defined_type(value, ValueType::I32, function_index, values, defined)?;
+            }
+            Ok(())
+        }
+        super::IrInstr::TableGrow {
+            result,
+            table,
+            value,
+            delta,
+        } => {
+            let declaration = table_declaration(module, *table)?;
+            expect_defined_type(*delta, ValueType::I32, function_index, values, defined)?;
+            expect_defined_type(
+                *value,
+                ValueType::Ref(declaration.element_type),
+                function_index,
+                values,
+                defined,
+            )?;
+            define_value(*result, ValueType::I32, function_index, values, defined)
+        }
+        super::IrInstr::TableSize { result, table } => {
+            table_declaration(module, *table)?;
+            define_value(*result, ValueType::I32, function_index, values, defined)
+        }
+        super::IrInstr::TableFill {
+            table,
+            index,
+            value,
+            len,
+        } => {
+            let declaration = table_declaration(module, *table)?;
+            expect_defined_type(*index, ValueType::I32, function_index, values, defined)?;
+            expect_defined_type(*len, ValueType::I32, function_index, values, defined)?;
             expect_defined_type(
                 *value,
                 ValueType::Ref(declaration.element_type),

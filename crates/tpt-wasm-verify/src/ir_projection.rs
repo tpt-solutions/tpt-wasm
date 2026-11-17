@@ -252,7 +252,14 @@ pub fn project_function_to_model(
                 return Err(IrProjectionError::UnsupportedInstruction("reference"))
             }
             // Tables are not in the formal model, so a table access is refused.
-            IrInstr::TableGet { .. } | IrInstr::TableSet { .. } => {
+            IrInstr::TableGet { .. }
+            | IrInstr::TableSet { .. }
+            | IrInstr::TableInit { .. }
+            | IrInstr::ElemDrop { .. }
+            | IrInstr::TableCopy { .. }
+            | IrInstr::TableGrow { .. }
+            | IrInstr::TableSize { .. }
+            | IrInstr::TableFill { .. } => {
                 return Err(IrProjectionError::UnsupportedInstruction("table"))
             }
             // A host call is capability-gated, and the projection has no way to

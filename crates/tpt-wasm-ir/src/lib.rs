@@ -57,6 +57,10 @@ pub struct IrModule {
     /// Each data segment's bytes, in data-index order: `Some` for a passive segment, which the bulk memory
     /// instructions read, and `None` for an active one, which is applied at instantiation.
     pub passive_data: Vec<Option<Vec<u8>>>,
+    /// Each element segment's initial contents, in element-index order: `Some` for a passive segment, which
+    /// the table instructions read, and `None` for an active or declarative one, which is dropped at
+    /// instantiation and so reads as empty.
+    pub passive_elements: Vec<Option<IrElementInit>>,
     /// Tables, in index order. MVP allows at most one table.
     ///
     /// An *imported* table occupies its own Wasm index here, before any defined
@@ -91,6 +95,10 @@ pub struct IrTable {
     /// The active element segments that seed this table, in module order. A later segment overwrites an
     /// earlier one at the same index, so they cannot be applied out of order.
     pub segments: Vec<IrElementSegment>,
+    /// The table's initial entry, from a table with an initializer (`0x40 0x00`). `None` means no
+    /// initializer, so every slot starts null. `Some(None)` initializes every slot to null, and
+    /// `Some(Some(index))` to the defined function `index`.
+    pub init: Option<Option<u32>>,
     /// Where this table is imported from, when it is imported rather than defined.
     ///
     /// `Some` means the table belongs to the exporting instance and nothing is
@@ -661,6 +669,58 @@ pub enum IrInstr {
         index: ValueId,
         value: ValueId,
     },
+    /// `table.init`: copy `len` entries from offset `src` of passive element segment `elem` to offset `dst`
+    /// of table `table`. Both ranges are checked before anything is written.
+    TableInit {
+        table: u32,
+        elem: u32,
+        dst: ValueId,
+        src: ValueId,
+        len: ValueId,
+    },
+    /// `elem.drop`: discard element segment `elem`, after which it is empty.
+    ElemDrop {
+        elem: u32,
+    },
+    /// `table.copy`: copy `len` entries from offset `src` of table `src_table` to offset `dst` of table
+    /// `dst_table`. The two may overlap, and either range leaving its table traps before anything is written.
+    TableCopy {
+        dst_table: u32,
+        src_table: u32,
+        dst: ValueId,
+        src: ValueId,
+        len: ValueId,
+    },
+    /// `table.grow`: grow table `table` by `delta`, filling the new slots with `value`. `result` is the old
+    /// size, or -1 when the table cannot grow.
+    TableGrow {
+        result: ValueId,
+        table: u32,
+        value: ValueId,
+        delta: ValueId,
+    },
+    /// `table.size`: the number of elements in table `table`.
+    TableSize {
+        result: ValueId,
+        table: u32,
+    },
+    /// `table.fill`: write `value` over `len` entries of table `table`, from offset `index`. The range is
+    /// checked before anything is written.
+    TableFill {
+        table: u32,
+        index: ValueId,
+        value: ValueId,
+        len: ValueId,
+    },
+}
+
+/// A passive element segment's contents, as the table instructions read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrElementInit {
+    /// The reference type of the segment, which the entries and any null they read take.
+    pub element_type: ReferenceType,
+    /// As in [`IrElementSegment::elements`].
+    pub elements: Vec<Option<u32>>,
 }
 
 /// One active element segment, as the table it seeds receives it.

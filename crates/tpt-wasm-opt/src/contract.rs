@@ -92,6 +92,12 @@ pub enum Effect {
     TableGet(u32),
     /// A write to a table entry.
     TableSet(u32),
+    /// A `table.init`: a write to a table that reads a passive element segment.
+    TableInit { table: u32, elem: u32 },
+    /// An `elem.drop`, which changes what a later `table.init` of that segment reads.
+    ElemDrop(u32),
+    /// A `table.copy`: a read of one table and a write of another, which may be the same one.
+    TableCopy { read: u32, write: u32 },
     /// A trap this module can reach, by the `Trap` value it carries.
     Trap(String),
     /// The function ended, returning this many values.
@@ -502,6 +508,23 @@ fn effect_of(instruction: &IrInstr, constants: &HashMap<ValueId, i64>) -> Option
         },
         IrInstr::TableGet { table, .. } => Effect::TableGet(*table),
         IrInstr::TableSet { table, .. } => Effect::TableSet(*table),
+        IrInstr::TableInit { table, elem, .. } => Effect::TableInit {
+            table: *table,
+            elem: *elem,
+        },
+        IrInstr::ElemDrop { elem } => Effect::ElemDrop(*elem),
+        IrInstr::TableCopy {
+            dst_table,
+            src_table,
+            ..
+        } => Effect::TableCopy {
+            read: *src_table,
+            write: *dst_table,
+        },
+        IrInstr::TableGrow { table, .. } | IrInstr::TableFill { table, .. } => {
+            Effect::TableSet(*table)
+        }
+        IrInstr::TableSize { table, .. } => Effect::TableGet(*table),
         _ => return None,
     })
 }

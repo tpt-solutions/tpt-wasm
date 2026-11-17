@@ -423,6 +423,46 @@ pub enum BaselineOp {
         index: u32,
         value: u32,
     },
+    /// `table.init`: copy `length` entries from offset `source` of passive element segment `elem` to offset
+    /// `destination` of `table`. Both ranges are checked before anything is written.
+    TableInit {
+        table: u32,
+        elem: u32,
+        destination: u32,
+        source: u32,
+        length: u32,
+    },
+    /// `elem.drop`: discard element segment `elem`.
+    ElemDrop {
+        elem: u32,
+    },
+    /// `table.copy`: copy `length` entries between two tables, which may be the same one.
+    TableCopy {
+        destination_table: u32,
+        source_table: u32,
+        destination: u32,
+        source: u32,
+        length: u32,
+    },
+    /// `table.grow`: grow `table` by `delta`, filling the new slots with `value`. `result` is the old size, or -1.
+    TableGrow {
+        result: u32,
+        table: u32,
+        value: u32,
+        delta: u32,
+    },
+    /// `table.size`: the number of elements in `table`.
+    TableSize {
+        result: u32,
+        table: u32,
+    },
+    /// `table.fill`: write `value` over `length` entries of `table`, from `index`.
+    TableFill {
+        table: u32,
+        index: u32,
+        value: u32,
+        length: u32,
+    },
 }
 
 /// One basic block of a lowered baseline function.
@@ -1478,6 +1518,84 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                         index,
                     });
                 }
+                IrInstr::TableInit {
+                    table,
+                    elem,
+                    dst,
+                    src,
+                    len,
+                } => {
+                    let destination = state.expect(*dst, ValueType::I32)?;
+                    let source = state.expect(*src, ValueType::I32)?;
+                    let length = state.expect(*len, ValueType::I32)?;
+                    ops.push(BaselineOp::TableInit {
+                        table: *table,
+                        elem: *elem,
+                        destination,
+                        source,
+                        length,
+                    });
+                }
+                IrInstr::ElemDrop { elem } => {
+                    ops.push(BaselineOp::ElemDrop { elem: *elem });
+                }
+                IrInstr::TableCopy {
+                    dst_table,
+                    src_table,
+                    dst,
+                    src,
+                    len,
+                } => {
+                    let destination = state.expect(*dst, ValueType::I32)?;
+                    let source = state.expect(*src, ValueType::I32)?;
+                    let length = state.expect(*len, ValueType::I32)?;
+                    ops.push(BaselineOp::TableCopy {
+                        destination_table: *dst_table,
+                        source_table: *src_table,
+                        destination,
+                        source,
+                        length,
+                    });
+                }
+                IrInstr::TableGrow {
+                    result,
+                    table,
+                    value,
+                    delta,
+                } => {
+                    let value = state.slot(*value)?;
+                    let delta = state.expect(*delta, ValueType::I32)?;
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::TableGrow {
+                        result,
+                        table: *table,
+                        value,
+                        delta,
+                    });
+                }
+                IrInstr::TableSize { result, table } => {
+                    let result = state.define(*result)?;
+                    ops.push(BaselineOp::TableSize {
+                        result,
+                        table: *table,
+                    });
+                }
+                IrInstr::TableFill {
+                    table,
+                    index,
+                    value,
+                    len,
+                } => {
+                    let index = state.expect(*index, ValueType::I32)?;
+                    let value = state.slot(*value)?;
+                    let length = state.expect(*len, ValueType::I32)?;
+                    ops.push(BaselineOp::TableFill {
+                        table: *table,
+                        index,
+                        value,
+                        length,
+                    });
+                }
                 IrInstr::TableSet {
                     table,
                     index,
@@ -1845,6 +1963,9 @@ pub struct BaselineModule {
     globals: SharedGlobals,
     /// The module's data segments by data index, `None` once dropped. Passive segments start populated.
     datas: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+    /// The passive element segments by element index: `Some` holds the entries, a null naming the segment's
+    /// own kind; `None` once dropped, and for an active or declarative segment, which reads as empty.
+    elems: Arc<Mutex<Vec<Option<Vec<tpt_wasm_types::RefValue>>>>>,
     /// How many leading globals are imports, whose handles the embedder supplies.
     global_import_count: usize,
     /// The globals whose initializer reads a global, as `(index, expression)`, in index order.
@@ -1927,6 +2048,16 @@ pub struct BaselineTable {
     /// `None` is a null reference, which `call_indirect` traps on. A function reference names the
     /// function by its store address, so a table shared with another instance names the same functions there.
     elements: Vec<Option<tpt_wasm_types::RefValue>>,
+    /// The most entries the table may hold: its declared maximum, capped by the resource limit.
+    maximum: u64,
+}
+
+impl BaselineTable {
+    /// How many entries the table holds now. A table that has grown is larger here than the size it was
+    /// declared with, and this is the size an importer must see.
+    pub fn size(&self) -> usize {
+        self.elements.len()
+    }
 }
 
 /// A baseline table shared by every instance that imports or exports it.
@@ -2181,9 +2312,18 @@ impl BaselineModule {
             }
             let length = usize::try_from(declaration.min)
                 .map_err(|_| CodegenError::UnsupportedMemory("table size"))?;
+            // A table with an initializer starts every slot at its entry, before the segments are applied.
+            let initial = declaration
+                .init
+                .flatten()
+                .map(tpt_wasm_types::RefValue::FuncRef);
             let mut table = BaselineTable {
                 element_type: declaration.element_type,
-                elements: vec![None; length],
+                elements: vec![initial; length],
+                maximum: declaration
+                    .max
+                    .unwrap_or(u64::MAX)
+                    .min(u64::from(ResourceLimits::default().max_table_elements)),
             };
             apply_element_segment(&mut table, declaration, &function_addresses)?;
             tables.push(Some(Arc::new(Mutex::new(table))));
@@ -2206,6 +2346,23 @@ impl BaselineModule {
             })
             .collect();
         let datas = Arc::new(Mutex::new(module.passive_data.clone()));
+        // A function reference holds the defined index it was seeded with until the addresses are bound.
+        let elems: Vec<Option<Vec<tpt_wasm_types::RefValue>>> = module
+            .passive_elements
+            .iter()
+            .map(|segment| {
+                segment.as_ref().map(|init| {
+                    init.elements
+                        .iter()
+                        .map(|entry| match entry {
+                            Some(index) => tpt_wasm_types::RefValue::FuncRef(*index),
+                            None => tpt_wasm_types::RefValue::Null(init.element_type),
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        let elems = Arc::new(Mutex::new(elems));
         let global_import_count = module.globals.iter().filter(|g| g.import.is_some()).count();
         let deferred_globals: Vec<(usize, Vec<u8>)> = module
             .globals
@@ -2226,6 +2383,7 @@ impl BaselineModule {
             global_import_count,
             deferred_globals,
             datas,
+            elems,
             imports: module.imports.clone(),
             host: None,
             pending_imported_memory,
@@ -2553,6 +2711,35 @@ impl BaselineModule {
                 }
             }
         }
+        let mut elems = lock_shared(&self.elems)
+            .map_err(|_| CodegenError::UnsupportedMemory("passive element segments are locked"))?;
+        for entry in elems
+            .iter_mut()
+            .flatten()
+            .flat_map(|segment| segment.iter_mut())
+        {
+            let index = match entry {
+                tpt_wasm_types::RefValue::FuncRef(index) => *index,
+                _ => continue,
+            };
+            let address = addresses
+                .get(index as usize)
+                .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
+            *entry = tpt_wasm_types::RefValue::FuncRef(*address);
+        }
+        drop(elems);
+        // A defined global's reference may name a function by its index, until it is bound here. An
+        // imported global's handle is the exporter's, already bound there, so it is left alone.
+        for handle in self.globals.iter().skip(self.global_import_count).flatten() {
+            let mut value = lock_shared(handle)
+                .map_err(|_| CodegenError::UnsupportedMemory("shared global is locked"))?;
+            if let Value::Ref(tpt_wasm_types::RefValue::FuncRef(index)) = *value {
+                let address = addresses
+                    .get(index as usize)
+                    .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
+                *value = Value::Ref(tpt_wasm_types::RefValue::FuncRef(*address));
+            }
+        }
         self.function_addresses = addresses.to_vec();
         self.function_locals = function_locals_of(addresses);
         Ok(())
@@ -2645,6 +2832,7 @@ impl BaselineModule {
         // the store at all: a reader outside this call must not see half of a
         // `global.set`, and a `table.set` must not be split across observers.
         let mut datas = lock_shared(&self.datas)?;
+        let mut elems = lock_shared(&self.elems)?;
         let globals = self.globals.clone();
         let mut guards = Vec::with_capacity(self.tables.len());
         for shared in &self.tables {
@@ -2665,6 +2853,7 @@ impl BaselineModule {
             types: &self.types,
             memory: memory.as_deref_mut(),
             datas: &mut datas,
+            elems: &mut elems,
             globals: &globals,
             host: self.host.as_deref_mut(),
             // The entry call is itself a frame, exactly as Micro counts the
@@ -2691,6 +2880,8 @@ struct ExecState<'a> {
     memory: Option<&'a mut BaselineMemory>,
     /// The module's data segments, `None` once dropped, locked for the whole execution like the memory.
     datas: &'a mut Vec<Option<Vec<u8>>>,
+    /// The passive element segments by element index, as the module's own copy holds them.
+    elems: &'a mut Vec<Option<Vec<tpt_wasm_types::RefValue>>>,
     globals: &'a [Option<SharedGlobal>],
     /// The installed host boundary, absent when the embedder granted none.
     ///
@@ -2801,6 +2992,7 @@ impl BaselineFunction {
             types: &[],
             memory: None,
             datas: &mut Vec::new(),
+            elems: &mut Vec::new(),
             globals: &mut Vec::new(),
             host: None,
             // The entry call counts as a frame, as it does in `call`.
@@ -3391,6 +3583,46 @@ fn exec_op(
                 .ok_or(Trap::TableOutOfBounds)?;
             *slot = entry;
         }
+        BaselineOp::TableInit {
+            table,
+            elem,
+            destination,
+            source,
+            length,
+        } => exec_table_init(state, slots, *table, *elem, *destination, *source, *length)?,
+        BaselineOp::ElemDrop { elem } => {
+            if let Some(entry) = state.elems.get_mut(*elem as usize) {
+                *entry = None;
+            }
+        }
+        BaselineOp::TableCopy {
+            destination_table,
+            source_table,
+            destination,
+            source,
+            length,
+        } => exec_table_copy(
+            state,
+            slots,
+            *destination_table,
+            *source_table,
+            *destination,
+            *source,
+            *length,
+        )?,
+        BaselineOp::TableGrow {
+            result,
+            table,
+            value,
+            delta,
+        } => exec_table_grow(state, slots, *result, *table, *value, *delta)?,
+        BaselineOp::TableSize { result, table } => exec_table_size(state, slots, *result, *table)?,
+        BaselineOp::TableFill {
+            table,
+            index,
+            value,
+            length,
+        } => exec_table_fill(state, slots, *table, *index, *value, *length)?,
         BaselineOp::Branch { target, values } => {
             return Ok(OpFlow::Jump(*target, values.clone()));
         }
@@ -3594,6 +3826,193 @@ fn exec_call_indirect(
     for (slot, value) in results.iter().copied().zip(returned) {
         check_value_type(&value, value_types[slot as usize])?;
         slots[slot as usize] = Some(value);
+    }
+    Ok(())
+}
+
+/// The entry a table slot stores for a reference: a null is the empty slot.
+fn slot_of(reference: tpt_wasm_types::RefValue) -> Option<tpt_wasm_types::RefValue> {
+    match reference {
+        tpt_wasm_types::RefValue::Null(_) => None,
+        other => Some(other),
+    }
+}
+
+/// Whether `count` entries starting at `start` fit a table or segment of `length` entries.
+fn fits(start: u64, count: u64, length: usize) -> bool {
+    start
+        .checked_add(count)
+        .is_some_and(|end| end <= length as u64)
+}
+
+/// The table at `index`, for a table instruction to write.
+fn table_mut<'s>(
+    state: &'s mut ExecState<'_>,
+    index: u32,
+) -> Result<&'s mut BaselineTable, BaselineError> {
+    state
+        .tables
+        .get_mut(index as usize)
+        .and_then(|slot| slot.as_deref_mut())
+        .ok_or_else(|| {
+            BaselineError::Trap(Trap::HostFailure(
+                "baseline table instruction needs a table".into(),
+            ))
+        })
+}
+
+/// `table.init`: copy entries from a passive element segment into a table. A dropped segment is empty.
+fn exec_table_init(
+    state: &mut ExecState<'_>,
+    slots: &[Option<Value>],
+    table: u32,
+    elem: u32,
+    destination: u32,
+    source: u32,
+    length: u32,
+) -> Result<(), BaselineError> {
+    let destination = u64::from(i32_slot(slots, destination)? as u32);
+    let source = u64::from(i32_slot(slots, source)? as u32);
+    let length = u64::from(i32_slot(slots, length)? as u32);
+    let segment = state
+        .elems
+        .get(elem as usize)
+        .and_then(|entry| entry.clone())
+        .unwrap_or_default();
+    if !fits(source, length, segment.len()) {
+        return Err(BaselineError::Trap(Trap::TableOutOfBounds));
+    }
+    let target = table_mut(state, table)?;
+    if !fits(destination, length, target.elements.len()) {
+        return Err(BaselineError::Trap(Trap::TableOutOfBounds));
+    }
+    for offset in 0..length {
+        target.elements[(destination + offset) as usize] =
+            slot_of(segment[(source + offset) as usize].clone());
+    }
+    Ok(())
+}
+
+/// `table.copy`: copy entries between two tables. The source is read in full first, so overlapping ranges
+/// copy the values that were there before the instruction ran.
+fn exec_table_copy(
+    state: &mut ExecState<'_>,
+    slots: &[Option<Value>],
+    destination_table: u32,
+    source_table: u32,
+    destination: u32,
+    source: u32,
+    length: u32,
+) -> Result<(), BaselineError> {
+    let destination = u64::from(i32_slot(slots, destination)? as u32);
+    let source = u64::from(i32_slot(slots, source)? as u32);
+    let length = u64::from(i32_slot(slots, length)? as u32);
+    let values = {
+        let from = state
+            .tables
+            .get(source_table as usize)
+            .and_then(|slot| slot.as_deref())
+            .ok_or_else(|| {
+                BaselineError::Trap(Trap::HostFailure(
+                    "baseline table.copy needs a source table".into(),
+                ))
+            })?;
+        if !fits(source, length, from.elements.len()) {
+            return Err(BaselineError::Trap(Trap::TableOutOfBounds));
+        }
+        (source..source + length)
+            .map(|index| from.elements[index as usize].clone())
+            .collect::<Vec<_>>()
+    };
+    let target = table_mut(state, destination_table)?;
+    if !fits(destination, length, target.elements.len()) {
+        return Err(BaselineError::Trap(Trap::TableOutOfBounds));
+    }
+    for (offset, entry) in values.into_iter().enumerate() {
+        target.elements[destination as usize + offset] = entry;
+    }
+    Ok(())
+}
+
+/// `table.grow`: grow a table, filling the new slots with a reference. The result is the old size, or -1
+/// when the table would exceed its maximum.
+fn exec_table_grow(
+    state: &mut ExecState<'_>,
+    slots: &mut [Option<Value>],
+    result: u32,
+    table: u32,
+    value: u32,
+    delta: u32,
+) -> Result<(), BaselineError> {
+    let delta = u64::from(i32_slot(slots, delta)? as u32);
+    let reference = match read_slot(slots, value)? {
+        Value::Ref(reference) => reference,
+        other => {
+            return Err(BaselineError::Trap(Trap::HostFailure(format!(
+                "baseline table.grow operand is not a reference: {other:?}"
+            ))))
+        }
+    };
+    let target = table_mut(state, table)?;
+    let old = target.elements.len() as u64;
+    let outcome = if old + delta <= target.maximum {
+        target
+            .elements
+            .resize((old + delta) as usize, slot_of(reference));
+        Value::I32(old as i32)
+    } else {
+        Value::I32(-1)
+    };
+    slots[result as usize] = Some(outcome);
+    Ok(())
+}
+
+/// `table.size`: the number of elements in a table.
+fn exec_table_size(
+    state: &mut ExecState<'_>,
+    slots: &mut [Option<Value>],
+    result: u32,
+    table: u32,
+) -> Result<(), BaselineError> {
+    let size = state
+        .tables
+        .get(table as usize)
+        .and_then(|slot| slot.as_deref())
+        .map(|table| table.elements.len())
+        .ok_or_else(|| {
+            BaselineError::Trap(Trap::HostFailure(
+                "baseline table.size needs a table".into(),
+            ))
+        })?;
+    slots[result as usize] = Some(Value::I32(size as i32));
+    Ok(())
+}
+
+/// `table.fill`: write a reference over a range of a table. The range is checked before anything is written.
+fn exec_table_fill(
+    state: &mut ExecState<'_>,
+    slots: &[Option<Value>],
+    table: u32,
+    index: u32,
+    value: u32,
+    length: u32,
+) -> Result<(), BaselineError> {
+    let index = u64::from(i32_slot(slots, index)? as u32);
+    let length = u64::from(i32_slot(slots, length)? as u32);
+    let reference = match read_slot(slots, value)? {
+        Value::Ref(reference) => reference,
+        other => {
+            return Err(BaselineError::Trap(Trap::HostFailure(format!(
+                "baseline table.fill operand is not a reference: {other:?}"
+            ))))
+        }
+    };
+    let target = table_mut(state, table)?;
+    if !fits(index, length, target.elements.len()) {
+        return Err(BaselineError::Trap(Trap::TableOutOfBounds));
+    }
+    for offset in 0..length {
+        target.elements[(index + offset) as usize] = slot_of(reference.clone());
     }
     Ok(())
 }

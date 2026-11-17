@@ -103,6 +103,14 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
     for global in &module.globals {
         let (init, init_expr) = if crate::const_expr::reads_globals(&global.init.0) {
             (None, Some(global.init.0.clone()))
+        } else if let ValueType::Ref(kind) = global.global_type.value_type {
+            // A reference is `ref.null`, or `ref.func` naming a defined function by its index, which the
+            // baseline binds to the function's address once the module is installed.
+            let value = match read_table_init_expr(&global.init, imported_functions)? {
+                None => tpt_wasm_types::Value::Ref(tpt_wasm_types::RefValue::Null(kind)),
+                Some(index) => tpt_wasm_types::Value::Ref(tpt_wasm_types::RefValue::FuncRef(index)),
+            };
+            (Some(value), None)
         } else {
             (
                 Some(read_const_expr(
@@ -222,6 +230,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             min: table_type.limits.min,
             max: table_type.limits.max,
             segments: seeds.next().unwrap_or_default(),
+            init: None,
             import: Some(super::IrImportSource {
                 module: import.module.clone(),
                 name: import.name.clone(),
@@ -229,17 +238,33 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         });
     }
     for table in &module.tables {
-        if table.init.is_some() {
-            return Err(LoweringError::UnsupportedFeature("table initializer"));
-        }
+        let init = match &table.init {
+            Some(expression) => Some(read_table_init_expr(expression, imported_functions)?),
+            None => None,
+        };
         tables.push(IrTable {
             element_type: table.table_type.element_type,
             min: table.table_type.limits.min,
             max: table.table_type.limits.max,
             segments: seeds.next().unwrap_or_default(),
+            init,
             import: None,
         });
     }
+    // A passive segment's contents are read by the table instructions. Active and declarative segments are
+    // dropped at instantiation, so they read as empty and carry no contents here.
+    let passive_elements: Vec<Option<super::IrElementInit>> = module
+        .elements
+        .iter()
+        .map(|element| match element.mode {
+            tpt_wasm_format::ElementMode::Passive => Ok(Some(super::IrElementInit {
+                element_type: element.element_type,
+                elements: lower_element_init(&element.init, imported_functions)?,
+            })),
+            tpt_wasm_format::ElementMode::Active { .. }
+            | tpt_wasm_format::ElementMode::Declarative => Ok(None),
+        })
+        .collect::<Result<_, LoweringError>>()?;
     let passive_data: Vec<Option<Vec<u8>>> = module
         .data
         .iter()
@@ -251,6 +276,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
     Ok(IrModule {
         functions,
         passive_data,
+        passive_elements,
         imports,
         globals,
         memory,
@@ -1225,6 +1251,69 @@ fn lower_body(
                             destination,
                             value,
                             length,
+                        });
+                    }
+                    12 => {
+                        let elem = reader.u32()?;
+                        let table = reader.u32()?;
+                        let length = state.pop(ValueType::I32)?;
+                        let source = state.pop(ValueType::I32)?;
+                        let destination = state.pop(ValueType::I32)?;
+                        builder.push(IrInstr::TableInit {
+                            table,
+                            elem,
+                            dst: destination,
+                            src: source,
+                            len: length,
+                        });
+                    }
+                    13 => {
+                        let elem = reader.u32()?;
+                        builder.push(IrInstr::ElemDrop { elem });
+                    }
+                    14 => {
+                        let dst_table = reader.u32()?;
+                        let src_table = reader.u32()?;
+                        let length = state.pop(ValueType::I32)?;
+                        let source = state.pop(ValueType::I32)?;
+                        let destination = state.pop(ValueType::I32)?;
+                        builder.push(IrInstr::TableCopy {
+                            dst_table,
+                            src_table,
+                            dst: destination,
+                            src: source,
+                            len: length,
+                        });
+                    }
+                    15 => {
+                        let table = reader.u32()?;
+                        let delta = state.pop(ValueType::I32)?;
+                        let value = state.pop_reference()?;
+                        let result = state.allocate(ValueType::I32)?;
+                        builder.push(IrInstr::TableGrow {
+                            result,
+                            table,
+                            value,
+                            delta,
+                        });
+                        state.push(result, ValueType::I32);
+                    }
+                    16 => {
+                        let table = reader.u32()?;
+                        let result = state.allocate(ValueType::I32)?;
+                        builder.push(IrInstr::TableSize { result, table });
+                        state.push(result, ValueType::I32);
+                    }
+                    17 => {
+                        let table = reader.u32()?;
+                        let length = state.pop(ValueType::I32)?;
+                        let value = state.pop_reference()?;
+                        let index = state.pop(ValueType::I32)?;
+                        builder.push(IrInstr::TableFill {
+                            table,
+                            index,
+                            value,
+                            len: length,
                         });
                     }
                     _ => return Err(LoweringError::UnsupportedInstruction(0xfc)),

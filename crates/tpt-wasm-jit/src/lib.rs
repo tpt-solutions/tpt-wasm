@@ -1270,7 +1270,7 @@ fn compile_module_with(
         .tables
         .first()
         .filter(|_| module.tables.len() == 1)
-        .filter(|table| table.import.is_none())
+        .filter(|table| table.import.is_none() && table.init.is_none())
         .filter(|table| table.min <= 1 << 20);
     // The layout is shared with the machine IR's interpreter, so both backends check the same table.
     let slots: Vec<Option<u32>> = mir::table_slots(module);

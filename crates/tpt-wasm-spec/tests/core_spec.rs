@@ -494,9 +494,10 @@ fn core_spec_suite_on_the_optimizing_engine() {
     assert_suite_passes(EngineMode::Optimizing);
 }
 
-/// The five reference-type files, on the interpreter. The baseline and optimizing tiers do not yet lower
-/// `externref` tables, several tables, or the table instructions, so these files are kept out of `SUITES`
-/// until they do. Each file's directive count is pinned, so a directive cannot drop out unnoticed.
+/// The reference-type files that do not yet pass on every engine. Each one still has refusals on the baseline
+/// (table and element initializers that read a global, references to imported functions, and calls through a
+/// table into another instance), so these run on the interpreter only. Each file's directive count is pinned,
+/// so a directive cannot drop out unnoticed.
 #[test]
 fn reference_type_files_pass_on_the_interpreter() {
     let files: &[(&str, &str, usize)] = &[
@@ -506,16 +507,6 @@ fn reference_type_files_pass_on_the_interpreter() {
             "ref_func.wast",
             include_str!("../testdata/ref_func.wast"),
             17,
-        ),
-        (
-            "table_grow.wast",
-            include_str!("../testdata/table_grow.wast"),
-            58,
-        ),
-        (
-            "table_size.wast",
-            include_str!("../testdata/table_size.wast"),
-            39,
         ),
     ];
     for (name, source, expected) in files {
@@ -535,6 +526,48 @@ fn reference_type_files_pass_on_the_interpreter() {
             failures.len(),
             failures.join("\n")
         );
+    }
+}
+
+/// The table files that pass on every engine. Each directive count is pinned, so a directive cannot drop out
+/// unnoticed, and each file must run cleanly on the interpreter, the baseline and the optimizing tier alike.
+#[test]
+fn table_files_pass_on_every_engine() {
+    let files: &[(&str, &str, usize)] = &[
+        (
+            "table_grow.wast",
+            include_str!("../testdata/table_grow.wast"),
+            58,
+        ),
+        (
+            "table_size.wast",
+            include_str!("../testdata/table_size.wast"),
+            39,
+        ),
+    ];
+    for mode in [
+        EngineMode::Micro,
+        EngineMode::Baseline,
+        EngineMode::Optimizing,
+    ] {
+        for (name, source, expected) in files {
+            let cases = run_core_suite_with(source, mode)
+                .unwrap_or_else(|error| panic!("{name}: could not parse: {error}"));
+            assert_eq!(cases.len(), *expected, "{name}: directive count changed");
+            let failures: Vec<String> = cases
+                .iter()
+                .filter_map(|case| match &case.outcome {
+                    CoreOutcome::Failed(reason) => Some(format!("line {}: {reason}", case.line)),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                failures.is_empty(),
+                "{mode:?} {name}: {} directive(s) failed:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        }
     }
 }
 

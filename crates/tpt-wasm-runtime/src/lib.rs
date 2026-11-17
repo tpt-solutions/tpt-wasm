@@ -1450,7 +1450,21 @@ fn instantiate_module(
                     return Err(incompatible(import, "definition is not a table"));
                 };
                 same_context(&context, export)?;
-                let actual = external_table_type(&store, export.address)?;
+                let mut actual = external_table_type(&store, export.address)?;
+                // A table a baseline instance holds is grown in its own copy, so the size an
+                // importer sees is that copy's, not the store's.
+                let shared = lock_baseline_tables(&context.baseline_tables)?
+                    .get(&export.address)
+                    .cloned();
+                if let Some(shared) = shared {
+                    let size = shared
+                        .lock()
+                        .map_err(|_| {
+                            RuntimeError::UnsupportedFeature("a baseline table that is locked")
+                        })?
+                        .size();
+                    actual.limits.min = size as u64;
+                }
                 if actual.element_type != expected.element_type
                     || !limits_match(&actual.limits, &expected.limits)
                 {

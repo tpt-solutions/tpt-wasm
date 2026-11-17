@@ -537,7 +537,13 @@ fn execute_ir_function(
                 IrInstr::MemoryInit { .. }
                 | IrInstr::DataDrop { .. }
                 | IrInstr::MemoryCopy { .. }
-                | IrInstr::MemoryFill { .. } => {
+                | IrInstr::MemoryFill { .. }
+                | IrInstr::TableInit { .. }
+                | IrInstr::ElemDrop { .. }
+                | IrInstr::TableCopy { .. }
+                | IrInstr::TableGrow { .. }
+                | IrInstr::TableSize { .. }
+                | IrInstr::TableFill { .. } => {
                     return Err(Trap::HostFailure(
                         "bulk memory is not in the test interpreter".into(),
                     ));

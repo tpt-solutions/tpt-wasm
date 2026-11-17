@@ -282,6 +282,7 @@ pub fn defines(instruction: &IrInstr) -> Option<ValueId> {
     Some(match instruction {
         // The bulk memory instructions define no value.
         MemoryInit { .. } | DataDrop { .. } | MemoryCopy { .. } | MemoryFill { .. } => return None,
+        TableInit { .. } | ElemDrop { .. } | TableCopy { .. } | TableFill { .. } => return None,
         ConstI32 { result, .. }
         | ConstI64 { result, .. }
         | ConstF32 { result, .. }
@@ -308,6 +309,8 @@ pub fn defines(instruction: &IrInstr) -> Option<ValueId> {
         | RefFunc { result, .. }
         | RefIsNull { result, .. }
         | TableGet { result, .. }
+        | TableGrow { result, .. }
+        | TableSize { result, .. }
         | Load { result, .. }
         | MemorySize { result }
         | MemoryGrow { result, .. }
@@ -418,6 +421,14 @@ pub fn used_values(instruction: &IrInstr) -> Vec<ValueId> {
         // A table get reads its index; a table set reads the index and the reference.
         TableGet { index, .. } => vec![*index],
         TableSet { index, value, .. } => vec![*index, *value],
+        TableInit { dst, src, len, .. } => vec![*dst, *src, *len],
+        ElemDrop { .. } => Vec::new(),
+        TableCopy { dst, src, len, .. } => vec![*dst, *src, *len],
+        TableGrow { value, delta, .. } => vec![*value, *delta],
+        TableSize { .. } => Vec::new(),
+        TableFill {
+            index, value, len, ..
+        } => vec![*index, *value, *len],
         RefNull { .. } | RefFunc { .. } | MemorySize { .. } | GlobalGet { .. } => Vec::new(),
         Load { address, .. } => vec![*address],
         Store { address, value, .. } => vec![*address, *value],
@@ -534,7 +545,11 @@ pub fn may_trap(instruction: &IrInstr) -> bool {
         // all traps, and the callee can trap too.
         CallIndirect { .. } | Call { .. } | CallHost { .. } => true,
         // A table access outside the table traps, so it stays even when its result is unused.
-        TableGet { .. } | TableSet { .. } => true,
+        TableGet { .. }
+        | TableSet { .. }
+        | TableInit { .. }
+        | TableCopy { .. }
+        | TableFill { .. } => true,
         // Everything else in the modeled instruction set is total.
         _ => false,
     }
@@ -558,6 +573,11 @@ pub fn has_side_effects(instruction: &IrInstr) -> bool {
         | CallHost { .. }
         | CallIndirect { .. }
         | TableSet { .. }
+        | TableInit { .. }
+        | ElemDrop { .. }
+        | TableCopy { .. }
+        | TableGrow { .. }
+        | TableFill { .. }
         | LocalSet { .. }
         | LocalTee { .. } => true,
         // A `drop` discards a value. Under the MVP there is nothing for a discard
@@ -622,6 +642,7 @@ pub fn reads_mutable_state(instruction: &IrInstr) -> bool {
             | IrInstr::MemorySize { .. }
             | IrInstr::RefFunc { .. }
             | IrInstr::TableGet { .. }
+            | IrInstr::TableSize { .. }
     )
 }
 
@@ -642,6 +663,11 @@ pub fn writes_mutable_state(instruction: &IrInstr) -> bool {
             | IrInstr::LocalSet { .. }
             | IrInstr::LocalTee { .. }
             | IrInstr::TableSet { .. }
+            | IrInstr::TableInit { .. }
+            | IrInstr::ElemDrop { .. }
+            | IrInstr::TableCopy { .. }
+            | IrInstr::TableGrow { .. }
+            | IrInstr::TableFill { .. }
     )
 }
 
@@ -899,6 +925,23 @@ pub fn map_operands(instruction: &mut IrInstr, mut f: impl FnMut(ValueId) -> Val
         TableSet { index, value, .. } => {
             *index = f(*index);
             *value = f(*value);
+        }
+        TableInit { dst, src, len, .. } | TableCopy { dst, src, len, .. } => {
+            *dst = f(*dst);
+            *src = f(*src);
+            *len = f(*len);
+        }
+        ElemDrop { .. } | TableSize { .. } => {}
+        TableGrow { value, delta, .. } => {
+            *value = f(*value);
+            *delta = f(*delta);
+        }
+        TableFill {
+            index, value, len, ..
+        } => {
+            *index = f(*index);
+            *value = f(*value);
+            *len = f(*len);
         }
         _ => {
             let operands = used_values(instruction);
