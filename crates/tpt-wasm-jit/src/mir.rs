@@ -1535,6 +1535,13 @@ pub fn table_slots(module: &IrModule) -> Vec<Option<u32>> {
                     .all(|index| *index >= imports)
             }) && table.init.flatten().is_none_or(|index| index >= imports)
         })
+        .filter(|table| table.init_expr.is_none())
+        .filter(|table| {
+            table
+                .segments
+                .iter()
+                .all(|segment| segment.entry_exprs.is_empty())
+        })
         .filter(|table| table.min <= 1 << 20);
     match table {
         Some(table) => {

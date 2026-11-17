@@ -215,10 +215,12 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
                     "table index out of range",
                 ))?;
         let (segment_offset, offset_expr) = element_offset(offset)?;
+        let (elements, entry_exprs) = lower_element_init(&element.init)?;
         seeded.push(super::IrElementSegment {
             offset: segment_offset,
             offset_expr,
-            elements: lower_element_init(&element.init)?,
+            elements,
+            entry_exprs,
         });
     }
     let mut seeds = seeds.into_iter();
@@ -233,6 +235,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             max: table_type.limits.max,
             segments: seeds.next().unwrap_or_default(),
             init: None,
+            init_expr: None,
             import: Some(super::IrImportSource {
                 module: import.module.clone(),
                 name: import.name.clone(),
@@ -240,9 +243,12 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         });
     }
     for table in &module.tables {
-        let init = match &table.init {
-            Some(expression) => Some(read_table_init_expr(expression)?),
-            None => None,
+        let (init, init_expr) = match &table.init {
+            Some(expression) if crate::const_expr::reads_globals(&expression.0) => {
+                (Some(None), Some(expression.0.clone()))
+            }
+            Some(expression) => (Some(read_table_init_expr(expression)?), None),
+            None => (None, None),
         };
         tables.push(IrTable {
             element_type: table.table_type.element_type,
@@ -250,6 +256,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             max: table.table_type.limits.max,
             segments: seeds.next().unwrap_or_default(),
             init,
+            init_expr,
             import: None,
         });
     }
@@ -259,10 +266,14 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         .elements
         .iter()
         .map(|element| match element.mode {
-            tpt_wasm_format::ElementMode::Passive => Ok(Some(super::IrElementInit {
-                element_type: element.element_type,
-                elements: lower_element_init(&element.init)?,
-            })),
+            tpt_wasm_format::ElementMode::Passive => {
+                let (elements, entry_exprs) = lower_element_init(&element.init)?;
+                Ok(Some(super::IrElementInit {
+                    element_type: element.element_type,
+                    elements,
+                    entry_exprs,
+                }))
+            }
             tpt_wasm_format::ElementMode::Active { .. }
             | tpt_wasm_format::ElementMode::Declarative => Ok(None),
         })
@@ -1678,15 +1689,31 @@ pub(crate) fn read_const_expr(
 /// numbers in the module's index space, so they only need rebasing past the
 /// imports. An expression is either `ref.null`, which leaves the slot empty, or
 /// `ref.func`, which names a function and is rebased the same way.
+/// An element segment's entries, and the positions and expressions of those that read a global.
+type ElementEntries = (Vec<Option<u32>>, Vec<(u32, Vec<u8>)>);
+
+/// Lower an element segment's entries. An entry whose expression reads a global is a null placeholder, and
+/// its position and expression are returned for the baseline to resolve once the imports are installed.
 fn lower_element_init(
     init: &tpt_wasm_format::ElementInit,
-) -> Result<Vec<Option<u32>>, LoweringError> {
+) -> Result<ElementEntries, LoweringError> {
     match init {
-        tpt_wasm_format::ElementInit::FuncIndices(indices) => {
-            indices.iter().map(|index| Ok(Some(*index))).collect()
-        }
+        tpt_wasm_format::ElementInit::FuncIndices(indices) => Ok((
+            indices.iter().map(|index| Some(*index)).collect(),
+            Vec::new(),
+        )),
         tpt_wasm_format::ElementInit::Expressions(expressions) => {
-            expressions.iter().map(read_table_init_expr).collect()
+            let mut entries = Vec::with_capacity(expressions.len());
+            let mut deferred = Vec::new();
+            for (position, expression) in expressions.iter().enumerate() {
+                if crate::const_expr::reads_globals(&expression.0) {
+                    entries.push(None);
+                    deferred.push((position as u32, expression.0.clone()));
+                } else {
+                    entries.push(read_table_init_expr(expression)?);
+                }
+            }
+            Ok((entries, deferred))
         }
     }
 }

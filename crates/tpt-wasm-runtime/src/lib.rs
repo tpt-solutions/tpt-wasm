@@ -376,6 +376,9 @@ struct RuntimeContext {
     baseline_globals: Arc<Mutex<HashMap<u32, tpt_wasm_codegen::SharedGlobal>>>,
     /// Baseline tables, keyed by the store address of the table they are.
     baseline_tables: Arc<Mutex<HashMap<u32, tpt_wasm_codegen::SharedTable>>>,
+    /// Each baseline function, by store address, with the copy of its module that runs it and its defined index.
+    /// A call from another instance's table or import reaches the function through this registry.
+    baseline_functions: Arc<Mutex<BaselineFunctionMap>>,
 }
 
 impl RuntimeContext {
@@ -390,6 +393,7 @@ impl RuntimeContext {
             baseline_memories: Arc::new(Mutex::new(HashMap::new())),
             baseline_globals: Arc::new(Mutex::new(HashMap::new())),
             baseline_tables: Arc::new(Mutex::new(HashMap::new())),
+            baseline_functions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -462,6 +466,16 @@ fn lock_baseline_globals(
     globals: &Arc<Mutex<BaselineGlobalMap>>,
 ) -> Result<MutexGuard<'_, BaselineGlobalMap>, RuntimeError> {
     globals.lock().map_err(|_| RuntimeError::StorePoisoned)
+}
+
+type BaselineFunctionMap = HashMap<u32, (Arc<Mutex<tpt_wasm_codegen::BaselineModule>>, usize)>;
+
+fn lock_baseline_functions(
+    functions: &Arc<Mutex<BaselineFunctionMap>>,
+) -> Result<MutexGuard<'_, BaselineFunctionMap>, RuntimeError> {
+    functions
+        .lock()
+        .map_err(|_| RuntimeError::UnsupportedFeature("the baseline function registry is locked"))
 }
 
 type BaselineTableMap = HashMap<u32, tpt_wasm_codegen::SharedTable>;
@@ -1238,6 +1252,9 @@ struct BaselineHost {
     /// One entry per import the baseline may call, mapping `module::name` to the
     /// synthesized callback name Micro resolves it to.
     bindings: Vec<(String, String)>,
+    /// Imports this boundary reaches in another instance: the qualified name, the store address of the
+    /// function it names, and its declared signature.
+    foreign: Vec<(String, u32, FunctionType)>,
     /// Calls made through this boundary, keyed by `module::name`, for the instance.
     counts: Arc<Mutex<BTreeMap<String, u64>>>,
     /// The calls made through this boundary, in order, for the instance.
@@ -1245,6 +1262,45 @@ struct BaselineHost {
 }
 
 impl tpt_wasm_codegen::HostBoundary for BaselineHost {
+    fn foreign_target(&self, module: &str, name: &str) -> Option<(u32, FunctionType)> {
+        let wanted = format!("{module}::{name}");
+        self.foreign
+            .iter()
+            .find(|(bound, _, _)| *bound == wanted)
+            .map(|(_, address, function_type)| (*address, function_type.clone()))
+    }
+
+    fn call_foreign(
+        &mut self,
+        address: u32,
+        expected: &FunctionType,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, tpt_wasm_codegen::BaselineError> {
+        use tpt_wasm_codegen::BaselineError;
+        let trap = |message: &str| BaselineError::Trap(Trap::HostFailure(message.into()));
+        let context = self
+            .context
+            .clone()
+            .ok_or_else(|| trap("baseline cross-instance call has no runtime context"))?;
+        let (shared, local) = lock_baseline_functions(&context.baseline_functions)
+            .map_err(|_| trap("the baseline function registry is locked"))?
+            .get(&address)
+            .cloned()
+            .ok_or_else(|| trap("baseline call target is not a function of this store"))?;
+        // The owner's copy may be running already, or may share a memory with a call that is. Either way it
+        // is refused rather than waited on, since waiting would deadlock on this thread.
+        const REENTERED: &str =
+            "a function of another instance is already running, so it is refused rather than re-entered";
+        let mut owner = shared.try_lock().map_err(|_| trap(REENTERED))?;
+        if !owner.is_free() {
+            return Err(trap(REENTERED));
+        }
+        if owner.function_type(local) != Some(expected) {
+            return Err(BaselineError::Trap(Trap::IndirectCallTypeMismatch));
+        }
+        owner.call(local, args)
+    }
+
     fn call(
         &mut self,
         module: &str,
@@ -1380,6 +1436,9 @@ fn instantiate_module(
     // Maps each import the baseline will call to the same synthesized callback
     // name Micro resolves it to, so both backends reach one implementation.
     let mut baseline_bindings: Vec<(String, String)> = Vec::new();
+    // Each function a baseline module imports from another instance: the qualified name, the store address
+    // of that function, and its signature. The host boundary reaches it.
+    let mut foreign_bindings: Vec<(String, u32, FunctionType)> = Vec::new();
     // Both compiled modes route through the baseline executor; they differ only
     // in whether the optimizer ran. Treating them the same here is what makes
     // them comparable.
@@ -1424,15 +1483,8 @@ fn instantiate_module(
                             .push((format!("{}::{}", import.module, import.name), callback_name));
                     }
                     LinkerDefinition::Instance(export) => {
-                        // A cross-instance import is a Wasm-to-Wasm call, not a
-                        // host capability, so the baseline's host boundary cannot
-                        // express it. Refused here rather than failing later at
-                        // the call site with a less useful message.
-                        if baseline_mode {
-                            return Err(RuntimeError::UnsupportedFeature(
-                                "cross-instance imports in baseline mode",
-                            ));
-                        }
+                        // Under the baseline, a cross-instance import is reached through the host boundary, which
+                        // runs the other instance's function by its store address. See the foreign binding below.
                         same_context(&context, export)?;
                         let actual = external_function_type(&store, export.address)?;
                         if &actual != expected {
@@ -1442,6 +1494,13 @@ fn instantiate_module(
                             ));
                         }
                         func_addrs.push(export.address);
+                        if baseline_mode {
+                            foreign_bindings.push((
+                                format!("{}::{}", import.module, import.name),
+                                export.address,
+                                expected.clone(),
+                            ));
+                        }
                     }
                 }
             }
@@ -1759,12 +1818,15 @@ fn instantiate_module(
     let host_counts = Arc::clone(&instance.baseline_host_counts);
     let host_trace = Arc::clone(&instance.baseline_host_trace);
     if let Some(module) = instance.baseline.as_mut() {
-        if !baseline_bindings.is_empty() {
+        // Always installed: a call from another instance reaches this module through the boundary, even when
+        // the module imports nothing itself.
+        {
             module.set_host(BaselineHost {
                 context: Some(context.clone()),
-                bindings: baseline_bindings,
-                counts: host_counts,
-                trace: host_trace,
+                bindings: baseline_bindings.clone(),
+                foreign: foreign_bindings.clone(),
+                counts: Arc::clone(&host_counts),
+                trace: Arc::clone(&host_trace),
             });
         }
         // The baseline recurses to make a call, so it needs the same call-depth
@@ -1884,6 +1946,29 @@ fn instantiate_module(
                     registry.insert(baseline_global_addresses[index], Arc::clone(owned));
                 }
             }
+        }
+    }
+    // Each function of a baseline module is reachable from another instance's table or import, through a copy of
+    // the module that shares every handle this one holds. The copy is registered before the start function runs,
+    // since the start function may call into another instance.
+    if let Some(module) = instance.baseline.as_ref() {
+        let mut copy = module.share();
+        copy.set_host(BaselineHost {
+            context: Some(context.clone()),
+            bindings: baseline_bindings.clone(),
+            foreign: foreign_bindings.clone(),
+            counts: Arc::clone(&host_counts),
+            trace: Arc::clone(&host_trace),
+        });
+        let copy = Arc::new(Mutex::new(copy));
+        let total = baseline_function_addresses.len();
+        let defined = module.functions.len();
+        let mut registry = lock_baseline_functions(&context.baseline_functions)?;
+        for local in 0..defined {
+            registry.insert(
+                baseline_function_addresses[total - defined + local],
+                (Arc::clone(&copy), local),
+            );
         }
     }
     if let Some(start) = start {

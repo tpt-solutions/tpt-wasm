@@ -107,7 +107,7 @@ fn the_interpreter_runs_a_function_of_another_instance_reached_through_a_shared_
 }
 
 #[test]
-fn the_baseline_refuses_a_call_through_a_table_into_another_instance_by_name() {
+fn the_baseline_reaches_another_instances_function_through_the_shared_table() {
     let mut engine = engine(EngineMode::Baseline);
     let mut provider = engine
         .instantiate_bytes(&provider())
@@ -119,11 +119,9 @@ fn the_baseline_refuses_a_call_through_a_table_into_another_instance_by_name() {
     engine
         .instantiate_bytes(&consumer())
         .expect("consumer instantiates over the shared table");
-    let error = provider
-        .call("call", Vec::new())
-        .expect_err("g belongs to the consumer, which the baseline cannot reach");
-    assert!(
-        error.to_string().contains("another instance"),
-        "the refusal names the cause: {error}"
+    assert_eq!(
+        provider.call("call", Vec::new()).expect("runs"),
+        vec![Value::I32(9)],
+        "the consumer's g runs from the provider's call, as on the interpreter"
     );
 }

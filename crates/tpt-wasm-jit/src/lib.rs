@@ -1287,6 +1287,13 @@ fn compile_module_with(
                     .all(|index| *index >= imports)
             }) && table.init.flatten().is_none_or(|index| index >= imports)
         })
+        .filter(|table| table.init_expr.is_none())
+        .filter(|table| {
+            table
+                .segments
+                .iter()
+                .all(|segment| segment.entry_exprs.is_empty())
+        })
         .filter(|table| table.min <= 1 << 20);
     // The layout is shared with the machine IR's interpreter, so both backends check the same table.
     let slots: Vec<Option<u32>> = mir::table_slots(module);

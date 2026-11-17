@@ -1937,6 +1937,12 @@ pub struct BaselineModule {
     /// that reads a global. Such a module applies all of them once the imports are installed, so they keep their
     /// order against one another. `None` when every offset is a constant, applied as the tables are made.
     deferred_elements: Option<Vec<(usize, tpt_wasm_ir::IrElementSegment)>>,
+    /// The table initializers resolved with the deferred segments: the table, its constant entry if any, and its
+    /// expression if it reads a global. Empty when nothing is deferred.
+    deferred_table_inits: Vec<DeferredTableInit>,
+    /// The passive entries whose expression reads a global: the element segment, the position, the expression,
+    /// and the segment's reference type.
+    deferred_elem_entries: Vec<(usize, u32, Vec<u8>, tpt_wasm_types::ReferenceType)>,
     /// The inverse of `function_addresses`: which defined function an address names.
     function_locals: HashMap<u32, usize>,
     /// The module's function types, needed to check an indirect call's target.
@@ -2072,6 +2078,16 @@ impl BaselineTable {
 /// other instance could see it.
 pub type SharedTable = Arc<Mutex<BaselineTable>>;
 
+/// A table initializer resolved with the deferred segments: the table, its constant entry if any, and its
+/// expression if it reads a global.
+type DeferredTableInit = (usize, Option<Option<u32>>, Option<Vec<u8>>);
+
+/// The passive data segments, shared by the module and each call.
+type SharedData = Arc<Mutex<Vec<Option<Vec<u8>>>>>;
+
+/// The passive element segments, shared by the module and each call.
+type SharedElems = Arc<Mutex<Vec<Option<Vec<tpt_wasm_types::RefValue>>>>>;
+
 /// Write a table's active element segment into it, in module order.
 ///
 /// Order is the point, the same as for data segments: a later segment overwrites
@@ -2189,7 +2205,29 @@ impl From<HostCallFailure> for BaselineError {
 /// do on its own. The embedder implements this against whatever authorizes calls;
 /// the runtime routes it through the same capability-mediated path the Micro
 /// interpreter uses, so both backends produce the same effects and failures.
-pub trait HostBoundary {
+pub trait HostBoundary: Send {
+    /// Where a foreign import leads, when this boundary reaches another instance's function: that function's
+    /// store address and its declared type. `None` for an ordinary host function, which is the default.
+    fn foreign_target(&self, module: &str, name: &str) -> Option<(u32, FunctionType)> {
+        let _ = (module, name);
+        None
+    }
+
+    /// Call another instance's function at a store address, from a table entry or a foreign import. The default
+    /// refuses, for a boundary that cannot reach another instance.
+    fn call_foreign(
+        &mut self,
+        address: u32,
+        expected: &FunctionType,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, BaselineError> {
+        let _ = (address, expected, args);
+        Err(BaselineError::Host(HostCallFailure {
+            name: "cross-instance call".to_owned(),
+            message: "the host boundary cannot reach another instance".to_owned(),
+        }))
+    }
+
     /// Invoke the host function an import names, or fail.
     ///
     /// `memory` is the calling module's memory, lent for this call when the module has
@@ -2229,6 +2267,11 @@ pub fn invoke_import(
             message: "no host boundary was installed".into(),
         })
     })?;
+    if let Some((address, function_type)) =
+        host.foreign_target(&declaration.module, &declaration.name)
+    {
+        return host.call_foreign(address, &function_type, args);
+    }
     let returned = host.call(&declaration.module, &declaration.name, memory, args)?;
     let expected_results = &declaration.function_type.results.0;
     if returned.len() != expected_results.len() {
@@ -2317,11 +2360,14 @@ impl BaselineModule {
         let function_addresses: Vec<u32> = (0..module.imports.len() + functions.len())
             .map(|index| u32::try_from(index).unwrap_or(u32::MAX))
             .collect();
+        // Anything that reads a global waits for the imports, and so does everything that must keep its order
+        // against it: when any of it is deferred, every table starts empty and is filled in order at resolve.
         let defer_elements = module.tables.iter().any(|table| {
-            table
-                .segments
-                .iter()
-                .any(|segment| segment.offset_expr.is_some())
+            table.init_expr.is_some()
+                || table
+                    .segments
+                    .iter()
+                    .any(|segment| segment.offset_expr.is_some() || !segment.entry_exprs.is_empty())
         });
         let deferred_elements = defer_elements.then(|| {
             module
@@ -2336,6 +2382,32 @@ impl BaselineModule {
                 })
                 .collect()
         });
+        let deferred_table_inits: Vec<DeferredTableInit> = if defer_elements {
+            module
+                .tables
+                .iter()
+                .enumerate()
+                .filter(|(_, table)| table.import.is_none())
+                .filter(|(_, table)| table.init.is_some() || table.init_expr.is_some())
+                .map(|(index, table)| (index, table.init, table.init_expr.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // A passive entry that reads a global is resolved once the imports are in, whatever else is deferred.
+        let deferred_elem_entries: Vec<(usize, u32, Vec<u8>, tpt_wasm_types::ReferenceType)> =
+            module
+                .passive_elements
+                .iter()
+                .enumerate()
+                .flat_map(|(index, segment)| {
+                    segment.iter().flat_map(move |init| {
+                        init.entry_exprs.iter().map(move |(position, expr)| {
+                            (index, *position, expr.clone(), init.element_type)
+                        })
+                    })
+                })
+                .collect();
         let mut tables = Vec::with_capacity(module.tables.len());
         let mut pending_imported_tables = Vec::with_capacity(module.tables.len());
         for declaration in &module.tables {
@@ -2347,10 +2419,15 @@ impl BaselineModule {
             let length = usize::try_from(declaration.min)
                 .map_err(|_| CodegenError::UnsupportedMemory("table size"))?;
             // A table with an initializer starts every slot at its entry, before the segments are applied.
-            let initial = declaration
-                .init
-                .flatten()
-                .map(tpt_wasm_types::RefValue::FuncRef);
+            // Deferred, the table starts empty and its initializer is applied at resolve, in order.
+            let initial = if defer_elements {
+                None
+            } else {
+                declaration
+                    .init
+                    .flatten()
+                    .map(tpt_wasm_types::RefValue::FuncRef)
+            };
             let mut table = BaselineTable {
                 element_type: declaration.element_type,
                 elements: vec![initial; length],
@@ -2413,6 +2490,8 @@ impl BaselineModule {
             pending_imported_tables,
             function_addresses,
             deferred_elements,
+            deferred_table_inits,
+            deferred_elem_entries,
             function_locals,
             types: module.types.clone(),
             memory,
@@ -2687,41 +2766,52 @@ impl BaselineModule {
                 .map_err(|_| CodegenError::UnsupportedMemory("shared memory is locked"))?;
             apply_segments(&mut guard, &resolved)?;
         }
-        // The deferred element segments, now that every global they may name has its value. Each offset is
-        // resolved to a plain one, and a segment that does not fit traps at instantiation, as the specification has it.
+        // The deferred table initializers first, then the deferred segments in module order: a segment overwrites
+        // what the initializer set, as the specification has it.
+        for (table_index, constant, expression) in std::mem::take(&mut self.deferred_table_inits) {
+            let reference = match expression {
+                Some(expression) => reference_of(eval_global_value(&self.globals, &expression)?)?,
+                None => match constant {
+                    Some(Some(index)) => Some(tpt_wasm_types::RefValue::FuncRef(
+                        *self
+                            .function_addresses
+                            .get(index as usize)
+                            .ok_or(CodegenError::ElementSegmentOutOfBounds)?,
+                    )),
+                    _ => None,
+                },
+            };
+            let shared = self
+                .tables
+                .get(table_index)
+                .and_then(|slot| slot.clone())
+                .ok_or(CodegenError::UnsupportedMemory(
+                    "a deferred table initializer names a table that is not installed",
+                ))?;
+            let mut table = lock_shared(&shared)
+                .map_err(|_| CodegenError::UnsupportedMemory("shared table is locked"))?;
+            for slot in table.elements.iter_mut() {
+                *slot = reference.clone();
+            }
+        }
         if let Some(segments) = self.deferred_elements.take() {
             for (table_index, segment) in segments {
                 let offset = match segment.offset_expr.as_ref() {
                     None => segment.offset,
-                    Some(expr) => {
-                        let globals = &self.globals;
-                        let value = tpt_wasm_ir::eval_const(expr, &|global| {
-                            globals
-                                .get(global as usize)
-                                .and_then(|slot| slot.as_ref())
-                                .and_then(|handle| {
-                                    lock_shared(handle).ok().map(|guard| (*guard).clone())
-                                })
-                        })
-                        .map_err(|_| {
-                            CodegenError::UnsupportedMemory(
-                                "an element offset could not be evaluated",
-                            )
-                        })?;
-                        match value {
-                            Value::I32(offset) => offset as u32,
-                            _ => {
-                                return Err(CodegenError::UnsupportedMemory(
-                                    "an element offset is not an i32",
-                                ))
-                            }
+                    Some(expr) => match eval_global_value(&self.globals, expr)? {
+                        Value::I32(offset) => offset as u32,
+                        _ => {
+                            return Err(CodegenError::UnsupportedMemory(
+                                "an element offset is not an i32",
+                            ))
                         }
-                    }
+                    },
                 };
                 let resolved = tpt_wasm_ir::IrElementSegment {
                     offset,
                     offset_expr: None,
                     elements: segment.elements.clone(),
+                    entry_exprs: Vec::new(),
                 };
                 let shared = self
                     .tables
@@ -2733,7 +2823,32 @@ impl BaselineModule {
                 let mut guard = lock_shared(&shared)
                     .map_err(|_| CodegenError::UnsupportedMemory("shared table is locked"))?;
                 apply_segment(&mut guard, &resolved, &self.function_addresses)?;
+                for (position, expression) in &segment.entry_exprs {
+                    let reference = reference_of(eval_global_value(&self.globals, expression)?)?;
+                    let slot = offset as usize + *position as usize;
+                    *guard
+                        .elements
+                        .get_mut(slot)
+                        .ok_or(CodegenError::ElementSegmentOutOfBounds)? = reference;
+                }
             }
+        }
+        // The passive entries that read a global, now that every global they may name has its value.
+        for (segment, position, expression, element_type) in
+            std::mem::take(&mut self.deferred_elem_entries)
+        {
+            let reference = reference_of(eval_global_value(&self.globals, &expression)?)?
+                .unwrap_or(tpt_wasm_types::RefValue::Null(element_type));
+            let mut elems = lock_shared(&self.elems).map_err(|_| {
+                CodegenError::UnsupportedMemory("passive element segments are locked")
+            })?;
+            let entries = elems
+                .get_mut(segment)
+                .and_then(|entries| entries.as_mut())
+                .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
+            *entries
+                .get_mut(position as usize)
+                .ok_or(CodegenError::ElementSegmentOutOfBounds)? = reference;
         }
         Ok(())
     }
@@ -2845,6 +2960,51 @@ impl BaselineModule {
         self.tables.len()
     }
 
+    /// A copy of this module that shares every handle it holds, so the copy and this module see one memory,
+    /// one set of tables, globals and segments. The host boundary is not copied, since it belongs to the
+    /// instance that installed it; the owner of the copy installs its own.
+    pub fn share(&self) -> BaselineModule {
+        BaselineModule {
+            functions: self.functions.clone(),
+            tables: self.tables.clone(),
+            function_addresses: self.function_addresses.clone(),
+            deferred_elements: self.deferred_elements.clone(),
+            deferred_table_inits: self.deferred_table_inits.clone(),
+            deferred_elem_entries: self.deferred_elem_entries.clone(),
+            function_locals: self.function_locals.clone(),
+            types: self.types.clone(),
+            memory: self.memory.clone(),
+            pending_imported_memory: self.pending_imported_memory.clone(),
+            pending_segments: self.pending_segments.clone(),
+            pending_imported_tables: self.pending_imported_tables.clone(),
+            globals: self.globals.clone(),
+            datas: Arc::clone(&self.datas),
+            elems: Arc::clone(&self.elems),
+            global_import_count: self.global_import_count,
+            deferred_globals: self.deferred_globals.clone(),
+            imports: self.imports.clone(),
+            host: None,
+            max_call_depth: self.max_call_depth,
+            max_execution_steps: self.max_execution_steps,
+        }
+    }
+
+    /// The declared signature of the defined function at `index`.
+    pub fn function_type(&self, index: usize) -> Option<&FunctionType> {
+        self.functions
+            .get(index)
+            .map(|function| &function.function_type)
+    }
+
+    /// Whether a call into this module can take its memory without waiting on a lock its caller holds. A
+    /// running call holds the memory for its whole duration, so a call into a module that shares it is refused.
+    pub fn is_free(&self) -> bool {
+        fn unlocked<T>(shared: &Arc<Mutex<T>>) -> bool {
+            shared.try_lock().is_ok()
+        }
+        self.memory.as_ref().is_none_or(unlocked)
+    }
+
     /// Lower a verified IR module and wrap it so it can be executed.
     pub fn lower(module: &tpt_wasm_ir::IrModule) -> Result<Self, CodegenError> {
         Self::new(module, lower_module(module)?)
@@ -2919,30 +3079,17 @@ impl BaselineModule {
         // same reason the memory is, and for the same reason they are shared with
         // the store at all: a reader outside this call must not see half of a
         // `global.set`, and a `table.set` must not be split across observers.
-        let mut datas = lock_shared(&self.datas)?;
-        let mut elems = lock_shared(&self.elems)?;
         let globals = self.globals.clone();
-        let mut guards = Vec::with_capacity(self.tables.len());
-        for shared in &self.tables {
-            guards.push(match shared {
-                Some(shared) => Some(lock_shared(shared)?),
-                None => None,
-            });
-        }
-        let mut table_refs: Vec<Option<&mut BaselineTable>> = guards
-            .iter_mut()
-            .map(|guard| guard.as_deref_mut())
-            .collect();
         let mut state = ExecState {
             functions,
             imports,
             function_locals: &self.function_locals,
             function_addresses: &self.function_addresses,
-            tables: &mut table_refs,
+            tables: &self.tables,
             types: &self.types,
             memory: memory.as_deref_mut(),
-            datas: &mut datas,
-            elems: &mut elems,
+            datas: &self.datas,
+            elems: &self.elems,
             globals: &globals,
             host: self.host.as_deref_mut(),
             // The entry call is itself a frame, exactly as Micro counts the
@@ -2961,7 +3108,7 @@ struct ExecState<'a> {
     functions: &'a [BaselineFunction],
     /// The imported functions a `CallHost` names.
     imports: &'a [tpt_wasm_ir::IrImport],
-    tables: &'a mut [Option<&'a mut BaselineTable>],
+    tables: &'a [Option<SharedTable>],
     /// The defined function each store address names, for a call through the table.
     function_locals: &'a HashMap<u32, usize>,
     /// The store address of each function, in the full index space, imports first.
@@ -2970,9 +3117,9 @@ struct ExecState<'a> {
     types: &'a [FunctionType],
     memory: Option<&'a mut BaselineMemory>,
     /// The module's data segments, `None` once dropped, locked for the whole execution like the memory.
-    datas: &'a mut Vec<Option<Vec<u8>>>,
+    datas: &'a SharedData,
     /// The passive element segments by element index, as the module's own copy holds them.
-    elems: &'a mut Vec<Option<Vec<tpt_wasm_types::RefValue>>>,
+    elems: &'a SharedElems,
     globals: &'a [Option<SharedGlobal>],
     /// The installed host boundary, absent when the embedder granted none.
     ///
@@ -3075,16 +3222,18 @@ impl BaselineFunction {
     ) -> Result<Vec<Value>, BaselineError> {
         let functions: &[BaselineFunction] = functions;
         let no_locals = HashMap::new();
+        let no_data: SharedData = Arc::new(Mutex::new(Vec::new()));
+        let no_elems: SharedElems = Arc::new(Mutex::new(Vec::new()));
         let mut state = ExecState {
             functions,
             imports: &[],
             function_locals: &no_locals,
             function_addresses: &[],
-            tables: &mut [],
+            tables: &[],
             types: &[],
             memory: None,
-            datas: &mut Vec::new(),
-            elems: &mut Vec::new(),
+            datas: &no_data,
+            elems: &no_elems,
             globals: &mut Vec::new(),
             host: None,
             // The entry call counts as a frame, as it does in `call`.
@@ -3487,8 +3636,8 @@ fn exec_op(
             let destination = i32_slot(slots, *destination)? as u32 as usize;
             let source = i32_slot(slots, *source)? as u32 as usize;
             let length = i32_slot(slots, *length)? as u32 as usize;
-            let segment: &[u8] = state
-                .datas
+            let datas = lock_shared(state.datas)?;
+            let segment: &[u8] = datas
                 .get(*data as usize)
                 .and_then(|segment| segment.as_deref())
                 .unwrap_or(&[]);
@@ -3504,7 +3653,8 @@ fn exec_op(
             memory.data[destination..destination_end].copy_from_slice(&segment[source..source_end]);
         }
         BaselineOp::DataDrop { data } => {
-            if let Some(segment) = state.datas.get_mut(*data as usize) {
+            let mut datas = lock_shared(state.datas)?;
+            if let Some(segment) = datas.get_mut(*data as usize) {
                 *segment = None;
             }
         }
@@ -3615,11 +3765,8 @@ fn exec_op(
             index,
         } => {
             let index = i32_slot(slots, *index)? as u32;
-            let table = state
-                .tables
-                .get(*table as usize)
-                .and_then(|slot| slot.as_deref())
-                .ok_or_else(|| Trap::HostFailure("baseline table.get needs a table".into()))?;
+            let handle = table_handle(state, *table, "baseline table.get needs a table")?;
+            let table = lock_shared(&handle)?;
             let entry = table
                 .elements
                 .get(index as usize)
@@ -3644,11 +3791,8 @@ fn exec_op(
                     ))))
                 }
             };
-            let table = state
-                .tables
-                .get_mut(*table_index as usize)
-                .and_then(|slot| slot.as_deref_mut())
-                .ok_or_else(|| Trap::HostFailure("baseline table.set needs a table".into()))?;
+            let handle = table_handle(state, *table_index, "baseline table.set needs a table")?;
+            let mut table = lock_shared(&handle)?;
             // A reference of the other kind is refused here, as the store refuses it, rather than written.
             if let Some(reference) = &entry {
                 let kind = match reference {
@@ -3679,7 +3823,8 @@ fn exec_op(
             length,
         } => exec_table_init(state, slots, *table, *elem, *destination, *source, *length)?,
         BaselineOp::ElemDrop { elem } => {
-            if let Some(entry) = state.elems.get_mut(*elem as usize) {
+            let mut elems = lock_shared(state.elems)?;
+            if let Some(entry) = elems.get_mut(*elem as usize) {
                 *entry = None;
             }
         }
@@ -3853,20 +3998,18 @@ fn exec_call_indirect(
     // Re-borrowed rather than moved: the recursive call takes
     // `&mut state` again, and the table handle has to stay
     // available for the next instruction.
-    let table_ref = state
-        .tables
-        .get_mut(table as usize)
-        .and_then(|slot| slot.as_deref_mut())
-        .ok_or_else(|| Trap::HostFailure("baseline indirect call needs a table".into()))?;
-    let index = i32_slot(slots, operand)? as u32;
-    // Out of range and null are distinct traps, matching the
-    // order in which the reference is resolved.
-    let target = table_ref
-        .elements
-        .get(index as usize)
-        .cloned()
-        .ok_or(Trap::TableOutOfBounds)?
-        .ok_or(Trap::NullReference)?;
+    let handle = table_handle(state, table, "baseline indirect call needs a table")?;
+    let target = {
+        let table = lock_shared(&handle)?;
+        let index = i32_slot(slots, operand)? as u32;
+        // Out of range and null are distinct traps, matching the order in which the reference is resolved.
+        table
+            .elements
+            .get(index as usize)
+            .cloned()
+            .ok_or(Trap::TableOutOfBounds)?
+            .ok_or(Trap::NullReference)?
+    };
     let address = match target {
         tpt_wasm_types::RefValue::FuncRef(address) => address,
         _ => {
@@ -3875,56 +4018,58 @@ fn exec_call_indirect(
             )))
         }
     };
-    // A table entry is a store address. It names a function by its index in the full function index space,
-    // so one below the import count is a host call, and one above it is a function of this module. A function
-    // of another instance has no body here, which the baseline cannot reach yet, and is refused by name.
-    let full = state
-        .function_locals
-        .get(&address)
-        .copied()
-        .ok_or_else(|| {
-            Trap::HostFailure(
-                "baseline indirect call into a function of another instance is not supported yet"
-                    .into(),
-            )
-        })?;
-    // The signature is checked against the entry the table holds, not against the type index the call names,
-    // since a mismatch is exactly the trap we are modelling.
+    // A table entry is a store address. A function of this module is named by its index in the full function
+    // index space, imports first. One that is not a function of this module is another instance's, and the
+    // host boundary reaches it.
+    let full = state.function_locals.get(&address).copied();
     let expected = state
         .types
         .get(type_index as usize)
-        .ok_or_else(|| Trap::HostFailure("baseline indirect call type is unknown".into()))?;
+        .ok_or_else(|| Trap::HostFailure("baseline indirect call type is unknown".into()))?
+        .clone();
     let mut call_args = Vec::with_capacity(arguments.len());
     for slot in arguments {
         call_args.push(read_slot(slots, *slot)?);
     }
-    let returned = if full < state.imports.len() {
-        if &state.imports[full].function_type != expected {
-            return Err(BaselineError::Trap(Trap::IndirectCallTypeMismatch));
-        }
-        let memory = state
-            .memory
-            .as_deref_mut()
-            .map(|memory| memory as &mut dyn GuestMemory);
-        invoke_import(
-            state.imports,
-            state
-                .host
+    let returned = match full {
+        Some(full) if full < state.imports.len() => {
+            if state.imports[full].function_type != expected {
+                return Err(BaselineError::Trap(Trap::IndirectCallTypeMismatch));
+            }
+            let memory = state
+                .memory
                 .as_deref_mut()
-                .map(|host| host as &mut dyn HostBoundary),
-            memory,
-            full as u32,
-            call_args,
-        )?
-    } else {
-        let local = full - state.imports.len();
-        let callee = state.functions.get(local).ok_or_else(|| {
-            Trap::HostFailure("baseline indirect target is not in the module".into())
-        })?;
-        if &callee.function_type != expected {
-            return Err(BaselineError::Trap(Trap::IndirectCallTypeMismatch));
+                .map(|memory| memory as &mut dyn GuestMemory);
+            invoke_import(
+                state.imports,
+                state
+                    .host
+                    .as_deref_mut()
+                    .map(|host| host as &mut dyn HostBoundary),
+                memory,
+                full as u32,
+                call_args,
+            )?
         }
-        state.call(function_key(state.imports, local), callee, call_args)?
+        Some(full) => {
+            let local = full - state.imports.len();
+            let callee = state.functions.get(local).ok_or_else(|| {
+                Trap::HostFailure("baseline indirect target is not in the module".into())
+            })?;
+            if callee.function_type != expected {
+                return Err(BaselineError::Trap(Trap::IndirectCallTypeMismatch));
+            }
+            state.call(function_key(state.imports, local), callee, call_args)?
+        }
+        None => {
+            let host = state.host.as_deref_mut().ok_or_else(|| {
+                BaselineError::Host(HostCallFailure {
+                    name: "cross-instance call".to_owned(),
+                    message: "no host boundary was installed".to_owned(),
+                })
+            })?;
+            host.call_foreign(address, &expected, call_args)?
+        }
     };
     if returned.len() != results.len() {
         return Err(BaselineError::Trap(Trap::HostFailure(
@@ -3936,6 +4081,31 @@ fn exec_call_indirect(
         slots[slot as usize] = Some(value);
     }
     Ok(())
+}
+
+/// The value of a constant expression that reads globals, with each global read through its handle.
+fn eval_global_value(
+    globals: &[Option<SharedGlobal>],
+    expression: &[u8],
+) -> Result<Value, CodegenError> {
+    tpt_wasm_ir::eval_const(expression, &|global| {
+        globals
+            .get(global as usize)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|handle| lock_shared(handle).ok().map(|guard| (*guard).clone()))
+    })
+    .map_err(|_| CodegenError::UnsupportedMemory("a constant expression could not be evaluated"))
+}
+
+/// The reference a constant evaluates to: `None` for a null, which a table slot stores as empty.
+fn reference_of(value: Value) -> Result<Option<tpt_wasm_types::RefValue>, CodegenError> {
+    match value {
+        Value::Ref(tpt_wasm_types::RefValue::Null(_)) => Ok(None),
+        Value::Ref(reference) => Ok(Some(reference)),
+        _ => Err(CodegenError::UnsupportedMemory(
+            "a constant expression is not a reference",
+        )),
+    }
 }
 
 /// The entry a table slot stores for a reference: a null is the empty slot.
@@ -3953,20 +4123,19 @@ fn fits(start: u64, count: u64, length: usize) -> bool {
         .is_some_and(|end| end <= length as u64)
 }
 
-/// The table at `index`, for a table instruction to write.
-fn table_mut<'s>(
-    state: &'s mut ExecState<'_>,
+/// The shared table at `index`, which an operation names. The operation locks it for as long as it needs it, so
+/// no lock is held across a call into another function.
+fn table_handle(
+    state: &ExecState<'_>,
     index: u32,
-) -> Result<&'s mut BaselineTable, BaselineError> {
+    message: &str,
+) -> Result<SharedTable, BaselineError> {
     state
         .tables
-        .get_mut(index as usize)
-        .and_then(|slot| slot.as_deref_mut())
-        .ok_or_else(|| {
-            BaselineError::Trap(Trap::HostFailure(
-                "baseline table instruction needs a table".into(),
-            ))
-        })
+        .get(index as usize)
+        .cloned()
+        .flatten()
+        .ok_or_else(|| BaselineError::Trap(Trap::HostFailure(message.into())))
 }
 
 /// `table.init`: copy entries from a passive element segment into a table. A dropped segment is empty.
@@ -3982,15 +4151,18 @@ fn exec_table_init(
     let destination = u64::from(i32_slot(slots, destination)? as u32);
     let source = u64::from(i32_slot(slots, source)? as u32);
     let length = u64::from(i32_slot(slots, length)? as u32);
-    let segment = state
-        .elems
-        .get(elem as usize)
-        .and_then(|entry| entry.clone())
-        .unwrap_or_default();
+    let segment = {
+        let elems = lock_shared(state.elems)?;
+        elems
+            .get(elem as usize)
+            .and_then(|entry| entry.clone())
+            .unwrap_or_default()
+    };
     if !fits(source, length, segment.len()) {
         return Err(BaselineError::Trap(Trap::TableOutOfBounds));
     }
-    let target = table_mut(state, table)?;
+    let handle = table_handle(state, table, "baseline table.init needs a table")?;
+    let mut target = lock_shared(&handle)?;
     if !fits(destination, length, target.elements.len()) {
         return Err(BaselineError::Trap(Trap::TableOutOfBounds));
     }
@@ -4015,16 +4187,13 @@ fn exec_table_copy(
     let destination = u64::from(i32_slot(slots, destination)? as u32);
     let source = u64::from(i32_slot(slots, source)? as u32);
     let length = u64::from(i32_slot(slots, length)? as u32);
+    let source_handle = table_handle(
+        state,
+        source_table,
+        "baseline table.copy needs a source table",
+    )?;
     let values = {
-        let from = state
-            .tables
-            .get(source_table as usize)
-            .and_then(|slot| slot.as_deref())
-            .ok_or_else(|| {
-                BaselineError::Trap(Trap::HostFailure(
-                    "baseline table.copy needs a source table".into(),
-                ))
-            })?;
+        let from = lock_shared(&source_handle)?;
         if !fits(source, length, from.elements.len()) {
             return Err(BaselineError::Trap(Trap::TableOutOfBounds));
         }
@@ -4032,7 +4201,12 @@ fn exec_table_copy(
             .map(|index| from.elements[index as usize].clone())
             .collect::<Vec<_>>()
     };
-    let target = table_mut(state, destination_table)?;
+    let destination_handle = table_handle(
+        state,
+        destination_table,
+        "baseline table.copy needs a destination table",
+    )?;
+    let mut target = lock_shared(&destination_handle)?;
     if !fits(destination, length, target.elements.len()) {
         return Err(BaselineError::Trap(Trap::TableOutOfBounds));
     }
@@ -4061,7 +4235,8 @@ fn exec_table_grow(
             ))))
         }
     };
-    let target = table_mut(state, table)?;
+    let handle = table_handle(state, table, "baseline table.grow needs a table")?;
+    let mut target = lock_shared(&handle)?;
     let old = target.elements.len() as u64;
     let outcome = if old + delta <= target.maximum {
         target
@@ -4082,16 +4257,8 @@ fn exec_table_size(
     result: u32,
     table: u32,
 ) -> Result<(), BaselineError> {
-    let size = state
-        .tables
-        .get(table as usize)
-        .and_then(|slot| slot.as_deref())
-        .map(|table| table.elements.len())
-        .ok_or_else(|| {
-            BaselineError::Trap(Trap::HostFailure(
-                "baseline table.size needs a table".into(),
-            ))
-        })?;
+    let handle = table_handle(state, table, "baseline table.size needs a table")?;
+    let size = lock_shared(&handle)?.elements.len();
     slots[result as usize] = Some(Value::I32(size as i32));
     Ok(())
 }
@@ -4115,7 +4282,8 @@ fn exec_table_fill(
             ))))
         }
     };
-    let target = table_mut(state, table)?;
+    let handle = table_handle(state, table, "baseline table.fill needs a table")?;
+    let mut target = lock_shared(&handle)?;
     if !fits(index, length, target.elements.len()) {
         return Err(BaselineError::Trap(Trap::TableOutOfBounds));
     }

@@ -99,6 +99,9 @@ pub struct IrTable {
     /// initializer, so every slot starts null. `Some(None)` initializes every slot to null, and
     /// `Some(Some(index))` to the defined function `index`.
     pub init: Option<Option<u32>>,
+    /// The initializer's expression, when it reads a global. `init` is then a null placeholder until the
+    /// baseline resolves the expression once the imports are installed.
+    pub init_expr: Option<Vec<u8>>,
     /// Where this table is imported from, when it is imported rather than defined.
     ///
     /// `Some` means the table belongs to the exporting instance and nothing is
@@ -721,6 +724,8 @@ pub struct IrElementInit {
     pub element_type: ReferenceType,
     /// As in [`IrElementSegment::elements`].
     pub elements: Vec<Option<u32>>,
+    /// As in [`IrElementSegment::entry_exprs`].
+    pub entry_exprs: Vec<(u32, Vec<u8>)>,
 }
 
 /// One active element segment, as the table it seeds receives it.
@@ -731,6 +736,9 @@ pub struct IrElementSegment {
     /// The offset's constant expression, when it reads a global. Its value is known only once the module's
     /// imports are installed, so the baseline resolves it then, and `offset` is unused.
     pub offset_expr: Option<Vec<u8>>,
+    /// The entries whose expression reads a global, as (position, expression). Each such entry is a null
+    /// placeholder in `elements` until the baseline resolves it.
+    pub entry_exprs: Vec<(u32, Vec<u8>)>,
     /// The entries. `Some` is a `ref.func` naming a function by its index in the module's full function index
     /// space, imports first, and `None` is a
     /// `ref.null`. A segment spelled as plain indices lowers to all `Some`; one spelled as expressions may
