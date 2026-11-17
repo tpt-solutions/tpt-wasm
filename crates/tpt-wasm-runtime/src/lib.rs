@@ -1661,6 +1661,14 @@ fn instantiate_module(
     // Captured for the same reason: the baseline publishes or installs its table
     // handle under the store address that table was allocated at.
     let baseline_table_address = table_addrs.first().copied();
+    // The store address of each defined function, in definition order. Imported functions come first in the
+    // store's index space, so the defined ones are the tail.
+    let imported_function_count = module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Function(_)))
+        .count();
+    let baseline_function_addresses: Vec<u32> = func_addrs[imported_function_count..].to_vec();
 
     let data_addrs: Vec<u32> = module
         .data
@@ -1770,6 +1778,9 @@ fn instantiate_module(
         // there and installs it. Re-exports need no special case: the address is
         // the original's, so the handle is found under it however many times the
         // memory has been passed along.
+        module
+            .bind_function_addresses(&baseline_function_addresses)
+            .map_err(codegen_error)?;
         if let Some(address) = baseline_memory_address {
             if let Some(shared) = module.memory_handle() {
                 lock_baseline_memories(&context.baseline_memories)?.insert(address, shared);
@@ -3605,14 +3616,9 @@ mod tests {
 
     /// A table import links, and the importer's element segment lands in it.
     ///
-    /// This covers the *linkage* half only. Dispatching through a table that
-    /// another module wrote into is a further step the baseline cannot take yet:
-    /// a `BaselineTable` entry is an index into the owning module's own function
-    /// list, so a shared entry has no function to name from a second module. Micro
-    /// stores a store-wide function address and has no such limit, which is a real
-    /// divergence between the two backends. It is recorded in `todo.md` rather
-    /// than papered over here, and no spec file exercises it (the file that would,
-    /// `elem.wast`, also needs the bulk-memory proposal).
+    /// This covers the *linkage* half. Dispatching through the shared table is in
+    /// `tests/baseline_shared_table.rs`: a table entry is a store address on both
+    /// engines, and the baseline refuses a call into another instance by name.
     #[test]
     fn a_table_import_links_and_carries_its_element_segment() {
         fn table_type() -> tpt_wasm_types::TableType {
