@@ -1943,9 +1943,7 @@ fn verify_instruction(
             // The index must name a function this module actually defines, the
             // same requirement a direct `call` places on its target.
             let exists = usize::try_from(*function)
-                .ok()
-                .and_then(|index| module.functions.get(index))
-                .is_some();
+                .is_ok_and(|index| index < module.imports.len() + module.functions.len());
             if !exists {
                 return Err(VerificationError::UnknownFunction(*function));
             }

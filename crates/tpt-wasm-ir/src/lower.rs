@@ -106,7 +106,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         } else if let ValueType::Ref(kind) = global.global_type.value_type {
             // A reference is `ref.null`, or `ref.func` naming a defined function by its index, which the
             // baseline binds to the function's address once the module is installed.
-            let value = match read_table_init_expr(&global.init, imported_functions)? {
+            let value = match read_table_init_expr(&global.init)? {
                 None => tpt_wasm_types::Value::Ref(tpt_wasm_types::RefValue::Null(kind)),
                 Some(index) => tpt_wasm_types::Value::Ref(tpt_wasm_types::RefValue::FuncRef(index)),
             };
@@ -214,9 +214,11 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
                 .ok_or(LoweringError::UnsupportedFeature(
                     "table index out of range",
                 ))?;
+        let (segment_offset, offset_expr) = element_offset(offset)?;
         seeded.push(super::IrElementSegment {
-            offset: element_segment_offset(offset)?,
-            elements: lower_element_init(&element.init, imported_functions)?,
+            offset: segment_offset,
+            offset_expr,
+            elements: lower_element_init(&element.init)?,
         });
     }
     let mut seeds = seeds.into_iter();
@@ -239,7 +241,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
     }
     for table in &module.tables {
         let init = match &table.init {
-            Some(expression) => Some(read_table_init_expr(expression, imported_functions)?),
+            Some(expression) => Some(read_table_init_expr(expression)?),
             None => None,
         };
         tables.push(IrTable {
@@ -259,7 +261,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         .map(|element| match element.mode {
             tpt_wasm_format::ElementMode::Passive => Ok(Some(super::IrElementInit {
                 element_type: element.element_type,
-                elements: lower_element_init(&element.init, imported_functions)?,
+                elements: lower_element_init(&element.init)?,
             })),
             tpt_wasm_format::ElementMode::Active { .. }
             | tpt_wasm_format::ElementMode::Declarative => Ok(None),
@@ -298,6 +300,17 @@ pub fn const_expr_i32(expr: &tpt_wasm_format::ConstExpr) -> Option<u32> {
 }
 
 /// Read an element segment's constant offset, which MVP requires to be an `i32`.
+/// An element segment's offset: a plain value when the expression is constant, or the expression itself
+/// when it reads a global, which the baseline resolves once the imports are in.
+fn element_offset(
+    expr: &tpt_wasm_format::ConstExpr,
+) -> Result<(u32, Option<Vec<u8>>), LoweringError> {
+    if crate::const_expr::reads_globals(&expr.0) {
+        return Ok((0, Some(expr.0.clone())));
+    }
+    Ok((element_segment_offset(expr)?, None))
+}
+
 fn element_segment_offset(expr: &tpt_wasm_format::ConstExpr) -> Result<u32, LoweringError> {
     let value = read_const_expr(expr, ValueType::I32)?;
     match value {
@@ -1405,8 +1418,10 @@ fn lower_body(
                 // below the import count would name an imported function, which
                 // the shared rebasing helper refuses for the same reason an
                 // element segment entry does.
-                let defined = defined_index(index, imported_functions)?;
-                if usize::try_from(defined).map_or(true, |i| i >= module.functions.len()) {
+                let defined = index;
+                if usize::try_from(defined).map_or(true, |i| {
+                    i >= imported_functions as usize + module.functions.len()
+                }) {
                     return Err(LoweringError::UnknownFunction(index));
                 }
                 let result = state.allocate(ValueType::Ref(ReferenceType::FuncRef))?;
@@ -1665,25 +1680,19 @@ pub(crate) fn read_const_expr(
 /// `ref.func`, which names a function and is rebased the same way.
 fn lower_element_init(
     init: &tpt_wasm_format::ElementInit,
-    imported_functions: u32,
 ) -> Result<Vec<Option<u32>>, LoweringError> {
     match init {
-        tpt_wasm_format::ElementInit::FuncIndices(indices) => indices
-            .iter()
-            .map(|index| Ok(Some(defined_index(*index, imported_functions)?)))
-            .collect(),
-        tpt_wasm_format::ElementInit::Expressions(expressions) => expressions
-            .iter()
-            .map(|expression| read_table_init_expr(expression, imported_functions))
-            .collect(),
+        tpt_wasm_format::ElementInit::FuncIndices(indices) => {
+            indices.iter().map(|index| Ok(Some(*index))).collect()
+        }
+        tpt_wasm_format::ElementInit::Expressions(expressions) => {
+            expressions.iter().map(read_table_init_expr).collect()
+        }
     }
 }
 
 /// Read one `ref.null` or `ref.func` element initializer.
-fn read_table_init_expr(
-    expr: &tpt_wasm_format::ConstExpr,
-    imported_functions: u32,
-) -> Result<Option<u32>, LoweringError> {
+fn read_table_init_expr(expr: &tpt_wasm_format::ConstExpr) -> Result<Option<u32>, LoweringError> {
     let mut reader = BodyReader::new(&expr.0);
     let entry = match reader.byte()? {
         // `ref.null t`, which initializes the slot to null.
@@ -1691,7 +1700,7 @@ fn read_table_init_expr(
             0x70 | 0x6f => None,
             _ => return Err(LoweringError::UnsupportedFeature("element initializer")),
         },
-        0xd2 => Some(defined_index(reader.u32()?, imported_functions)?),
+        0xd2 => Some(reader.u32()?),
         _ => return Err(LoweringError::UnsupportedFeature("element initializer")),
     };
     if reader.byte()? != 0x0b || reader.remaining() != 0 {
@@ -1706,15 +1715,6 @@ fn read_table_init_expr(
 /// import count into a host call. A reference or a table entry has to name a
 /// concrete function of this module, so an index below that count is refused
 /// rather than redirected at a different function.
-fn defined_index(index: u32, imported_functions: u32) -> Result<u32, LoweringError> {
-    if index < imported_functions {
-        return Err(LoweringError::UnsupportedFeature(
-            "reference to an imported function",
-        ));
-    }
-    Ok(index - imported_functions)
-}
-
 fn lower_call(
     function: u32,
     module: &tpt_wasm_format::Module,

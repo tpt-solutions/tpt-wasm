@@ -1676,14 +1676,8 @@ fn instantiate_module(
     // handle under the store address that table was allocated at.
     // Every table, imported ones first, in the order the module numbers them.
     let baseline_table_addresses: Vec<u32> = table_addrs.clone();
-    // The store address of each defined function, in definition order. Imported functions come first in the
-    // store's index space, so the defined ones are the tail.
-    let imported_function_count = module
-        .imports
-        .iter()
-        .filter(|import| matches!(import.desc, ImportDesc::Function(_)))
-        .count();
-    let baseline_function_addresses: Vec<u32> = func_addrs[imported_function_count..].to_vec();
+    // The store address of every function, imported ones first, as the module numbers them.
+    let baseline_function_addresses: Vec<u32> = func_addrs.clone();
 
     let data_addrs: Vec<u32> = module
         .data

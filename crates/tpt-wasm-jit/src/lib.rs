@@ -1271,6 +1271,22 @@ fn compile_module_with(
         .first()
         .filter(|_| module.tables.len() == 1)
         .filter(|table| table.import.is_none() && table.init.is_none())
+        .filter(|table| {
+            table
+                .segments
+                .iter()
+                .all(|segment| segment.offset_expr.is_none())
+        })
+        .filter(|table| {
+            let imports = module.imports.len() as u32;
+            table.segments.iter().all(|segment| {
+                segment
+                    .elements
+                    .iter()
+                    .flatten()
+                    .all(|index| *index >= imports)
+            }) && table.init.flatten().is_none_or(|index| index >= imports)
+        })
         .filter(|table| table.min <= 1 << 20);
     // The layout is shared with the machine IR's interpreter, so both backends check the same table.
     let slots: Vec<Option<u32>> = mir::table_slots(module);

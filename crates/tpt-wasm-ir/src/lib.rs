@@ -643,8 +643,8 @@ pub enum IrInstr {
     },
     /// A reference to the function at this index in the module's function table.
     ///
-    /// The index is the same one a direct `Call` uses, so the two address a
-    /// function the same way.
+    /// The index names the function in the module's full index space, imports first, as a table entry does.
+    /// A direct `Call` numbers only the module's own functions, so the two differ by the import count.
     RefFunc {
         result: ValueId,
         function: u32,
@@ -728,7 +728,11 @@ pub struct IrElementInit {
 pub struct IrElementSegment {
     /// Where the entries start in the table.
     pub offset: u32,
-    /// The entries. `Some` is a `ref.func` naming a function in this IR's index space and `None` is a
+    /// The offset's constant expression, when it reads a global. Its value is known only once the module's
+    /// imports are installed, so the baseline resolves it then, and `offset` is unused.
+    pub offset_expr: Option<Vec<u8>>,
+    /// The entries. `Some` is a `ref.func` naming a function by its index in the module's full function index
+    /// space, imports first, and `None` is a
     /// `ref.null`. A segment spelled as plain indices lowers to all `Some`; one spelled as expressions may
     /// contain either, which is the whole reason the two families cannot share one representation.
     pub elements: Vec<Option<u32>>,
