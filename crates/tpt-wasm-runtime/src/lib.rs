@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tpt_wasm_decode::{decode, DecodeError};
 
@@ -1255,6 +1255,9 @@ struct BaselineHost {
     /// Imports this boundary reaches in another instance: the qualified name, the store address of the
     /// function it names, and its declared signature.
     foreign: Vec<(String, u32, FunctionType)>,
+    /// The registry of copies, held weakly. The copies' hosts are reachable from the registry, so a strong
+    /// reference here would keep the registry alive for ever.
+    functions: Weak<Mutex<BaselineFunctionMap>>,
     /// Calls made through this boundary, keyed by `module::name`, for the instance.
     counts: Arc<Mutex<BTreeMap<String, u64>>>,
     /// The calls made through this boundary, in order, for the instance.
@@ -1278,11 +1281,11 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
     ) -> Result<Vec<Value>, tpt_wasm_codegen::BaselineError> {
         use tpt_wasm_codegen::BaselineError;
         let trap = |message: &str| BaselineError::Trap(Trap::HostFailure(message.into()));
-        let context = self
-            .context
-            .clone()
-            .ok_or_else(|| trap("baseline cross-instance call has no runtime context"))?;
-        let (shared, local) = lock_baseline_functions(&context.baseline_functions)
+        let functions = self
+            .functions
+            .upgrade()
+            .ok_or_else(|| trap("the baseline function registry has been dropped"))?;
+        let (shared, local) = lock_baseline_functions(&functions)
             .map_err(|_| trap("the baseline function registry is locked"))?
             .get(&address)
             .cloned()
@@ -1825,6 +1828,7 @@ fn instantiate_module(
                 context: Some(context.clone()),
                 bindings: baseline_bindings.clone(),
                 foreign: foreign_bindings.clone(),
+                functions: Arc::downgrade(&context.baseline_functions),
                 counts: Arc::clone(&host_counts),
                 trace: Arc::clone(&host_trace),
             });
@@ -1953,10 +1957,15 @@ fn instantiate_module(
     // since the start function may call into another instance.
     if let Some(module) = instance.baseline.as_ref() {
         let mut copy = module.share();
+        // The copy's context is detached from the registry, so the registry does not keep itself alive through
+        // the copies it holds.
+        let mut detached = context.clone();
+        detached.baseline_functions = Arc::new(Mutex::new(HashMap::new()));
         copy.set_host(BaselineHost {
-            context: Some(context.clone()),
+            context: Some(detached),
             bindings: baseline_bindings.clone(),
             foreign: foreign_bindings.clone(),
+            functions: Arc::downgrade(&context.baseline_functions),
             counts: Arc::clone(&host_counts),
             trace: Arc::clone(&host_trace),
         });
@@ -5060,5 +5069,42 @@ mod tests {
                 "mode {mode:?} disagreed on the host call result"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_lifetime_tests {
+    use super::*;
+
+    /// `f() -> i32` returns 7. It needs no imports, so an instance of it is a baseline instance with nothing else.
+    fn trivial_module() -> Vec<u8> {
+        let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        module.extend([1, 5, 1, 0x60, 0, 1, 0x7f]);
+        module.extend([3, 2, 1, 0]);
+        module.extend([7, 5, 1, 1, b'f', 0, 0]);
+        module.extend([10, 6, 1, 4, 0, 0x41, 7, 0x0b]);
+        module
+    }
+
+    /// Dropping the engine and every instance frees the registry of copies. Before the copies' hosts held the
+    /// registry weakly, the registry, its copies, their hosts and the context each held one another, and the
+    /// registry outlived everything that could reach it.
+    #[test]
+    fn the_registry_of_copies_is_freed_with_its_engine() {
+        let engine = Engine::new(Config {
+            engine_mode: EngineMode::Baseline,
+            ..Config::default()
+        })
+        .expect("engine");
+        let registry = Arc::downgrade(&engine.context.baseline_functions);
+        let instance = engine
+            .instantiate_bytes(&trivial_module())
+            .expect("instantiates");
+        drop(instance);
+        drop(engine);
+        assert!(
+            registry.upgrade().is_none(),
+            "the registry of copies is freed once nothing holds the engine"
+        );
     }
 }
