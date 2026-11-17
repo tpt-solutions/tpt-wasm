@@ -1986,16 +1986,13 @@ fn verify_instruction(
     }
 }
 
-/// The declaration of a table an instruction names. Only `funcref` tables exist in the
-/// IR, so any other element type is refused here rather than read as a function table.
+/// The declaration of a table an instruction names. Both kinds of table are accepted here; an
+/// instruction that needs a function table checks the element type itself.
 fn table_declaration(module: &IrModule, table: u32) -> Result<&super::IrTable, VerificationError> {
     let declaration = module
         .tables
         .get(table as usize)
         .ok_or(VerificationError::UnknownTable(table))?;
-    if declaration.element_type != ReferenceType::FuncRef {
-        return Err(VerificationError::NotAFunctionTable(table));
-    }
     Ok(declaration)
 }
 

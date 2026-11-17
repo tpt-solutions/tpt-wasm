@@ -230,9 +230,6 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         let tpt_wasm_format::ImportDesc::Table(table_type) = import.desc else {
             unreachable!("filtered to table imports above");
         };
-        if table_type.element_type != tpt_wasm_types::ReferenceType::FuncRef {
-            return Err(LoweringError::UnsupportedFeature("non-funcref table"));
-        }
         tables.push(IrTable {
             element_type: table_type.element_type,
             min: table_type.limits.min,
@@ -248,9 +245,6 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
     for table in &module.tables {
         if table.init.is_some() {
             return Err(LoweringError::UnsupportedFeature("table initializer"));
-        }
-        if table.table_type.element_type != tpt_wasm_types::ReferenceType::FuncRef {
-            return Err(LoweringError::UnsupportedFeature("non-funcref table"));
         }
         tables.push(IrTable {
             element_type: table.table_type.element_type,
@@ -1739,8 +1733,8 @@ fn allocate_results(
 }
 
 /// The element type of table `table`, counting imported tables first, as Wasm numbers
-/// them. Only `funcref` tables can be lowered: an `externref` table would hold values the
-/// baseline's table cannot represent, so it is refused rather than stored wrongly.
+/// them. The element type is the table's own, so `table.get` and `table.set` read and write the
+/// kind of reference the table holds.
 fn table_element_type(
     module: &tpt_wasm_format::Module,
     table: u32,
@@ -1763,9 +1757,6 @@ fn table_element_type(
             .ok_or(LoweringError::UnsupportedFeature(
                 "table index out of range",
             ))?;
-    if element_type != ReferenceType::FuncRef {
-        return Err(LoweringError::UnsupportedFeature("externref table"));
-    }
     Ok(element_type)
 }
 

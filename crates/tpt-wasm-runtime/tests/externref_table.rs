@@ -87,16 +87,37 @@ fn an_externref_table_refuses_a_funcref_value_and_traps_past_its_end() {
     );
 }
 
+/// The same sequence as the interpreter tests, on the baseline, which must agree with it.
 #[test]
-fn the_baseline_refuses_an_externref_table_by_name() {
-    let error = engine(EngineMode::Baseline)
+fn the_baseline_holds_extern_values_and_traps_past_its_end_as_the_interpreter_does() {
+    let mut instance = engine(EngineMode::Baseline)
         .instantiate_bytes(&externref_table_module())
-        .expect_err("the baseline does not lower an externref table yet");
-    match error {
-        RuntimeError::Refused(message) => assert!(
-            message.contains("externref table"),
-            "the refusal names the table kind: {message}"
-        ),
-        other => panic!("expected a refusal naming the table, got {other:?}"),
-    }
+        .expect("the baseline lowers an externref table");
+    assert_eq!(
+        instance.call("get", vec![Value::I32(0)]).expect("reads"),
+        vec![Value::Ref(RefValue::Null(ReferenceType::ExternRef))],
+    );
+    instance
+        .call(
+            "set",
+            vec![Value::I32(1), Value::Ref(RefValue::ExternRef(42))],
+        )
+        .expect("stores an extern value");
+    assert_eq!(
+        instance.call("get", vec![Value::I32(1)]).expect("reads"),
+        vec![Value::Ref(RefValue::ExternRef(42))],
+    );
+    assert!(
+        instance
+            .call("set", vec![Value::I32(0), Value::Ref(RefValue::FuncRef(0))])
+            .is_err(),
+        "a funcref is refused by an externref table"
+    );
+    let error: RuntimeError = instance
+        .call("get", vec![Value::I32(2)])
+        .expect_err("slot 2 is past a two-slot table");
+    assert!(
+        matches!(error, RuntimeError::Trap(Trap::TableOutOfBounds)),
+        "the access traps as out of bounds: {error:?}"
+    );
 }

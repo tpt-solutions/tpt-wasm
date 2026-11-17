@@ -1920,9 +1920,12 @@ fn lock_shared<T>(shared: &Arc<Mutex<T>>) -> Result<MutexGuard<'_, T>, BaselineE
 /// A table of optional function references, as MVP `funcref` tables hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineTable {
-    /// `None` is a null reference, which `call_indirect` traps on. `Some` is the store address of the
-    /// function, so a table shared with another instance names the same functions there.
-    elements: Vec<Option<u32>>,
+    /// The reference type the table holds. A `funcref` table's entries are function references and an
+    /// `externref` table's are host values.
+    element_type: tpt_wasm_types::ReferenceType,
+    /// `None` is a null reference, which `call_indirect` traps on. A function reference names the
+    /// function by its store address, so a table shared with another instance names the same functions there.
+    elements: Vec<Option<tpt_wasm_types::RefValue>>,
 }
 
 /// A baseline table shared by every instance that imports or exports it.
@@ -1952,11 +1955,12 @@ fn apply_element_segment(
             .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
         // A segment names defined functions by their index, which becomes their store address.
         *cell = match entry {
-            Some(index) => Some(
-                *function_addresses
+            Some(index) => {
+                let address = function_addresses
                     .get(*index as usize)
-                    .ok_or(CodegenError::ElementSegmentOutOfBounds)?,
-            ),
+                    .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
+                Some(tpt_wasm_types::RefValue::FuncRef(*address))
+            }
             None => None,
         };
     }
@@ -2170,6 +2174,7 @@ impl BaselineModule {
                 let length = usize::try_from(declaration.min)
                     .map_err(|_| CodegenError::UnsupportedMemory("table size"))?;
                 let mut table = BaselineTable {
+                    element_type: declaration.element_type,
                     elements: vec![None; length],
                 };
                 apply_element_segment(&mut table, declaration, &function_addresses)?;
@@ -2513,12 +2518,15 @@ impl BaselineModule {
                 let mut table = lock_shared(shared)
                     .map_err(|_| CodegenError::UnsupportedMemory("shared table is locked"))?;
                 for entry in table.elements.iter_mut() {
-                    if let Some(index) = *entry {
-                        let address = addresses
-                            .get(index as usize)
-                            .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
-                        *entry = Some(*address);
-                    }
+                    // Before binding, a function reference holds the defined index it was seeded with.
+                    let index = match entry {
+                        Some(tpt_wasm_types::RefValue::FuncRef(index)) => *index,
+                        _ => continue,
+                    };
+                    let address = addresses
+                        .get(index as usize)
+                        .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
+                    *entry = Some(tpt_wasm_types::RefValue::FuncRef(*address));
                 }
             }
         }
@@ -3292,22 +3300,20 @@ fn exec_op(
             let entry = table
                 .elements
                 .get(index as usize)
-                .copied()
+                .cloned()
                 .ok_or(Trap::TableOutOfBounds)?;
-            let reference = match entry {
-                Some(function) => tpt_wasm_types::RefValue::FuncRef(function),
-                None => tpt_wasm_types::RefValue::Null(tpt_wasm_types::ReferenceType::FuncRef),
-            };
+            // An empty slot reads as the null reference of the table's own element type.
+            let reference = entry.unwrap_or(tpt_wasm_types::RefValue::Null(table.element_type));
             slots[*result as usize] = Some(Value::Ref(reference));
         }
         BaselineOp::TableSet { index, value } => {
             let index = i32_slot(slots, *index)? as u32;
             let entry = match read_slot(slots, *value)? {
-                Value::Ref(tpt_wasm_types::RefValue::FuncRef(function)) => Some(function),
                 Value::Ref(tpt_wasm_types::RefValue::Null(_)) => None,
+                Value::Ref(reference) => Some(reference),
                 other => {
                     return Err(BaselineError::Trap(Trap::HostFailure(format!(
-                        "baseline table.set operand is not a funcref: {other:?}"
+                        "baseline table.set operand is not a reference: {other:?}"
                     ))))
                 }
             };
@@ -3315,6 +3321,22 @@ fn exec_op(
                 .table
                 .as_deref_mut()
                 .ok_or_else(|| Trap::HostFailure("baseline table.set needs a table".into()))?;
+            // A reference of the other kind is refused here, as the store refuses it, rather than written.
+            if let Some(reference) = &entry {
+                let kind = match reference {
+                    tpt_wasm_types::RefValue::FuncRef(_) => tpt_wasm_types::ReferenceType::FuncRef,
+                    tpt_wasm_types::RefValue::ExternRef(_) => {
+                        tpt_wasm_types::ReferenceType::ExternRef
+                    }
+                    tpt_wasm_types::RefValue::Null(kind) => *kind,
+                };
+                if kind != table.element_type {
+                    return Err(BaselineError::Trap(Trap::HostFailure(format!(
+                        "baseline table.set stores a {kind:?} into a {:?} table",
+                        table.element_type
+                    ))));
+                }
+            }
             let slot = table
                 .elements
                 .get_mut(index as usize)
@@ -3456,17 +3478,29 @@ fn exec_call_indirect(
     let target = table
         .elements
         .get(index as usize)
-        .copied()
+        .cloned()
         .ok_or(Trap::TableOutOfBounds)?
         .ok_or(Trap::NullReference)?;
+    let address = match target {
+        tpt_wasm_types::RefValue::FuncRef(address) => address,
+        _ => {
+            return Err(BaselineError::Trap(Trap::HostFailure(
+                "baseline indirect call through a table that holds no functions".into(),
+            )))
+        }
+    };
     // A table entry is a store address. One that names a function of this module is run here; one that
     // names a function of another instance has no body in this module, which the baseline cannot reach yet.
-    let local = state.function_locals.get(&target).copied().ok_or_else(|| {
-        Trap::HostFailure(
-            "baseline indirect call into a function of another instance is not supported yet"
-                .into(),
-        )
-    })?;
+    let local = state
+        .function_locals
+        .get(&address)
+        .copied()
+        .ok_or_else(|| {
+            Trap::HostFailure(
+                "baseline indirect call into a function of another instance is not supported yet"
+                    .into(),
+            )
+        })?;
     let callee = state
         .functions
         .get(local)
