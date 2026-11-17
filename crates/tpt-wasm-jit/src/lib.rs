@@ -1269,6 +1269,7 @@ fn compile_module_with(
     let table = module
         .tables
         .first()
+        .filter(|_| module.tables.len() == 1)
         .filter(|table| table.import.is_none())
         .filter(|table| table.min <= 1 << 20);
     // The layout is shared with the machine IR's interpreter, so both backends check the same table.

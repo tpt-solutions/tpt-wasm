@@ -1517,14 +1517,17 @@ pub fn table_slots(module: &IrModule) -> Vec<Option<u32>> {
     let table = module
         .tables
         .first()
+        .filter(|_| module.tables.len() == 1)
         .filter(|table| table.import.is_none())
         .filter(|table| table.min <= 1 << 20);
     match table {
         Some(table) => {
             let mut slots = vec![None; table.min as usize];
-            for (offset, element) in table.elements.iter().enumerate() {
-                if let Some(slot) = slots.get_mut(table.offset as usize + offset) {
-                    *slot = *element;
+            for segment in &table.segments {
+                for (offset, element) in segment.elements.iter().enumerate() {
+                    if let Some(slot) = slots.get_mut(segment.offset as usize + offset) {
+                        *slot = *element;
+                    }
                 }
             }
             slots

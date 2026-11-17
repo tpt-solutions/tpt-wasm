@@ -346,6 +346,8 @@ pub enum BaselineOp {
     },
     /// Indirect call: read `operand` from the table, then dispatch.
     CallIndirect {
+        /// The table the index operand reads.
+        table: u32,
         /// The expected signature, as an index into the module's types.
         type_index: u32,
         /// Slot of the `i32` table index.
@@ -411,11 +413,13 @@ pub enum BaselineOp {
     /// `table.get`: read the entry at `index` into `result`. An empty entry is the
     /// null `funcref`, the only element type the baseline's table holds.
     TableGet {
+        table: u32,
         result: u32,
         index: u32,
     },
     /// `table.set`: store the reference in `value` at `index`.
     TableSet {
+        table: u32,
         index: u32,
         value: u32,
     },
@@ -1305,11 +1309,11 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     });
                 }
                 IrInstr::CallIndirect {
+                    table,
                     type_index,
                     operand,
                     arguments,
                     results,
-                    ..
                 } => {
                     let operand = state.expect(*operand, ValueType::I32)?;
                     let mut argument_slots = Vec::with_capacity(arguments.len());
@@ -1321,6 +1325,7 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                         result_slots.push(state.define(*id)?);
                     }
                     ops.push(BaselineOp::CallIndirect {
+                        table: *table,
                         type_index: *type_index,
                         operand,
                         arguments: argument_slots,
@@ -1465,30 +1470,26 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     table,
                     index,
                 } => {
-                    // The baseline holds one table, and the IR refuses a module
-                    // with more, so the table index is always 0 here.
-                    if *table != 0 {
-                        return Err(CodegenError::UnsupportedInstruction(
-                            "table index other than 0",
-                        ));
-                    }
                     let index = state.expect(*index, ValueType::I32)?;
                     let result = state.define(*result)?;
-                    ops.push(BaselineOp::TableGet { result, index });
+                    ops.push(BaselineOp::TableGet {
+                        table: *table,
+                        result,
+                        index,
+                    });
                 }
                 IrInstr::TableSet {
                     table,
                     index,
                     value,
                 } => {
-                    if *table != 0 {
-                        return Err(CodegenError::UnsupportedInstruction(
-                            "table index other than 0",
-                        ));
-                    }
                     let index = state.expect(*index, ValueType::I32)?;
                     let value = state.slot(*value)?;
-                    ops.push(BaselineOp::TableSet { index, value });
+                    ops.push(BaselineOp::TableSet {
+                        table: *table,
+                        index,
+                        value,
+                    });
                 } // Every IR instruction is lowered above. When the IR grows, this
                   // arm becomes reachable again and rejects the new instruction
                   // rather than silently dropping it; until then it is dead, so the
@@ -1810,7 +1811,7 @@ pub struct BaselineModule {
     ///
     /// A defined table is allocated and seeded here; an imported one is installed
     /// by the embedder. Shared so an importing instance reaches the same table.
-    table: Option<SharedTable>,
+    tables: Vec<Option<SharedTable>>,
     /// The store address of each defined function, by its index in `functions`. A table entry names a
     /// function by this address. Until the embedder binds the real addresses, they are the indices.
     function_addresses: Vec<u32>,
@@ -1835,7 +1836,7 @@ pub struct BaselineModule {
     /// moment the table arrives, the same way a memory's data segments are: an
     /// importing module's active element segment writes into the table it
     /// imports, after the exporter's own and before any function runs.
-    pending_imported_table: Option<tpt_wasm_ir::IrTable>,
+    pending_imported_tables: Vec<Option<tpt_wasm_ir::IrTable>>,
     /// The globals, in Wasm index order, as one handle each.
     ///
     /// An *imported* global's handle is installed by the embedder before any
@@ -1945,24 +1946,26 @@ fn apply_element_segment(
     declaration: &tpt_wasm_ir::IrTable,
     function_addresses: &[u32],
 ) -> Result<(), CodegenError> {
-    for (position, entry) in declaration.elements.iter().enumerate() {
-        let slot = declaration.offset as usize + position;
-        // The validator bounds-checks the segment against the table, so a slot
-        // past the end here means the two disagree.
-        let cell = table
-            .elements
-            .get_mut(slot)
-            .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
-        // A segment names defined functions by their index, which becomes their store address.
-        *cell = match entry {
-            Some(index) => {
-                let address = function_addresses
-                    .get(*index as usize)
-                    .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
-                Some(tpt_wasm_types::RefValue::FuncRef(*address))
-            }
-            None => None,
-        };
+    for segment in &declaration.segments {
+        for (position, entry) in segment.elements.iter().enumerate() {
+            let slot = segment.offset as usize + position;
+            // The validator bounds-checks the segment against the table, so a slot
+            // past the end here means the two disagree.
+            let cell = table
+                .elements
+                .get_mut(slot)
+                .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
+            // A segment names defined functions by their index, which becomes their store address.
+            *cell = match entry {
+                Some(index) => {
+                    let address = function_addresses
+                        .get(*index as usize)
+                        .ok_or(CodegenError::ElementSegmentOutOfBounds)?;
+                    Some(tpt_wasm_types::RefValue::FuncRef(*address))
+                }
+                None => None,
+            };
+        }
     }
     Ok(())
 }
@@ -1980,7 +1983,7 @@ impl fmt::Debug for BaselineModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BaselineModule")
             .field("functions", &self.functions.len())
-            .field("table", &self.table)
+            .field("tables", &self.tables)
             .field("types", &self.types)
             .field("memory", &self.memory)
             .field("globals", &self.globals)
@@ -2168,20 +2171,24 @@ impl BaselineModule {
         let function_addresses: Vec<u32> = (0..functions.len())
             .map(|index| u32::try_from(index).unwrap_or(u32::MAX))
             .collect();
-        let (table, pending_imported_table) = match module.tables.first() {
-            Some(declaration) if declaration.import.is_some() => (None, Some(declaration.clone())),
-            Some(declaration) => {
-                let length = usize::try_from(declaration.min)
-                    .map_err(|_| CodegenError::UnsupportedMemory("table size"))?;
-                let mut table = BaselineTable {
-                    element_type: declaration.element_type,
-                    elements: vec![None; length],
-                };
-                apply_element_segment(&mut table, declaration, &function_addresses)?;
-                (Some(Arc::new(Mutex::new(table))), None)
+        let mut tables = Vec::with_capacity(module.tables.len());
+        let mut pending_imported_tables = Vec::with_capacity(module.tables.len());
+        for declaration in &module.tables {
+            if declaration.import.is_some() {
+                tables.push(None);
+                pending_imported_tables.push(Some(declaration.clone()));
+                continue;
             }
-            None => (None, None),
-        };
+            let length = usize::try_from(declaration.min)
+                .map_err(|_| CodegenError::UnsupportedMemory("table size"))?;
+            let mut table = BaselineTable {
+                element_type: declaration.element_type,
+                elements: vec![None; length],
+            };
+            apply_element_segment(&mut table, declaration, &function_addresses)?;
+            tables.push(Some(Arc::new(Mutex::new(table))));
+            pending_imported_tables.push(None);
+        }
         // One slot per global, in Wasm index order. A defined global gets a handle
         // holding its initializer; an imported one is `None` until the embedder
         // installs the exporter's handle. `None` rather than a placeholder value,
@@ -2209,7 +2216,8 @@ impl BaselineModule {
         let function_locals = function_locals_of(&function_addresses);
         Ok(Self {
             functions,
-            table,
+            tables,
+            pending_imported_tables,
             function_addresses,
             function_locals,
             types: module.types.clone(),
@@ -2218,7 +2226,6 @@ impl BaselineModule {
             global_import_count,
             deferred_globals,
             datas,
-            pending_imported_table,
             imports: module.imports.clone(),
             host: None,
             pending_imported_memory,
@@ -2488,24 +2495,37 @@ impl BaselineModule {
         Ok(())
     }
 
-    /// Supply the table this module imports.
+    /// Supply the table at `index`, which this module imports.
     ///
-    /// The handle has to be the one the exporting instance holds, not a copy.
-    /// The importing module's own active element segment is applied here, before
-    /// any function can run and after the exporter's own, as required.
-    pub fn set_table(&mut self, table: SharedTable) -> Result<(), CodegenError> {
-        if let Some(declaration) = self.pending_imported_table.take() {
+    /// The handle has to be the one the exporting instance holds, not a copy. The importing module's own
+    /// active segments for that table are applied here, after the exporter's own, as required.
+    pub fn set_table(&mut self, index: usize, table: SharedTable) -> Result<(), CodegenError> {
+        if index >= self.tables.len() {
+            return Err(CodegenError::UnsupportedMemory("table index out of range"));
+        }
+        // One execution locks every table once, so a table handed in twice would deadlock.
+        if self
+            .tables
+            .iter()
+            .flatten()
+            .any(|existing| Arc::ptr_eq(existing, &table))
+        {
+            return Err(CodegenError::UnsupportedMemory(
+                "a table imported more than once",
+            ));
+        }
+        if let Some(declaration) = self.pending_imported_tables[index].take() {
             let mut guard = lock_shared(&table)
                 .map_err(|_| CodegenError::UnsupportedMemory("shared table is locked"))?;
             apply_element_segment(&mut guard, &declaration, &self.function_addresses)?;
         }
-        self.table = Some(table);
+        self.tables[index] = Some(table);
         Ok(())
     }
 
     /// Bind the store address of each defined function, by its index. The runtime calls this once, before
-    /// it publishes the module's table. A defined table's entries are rewritten from indices to addresses,
-    /// which is exact because nothing has read or shared the table yet.
+    /// it publishes the module's tables. A defined table's function references are rewritten from indices
+    /// to addresses, which is exact because nothing has read or shared those tables yet.
     pub fn bind_function_addresses(&mut self, addresses: &[u32]) -> Result<(), CodegenError> {
         if addresses.len() != self.functions.len() {
             return Err(CodegenError::FunctionAddressMismatch {
@@ -2513,8 +2533,11 @@ impl BaselineModule {
                 actual: addresses.len(),
             });
         }
-        if self.pending_imported_table.is_none() {
-            if let Some(shared) = self.table.as_ref() {
+        for (index, slot) in self.tables.iter().enumerate() {
+            if self.pending_imported_tables[index].is_some() {
+                continue;
+            }
+            if let Some(shared) = slot {
                 let mut table = lock_shared(shared)
                     .map_err(|_| CodegenError::UnsupportedMemory("shared table is locked"))?;
                 for entry in table.elements.iter_mut() {
@@ -2535,12 +2558,16 @@ impl BaselineModule {
         Ok(())
     }
 
-    /// The handle to this module's table, for an instance that imports it.
+    /// The handle to the table at `index`, for an instance that imports it.
     ///
-    /// `None` for a module that defines no table, and for one that imports a
-    /// table it has not been given yet.
-    pub fn table_handle(&self) -> Option<SharedTable> {
-        self.table.clone()
+    /// `None` for a module that defines no such table, and for an imported one it has not been given yet.
+    pub fn table_handle(&self, index: usize) -> Option<SharedTable> {
+        self.tables.get(index).cloned().flatten()
+    }
+
+    /// How many tables the module has, imported ones first, as Wasm numbers them.
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
     }
 
     /// Lower a verified IR module and wrap it so it can be executed.
@@ -2619,15 +2646,22 @@ impl BaselineModule {
         // `global.set`, and a `table.set` must not be split across observers.
         let mut datas = lock_shared(&self.datas)?;
         let globals = self.globals.clone();
-        let mut table = match self.table.as_ref() {
-            Some(shared) => Some(lock_shared(shared)?),
-            None => None,
-        };
+        let mut guards = Vec::with_capacity(self.tables.len());
+        for shared in &self.tables {
+            guards.push(match shared {
+                Some(shared) => Some(lock_shared(shared)?),
+                None => None,
+            });
+        }
+        let mut table_refs: Vec<Option<&mut BaselineTable>> = guards
+            .iter_mut()
+            .map(|guard| guard.as_deref_mut())
+            .collect();
         let mut state = ExecState {
             functions,
             imports,
             function_locals: &self.function_locals,
-            table: table.as_deref_mut(),
+            tables: &mut table_refs,
             types: &self.types,
             memory: memory.as_deref_mut(),
             datas: &mut datas,
@@ -2649,7 +2683,7 @@ struct ExecState<'a> {
     functions: &'a [BaselineFunction],
     /// The imported functions a `CallHost` names.
     imports: &'a [tpt_wasm_ir::IrImport],
-    table: Option<&'a mut BaselineTable>,
+    tables: &'a mut [Option<&'a mut BaselineTable>],
     /// The defined function each store address names, for a call through the table.
     function_locals: &'a HashMap<u32, usize>,
     /// Module types, so an indirect call can check its target's signature.
@@ -2763,7 +2797,7 @@ impl BaselineFunction {
             functions,
             imports: &[],
             function_locals: &no_locals,
-            table: None,
+            tables: &mut [],
             types: &[],
             memory: None,
             datas: &mut Vec::new(),
@@ -2828,6 +2862,7 @@ impl BaselineFunction {
                         results,
                     )?,
                     BaselineOp::CallIndirect {
+                        table,
                         type_index,
                         operand,
                         arguments,
@@ -2836,10 +2871,13 @@ impl BaselineFunction {
                         state,
                         &mut slots,
                         &self.value_types,
-                        *type_index,
-                        *operand,
-                        arguments,
-                        results,
+                        IndirectCall {
+                            table: *table,
+                            type_index: *type_index,
+                            operand: *operand,
+                            arguments,
+                            results,
+                        },
                     )?,
                     _ => match exec_op(state, &mut slots, &self.value_types, op)? {
                         OpFlow::Continue => {}
@@ -3291,11 +3329,16 @@ fn exec_op(
             };
             slots[*result as usize] = Some(Value::I32(is_null as i32));
         }
-        BaselineOp::TableGet { result, index } => {
+        BaselineOp::TableGet {
+            table,
+            result,
+            index,
+        } => {
             let index = i32_slot(slots, *index)? as u32;
             let table = state
-                .table
-                .as_deref()
+                .tables
+                .get(*table as usize)
+                .and_then(|slot| slot.as_deref())
                 .ok_or_else(|| Trap::HostFailure("baseline table.get needs a table".into()))?;
             let entry = table
                 .elements
@@ -3306,7 +3349,11 @@ fn exec_op(
             let reference = entry.unwrap_or(tpt_wasm_types::RefValue::Null(table.element_type));
             slots[*result as usize] = Some(Value::Ref(reference));
         }
-        BaselineOp::TableSet { index, value } => {
+        BaselineOp::TableSet {
+            table: table_index,
+            index,
+            value,
+        } => {
             let index = i32_slot(slots, *index)? as u32;
             let entry = match read_slot(slots, *value)? {
                 Value::Ref(tpt_wasm_types::RefValue::Null(_)) => None,
@@ -3318,8 +3365,9 @@ fn exec_op(
                 }
             };
             let table = state
-                .table
-                .as_deref_mut()
+                .tables
+                .get_mut(*table_index as usize)
+                .and_then(|slot| slot.as_deref_mut())
                 .ok_or_else(|| Trap::HostFailure("baseline table.set needs a table".into()))?;
             // A reference of the other kind is refused here, as the store refuses it, rather than written.
             if let Some(reference) = &entry {
@@ -3394,6 +3442,7 @@ fn exec_op(
             results,
         } => exec_call(state, slots, value_types, *function, arguments, results)?,
         BaselineOp::CallIndirect {
+            table,
             type_index,
             operand,
             arguments,
@@ -3402,10 +3451,13 @@ fn exec_op(
             state,
             slots,
             value_types,
-            *type_index,
-            *operand,
-            arguments,
-            results,
+            IndirectCall {
+                table: *table,
+                type_index: *type_index,
+                operand: *operand,
+                arguments,
+                results,
+            },
         )?,
     }
     Ok(OpFlow::Continue)
@@ -3454,28 +3506,42 @@ fn exec_call(
     Ok(())
 }
 
+/// The operands of one indirect call, as the baseline op names them.
+struct IndirectCall<'a> {
+    table: u32,
+    type_index: u32,
+    operand: u32,
+    arguments: &'a [u32],
+    results: &'a [u32],
+}
+
 /// An indirect call through the table. The other op that recurses.
 #[inline(never)]
 fn exec_call_indirect(
     state: &mut ExecState<'_>,
     slots: &mut [Option<Value>],
     value_types: &[ValueType],
-    type_index: u32,
-    operand: u32,
-    arguments: &[u32],
-    results: &[u32],
+    call: IndirectCall<'_>,
 ) -> Result<(), BaselineError> {
+    let IndirectCall {
+        table,
+        type_index,
+        operand,
+        arguments,
+        results,
+    } = call;
     // Re-borrowed rather than moved: the recursive call takes
     // `&mut state` again, and the table handle has to stay
     // available for the next instruction.
-    let table = state
-        .table
-        .as_deref_mut()
+    let table_ref = state
+        .tables
+        .get_mut(table as usize)
+        .and_then(|slot| slot.as_deref_mut())
         .ok_or_else(|| Trap::HostFailure("baseline indirect call needs a table".into()))?;
     let index = i32_slot(slots, operand)? as u32;
     // Out of range and null are distinct traps, matching the
     // order in which the reference is resolved.
-    let target = table
+    let target = table_ref
         .elements
         .get(index as usize)
         .cloned()

@@ -182,49 +182,36 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         }
         _ => return Err(LoweringError::UnsupportedFeature("multiple memories")),
     };
-    // MVP allows at most one table in total, imported or defined, so the shape is
-    // decided by the two counts together rather than by the table section alone:
-    // a module that imports its table has no entry in the table *section* at all.
     let imported_tables: Vec<&tpt_wasm_format::Import> = module
         .imports
         .iter()
         .filter(|import| matches!(import.desc, tpt_wasm_format::ImportDesc::Table(_)))
         .collect();
-    if imported_tables.len() + module.tables.len() > 1 {
-        return Err(LoweringError::UnsupportedFeature("multiple tables"));
+    // The table index space puts imported tables first, then defined ones, as Wasm numbers them.
+    let table_count = imported_tables.len() + module.tables.len();
+    // Every active element segment seeds the table it names, in module order. So an importing module's
+    // segment lands on the exporter's table after the exporter's own.
+    let mut seeds: Vec<Vec<super::IrElementSegment>> = vec![Vec::new(); table_count];
+    for element in &module.elements {
+        let tpt_wasm_format::ElementMode::Active {
+            table_index,
+            offset,
+        } = &element.mode
+        else {
+            continue;
+        };
+        let seeded =
+            seeds
+                .get_mut(*table_index as usize)
+                .ok_or(LoweringError::UnsupportedFeature(
+                    "table index out of range",
+                ))?;
+        seeded.push(super::IrElementSegment {
+            offset: element_segment_offset(offset)?,
+            elements: lower_element_init(&element.init, imported_functions)?,
+        });
     }
-    // The element segment seeds whichever table there is, and is applied in this
-    // module's order, so an importing module's segment lands on the exporter's
-    // table after the exporter's own.
-    let active: Vec<&tpt_wasm_format::Element> = module
-        .elements
-        .iter()
-        .filter(|element| matches!(element.mode, tpt_wasm_format::ElementMode::Active { .. }))
-        .collect();
-    if active.len() > 1 {
-        return Err(LoweringError::UnsupportedFeature(
-            "multiple element segments",
-        ));
-    }
-    let (elements, offset) = match active.first() {
-        Some(element) => {
-            let tpt_wasm_format::ElementMode::Active {
-                table_index,
-                offset,
-            } = &element.mode
-            else {
-                unreachable!("filtered to active segments above");
-            };
-            if *table_index != 0 {
-                return Err(LoweringError::UnsupportedFeature("non-zero table index"));
-            }
-            (
-                lower_element_init(&element.init, imported_functions)?,
-                element_segment_offset(offset)?,
-            )
-        }
-        None => (Vec::new(), 0),
-    };
+    let mut seeds = seeds.into_iter();
     let mut tables = Vec::new();
     for import in imported_tables {
         let tpt_wasm_format::ImportDesc::Table(table_type) = import.desc else {
@@ -234,8 +221,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             element_type: table_type.element_type,
             min: table_type.limits.min,
             max: table_type.limits.max,
-            elements: elements.clone(),
-            offset,
+            segments: seeds.next().unwrap_or_default(),
             import: Some(super::IrImportSource {
                 module: import.module.clone(),
                 name: import.name.clone(),
@@ -250,10 +236,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             element_type: table.table_type.element_type,
             min: table.table_type.limits.min,
             max: table.table_type.limits.max,
-            // The last consumer, since MVP permits at most one table in total and
-            // so the loop above only runs when this one does not.
-            elements: elements.clone(),
-            offset,
+            segments: seeds.next().unwrap_or_default(),
             import: None,
         });
     }

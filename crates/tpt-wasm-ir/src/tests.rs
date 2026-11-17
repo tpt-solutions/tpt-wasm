@@ -166,10 +166,12 @@ impl ModuleState {
                 .iter()
                 .map(|declaration| {
                     let mut entries = vec![None; declaration.min as usize];
-                    for (position, entry) in declaration.elements.iter().enumerate() {
-                        let at = declaration.offset as usize + position;
-                        let slot = entries.get_mut(at).expect("element segment fits the table");
-                        *slot = *entry;
+                    for segment in &declaration.segments {
+                        for (position, entry) in segment.elements.iter().enumerate() {
+                            let at = segment.offset as usize + position;
+                            let slot = entries.get_mut(at).expect("element segment fits the table");
+                            *slot = *entry;
+                        }
                     }
                     entries
                 })

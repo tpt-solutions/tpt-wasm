@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 TPT Solutions
 
-//! A module with two tables validates, and an indirect call through the second one reaches it. The compiled
-//! tiers do not yet hold more than one table, so they refuse such a module by name.
+//! A module with two tables validates, and an indirect call through the second one reaches it, on the
+//! interpreter and on the baseline alike.
 
 use tpt_wasm_runtime::{Config, Engine, EngineMode, RuntimeError};
 
@@ -41,17 +41,20 @@ fn an_indirect_call_through_the_second_table_traps_on_the_interpreter() {
 }
 
 #[test]
-fn a_compiled_tier_refuses_two_tables_by_name() {
+fn the_baseline_traps_on_the_second_table_as_the_interpreter_does() {
     let engine = Engine::new(Config {
         engine_mode: EngineMode::Baseline,
         ..Config::default()
     })
     .expect("engine");
-    let error = engine
+    let mut instance = engine
         .instantiate_bytes(&two_tables())
-        .expect_err("the baseline holds one table");
+        .expect("the baseline holds both tables");
+    let error = instance
+        .call("f", Vec::new())
+        .expect_err("the second table's only slot is empty");
     assert!(
-        error.to_string().contains("table"),
-        "the refusal names the table: {error}"
+        matches!(error, RuntimeError::Trap(_)),
+        "the call reaches the second table and traps there: {error:?}"
     );
 }

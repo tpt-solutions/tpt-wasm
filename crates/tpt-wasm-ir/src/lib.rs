@@ -88,16 +88,9 @@ pub struct IrTable {
     pub element_type: ReferenceType,
     pub min: u64,
     pub max: Option<u64>,
-    /// The initial contents of the table, from the module's active element
-    /// segment.
-    ///
-    /// `Some` is a `ref.func` naming a function in this IR's index space and
-    /// `None` is a `ref.null`. A segment spelled as plain indices lowers to all
-    /// `Some`; one spelled as expressions may contain either, which is the whole
-    /// reason the two families cannot share one representation.
-    pub elements: Vec<Option<u32>>,
-    /// Where those entries start in the table.
-    pub offset: u32,
+    /// The active element segments that seed this table, in module order. A later segment overwrites an
+    /// earlier one at the same index, so they cannot be applied out of order.
+    pub segments: Vec<IrElementSegment>,
     /// Where this table is imported from, when it is imported rather than defined.
     ///
     /// `Some` means the table belongs to the exporting instance and nothing is
@@ -668,6 +661,17 @@ pub enum IrInstr {
         index: ValueId,
         value: ValueId,
     },
+}
+
+/// One active element segment, as the table it seeds receives it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IrElementSegment {
+    /// Where the entries start in the table.
+    pub offset: u32,
+    /// The entries. `Some` is a `ref.func` naming a function in this IR's index space and `None` is a
+    /// `ref.null`. A segment spelled as plain indices lowers to all `Some`; one spelled as expressions may
+    /// contain either, which is the whole reason the two families cannot share one representation.
+    pub elements: Vec<Option<u32>>,
 }
 
 /// Whether a memory access still needs a run-time bounds check.

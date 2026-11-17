@@ -1660,7 +1660,8 @@ fn instantiate_module(
     let baseline_global_addresses: Vec<u32> = global_addrs.clone();
     // Captured for the same reason: the baseline publishes or installs its table
     // handle under the store address that table was allocated at.
-    let baseline_table_address = table_addrs.first().copied();
+    // Every table, imported ones first, in the order the module numbers them.
+    let baseline_table_addresses: Vec<u32> = table_addrs.clone();
     // The store address of each defined function, in definition order. Imported functions come first in the
     // store's index space, so the defined ones are the tail.
     let imported_function_count = module
@@ -1803,8 +1804,8 @@ fn instantiate_module(
         // handle up there and installs that same one. A copy would satisfy every
         // type check and then let the importer's element segment land where the
         // exporter could not see it.
-        if let Some(address) = baseline_table_address {
-            if let Some(shared) = module.table_handle() {
+        for (index, address) in baseline_table_addresses.iter().copied().enumerate() {
+            if let Some(shared) = module.table_handle(index) {
                 lock_baseline_tables(&context.baseline_tables)?.insert(address, shared);
             } else {
                 let shared = lock_baseline_tables(&context.baseline_tables)?
@@ -1813,14 +1814,8 @@ fn instantiate_module(
                     .ok_or(RuntimeError::UnsupportedFeature(
                         "a table imported in baseline mode that no instance in this store exports",
                     ))?;
-                module.set_table(shared).map_err(|_| {
-                    RuntimeError::UnsupportedFeature("an imported table in baseline mode")
-                })?;
+                module.set_table(index, shared).map_err(codegen_error)?;
             }
-        } else if module.table_handle().is_some() {
-            return Err(RuntimeError::UnsupportedFeature(
-                "a compiled table with no store address",
-            ));
         }
         // Globals, one handle each, keyed by store address. A *defined* global
         // publishes its handle so a reader and a later importer find the same
