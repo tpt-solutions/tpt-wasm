@@ -42,6 +42,22 @@ goes to `.lake/`, which is gitignored.
 | `TptWasm/Proofs/V5.lean` | V5: which instructions are observably inert, and which are not. |
 | `TptWasm/Proofs/V4.lean` | V4: the correspondence between Wasm and IR instructions, and the address agreement. |
 | `TptWasm/Proofs/V4Straight.lean` | V4 simulation on the straight-line subset: a Wasm body and its lowering step together, from an operand-stack correspondence to the IR run. |
+| `TptWasm/Diamond.lean` | V4 control flow: one `if`/`else` diamond -- its Wasm meaning (`runShape`) and its four-block lowering (`lowerShape`). |
+| `TptWasm/Proofs/V4Diamond.lean` | V4 control flow: `diamond_simulation`, the lowered diamond returns the Wasm run's events and values. |
+| `TptWasm/Proofs/V4DiamondExample.lean` | A concrete diamond that discharges every hypothesis of `diamond_simulation`. |
+| `TptWasm/Proofs/IfControl.lean` | The structured `if` rules: the program counter lands at the else-body, after the marker, or falls into the then-body. |
+| `TptWasm/Proofs/MachineDiamond.lean` | The machine (`execOp` over the program counter) runs a flat diamond body the way `runShape` runs the diamond: `machine_diamond`. |
+| `TptWasm/Proofs/Triangle.lean` | The machine and the block graph agree on one diamond from one start: `triangle`, and a concrete instance. |
+| `TptWasm/Proofs/FlatLower.lean` | The lowering read from the flat body the machine runs: `lowerFlat`, `decompose`, and `triangleFlat`. |
+| `TptWasm/Nested/Syntax.lean` | Nested statements: straight-line code and `if`/`else` with statement-list arms; the list semantics `runSeq` and the flat layout. |
+| `TptWasm/Nested/Frames.lean` | A nested run keeps the function table and the active frame. |
+| `TptWasm/Nested/Machine.lean` | The machine runs nested statements as the list semantics does: `machine_seq`, `machine_stmt`. |
+| `TptWasm/Nested/Sim.lean` | Helpers for the simulation: block correspondence, binding, global-type preservation. |
+| `TptWasm/Nested/Lower.lean` | Lowering nested statements with continuations, and its range, distinctness and membership specs. |
+| `TptWasm/Nested/Goto.lean` | The block graph reaches a continuation in `n` steps (`GotoN`), with fuel and composition lemmas. |
+| `TptWasm/Nested/Simulate.lean` | The nested simulation, by mutual induction: `sim_stmt`, `sim_seq`. |
+| `TptWasm/Nested/Program.lean` | Program lowering `lowerProg`, the IR run, the machine run, and `nested_triangle`. |
+| `TptWasm/Nested/Example.lean` | A program with an `if` nested in an arm, checked against `nested_triangle`. |
 | `TptWasm/Proofs/V6.lean` | V6: the lowering skeleton -- the machine, the lowering, and the obligations. |
 | `TptWasm/CFG.lean` | Whole-function execution, block lookup, pruning, and the `Reachable` relation. |
 | `TptWasm/Proofs/CFG.lean` | CFG simplification: removing unreachable blocks preserves every run. |

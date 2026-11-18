@@ -61,7 +61,7 @@ modules, the theory says what one would mean.
 | V1 interpreter correspondence | proved | `TptWasm.Proofs.V1` |
 | V2 memory safety | proved | `TptWasm.Proofs.V2` |
 | V3 host capability safety | proved | `TptWasm.Proofs.V3` |
-| V4 IR refinement | **model + vocabulary only** | see below |
+| V4 IR refinement | **partial**: straight-line subset and one `if`/`else` diamond proved | see below |
 | V5 transformation correctness | **partial** | six theorems proved |
 | V6 machine-code refinement | **not started** | see below |
 
@@ -72,16 +72,44 @@ arms bundle a target with the values binding it) and `TptWasm.IRExec` gives its
 execution. That is the vocabulary V4 and V5 are stated in, and it is what a later
 refinement theorem would quantify over.
 
-The refinement theorem itself is **not proved**. The missing piece is the erasure
-from IR back to a Wasm instruction sequence together with the theorem that the two
-observe identically. The reason it is not written yet is specific rather than
-general: `TptWasm.Transition` models Wasm execution over a *list of
-instructions* with an operand stack, whereas the IR is in SSA form with block
-parameters. Bridging them is a real theorem about the shape of the two, not a
-definition, and it needs a typing theory to say which values a block parameter may
-legitimately bind. Writing it before that theory would produce a theorem whose
-premises were stronger than the claim, which is the failure mode this document
-exists to prevent.
+Two refinement results are proved, each for a shape narrower than the full language:
+
+* **Straight-line bodies** (`TptWasm.Proofs.V4Straight`, `simulation`): a Wasm body of `i32`
+  constants, operators, comparisons, memory accesses, globals and locals, and its lowering to one
+  IR block, end in the same operand values, store and events.
+* **One `if`/`else` diamond** (`TptWasm.Diamond`, `TptWasm.Proofs.V4Diamond`,
+  `diamond_simulation`): `pre ; if ... else ... end ; post`, where `pre` leaves one `i32`
+  condition, the arms are stack-neutral, and the locals pass through block parameters. The
+  lowering is four IR blocks. The theorem says the lowered function returns the events and
+  values the Wasm run returns. `TptWasm.V4DiamondExample` applies it to one concrete diamond and
+  discharges every hypothesis, so the statement is shown to be inhabited.
+
+Both are checked with `lake build`, with no `sorry`, and depend only on the standard axioms.
+
+The Wasm model now has the structured `if` as `OpStep` rules (`ifThen`, `ifElse`, `elseSkip`, over a
+flat layout with `ifInstr` and `elseInstr` markers), and `TptWasm.Proofs.IfControl` proves that each
+rule lands the program counter where that layout says. `TptWasm.Proofs.MachineDiamond` proves that
+the machine (the interpreter, run over the program counter) computes what the diamond's `runShape`
+computes on a flat body, so the rules and the list semantics agree on the diamond. `TptWasm.Proofs.Triangle`
+states the machine, the list semantics and the block graph together for one run: the machine's end
+state carries the block graph's returned values, with the same events. The lowering is stated over
+the flat body the machine runs (`TptWasm.Proofs.FlatLower`: `lowerFlat`, with `triangleFlat`), which
+reads a flat diamond back into its shape and lowers that shape. The two sides still meet through the
+list semantics (`runShape`), not directly. Block, loop and branch instructions are not in the model.
+
+Nested diamonds are also proved (`TptWasm.Nested`): a statement is straight-line code or an
+`if`/`else` whose arms are statement lists, to any depth. The machine runs the flat layout as the
+list semantics does (`machine_seq`); the lowering gives each statement a continuation block, so an
+`if` needs no join block (`Lower`); the block graph reaches the continuation in a known number of
+steps (`GotoN`), and the simulation is by induction over the statement structure (`Simulate`).
+`nested_triangle` states the machine and the IR agree with the Wasm run, and `Nested.Example`
+applies it to a program with an `if` nested in an arm. Loops, branches, calls, and traps inside
+statements are not yet in the model.
+
+Not proved: nested control flow, loops, `br`/`br_if`/`br_table`, calls, traps in the diamond,
+the store and locals after the run (the diamond theorem exports events and values only), and
+the refinement chain that composes V4 with V5 and V6. The lowering is not yet tied to the Rust
+lowerer by translation validation for the diamond; the straight-line subset is.
 
 ### V5: what is proved
 
