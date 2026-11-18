@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 TPT Solutions
+
+//! Translation validation of the diamond simulation against the Rust engine.
+//!
+//! `formal/TptWasm/Proofs/V4Diamond.lean` proves that the lowered form of an `if`/`else` diamond
+//! returns what the Wasm run returns. That proof is about the Lean model. This test ties the model
+//! to the Micro engine: it generates random diamonds over `i32` values, with one local, runs each
+//! as a Wasm function on the Micro engine for its result, and asks the Lean checker to evaluate
+//! the same diamond two ways: by the Wasm model `runShape` and by the lowering `lowerShape`
+//! followed by the IR executor. A verdict is true only when both model runs produce exactly the
+//! Micro result.
+//!
+//! Needs Lean and Lake, so it runs only when `TPT_TRANSLATION_VALIDATION` is set. With
+//! `TPT_TRANSLATION_MUTANT` set, the expected results are corrupted, and the test passes only if
+//! the checker rejects every corrupted case.
+//!
+//! This is testing evidence on generated diamonds, not a proof that the Rust engine refines the
+//! model.
+
+mod common;
+
+use common::{push_i32_constant, Rng};
+use tpt_wasm_format::{Export, ExportDesc, Function, LocalDecl, Module};
+use tpt_wasm_runtime::{Config, Engine};
+use tpt_wasm_types::{FunctionType, ResultType, Value, ValueType};
+
+/// The binary operators the IR lifts, with their Wasm opcode and Lean constructor.
+const BINARY: [(u8, &str); 6] = [
+    (0x6a, "add"),
+    (0x6b, "sub"),
+    (0x6c, "mul"),
+    (0x71, "and"),
+    (0x72, "or"),
+    (0x73, "xor"),
+];
+
+/// The `i32` comparisons, with their Wasm opcode and Lean constructor.
+const COMPARE: [(u8, &str); 10] = [
+    (0x46, "eq"),
+    (0x47, "ne"),
+    (0x48, "ltS"),
+    (0x49, "ltU"),
+    (0x4a, "gtS"),
+    (0x4b, "gtU"),
+    (0x4c, "leS"),
+    (0x4d, "leU"),
+    (0x4e, "geS"),
+    (0x4f, "geU"),
+];
+
+/// Append one operator, chosen at random, and its Lean rendering to `bytes` and `lean`.
+fn push_operator(rng: &mut Rng, bytes: &mut Vec<u8>, lean: &mut Vec<String>) {
+    if rng.below(4) == 0 {
+        let (opcode, name) = COMPARE[rng.below(COMPARE.len() as u64) as usize];
+        bytes.push(opcode);
+        lean.push(format!(".i32Cmp .{name}"));
+    } else {
+        let (opcode, name) = BINARY[rng.below(BINARY.len() as u64) as usize];
+        bytes.push(opcode);
+        lean.push(format!(".i32Bin .{name}"));
+    }
+}
+
+/// An expression that leaves exactly one `i32` on the operand stack, with no `end` opcode. Its
+/// leaves are constants and reads of local 0.
+fn expression(rng: &mut Rng, steps: usize) -> (Vec<u8>, Vec<String>) {
+    let mut bytes = Vec::new();
+    let mut lean = Vec::new();
+    let mut depth = 0usize;
+    for _ in 0..steps {
+        if depth >= 2 && rng.below(3) != 0 {
+            push_operator(rng, &mut bytes, &mut lean);
+            depth -= 1;
+        } else if rng.below(3) == 0 {
+            bytes.extend_from_slice(&[0x20, 0x00]); // local.get 0
+            lean.push(".localGet 0".to_owned());
+            depth += 1;
+        } else {
+            let value = (rng.next() as i32) >> rng.below(31);
+            push_i32_constant(&mut bytes, value);
+            lean.push(format!(".i32Const ({value})"));
+            depth += 1;
+        }
+    }
+    while depth > 1 {
+        push_operator(rng, &mut bytes, &mut lean);
+        depth -= 1;
+    }
+    if depth == 0 {
+        push_i32_constant(&mut bytes, 0);
+        lean.push(".i32Const (0)".to_owned());
+    }
+    (bytes, lean)
+}
+
+/// A void arm: one or two assignments to local 0, each an expression followed by `local.set 0`.
+fn arm(rng: &mut Rng) -> (Vec<u8>, Vec<String>) {
+    let mut bytes = Vec::new();
+    let mut lean = Vec::new();
+    for _ in 0..1 + rng.below(2) {
+        let steps = 1 + rng.below(5) as usize;
+        let (expr_bytes, expr_lean) = expression(rng, steps);
+        bytes.extend(expr_bytes);
+        bytes.extend_from_slice(&[0x21, 0x00]); // local.set 0
+        lean.extend(expr_lean);
+        lean.push(".localSet 0".to_owned());
+    }
+    (bytes, lean)
+}
+
+/// The Wasm body of a diamond: `pre`, `if` with void arms, then `post`, then `end`.
+fn diamond_body(pre: &[u8], then_arm: &[u8], else_arm: &[u8], post: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(pre);
+    bytes.extend_from_slice(&[0x04, 0x40]); // if (void)
+    bytes.extend_from_slice(then_arm);
+    bytes.push(0x05); // else
+    bytes.extend_from_slice(else_arm);
+    bytes.push(0x0b); // end of the if
+    bytes.extend_from_slice(post);
+    bytes.push(0x0b); // end of the function
+    bytes
+}
+
+/// The `i32` the Micro engine returns for a function with one `i32` local, initialised to zero.
+fn micro_result(body: &[u8]) -> i32 {
+    let module = Module {
+        types: vec![FunctionType {
+            params: ResultType(Vec::new()),
+            results: ResultType(vec![ValueType::I32]),
+        }],
+        functions: vec![Function {
+            type_index: 0,
+            locals: vec![LocalDecl {
+                count: 1,
+                value_type: ValueType::I32,
+            }],
+            body: body.to_vec(),
+        }],
+        exports: vec![Export {
+            name: "run".into(),
+            desc: ExportDesc::Function(0),
+        }],
+        ..Module::default()
+    };
+    let engine = Engine::new(Config::default()).expect("the engine is constructible");
+    let mut instance = engine
+        .instantiate(module)
+        .expect("a generated diamond validates");
+    match instance
+        .call("run", Vec::new())
+        .expect("the diamond returns")
+        .as_slice()
+    {
+        [Value::I32(value)] => *value,
+        other => panic!("the diamond returned {other:?}, not one i32"),
+    }
+}
+
+fn lean_list(items: &[String]) -> String {
+    format!("[{}]", items.join(", "))
+}
+
+#[test]
+fn the_diamond_model_agrees_with_the_micro_engine_on_generated_diamonds() {
+    if !common::enabled("diamond validation") {
+        return;
+    }
+    let mutant = common::mutant();
+    let cases: u64 = std::env::var("TPT_TRANSLATION_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+
+    let mut source = String::new();
+    source.push_str("import TptWasm.Diamond\n\n");
+    source.push_str("open TptWasm TptWasm.Diamond TptWasm.V4Straight\n\n");
+    source.push_str(
+        "def startConfig : Configuration :=\n  \
+         { store := {}, frames := [⟨0, [.i32 0], 0, 0, 0, 0⟩], operandStack := [], controlStack := [] }\n\n\
+         def startState : IR.State := { values := fun _ => .i32 0, store := {} }\n\n\
+         def wasmDiamond (d : Shape) : Option (List Value) :=\n  \
+         (runShape d startConfig).map (·.1.operandStack)\n\n\
+         def irDiamond (d : Shape) : Option (List Value) :=\n  \
+         match lowerShape d [0] 1 with\n  \
+         | some f =>\n    \
+           match IR.runFunction f 3 startState with\n    \
+           | .returned _ values => some values\n    \
+           | _ => none\n  \
+         | none => none\n\n",
+    );
+
+    let mut rng = Rng(0x5eed_0005);
+    let mut results = std::collections::BTreeSet::new();
+    for case in 0..cases {
+        let pre_steps = 1 + rng.below(6) as usize;
+        let (pre_bytes, pre_lean) = expression(&mut rng, pre_steps);
+        let (then_bytes, then_lean) = arm(&mut rng);
+        let (else_bytes, else_lean) = arm(&mut rng);
+        let post_steps = 1 + rng.below(6) as usize;
+        let (post_bytes, post_lean) = expression(&mut rng, post_steps);
+
+        let body = diamond_body(&pre_bytes, &then_bytes, &else_bytes, &post_bytes);
+        let expected = micro_result(&body);
+        results.insert(expected);
+        // The mutant shifts every expectation by one, so each case must be rejected.
+        let expected = if mutant {
+            expected.wrapping_add(1)
+        } else {
+            expected
+        };
+        source.push_str(&format!(
+            "def diamond{case} : Shape :=\n  {{ pre := {}, thenArm := {}, elseArm := {}, post := {} }}\n",
+            lean_list(&pre_lean),
+            lean_list(&then_lean),
+            lean_list(&else_lean),
+            lean_list(&post_lean),
+        ));
+        source.push_str(&format!(
+            "#eval decide (wasmDiamond diamond{case} = some [.i32 ({expected})]) && \
+             decide (irDiamond diamond{case} = some [.i32 ({expected})])\n\n"
+        ));
+    }
+
+    // The check must not pass vacuously: the generated diamonds have to produce varied results.
+    assert!(
+        results.len() >= 10,
+        "the generated diamonds produced only {} distinct results",
+        results.len()
+    );
+
+    let verdicts = common::run_lean_checker("DiamondCases.lean", &source);
+    assert_eq!(
+        verdicts.len() as u64,
+        cases,
+        "one verdict per case; got {}",
+        verdicts.len()
+    );
+    let agreeing = verdicts.iter().filter(|verdict| *verdict == "true").count();
+    if mutant {
+        assert_eq!(
+            agreeing, 0,
+            "{agreeing} of {cases} corrupted expectations were accepted; the check cannot fail"
+        );
+        eprintln!("mutant check: all {cases} corrupted expectations are rejected");
+        return;
+    }
+    assert_eq!(
+        agreeing as u64,
+        cases,
+        "the diamond model disagrees with the Micro engine on {} of {cases} diamonds",
+        cases as usize - agreeing
+    );
+    eprintln!("diamond validation: {cases} diamonds agree with the Micro engine");
+}

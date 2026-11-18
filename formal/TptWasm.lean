@@ -27,3 +27,10 @@ import TptWasm.Dominance
 import TptWasm.Proofs.FoldGlobal
 import TptWasm.Proofs.FoldWhole
 import TptWasm.Proofs.IfControl
+import TptWasm.Diamond
+import TptWasm.Proofs.V4Diamond
+import TptWasm.Proofs.V4DiamondExample
+import TptWasm.Proofs.IfControl
+import TptWasm.Proofs.MachineDiamond
+import TptWasm.Proofs.Triangle
+import TptWasm.Proofs.FlatLower
