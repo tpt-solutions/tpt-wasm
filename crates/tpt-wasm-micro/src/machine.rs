@@ -1405,8 +1405,13 @@ fn table_grow(machine: &mut Machine, table: u32) -> Step {
     };
     match target.grow(delta, limit) {
         Ok(old_len) => {
-            for index in old_len as usize..old_len as usize + delta as usize {
-                target.elements[index] = Some(reference.clone());
+            for slot in target
+                .elements
+                .iter_mut()
+                .skip(old_len as usize)
+                .take(delta as usize)
+            {
+                *slot = Some(reference.clone());
             }
             push_value(machine, Value::I32(old_len as i32))
         }
