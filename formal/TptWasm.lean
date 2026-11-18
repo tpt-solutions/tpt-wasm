@@ -36,3 +36,4 @@ import TptWasm.Proofs.FlatLower
 import TptWasm.Nested.Simulate
 import TptWasm.Nested.Program
 import TptWasm.Nested.Example
+import TptWasm.Nested.LoopExample

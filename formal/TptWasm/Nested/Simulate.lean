@@ -31,17 +31,23 @@ def condBlk (nb : Nat) (irC : List IR.Instr) (c0 : IR.ValueId) (L n : Nat) (tE e
   { id := nb, params := List.range' n L, instrs := irC,
     terminator := .condBranch c0 (tE, Q) (eE, Q) }
 
+/-- The header block of a loop: the condition, and a branch on it to the body or to the continuation. -/
+def loopBlk (nb : Nat) (irC : List IR.Instr) (c0 : IR.ValueId) (L n : Nat) (bE kid : IR.BlockId)
+    (Q : List IR.ValueId) : IR.Block :=
+  { id := nb, params := List.range' n L, instrs := irC,
+    terminator := .condBranch c0 (bE, Q) (kid, Q) }
+
 mutual
 
-theorem sim_stmt : ∀ (s : Stmt) (kid : IR.BlockId) (kps : List IR.ValueId) (kblk : IR.Block)
+theorem sim_stmt : ∀ (k : Nat) (s : Stmt) (kid : IR.BlockId) (kps : List IR.ValueId) (kblk : IR.Block)
     (L n nb : Nat) (E : IR.BlockId) (EP : List IR.ValueId) (B : List IR.Block) (n' nb' : Nat)
     (G : List IR.Block) (c c' : Configuration) (evs : List Event) (st : IR.State),
     lowerStmt s (kid, kps) L n nb = some (E, EP, B, n', nb') →
-    SupStmt s → kps.length = L → kps.Nodup → IR.findBlock G kid = some kblk →
+    SupStmtL s → kps.length = L → kps.Nodup → IR.findBlock G kid = some kblk →
     kblk.params = kps → (∀ b ∈ B, b ∈ G) → (G.map IR.Block.id).Nodup →
-    V4Diamond.GlobalsI32 c.store → BoundCorr c st EP → runStmt s c = some (c', evs) →
+    V4Diamond.GlobalsI32 c.store → BoundCorr c st EP → runStmt k s c = some (c', evs) →
     ∀ tr, ∃ n0 st', GotoN G n0 E st tr kid st' (tr ++ evs) ∧ BoundCorr c' st' kps
-  | .straight ops, kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, h, hs, hkL,
+  | k, .straight ops, kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, h, hs, hkL,
       hkN, hK, hkb, hG, hnd, hgl, hc, hr, tr => by
     obtain ⟨hw, hstk0, hstk1⟩ := runStmt_straight_extract hr
     have hspec := lowerStmt_spec (.straight ops) (kid, kps) L n nb E EP B n' nb' h
@@ -74,7 +80,7 @@ theorem sim_stmt : ∀ (s : Stmt) (kid : IR.BlockId) (kps : List IR.ValueId) (kb
         refine ⟨0 + 1, _, hstep, ?_⟩
         have hBC1 := boundCorr_of_corresponds hcorr1
         exact boundCorr_bind hBC1 hkN (by rw [hQlen, hkL])
-  | .ifElse cond t el, kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, h, hs,
+  | k, .ifElse cond t el, kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, h, hs,
       hkL, hkN, hK, hkb, hG, hnd, hgl, hc, hr, tr => by
     obtain ⟨hsc, hst, hse⟩ := hs
     unfold runStmt at hr
@@ -87,8 +93,8 @@ theorem sim_stmt : ∀ (s : Stmt) (kid : IR.BlockId) (kps : List IR.ValueId) (kb
         simp only [hcond] at hr
         split at hr
         next v hop =>
-          cases harm : (if v = 0 then runSeq el { c1 with operandStack := [] }
-              else runSeq t { c1 with operandStack := [] }) with
+          cases harm : (if v = 0 then runSeq k el { c1 with operandStack := [] }
+              else runSeq k t { c1 with operandStack := [] }) with
           | none => simp [harm] at hr
           | some q2 =>
             obtain ⟨c3, e2⟩ := q2
@@ -164,7 +170,7 @@ theorem sim_stmt : ∀ (s : Stmt) (kid : IR.BlockId) (kps : List IR.ValueId) (kb
                         have hv0 : IR.intPayload (st1.values c0) = 0 := by
                           rw [hv1]
                           rfl
-                        obtain ⟨n', s', hG2, hBC3⟩ := sim_seq el kid kps kblk L m2 nb2 eE eEP eB m3
+                        obtain ⟨n', s', hG2, hBC3⟩ := sim_seq k el kid kps kblk L m2 nb2 eE eEP eB m3
                           nb3 G { c1 with operandStack := [] } c3 e2 (st1.bindAll eEP (Q.map st1.values))
                           he hse hkL hkN hK hkb hGe hnd hgl1 hBCe harm (tr ++ e1)
                         refine ⟨n' + 1, s', ?_, hBC3⟩
@@ -177,7 +183,7 @@ theorem sim_stmt : ∀ (s : Stmt) (kid : IR.BlockId) (kps : List IR.ValueId) (kb
                         have hv0 : IR.intPayload (st1.values c0) ≠ 0 := by
                           rw [hv1]
                           exact hv
-                        obtain ⟨n', s', hG2, hBC3⟩ := sim_seq t kid kps kblk L m (nb + 1) tE tEP tB m2
+                        obtain ⟨n', s', hG2, hBC3⟩ := sim_seq k t kid kps kblk L m (nb + 1) tE tEP tB m2
                           nb2 G { c1 with operandStack := [] } c3 e2 (st1.bindAll tEP (Q.map st1.values))
                           ht hst hkL hkN hK hkb hGt hnd hgl1 hBCt harm (tr ++ e1)
                         refine ⟨n' + 1, s', ?_, hBC3⟩
@@ -190,15 +196,132 @@ theorem sim_stmt : ∀ (s : Stmt) (kid : IR.BlockId) (kps : List IR.ValueId) (kb
         next => simp at hr
     · simp [hstk] at hr
 
-theorem sim_seq : ∀ (ss : List Stmt) (kid : IR.BlockId) (kps : List IR.ValueId) (kblk : IR.Block)
+  | 0, .whileNZ _ _, kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, _, hs, hkL,
+      hkN, hK, hkb, hG, hnd, hgl, hc, hr, tr => by
+    simp [runStmt] at hr
+  | k + 1, .whileNZ cond body, kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, h, hs,
+      hkL, hkN, hK, hkb, hG, hnd, hgl, hc, hr, tr => by
+    have hlow0 := h
+    have hs0 := hs
+    obtain ⟨hsc, hsb⟩ := hs
+    unfold lowerStmt at h
+    cases hl : V4Straight.lower cond [] (List.range' n L) (n + L) with
+    | none => simp [hl] at h
+    | some q3 =>
+      obtain ⟨irC, fin, Q, m⟩ := q3
+      rcases fin with _ | ⟨c0, _ | ⟨c2', tl⟩⟩
+      · simp [hl] at h
+      · cases hb : lowerSeq body (nb, List.range' n L) L m (nb + 1) with
+        | none => simp [hl, hb] at h
+        | some qb =>
+          obtain ⟨bE, bEP, bB, m2, nb2⟩ := qb
+          simp only [hl, hb, Option.some.injEq, Prod.mk.injEq] at h
+          obtain ⟨rfl, rfl, rfl, rfl, rfl⟩ := h
+          unfold runStmt at hr
+          by_cases hstk : c.operandStack = []
+          · simp only [hstk, ↓reduceIte] at hr
+            cases hcond : runWasm cond c with
+            | none => simp [hcond] at hr
+            | some q =>
+              obtain ⟨c1, e1⟩ := q
+              simp only [hcond] at hr
+              split at hr
+              next v hop =>
+                -- the header runs the condition and branches on the value it leaves
+                have hcorr := corresponds_of_bound (n := n + L) hc (fun id hid => by
+                  have hid2 := (List.mem_range'_1.mp hid).2
+                  exact hid2)
+                have sim := V4Straight.simulation cond c c1 e1 st [] (List.range' n L)
+                  (n + L) irC [c0] Q m hcorr hgl hl hcond
+                obtain ⟨st1, hrb, hcorr1⟩ := sim tr
+                have hv1 : st1.values c0 = .i32 v := by
+                  have h1' := hcorr1.1
+                  rw [hop] at h1'
+                  simp at h1'
+                  exact h1'.symm
+                have hrbR := V4Diamond.runBodyR_of_runBody irC st tr st1 (tr ++ e1) hrb
+                have hQlen : Q.length = L := by
+                  have := (V4Diamond.lower_props cond [] (List.range' n L) (n + L) irC
+                    [c0] Q m hl).1
+                  simpa using this
+                have hmemH : loopBlk nb irC c0 L n bE kid Q ∈ G := hG _ (by simp [loopBlk])
+                have hfbH : IR.findBlock G nb = some (loopBlk nb irC c0 L n bE kid Q) :=
+                  findBlock_of_mem G _ hmemH hnd
+                have hOKb := lowerSeq_spec body (nb, List.range' n L) L m (nb + 1) bE bEP bB m2 nb2 hb
+                have hGb : ∀ b ∈ bB, b ∈ G := fun b hb' => hG b (List.mem_cons_of_mem _ hb')
+                obtain ⟨bblk, hbfb, hbpar, -⟩ := entry_lookup hOKb.1 hGb hnd
+                have hc2 := boundCorr_of_corresponds_nostack hcorr1
+                have hgl1 := runWasm_globals_of_sup cond c c1 e1 hsc hgl hcond
+                obtain ⟨n0b, hbEPeq⟩ := lowerSeq_params body (nb, List.range' n L) L m (nb + 1)
+                  bE bEP bB m2 nb2 hb
+                have hndb : bEP.Nodup := by
+                  rw [hbEPeq]
+                  exact List.nodup_range' (s := n0b) (n := L)
+                have hBCb := boundCorr_bind hc2 hndb (by rw [hOKb.2, hQlen])
+                by_cases hv : v = 0
+                · -- the condition is zero: the loop leaves to its continuation
+                  subst hv
+                  simp only [↓reduceIte, Option.some.injEq, Prod.mk.injEq] at hr
+                  obtain ⟨hc2e, hee⟩ := hr
+                  subst hee
+                  subst hc2e
+                  have hv0 : IR.intPayload (st1.values c0) = 0 := by
+                    rw [hv1]
+                    rfl
+                  have hBCk := boundCorr_bind hc2 hkN (by rw [hkL, hQlen])
+                  refine ⟨0 + 1, st1.bindAll kps (Q.map st1.values), ?_, hBCk⟩
+                  have hgoto := GotoN.condElse (n := 0) (ta := Q) (ea := Q) hfbH rfl hrbR hv0 hK
+                    (GotoN.here kid _ (tr ++ e1))
+                  rw [hkb] at hgoto
+                  exact hgoto
+                · -- the condition is non-zero: one iteration of the body, then the loop again
+                  simp only [hv, ↓reduceIte] at hr
+                  cases harm : runSeq k body { c1 with operandStack := [] } with
+                  | none => simp [harm] at hr
+                  | some q2 =>
+                    obtain ⟨c3, e2⟩ := q2
+                    simp only [harm] at hr
+                    cases hrec : runStmt k (.whileNZ cond body) c3 with
+                    | none => simp [hrec] at hr
+                    | some q4 =>
+                      obtain ⟨c4, e3⟩ := q4
+                      simp only [hrec, Option.some.injEq, Prod.mk.injEq] at hr
+                      obtain ⟨hev, hc4⟩ := hr
+                      subst hev
+                      subst hc4
+                      have hv0 : IR.intPayload (st1.values c0) ≠ 0 := by
+                        rw [hv1]
+                        exact hv
+                      have hgl3 := runSeq_globals k body { c1 with operandStack := [] } c3 e2 hsb
+                        hgl1 harm
+                      obtain ⟨n0b', st2, hG2, hBC2⟩ := sim_seq k body nb (List.range' n L)
+                        (loopBlk nb irC c0 L n bE kid Q) L m (nb + 1) bE bEP bB m2 nb2 G
+                        { c1 with operandStack := [] } c3 e2 (st1.bindAll bEP (Q.map st1.values))
+                        hb hsb (by simp) (List.nodup_range' (s := n) (n := L)) hfbH rfl hGb hnd
+                        hgl1 hBCb harm (tr ++ e1)
+                      obtain ⟨n0r, st3, hGr, hBC3⟩ := sim_stmt k (.whileNZ cond body) kid kps kblk L
+                        n nb _ _ _ _ _ G c3 c4 e3 st2 hlow0 hs0 hkL hkN hK hkb hG hnd hgl3 hBC2 hrec
+                        ((tr ++ e1) ++ e2)
+                      refine ⟨(n0b' + 1) + n0r, st3, ?_, hBC3⟩
+                      have hstep := GotoN.condThen (n := n0b') (ta := Q) (ea := Q) hfbH rfl hrbR
+                        hv0 hbfb (by rw [hbpar]; exact hG2)
+                      have htot := GotoN_trans hstep hGr
+                      rw [show tr ++ (e1 ++ e2 ++ e3) = (tr ++ e1 ++ e2) ++ e3 by
+                        simp [List.append_assoc]]
+                      exact htot
+              next => simp at hr
+          · simp [hstk] at hr
+      · simp [hl] at h
+
+theorem sim_seq : ∀ (k : Nat) (ss : List Stmt) (kid : IR.BlockId) (kps : List IR.ValueId) (kblk : IR.Block)
     (L n nb : Nat) (E : IR.BlockId) (EP : List IR.ValueId) (B : List IR.Block) (n' nb' : Nat)
     (G : List IR.Block) (c c' : Configuration) (evs : List Event) (st : IR.State),
     lowerSeq ss (kid, kps) L n nb = some (E, EP, B, n', nb') →
-    SupSeq ss → kps.length = L → kps.Nodup → IR.findBlock G kid = some kblk →
+    SupSeqL ss → kps.length = L → kps.Nodup → IR.findBlock G kid = some kblk →
     kblk.params = kps → (∀ b ∈ B, b ∈ G) → (G.map IR.Block.id).Nodup →
-    V4Diamond.GlobalsI32 c.store → BoundCorr c st EP → runSeq ss c = some (c', evs) →
+    V4Diamond.GlobalsI32 c.store → BoundCorr c st EP → runSeq k ss c = some (c', evs) →
     ∀ tr, ∃ n0 st', GotoN G n0 E st tr kid st' (tr ++ evs) ∧ BoundCorr c' st' kps
-  | [], kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, h, hs, hkL, hkN, hK,
+  | _, [], kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, h, hs, hkL, hkN, hK,
       hkb, hG, hnd, hgl, hc, hr, tr => by
     simp only [lowerSeq, Option.some.injEq, Prod.mk.injEq] at h
     obtain ⟨rfl, rfl, rfl, rfl, rfl⟩ := h
@@ -213,7 +336,7 @@ theorem sim_seq : ∀ (ss : List Stmt) (kid : IR.BlockId) (kps : List IR.ValueId
     rw [hkb] at hstep
     refine ⟨0 + 1, _, by simpa [emptyBlk] using hstep, ?_⟩
     exact boundCorr_bind hc hkN (by simp [hkL])
-  | s :: rest, kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, h, hs, hkL, hkN,
+  | k, s :: rest, kid, kps, kblk, L, n, nb, E, EP, B, n', nb', G, c, c', evs, st, h, hs, hkL, hkN,
       hK, hkb, hG, hnd, hgl, hc, hr, tr => by
     obtain ⟨hs1, hs2⟩ := hs
     unfold lowerSeq at h
@@ -228,12 +351,12 @@ theorem sim_seq : ∀ (ss : List Stmt) (kid : IR.BlockId) (kps : List IR.ValueId
         simp only [hr', hs', Option.some.injEq, Prod.mk.injEq] at h
         obtain ⟨rfl, rfl, rfl, rfl, rfl⟩ := h
         unfold runSeq at hr
-        cases h1 : runStmt s c with
+        cases h1 : runStmt k s c with
         | none => simp [h1] at hr
         | some q1 =>
           obtain ⟨c1, e1⟩ := q1
           simp only [h1] at hr
-          cases h2 : runSeq rest c1 with
+          cases h2 : runSeq k rest c1 with
           | none => simp [h2] at hr
           | some q2 =>
             obtain ⟨c2, e2⟩ := q2
@@ -248,11 +371,11 @@ theorem sim_seq : ∀ (ss : List Stmt) (kid : IR.BlockId) (kps : List IR.ValueId
               rw [hrEPeq]
               exact List.nodup_range' (s := n0r) (n := L)
             have hrLen : rEP.length = L := hrestSpec.2
-            obtain ⟨n1', st1, hG1, hBC1⟩ := sim_stmt s rE rEP rblk L n1 nb1 sE sEP sB n2 nb2 G c c1
+            obtain ⟨n1', st1, hG1, hBC1⟩ := sim_stmt k s rE rEP rblk L n1 nb1 sE sEP sB n2 nb2 G c c1
               e1 st hs' hs1 hrLen hrNd hrfb (by rw [hrpar])
               (fun b hb => hG b (List.mem_append_left _ hb)) hnd hgl hc h1 tr
-            have hgl1 := runStmt_globals s c c1 e1 hs1 hgl h1
-            obtain ⟨n2', st2, hG2, hBC2⟩ := sim_seq rest kid kps kblk L n nb rE rEP rB n1 nb1 G c1 c2
+            have hgl1 := runStmt_globals k s c c1 e1 hs1 hgl h1
+            obtain ⟨n2', st2, hG2, hBC2⟩ := sim_seq k rest kid kps kblk L n nb rE rEP rB n1 nb1 G c1 c2
               e2 st1 hr' hs2 hkL hkN hK hkb (fun b hb => hG b (List.mem_append_right _ hb)) hnd hgl1
               hBC1 h2 (tr ++ e1)
             refine ⟨n1' + n2', st2, ?_, hBC2⟩

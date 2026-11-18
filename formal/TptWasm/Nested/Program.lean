@@ -38,11 +38,11 @@ def lowerProg (body : List Stmt) (ret : List Instr) (L : Nat) : Option IR.Functi
   | none => none
 
 /-- The IR run of the lowered program returns the Wasm run's events and values. -/
-theorem nested_ir_run (body : List Stmt) (ret : List Instr) (L : Nat) (lf : IR.Function)
+theorem nested_ir_run (k : Nat) (body : List Stmt) (ret : List Instr) (L : Nat) (lf : IR.Function)
     (hl : lowerProg body ret L = some lf) (c c1 c2 : Configuration) (e1 e2 : List Event)
     (s : IR.State) (hbc : BoundCorr c s (List.range' 0 L)) (hg : V4Diamond.GlobalsI32 c.store)
-    (hsup : SupSeq body) (_hsupR : ∀ i ∈ ret, V4Diamond.Supported i)
-    (hrun1 : runSeq body c = some (c1, e1)) (hrun2 : runWasm ret c1 = some (c2, e2)) :
+    (hsup : SupSeqL body) (_hsupR : ∀ i ∈ ret, V4Diamond.Supported i)
+    (hrun1 : runSeq k body c = some (c1, e1)) (hrun2 : runWasm ret c1 = some (c2, e2)) :
     ∃ n0, IR.runFunction lf (n0 + 2) s = .returned (e1 ++ e2) c2.operandStack := by
   unfold lowerProg at hl
   cases hr : V4Straight.lower ret [] (List.range' L L) (L + L) with
@@ -92,7 +92,7 @@ theorem nested_ir_run (body : List Stmt) (ret : List Instr) (L : Nat) (lf : IR.F
         boundCorr_bind hbc (by rw [hbEPeq]; exact List.nodup_range' (s := n0b) (n := L))
           (by rw [hbOK.2]; simp)
       -- the body reaches the return block
-      obtain ⟨n0, st1, hG1, hBC1⟩ := sim_seq body 1 (List.range' L L) (retBlk L fin irRet) L m 2 bE
+      obtain ⟨n0, st1, hG1, hBC1⟩ := sim_seq k body 1 (List.range' L L) (retBlk L fin irRet) L m 2 bE
         bEP bB m2 nb2 (topBlk bE L :: retBlk L fin irRet :: bB) c c1 e1
         (s.bindAll bEP ((List.range' 0 L).map s.values)) hb hsup hkL hkN hKfb hkb
         (fun b hb => hGmem b hb) hnd hg hbcTop hrun1 []
@@ -102,7 +102,7 @@ theorem nested_ir_run (body : List Stmt) (ret : List Instr) (L : Nat) (lf : IR.F
         corresponds_of_bound (n := L + L) hBC1 (fun id hid => by
           rw [List.mem_range'_1] at hid
           exact hid.2)
-      have hgl1 := runSeq_globals body c c1 e1 hsup hg hrun1
+      have hgl1 := runSeq_globals k body c c1 e1 hsup hg hrun1
       have sim := V4Straight.simulation ret c1 c2 e2 st1 [] (List.range' L L) (L + L) irRet fin Q m
         hcorrRet hgl1 hr hrun2
       obtain ⟨st2, hrb2, hcorr2⟩ := sim e1
@@ -123,20 +123,20 @@ theorem nested_ir_run (body : List Stmt) (ret : List Instr) (L : Nat) (lf : IR.F
 
 /-- The machine runs the flat program: the body, then the return expression, and reaches the end of
 the flat code with the events and stack the Wasm run gives. -/
-theorem nested_machine (body : List Stmt) (ret : List Instr) (c c1 c2 : Configuration)
+theorem nested_machine (k : Nat) (body : List Stmt) (ret : List Instr) (c c1 c2 : Configuration)
     (e1 e2 : List Event) (f : Frame) (fn : FunctionState)
     (hf : c.activeFrame? = some f) (hfn : c.store.function? f.functionIndex = some fn)
     (hbody : fn.body = flatSeq body ++ ret) (hsup : SupSeq body)
     (hsupR : ∀ i ∈ ret, V4Diamond.Supported i)
-    (hrun1 : runSeq body c = some (c1, e1)) (hrun2 : runWasm ret c1 = some (c2, e2)) :
+    (hrun1 : runSeq k body c = some (c1, e1)) (hrun2 : runWasm ret c1 = some (c2, e2)) :
     ∃ cEnd, MReach (c.setActivePc 0) cEnd (e1 ++ e2) ∧ cEnd.currentInstr? = none ∧
       cEnd.operandStack = c2.operandStack := by
-  obtain ⟨hfs1, hfr1⟩ := runSeq_frames body c c1 e1 hsup hrun1
+  obtain ⟨hfs1, hfr1⟩ := runSeq_frames k body c c1 e1 hsup hrun1
   obtain ⟨g, hg1, hgi⟩ := hfr1 f hf
   have hfn1 : c1.store.function? g.functionIndex = some fn := by
     rw [function?_of_functions c.store c1.store hfs1, hgi]
     exact hfn
-  have hA := machine_seq body 0 [] ret c c1 e1 f fn (by simp) hsup hf hfn
+  have hA := machine_seq k body 0 [] ret c c1 e1 f fn (by simp) hsup hf hfn
     (by rw [hbody]; simp) hrun1
   simp only [Nat.zero_add] at hA
   have hB := MachineDiamond.segment ret (flatSeq body).length (flatSeq body) [] c1 c2 e2 g fn rfl
@@ -156,19 +156,19 @@ theorem nested_machine (body : List Stmt) (ret : List Instr) (c c1 c2 : Configur
 
 /-- The triangle for nested programs: the lowered program's IR run and the machine's run of the flat
 program agree with the Wasm run, on events and on the returned values. -/
-theorem nested_triangle (body : List Stmt) (ret : List Instr) (L : Nat) (lf : IR.Function)
+theorem nested_triangle (k : Nat) (body : List Stmt) (ret : List Instr) (L : Nat) (lf : IR.Function)
     (hl : lowerProg body ret L = some lf) (c c1 c2 : Configuration) (e1 e2 : List Event)
     (s : IR.State) (f : Frame) (fn : FunctionState)
     (hbc : BoundCorr c s (List.range' 0 L)) (hg : V4Diamond.GlobalsI32 c.store)
     (hf : c.activeFrame? = some f) (hfn : c.store.function? f.functionIndex = some fn)
     (hbody : fn.body = flatSeq body ++ ret) (hsup : SupSeq body)
     (hsupR : ∀ i ∈ ret, V4Diamond.Supported i)
-    (hrun1 : runSeq body c = some (c1, e1)) (hrun2 : runWasm ret c1 = some (c2, e2)) :
+    (hrun1 : runSeq k body c = some (c1, e1)) (hrun2 : runWasm ret c1 = some (c2, e2)) :
     (∃ cEnd, MReach (c.setActivePc 0) cEnd (e1 ++ e2) ∧ cEnd.currentInstr? = none ∧
       cEnd.operandStack = c2.operandStack) ∧
     ∃ n0, IR.runFunction lf (n0 + 2) s = .returned (e1 ++ e2) c2.operandStack :=
-  ⟨nested_machine body ret c c1 c2 e1 e2 f fn hf hfn hbody hsup hsupR hrun1 hrun2,
-    nested_ir_run body ret L lf hl c c1 c2 e1 e2 s hbc hg hsup hsupR hrun1 hrun2⟩
+  ⟨nested_machine k body ret c c1 c2 e1 e2 f fn hf hfn hbody hsup hsupR hrun1 hrun2,
+    nested_ir_run k body ret L lf hl c c1 c2 e1 e2 s hbc hg (supSeq_toL body hsup) hsupR hrun1 hrun2⟩
 
 end Nested
 end TptWasm

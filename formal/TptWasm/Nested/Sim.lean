@@ -92,10 +92,10 @@ theorem runWasm_globals_of_sup (xs : List Instr) (c c' : Configuration) (evs : L
 
 mutual
 
-theorem runStmt_globals : ∀ (s : Stmt) (c c' : Configuration) (e : List Event),
-    SupStmt s → V4Diamond.GlobalsI32 c.store → runStmt s c = some (c', e) →
+theorem runStmt_globals : ∀ (k : Nat) (s : Stmt) (c c' : Configuration) (e : List Event),
+    SupStmtL s → V4Diamond.GlobalsI32 c.store → runStmt k s c = some (c', e) →
     V4Diamond.GlobalsI32 c'.store
-  | .straight ops, c, c', e, hs, hg, h => by
+  | k, .straight ops, c, c', e, hs, hg, h => by
     unfold runStmt at h
     cases hw : runWasm ops c with
     | none => simp [hw] at h
@@ -107,7 +107,7 @@ theorem runStmt_globals : ∀ (s : Stmt) (c c' : Configuration) (e : List Event)
         obtain ⟨rfl, -⟩ := h
         exact runWasm_globals_of_sup ops c c1 e1 hs hg hw
       · simp at h
-  | .ifElse cond t el, c, c', e, hs, hg, h => by
+  | k, .ifElse cond t el, c, c', e, hs, hg, h => by
     obtain ⟨hsc, hst, hse⟩ := hs
     unfold runStmt at h
     by_cases hstk : c.operandStack = []
@@ -119,8 +119,8 @@ theorem runStmt_globals : ∀ (s : Stmt) (c c' : Configuration) (e : List Event)
         simp only [hcond] at h
         split at h
         next v hop =>
-          cases harm : (if v = 0 then runSeq el { c1 with operandStack := [] }
-              else runSeq t { c1 with operandStack := [] }) with
+          cases harm : (if v = 0 then runSeq k el { c1 with operandStack := [] }
+              else runSeq k t { c1 with operandStack := [] }) with
           | none => simp [harm] at h
           | some q2 =>
             obtain ⟨c3, e2⟩ := q2
@@ -132,35 +132,72 @@ theorem runStmt_globals : ∀ (s : Stmt) (c c' : Configuration) (e : List Event)
               have hg1 := runWasm_globals_of_sup cond c c1 e1 hsc hg hcond
               by_cases hv : v = 0
               · simp only [hv, ↓reduceIte] at harm
-                exact runSeq_globals el { c1 with operandStack := [] } c3 e2 hse hg1 harm
+                exact runSeq_globals k el { c1 with operandStack := [] } c3 e2 hse hg1 harm
               · simp only [hv, ↓reduceIte] at harm
-                exact runSeq_globals t { c1 with operandStack := [] } c3 e2 hst hg1 harm
+                exact runSeq_globals k t { c1 with operandStack := [] } c3 e2 hst hg1 harm
             next => simp at h
         next => simp at h
     · simp [hstk] at h
+  | 0, .whileNZ _ _, c, c', e, _, _, h => by
+    simp [runStmt] at h
+  | k + 1, .whileNZ cond body, c, c', e, hs, hg, h => by
+    have hs0 := hs
+    obtain ⟨hsc, hsb⟩ := hs
+    unfold runStmt at h
+    by_cases hstk : c.operandStack = []
+    · simp only [hstk, ↓reduceIte] at h
+      cases hcond : runWasm cond c with
+      | none => simp [hcond] at h
+      | some q =>
+        obtain ⟨c1, e1⟩ := q
+        simp only [hcond] at h
+        split at h
+        next v hop =>
+          have hg1 := runWasm_globals_of_sup cond c c1 e1 hsc hg hcond
+          by_cases hv : v = 0
+          · simp only [hv, ↓reduceIte, Option.some.injEq, Prod.mk.injEq] at h
+            obtain ⟨rfl, -⟩ := h
+            exact hg1
+          · simp only [hv, ↓reduceIte] at h
+            cases harm : runSeq k body { c1 with operandStack := [] } with
+            | none => simp [harm] at h
+            | some q2 =>
+              obtain ⟨c3, e2⟩ := q2
+              simp only [harm] at h
+              cases hrec : runStmt k (.whileNZ cond body) c3 with
+              | none => simp [hrec] at h
+              | some q3 =>
+                obtain ⟨c4, e3⟩ := q3
+                simp only [hrec, Option.some.injEq, Prod.mk.injEq] at h
+                obtain ⟨rfl, -⟩ := h
+                have hg3 := runSeq_globals k body { c1 with operandStack := [] } c3 e2 hsb hg1 harm
+                exact runStmt_globals k (.whileNZ cond body) c3 c4 e3 hs0 hg3 hrec
+        next => simp at h
+    · simp [hstk] at h
 
-theorem runSeq_globals : ∀ (ss : List Stmt) (c c' : Configuration) (e : List Event),
-    SupSeq ss → V4Diamond.GlobalsI32 c.store → runSeq ss c = some (c', e) →
+theorem runSeq_globals : ∀ (k : Nat) (ss : List Stmt) (c c' : Configuration) (e : List Event),
+    SupSeqL ss → V4Diamond.GlobalsI32 c.store → runSeq k ss c = some (c', e) →
     V4Diamond.GlobalsI32 c'.store
-  | [], c, c', e, _, hg, h => by
+  | _, [], c, c', e, _, hg, h => by
     simp only [runSeq, Option.some.injEq, Prod.mk.injEq] at h
     obtain ⟨rfl, -⟩ := h
     exact hg
-  | s :: rest, c, c', e, hs, hg, h => by
+  | k, s :: rest, c, c', e, hs, hg, h => by
     obtain ⟨hs1, hs2⟩ := hs
     unfold runSeq at h
-    cases h1 : runStmt s c with
+    cases h1 : runStmt k s c with
     | none => simp [h1] at h
     | some q =>
       obtain ⟨c1, e1⟩ := q
       simp only [h1] at h
-      cases h2 : runSeq rest c1 with
+      cases h2 : runSeq k rest c1 with
       | none => simp [h2] at h
       | some q2 =>
         obtain ⟨c2, e2⟩ := q2
         simp only [h2, Option.some.injEq, Prod.mk.injEq] at h
         obtain ⟨rfl, -⟩ := h
-        exact runSeq_globals rest c1 c2 e2 hs2 (runStmt_globals s c c1 e1 hs1 hg h1) h2
+        exact runSeq_globals k rest c1 c2 e2 hs2 (runStmt_globals k s c c1 e1 hs1 hg h1) h2
+
 
 end
 
@@ -187,8 +224,8 @@ theorem boundCorr_of_corresponds_nostack {c : Configuration} {s : IR.State} {sta
   exact ⟨rfl, hst, ⟨f, hf, hfl⟩, hi⟩
 
 /-- A straight-line statement's run is its operator run, with empty stacks at both ends. -/
-theorem runStmt_straight_extract {ops : List Instr} {c c' : Configuration} {e : List Event}
-    (h : runStmt (.straight ops) c = some (c', e)) :
+theorem runStmt_straight_extract {k : Nat} {ops : List Instr} {c c' : Configuration} {e : List Event}
+    (h : runStmt k (.straight ops) c = some (c', e)) :
     runWasm ops c = some (c', e) ∧ c.operandStack = [] ∧ c'.operandStack = [] := by
   unfold runStmt at h
   cases hw : runWasm ops c with

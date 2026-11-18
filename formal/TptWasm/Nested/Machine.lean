@@ -141,13 +141,13 @@ theorem marker_machine (c3 : Configuration) (g3 : Frame) (fn : FunctionState)
 mutual
 
 /-- A statement, run by the list semantics, is run by the machine over its flat code. -/
-theorem machine_stmt : ∀ (s : Stmt) (p : Nat) (P R : List Instr) (cw cw' : Configuration)
+theorem machine_stmt : ∀ (k : Nat) (s : Stmt) (p : Nat) (P R : List Instr) (cw cw' : Configuration)
     (evs : List Event) (f : Frame) (fn : FunctionState),
     P.length = p → SupStmt s → cw.activeFrame? = some f →
     cw.store.function? f.functionIndex = some fn → fn.body = P ++ flatStmt s ++ R →
-    runStmt s cw = some (cw', evs) →
+    runStmt k s cw = some (cw', evs) →
     MReach (cw.setActivePc p) (cw'.setActivePc (p + (flatStmt s).length)) evs
-  | .straight ops, p, P, R, cw, cw', evs, f, fn, hp, hs, hf, hfn, hbody, hr => by
+  | k, .straight ops, p, P, R, cw, cw', evs, f, fn, hp, hs, hf, hfn, hbody, hr => by
     unfold runStmt at hr
     cases hw : runWasm ops cw with
     | none => simp [hw] at hr
@@ -161,7 +161,7 @@ theorem machine_stmt : ∀ (s : Stmt) (p : Nat) (P R : List Instr) (cw cw' : Con
           (by rw [hbody]; simp [flatStmt]) hw
         simpa [flatStmt] using hseg
       · simp at hr
-  | .ifElse cond t el, p, P, R, cw, cw', evs, f, fn, hp, hs, hf, hfn, hbody, hr => by
+  | k, .ifElse cond t el, p, P, R, cw, cw', evs, f, fn, hp, hs, hf, hfn, hbody, hr => by
     obtain ⟨hsc, hst, hse⟩ := hs
     unfold runStmt at hr
     by_cases hstk : cw.operandStack = []
@@ -173,8 +173,8 @@ theorem machine_stmt : ∀ (s : Stmt) (p : Nat) (P R : List Instr) (cw cw' : Con
         simp only [hcond] at hr
         split at hr
         next v hop =>
-          cases harm : (if v = 0 then runSeq el { c1 with operandStack := [] }
-              else runSeq t { c1 with operandStack := [] }) with
+          cases harm : (if v = 0 then runSeq k el { c1 with operandStack := [] }
+              else runSeq k t { c1 with operandStack := [] }) with
           | none => simp [harm] at hr
           | some q2 =>
             obtain ⟨c3, e2⟩ := q2
@@ -209,7 +209,7 @@ theorem machine_stmt : ∀ (s : Stmt) (p : Nat) (P R : List Instr) (cw cw' : Con
                 have hop0 : c1.operandStack = [.i32 0] := hop
                 have B := if_zero_machine c1 g fn (P ++ cond) (flatSeq t) (flatSeq el) R hg1 hfn1
                   hbodyL hop0
-                have C := machine_seq el ((P ++ cond).length + (flatSeq t).length + 2)
+                have C := machine_seq k el ((P ++ cond).length + (flatSeq t).length + 2)
                   ((P ++ cond) ++ [Instr.ifInstr (flatSeq t).length] ++ flatSeq t ++
                     [Instr.elseInstr (flatSeq el).length]) R
                   ({ c1 with operandStack := [] }) c3 e2 g fn
@@ -226,14 +226,14 @@ theorem machine_stmt : ∀ (s : Stmt) (p : Nat) (P R : List Instr) (cw cw' : Con
                 have hop1 : c1.operandStack = [.i32 v] := hop
                 have B := if_nonzero_machine c1 g fn (P ++ cond) (flatSeq t) (flatSeq el) R v hg1
                   hfn1 hbodyL hop1 hv
-                have C := machine_seq t ((P ++ cond).length + 1)
+                have C := machine_seq k t ((P ++ cond).length + 1)
                   ((P ++ cond) ++ [Instr.ifInstr (flatSeq t).length])
                   (Instr.elseInstr (flatSeq el).length :: flatSeq el ++ R)
                   ({ c1 with operandStack := [] }) c3 e2 g fn
                   (by simp; omega) hst hg2 hfn2
                   (by rw [hbody]; simp [flatStmt, List.append_assoc]) harm
                 obtain ⟨hfs3, hfr3⟩ :=
-                  runSeq_frames t { c1 with operandStack := [] } c3 e2 hst harm
+                  runSeq_frames k t { c1 with operandStack := [] } c3 e2 hst harm
                 obtain ⟨g3, hg3, hgi3⟩ := hfr3 g hg2
                 have hfn3 : c3.store.function? g3.functionIndex = some fn := by
                   rw [function?_of_functions cw.store c3.store (hfs3.trans hfs1), hgi3, hgi]
@@ -253,40 +253,42 @@ theorem machine_stmt : ∀ (s : Stmt) (p : Nat) (P R : List Instr) (cw cw' : Con
             next => simp at hr
         next => simp at hr
     · simp [hstk] at hr
+  | _, .whileNZ _ _, _, _, _, _, _, _, _, _, _, hs, _, _, _, _ => by
+    simp [SupStmt] at hs
 
 /-- A statement list, run by the list semantics, is run by the machine over its flat code. -/
-theorem machine_seq : ∀ (ss : List Stmt) (p : Nat) (P R : List Instr) (cw cw' : Configuration)
+theorem machine_seq : ∀ (k : Nat) (ss : List Stmt) (p : Nat) (P R : List Instr) (cw cw' : Configuration)
     (evs : List Event) (f : Frame) (fn : FunctionState),
     P.length = p → SupSeq ss → cw.activeFrame? = some f →
     cw.store.function? f.functionIndex = some fn → fn.body = P ++ flatSeq ss ++ R →
-    runSeq ss cw = some (cw', evs) →
+    runSeq k ss cw = some (cw', evs) →
     MReach (cw.setActivePc p) (cw'.setActivePc (p + (flatSeq ss).length)) evs
-  | [], p, P, R, cw, cw', evs, f, fn, hp, _, hf, hfn, hbody, hr => by
+  | _, [], p, P, R, cw, cw', evs, f, fn, hp, _, hf, hfn, hbody, hr => by
     simp only [runSeq, Option.some.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, rfl⟩ := hr
     simpa [flatSeq] using MReach.refl _
-  | s :: rest, p, P, R, cw, cw', evs, f, fn, hp, hs, hf, hfn, hbody, hr => by
+  | k, s :: rest, p, P, R, cw, cw', evs, f, fn, hp, hs, hf, hfn, hbody, hr => by
     obtain ⟨hs1, hs2⟩ := hs
     unfold runSeq at hr
-    cases h1 : runStmt s cw with
+    cases h1 : runStmt k s cw with
     | none => simp [h1] at hr
     | some q =>
       obtain ⟨c1, e1⟩ := q
       simp only [h1] at hr
-      cases h2 : runSeq rest c1 with
+      cases h2 : runSeq k rest c1 with
       | none => simp [h2] at hr
       | some q2 =>
         obtain ⟨c2, e2⟩ := q2
         simp only [h2, Option.some.injEq, Prod.mk.injEq] at hr
         obtain ⟨rfl, rfl⟩ := hr
-        obtain ⟨f1, r1⟩ := runStmt_frames s cw c1 e1 hs1 h1
+        obtain ⟨f1, r1⟩ := runStmt_frames k s cw c1 e1 hs1 h1
         obtain ⟨g, hg, hgi⟩ := r1 f hf
         have hfn1 : c1.store.function? g.functionIndex = some fn := by
           rw [function?_of_functions cw.store c1.store f1, hgi]
           exact hfn
-        have A := machine_stmt s p P (flatSeq rest ++ R) cw c1 e1 f fn hp hs1 hf hfn
+        have A := machine_stmt k s p P (flatSeq rest ++ R) cw c1 e1 f fn hp hs1 hf hfn
           (by rw [hbody]; simp [flatSeq, List.append_assoc]) h1
-        have B := machine_seq rest (p + (flatStmt s).length) (P ++ flatStmt s) R c1 c2 e2 g fn
+        have B := machine_seq k rest (p + (flatStmt s).length) (P ++ flatStmt s) R c1 c2 e2 g fn
           (by simp [hp]) hs2 hg hfn1 (by rw [hbody]; simp [flatSeq, List.append_assoc]) h2
         have heq : p + (flatSeq (s :: rest)).length =
             p + (flatStmt s).length + (flatSeq rest).length := by

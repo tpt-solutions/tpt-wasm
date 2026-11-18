@@ -4,13 +4,17 @@
 //! Translation validation of the nested simulation against the Rust engine.
 //!
 //! `formal/TptWasm/Proofs/Nested/Program.lean` proves that a program of nested `if`/`else`
-//! statements, lowered to IR, returns what its Wasm run returns, and that the machine running the
-//! flat layout reaches the same end. That proof is about the Lean model. This test ties the model
-//! to the Micro engine: it generates random programs whose statements nest `if`/`else` to depth
-//! three, runs each as a Wasm function on the Micro engine for its result, and asks the Lean checker
-//! to evaluate the same program two ways: by the Wasm model `runSeq` followed by the return
-//! expression, and by `lowerProg` followed by the IR executor. A verdict is true only when both
-//! model runs produce exactly the Micro result.
+//! statements and loops, lowered to IR, returns what its Wasm run returns. That proof is about the
+//! Lean model. This test ties the model to the Micro engine: it generates random programs whose
+//! statements nest `if`/`else` and loops to depth three, runs each as a Wasm function on the Micro
+//! engine for its result, and asks the Lean checker to evaluate the same program two ways: by the
+//! Wasm model `runSeq` followed by the return expression, and by `lowerProg` followed by the IR
+//! executor. A verdict is true only when both model runs produce exactly the Micro result.
+//!
+//! A loop is encoded as the usual Wasm loop, `loop { cond; if { body; br 1 } }`, and modelled as
+//! `whileNZ cond body`. Each loop counts down a counter local of its own, set to a small value
+//! before it starts, and decrements it at the top of its body, so every generated loop terminates.
+//! Only local 0 is written by the random statements, so the counters are not disturbed.
 //!
 //! Needs Lean and Lake, so it runs only when `TPT_TRANSLATION_VALIDATION` is set. With
 //! `TPT_TRANSLATION_MUTANT` set, the expected results are corrupted, and the test passes only if
@@ -26,8 +30,15 @@ use tpt_wasm_format::{Export, ExportDesc, Function, LocalDecl, Module};
 use tpt_wasm_runtime::{Config, Engine};
 use tpt_wasm_types::{FunctionType, ResultType, Value, ValueType};
 
-/// How deeply `if`s nest. The model's proof is for any depth; the test uses three.
+/// How deeply `if`s and loops nest. The model's proof is for any depth; the test uses three.
 const MAX_DEPTH: usize = 3;
+
+/// The locals of each program: local 0 holds the result, and local `1 + depth` counts a loop at
+/// nesting `depth`.
+const LOCALS: usize = MAX_DEPTH + 1;
+
+/// The fuel the Lean evaluations get: enough for every generated loop to finish.
+const FUEL: u32 = 5000;
 
 /// The binary operators the IR lifts, with their Wasm opcode and Lean constructor.
 const BINARY: [(u8, &str); 6] = [
@@ -102,21 +113,73 @@ fn lean_list(items: &[String]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/// One statement, appended to `bytes`, and its Lean rendering. A statement is straight-line
-/// assignments to local 0, or a void `if`/`else` whose arms are statement lists. `deepest` records
-/// the greatest depth at which an `if` was generated.
-fn statement(rng: &mut Rng, depth: usize, bytes: &mut Vec<u8>, deepest: &mut usize) -> String {
-    if depth < MAX_DEPTH && rng.below(2) == 0 {
+/// The statements of a list of between `min` and `max` statements, each appended to `bytes`, as
+/// their Lean renderings. `deepest` records the greatest depth at which an `if` or a loop was
+/// generated.
+fn statements(
+    rng: &mut Rng,
+    depth: usize,
+    bytes: &mut Vec<u8>,
+    deepest: &mut usize,
+    min: u64,
+    max: u64,
+) -> Vec<String> {
+    let count = min + rng.below(max - min + 1);
+    let mut items = Vec::new();
+    for _ in 0..count {
+        items.extend(statement(rng, depth, bytes, deepest));
+    }
+    items
+}
+
+/// One statement, appended to `bytes`, as its Lean renderings: straight-line assignments to local
+/// 0, a void `if`/`else` whose arms are statement lists, or a loop with its counter.
+fn statement(rng: &mut Rng, depth: usize, bytes: &mut Vec<u8>, deepest: &mut usize) -> Vec<String> {
+    let roll = rng.below(4);
+    if depth < MAX_DEPTH && roll == 0 {
         *deepest = (*deepest).max(depth);
         let steps = 1 + rng.below(4) as usize;
         let (cond_bytes, cond_lean) = expression(rng, steps);
         bytes.extend(cond_bytes);
         bytes.extend_from_slice(&[0x04, 0x40]); // if (void)
-        let then_lean = statements(rng, depth + 1, bytes, deepest, 0, 2);
+        let then_items = statements(rng, depth + 1, bytes, deepest, 0, 2);
         bytes.push(0x05); // else
-        let else_lean = statements(rng, depth + 1, bytes, deepest, 0, 2);
+        let else_items = statements(rng, depth + 1, bytes, deepest, 0, 2);
         bytes.push(0x0b); // end of the if
-        format!(".ifElse {} {then_lean} {else_lean}", lean_list(&cond_lean))
+        vec![format!(
+            ".ifElse {} {} {}",
+            lean_list(&cond_lean),
+            lean_list(&then_items),
+            lean_list(&else_items)
+        )]
+    } else if depth < MAX_DEPTH && roll == 1 {
+        *deepest = (*deepest).max(depth);
+        let counter = 1 + depth;
+        let c = counter as u8;
+        // the counter starts at a small value, so the loop runs at most three times
+        let start = rng.below(4) as i32;
+        push_i32_constant(bytes, start);
+        bytes.extend_from_slice(&[0x21, c]); // local.set counter
+        let mut items = vec![format!(
+            ".straight [.i32Const ({start}), .localSet {counter}]"
+        )];
+        bytes.extend_from_slice(&[0x03, 0x40]); // loop (void)
+        bytes.extend_from_slice(&[0x20, c]); // the condition: the counter
+        bytes.extend_from_slice(&[0x04, 0x40]); // if (void): taken while the counter is non-zero
+        bytes.extend_from_slice(&[0x20, c, 0x41, 0x01, 0x6b, 0x21, c]); // counter := counter - 1
+        let body = statements(rng, depth + 1, bytes, deepest, 0, 2);
+        bytes.extend_from_slice(&[0x0c, 0x01]); // br 1: back to the loop
+        bytes.push(0x0b); // end of the if
+        bytes.push(0x0b); // end of the loop
+        let mut lean_body = vec![format!(
+            ".straight [.localGet {counter}, .i32Const (1), .i32Bin .sub, .localSet {counter}]"
+        )];
+        lean_body.extend(body);
+        items.push(format!(
+            ".whileNZ [.localGet {counter}] {}",
+            lean_list(&lean_body)
+        ));
+        items
     } else {
         let mut lean = Vec::new();
         for _ in 0..1 + rng.below(2) {
@@ -127,27 +190,11 @@ fn statement(rng: &mut Rng, depth: usize, bytes: &mut Vec<u8>, deepest: &mut usi
             lean.extend(expr_lean);
             lean.push(".localSet 0".to_owned());
         }
-        format!(".straight {}", lean_list(&lean))
+        vec![format!(".straight {}", lean_list(&lean))]
     }
 }
 
-/// A statement list of between `min` and `max` statements, as a Lean list.
-fn statements(
-    rng: &mut Rng,
-    depth: usize,
-    bytes: &mut Vec<u8>,
-    deepest: &mut usize,
-    min: u64,
-    max: u64,
-) -> String {
-    let count = min + rng.below(max - min + 1);
-    let items: Vec<String> = (0..count)
-        .map(|_| statement(rng, depth, bytes, deepest))
-        .collect();
-    lean_list(&items)
-}
-
-/// The `i32` the Micro engine returns for a function with one `i32` local, initialised to zero.
+/// The `i32` the Micro engine returns for a function with `LOCALS` `i32` locals, all zero.
 fn micro_result(body: &[u8]) -> i32 {
     let module = Module {
         types: vec![FunctionType {
@@ -157,7 +204,7 @@ fn micro_result(body: &[u8]) -> i32 {
         functions: vec![Function {
             type_index: 0,
             locals: vec![LocalDecl {
-                count: 1,
+                count: LOCALS as u32,
                 value_type: ValueType::I32,
             }],
             body: body.to_vec(),
@@ -193,32 +240,38 @@ fn the_nested_model_agrees_with_the_micro_engine_on_generated_programs() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(200);
 
+    let zeros = ["Value.i32 0"; LOCALS].join(", ");
     let mut source = String::new();
     source.push_str("import TptWasm.Nested.Program\n\n");
     source.push_str("open TptWasm TptWasm.Nested TptWasm.V4Straight\n\n");
-    source.push_str(
+    source.push_str(&format!(
         "def startConfig : Configuration :=\n  \
-         { store := {}, frames := [⟨0, [.i32 0], 0, 0, 0, 0⟩], operandStack := [], controlStack := [] }\n\n\
-         def startState : IR.State := { values := fun _ => .i32 0, store := {} }\n\n\
+         {{ store := {{}}, frames := [⟨0, [{zeros}], 0, 0, 0, 0⟩], operandStack := [], controlStack := [] }}\n\n\
+         def startState : IR.State := {{ values := fun _ => .i32 0, store := {{}} }}\n\n\
          def wasmNest (b : List Stmt) : Option (List Value) :=\n  \
-         match runSeq b startConfig with\n  \
+         match runSeq {FUEL} b startConfig with\n  \
          | some (c1, _) => (runWasm [.localGet 0] c1).map (·.1.operandStack)\n  \
          | none => none\n\n\
          def irNest (b : List Stmt) : Option (List Value) :=\n  \
-         match lowerProg b [.localGet 0] 1 with\n  \
+         match lowerProg b [.localGet 0] {LOCALS} with\n  \
          | some f =>\n    \
-           match IR.runFunction f 400 startState with\n    \
+           match IR.runFunction f {FUEL} startState with\n    \
            | .returned _ values => some values\n    \
            | _ => none\n  \
-         | none => none\n\n",
-    );
+         | none => none\n\n"
+    ));
 
     let mut rng = Rng(0x5eed_0006);
     let mut results = std::collections::BTreeSet::new();
     let mut deepest = 0usize;
+    let mut programs_with_loops = 0u64;
     for case in 0..cases {
         let mut body = Vec::new();
-        let lean = statements(&mut rng, 0, &mut body, &mut deepest, 1, 3);
+        let items = statements(&mut rng, 0, &mut body, &mut deepest, 1, 3);
+        let lean = lean_list(&items);
+        if lean.contains(".whileNZ") {
+            programs_with_loops += 1;
+        }
         body.extend_from_slice(&[0x20, 0x00]); // local.get 0: the return expression
         body.push(0x0b); // end of the function
         let expected = micro_result(&body);
@@ -236,10 +289,15 @@ fn the_nested_model_agrees_with_the_micro_engine_on_generated_programs() {
         ));
     }
 
-    // The check must not pass vacuously: the programs have to nest, and produce varied results.
+    // The check must not pass vacuously: the programs have to nest, loop, and produce varied
+    // results.
     assert!(
         deepest >= 2,
-        "no program nested an `if` inside an arm of another (deepest {deepest})"
+        "no program nested a statement inside an arm or a loop body (deepest {deepest})"
+    );
+    assert!(
+        programs_with_loops >= cases / 10,
+        "only {programs_with_loops} of {cases} programs contain a loop"
     );
     assert!(
         results.len() >= 10,
@@ -269,5 +327,7 @@ fn the_nested_model_agrees_with_the_micro_engine_on_generated_programs() {
         "the nested model disagrees with the Micro engine on {} of {cases} programs",
         cases as usize - agreeing
     );
-    eprintln!("nested validation: {cases} programs agree with the Micro engine");
+    eprintln!(
+        "nested validation: {cases} programs ({programs_with_loops} with loops) agree with the Micro engine"
+    );
 }

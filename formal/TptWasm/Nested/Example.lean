@@ -79,9 +79,11 @@ theorem example_triangle :
         cEnd.operandStack = [.i32 7]) ∧
       ∃ n0, IR.runFunction lf (n0 + 2) sEx = .returned [] [.i32 7] := by
   obtain ⟨lf, hl⟩ : ∃ lf, lowerProg bodyEx retEx 1 = some lf := ⟨_, rfl⟩
-  have h1 : runSeq bodyEx cEx = some (c1ex, []) := rfl
+  have h1 : runSeq 1 bodyEx cEx = some (c1ex, []) := by
+    simp only [runSeq, runStmt, bodyEx, cEx]
+    rfl
   have h2 : runWasm retEx c1ex = some (c2ex, []) := rfl
-  obtain ⟨hm, hir⟩ := nested_triangle bodyEx retEx 1 lf hl cEx c1ex c2ex [] [] sEx
+  obtain ⟨hm, hir⟩ := nested_triangle 1 bodyEx retEx 1 lf hl cEx c1ex c2ex [] [] sEx
     ⟨0, [.i32 0], 0, 0, 0, 0⟩ fnEx bc_start globals_start rfl rfl rfl supBody supRet h1 h2
   obtain ⟨cEnd, hr, hend, hst⟩ := hm
   obtain ⟨n0, hn⟩ := hir

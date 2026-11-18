@@ -52,6 +52,19 @@ def lowerStmt : Stmt → IR.BlockId × List IR.ValueId → Nat → Nat → Nat �
         | none => none
       | none => none
     | _ => none
+  | .whileNZ cond body, (kid, _), L, n, nb =>
+    -- the header runs the condition: non-zero enters the body, zero continues to `kid`. The body
+    -- continues to the header, so the loop's blocks are the header and the body's blocks.
+    match V4Straight.lower cond [] (List.range' n L) (n + L) with
+    | some (irC, [c], Q, m) =>
+      match lowerSeq body (nb, List.range' n L) L m (nb + 1) with
+      | some (bE, _, bB, m2, nb2) =>
+        some (nb, List.range' n L,
+          { id := nb, params := List.range' n L, instrs := irC,
+            terminator := .condBranch c (bE, Q) (kid, Q) } :: bB,
+          m2, nb2)
+      | none => none
+    | _ => none
 
 /-- Lower a statement list, continuing to block `K`. -/
 def lowerSeq : List Stmt → IR.BlockId × List IR.ValueId → Nat → Nat → Nat → Option Lowered
@@ -166,6 +179,41 @@ theorem lowerStmt_spec : ∀ (s : Stmt) (K : IR.BlockId × List IR.ValueId) (L n
                   rw [hbi] at h3
                   exact Nat.lt_irrefl _ h3
               · exact nodup_ranges tB eB nb2 (fun b hb => (tlr b hb).2) (fun b hb => (elr b hb).1) tlnd elnd
+      · simp [hl] at h
+  | .whileNZ cond body, (kid, kps), L, n, nb, E, EP, B, n', nb', h => by
+    unfold lowerStmt at h
+    cases hl : V4Straight.lower cond [] (List.range' n L) (n + L) with
+    | none => simp [hl] at h
+    | some q =>
+      obtain ⟨irC, fin, Q, m⟩ := q
+      rcases fin with _ | ⟨c, _ | ⟨c2, tl⟩⟩
+      · simp [hl] at h
+      · cases hb : lowerSeq body (nb, List.range' n L) L m (nb + 1) with
+        | none => simp [hl, hb] at h
+        | some qb =>
+          obtain ⟨bE, bEP, bB, m2, nb2⟩ := qb
+          simp only [hl, hb, Option.some.injEq, Prod.mk.injEq] at h
+          obtain ⟨rfl, rfl, rfl, rfl, rfl⟩ := h
+          have bOK := (lowerSeq_spec body (nb, List.range' n L) L m (nb + 1) bE bEP bB m2 nb2 hb).1
+          unfold LoweredOK at bOK
+          obtain ⟨blo, blh, blr, blnd, -⟩ := bOK
+          have hlt : nb < nb2 :=
+            Nat.lt_of_lt_of_le (Nat.lt_succ_self nb) (Nat.le_trans blo (Nat.le_of_lt blh))
+          refine ⟨rfl, ?_⟩
+          unfold LoweredOK
+          refine ⟨Nat.le_refl _, hlt, ?_, ?_, ⟨_, List.mem_cons_self, rfl, rfl⟩⟩
+          · intro b hb
+            simp only [List.mem_cons] at hb
+            rcases hb with rfl | hb
+            · exact ⟨Nat.le_refl _, hlt⟩
+            · exact ⟨Nat.le_trans (Nat.le_succ nb) (blr b hb).1, (blr b hb).2⟩
+          · simp only [List.map_cons]
+            refine List.nodup_cons.mpr ⟨?_, blnd⟩
+            intro hmem
+            obtain ⟨b, hb, hbi⟩ := List.mem_map.mp hmem
+            have h3 : nb < b.id := Nat.lt_of_lt_of_le (Nat.lt_succ_self nb) (blr b hb).1
+            rw [hbi] at h3
+            exact Nat.lt_irrefl _ h3
       · simp [hl] at h
 
 theorem lowerSeq_spec : ∀ (ss : List Stmt) (K : IR.BlockId × List IR.ValueId) (L n nb : Nat)
