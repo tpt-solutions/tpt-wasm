@@ -150,6 +150,7 @@ pub enum BaselineOp {
     /// `destination`. The operands are slots.
     MemoryInit {
         data: u32,
+        memory: u32,
         destination: u32,
         source: u32,
         length: u32,
@@ -158,14 +159,17 @@ pub enum BaselineOp {
     DataDrop {
         data: u32,
     },
-    /// `memory.copy` within the module's memory.
+    /// `memory.copy` from memory `source_memory` to memory `destination_memory`, which may be the same.
     MemoryCopy {
+        destination_memory: u32,
+        source_memory: u32,
         destination: u32,
         source: u32,
         length: u32,
     },
-    /// `memory.fill` within the module's memory.
+    /// `memory.fill` within memory `memory`.
     MemoryFill {
+        memory: u32,
         destination: u32,
         value: u32,
         length: u32,
@@ -355,10 +359,11 @@ pub enum BaselineOp {
         arguments: Vec<u32>,
         results: Vec<u32>,
     },
-    /// Read `width` bytes little-endian from memory at `address + offset`.
+    /// Read `width` bytes little-endian from memory `memory` at `address + offset`.
     Load {
         result: u32,
         address: u32,
+        memory: u32,
         offset: u32,
         operation: tpt_wasm_ir::MemoryLoad,
         /// Whether the access still needs a run-time range check.
@@ -371,10 +376,11 @@ pub enum BaselineOp {
         /// rather than a second place where a bounds proof has to be trusted.
         bounds: tpt_wasm_ir::BoundsCheck,
     },
-    /// Write the low `width` bytes of `value` at `address + offset`.
+    /// Write the low `width` bytes of `value` at `address + offset` in memory `memory`.
     Store {
         address: u32,
         value: u32,
+        memory: u32,
         offset: u32,
         operation: tpt_wasm_ir::MemoryStore,
         /// See [`BaselineOp::Load::bounds`].
@@ -382,10 +388,12 @@ pub enum BaselineOp {
     },
     MemorySize {
         result: u32,
+        memory: u32,
     },
     MemoryGrow {
         result: u32,
         delta: u32,
+        memory: u32,
     },
     GlobalGet {
         result: u32,
@@ -1375,6 +1383,7 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                 IrInstr::Load {
                     result,
                     address,
+                    memory,
                     offset,
                     operation,
                     bounds,
@@ -1384,6 +1393,7 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     ops.push(BaselineOp::Load {
                         result,
                         address,
+                        memory: *memory,
                         offset: *offset,
                         operation: *operation,
                         bounds: *bounds,
@@ -1392,6 +1402,7 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                 IrInstr::Store {
                     address,
                     value,
+                    memory,
                     offset,
                     operation,
                     bounds,
@@ -1401,17 +1412,22 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     ops.push(BaselineOp::Store {
                         address,
                         value,
+                        memory: *memory,
                         offset: *offset,
                         operation: *operation,
                         bounds: *bounds,
                     });
                 }
-                IrInstr::MemorySize { result } => {
+                IrInstr::MemorySize { result, memory } => {
                     let result = state.define(*result)?;
-                    ops.push(BaselineOp::MemorySize { result });
+                    ops.push(BaselineOp::MemorySize {
+                        result,
+                        memory: *memory,
+                    });
                 }
                 IrInstr::MemoryInit {
                     data,
+                    memory,
                     destination,
                     source,
                     length,
@@ -1421,6 +1437,7 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     let length = state.expect(*length, ValueType::I32)?;
                     ops.push(BaselineOp::MemoryInit {
                         data: *data,
+                        memory: *memory,
                         destination,
                         source,
                         length,
@@ -1430,6 +1447,8 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     ops.push(BaselineOp::DataDrop { data: *data });
                 }
                 IrInstr::MemoryCopy {
+                    destination_memory,
+                    source_memory,
                     destination,
                     source,
                     length,
@@ -1438,12 +1457,15 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     let source = state.expect(*source, ValueType::I32)?;
                     let length = state.expect(*length, ValueType::I32)?;
                     ops.push(BaselineOp::MemoryCopy {
+                        destination_memory: *destination_memory,
+                        source_memory: *source_memory,
                         destination,
                         source,
                         length,
                     });
                 }
                 IrInstr::MemoryFill {
+                    memory,
                     destination,
                     value,
                     length,
@@ -1452,15 +1474,24 @@ pub fn lower_function(function: &IrFunction) -> Result<BaselineFunction, Codegen
                     let value = state.expect(*value, ValueType::I32)?;
                     let length = state.expect(*length, ValueType::I32)?;
                     ops.push(BaselineOp::MemoryFill {
+                        memory: *memory,
                         destination,
                         value,
                         length,
                     });
                 }
-                IrInstr::MemoryGrow { result, delta } => {
+                IrInstr::MemoryGrow {
+                    result,
+                    delta,
+                    memory,
+                } => {
                     let delta = state.expect(*delta, ValueType::I32)?;
                     let result = state.define(*result)?;
-                    ops.push(BaselineOp::MemoryGrow { result, delta });
+                    ops.push(BaselineOp::MemoryGrow {
+                        result,
+                        delta,
+                        memory: *memory,
+                    });
                 }
                 IrInstr::GlobalGet { result, global } => {
                     let result = state.define(*result)?;
@@ -1947,17 +1978,24 @@ pub struct BaselineModule {
     function_locals: HashMap<u32, usize>,
     /// The module's function types, needed to check an indirect call's target.
     types: Vec<FunctionType>,
-    memory: Option<SharedMemory>,
-    /// A memory this module imports, awaiting the memory the embedder shares.
+    /// The module's memories, in index order: imported ones first, then defined ones. An imported memory is
+    /// `None` until the embedder supplies its handle.
+    memories: Vec<Option<SharedMemory>>,
+    /// For each function, the memories it can reach, by memory index. See [`memory_reach`].
+    memory_reach: Vec<Vec<bool>>,
+    /// Each memory this module imports, awaiting the memory the embedder shares, by memory index.
     ///
-    /// The declaration is held rather than discarded so its data segments can be
-    /// applied the moment the memory arrives: an importing module's own active
-    /// segments write into the memory it imports, and they have to land after the
-    /// exporter's own segments and before any function runs.
-    pending_imported_memory: Option<tpt_wasm_ir::IrMemory>,
-    /// The memory's data segments, kept whole when any of them takes its offset from a global. They are
-    /// applied, in order, once the imports are installed; until then none of them is written.
-    pending_segments: Option<Vec<tpt_wasm_ir::IrDataSegment>>,
+    /// The declaration is held rather than discarded so its data segments can be applied the moment the
+    /// memory arrives: an importing module's own active segments write into the memory it imports, and they
+    /// have to land after the exporter's own segments and before any function runs.
+    pending_imported_memories: Vec<Option<tpt_wasm_ir::IrMemory>>,
+    /// Each memory's data segments, by memory index, kept whole when any of them takes its offset from a
+    /// global. They are applied, in order, once the imports are installed; until then none of them is
+    /// written.
+    pending_segments: Vec<Option<Vec<tpt_wasm_ir::IrDataSegment>>>,
+    /// Each memory's segments that do not wait for a global, by memory index, applied by `finish_data` once
+    /// the memory's handle is in place and the tables are wired. Empty for a deferred memory.
+    pending_data: Vec<Vec<tpt_wasm_ir::IrDataSegment>>,
     /// A table this module imports, awaiting the table the embedder shares.
     ///
     /// Held rather than discarded so its element segment can be applied the
@@ -2147,7 +2185,7 @@ impl fmt::Debug for BaselineModule {
             .field("functions", &self.functions.len())
             .field("tables", &self.tables)
             .field("types", &self.types)
-            .field("memory", &self.memory)
+            .field("memories", &self.memories)
             .field("globals", &self.globals)
             .field("imports", &self.imports)
             .field("max_call_depth", &self.max_call_depth)
@@ -2302,6 +2340,81 @@ pub fn invoke_import(
 ///
 /// Order is the point: a later segment overwrites an earlier one at the same
 /// address, so they cannot be applied out of order or merged.
+/// Whether function `function` can reach memory `memory`, by the analysis [`memory_reach`] makes. A function
+/// or memory the table does not know is treated as reached, so the caller locks it.
+fn reaches(reach: &[Vec<bool>], function: usize, memory: usize) -> bool {
+    reach
+        .get(function)
+        .and_then(|reached| reached.get(memory))
+        .copied()
+        .unwrap_or(true)
+}
+
+/// For each function, which of the module's `memory_count` memories it can reach: the ones its own
+/// operations name, and the ones of every function it calls directly. An indirect call can reach any
+/// function, and a host call can read memory 0, so each of those reaches every memory.
+///
+/// A call locks only the memories its function reaches. So a call into a module that shares a memory
+/// with a running caller goes through, as long as the callee does not touch that memory.
+fn memory_reach(functions: &[BaselineFunction], memory_count: usize) -> Vec<Vec<bool>> {
+    let mut reach = vec![vec![false; memory_count]; functions.len()];
+    let mut calls: Vec<Vec<usize>> = vec![Vec::new(); functions.len()];
+    let mut reaches_all = vec![false; functions.len()];
+    let mark = |reach: &mut Vec<bool>, memory: u32| {
+        if let Some(slot) = reach.get_mut(memory as usize) {
+            *slot = true;
+        }
+    };
+    for (index, function) in functions.iter().enumerate() {
+        for block in &function.blocks {
+            for op in &block.ops {
+                match op {
+                    BaselineOp::Load { memory, .. }
+                    | BaselineOp::Store { memory, .. }
+                    | BaselineOp::MemorySize { memory, .. }
+                    | BaselineOp::MemoryGrow { memory, .. }
+                    | BaselineOp::MemoryInit { memory, .. }
+                    | BaselineOp::MemoryFill { memory, .. } => mark(&mut reach[index], *memory),
+                    BaselineOp::MemoryCopy {
+                        destination_memory,
+                        source_memory,
+                        ..
+                    } => {
+                        mark(&mut reach[index], *destination_memory);
+                        mark(&mut reach[index], *source_memory);
+                    }
+                    BaselineOp::Call { function, .. } => calls[index].push(*function as usize),
+                    BaselineOp::CallIndirect { .. } | BaselineOp::CallHost { .. } => {
+                        reaches_all[index] = true
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Propagate along the calls until nothing changes. The sets only grow, so this terminates.
+    loop {
+        let mut changed = false;
+        for index in 0..functions.len() {
+            let before = reach[index].clone();
+            if reaches_all[index] {
+                reach[index].iter_mut().for_each(|slot| *slot = true);
+            }
+            for &callee in &calls[index] {
+                if let Some(callee_reach) = reach.get(callee).cloned() {
+                    for (slot, reached) in reach[index].iter_mut().zip(callee_reach) {
+                        *slot |= reached;
+                    }
+                }
+            }
+            changed |= before != reach[index];
+        }
+        if !changed {
+            return reach;
+        }
+    }
+}
+
 fn apply_segments(
     memory: &mut BaselineMemory,
     segments: &[tpt_wasm_ir::IrDataSegment],
@@ -2328,28 +2441,35 @@ impl BaselineModule {
         // that later imports it can be given the same memory. An imported memory
         // is not allocated at all: the embedder supplies it, and the declaration
         // is kept so its data segments can be applied on arrival.
-        let pending_segments = module
-            .memory
-            .as_ref()
-            .filter(|declaration| {
-                declaration
-                    .segments
-                    .iter()
-                    .any(|segment| segment.offset_expr.is_some())
-            })
-            .map(|declaration| declaration.segments.clone());
-        let (memory, pending_imported_memory) = match module.memory.as_ref() {
-            Some(declaration) if declaration.imported => (None, Some(declaration.clone())),
-            Some(declaration) => {
-                let mut allocated =
-                    BaselineMemory::new(declaration.min_pages, declaration.max_pages)?;
-                if pending_segments.is_none() {
-                    apply_segments(&mut allocated, &declaration.segments)?;
-                }
-                (Some(Arc::new(Mutex::new(allocated))), None)
+        let memory_reach = memory_reach(&functions, module.memories.len());
+        let mut memories = Vec::with_capacity(module.memories.len());
+        let mut pending_imported_memories = Vec::with_capacity(module.memories.len());
+        let mut pending_segments = Vec::with_capacity(module.memories.len());
+        let mut pending_data = Vec::with_capacity(module.memories.len());
+        for declaration in &module.memories {
+            // A segment that takes its offset from a global defers the whole memory's segments.
+            let deferred = declaration
+                .segments
+                .iter()
+                .any(|segment| segment.offset_expr.is_some());
+            pending_segments.push(deferred.then(|| declaration.segments.clone()));
+            // The segments that do not wait for a global are applied by `finish_data`, once the tables are
+            // wired: the specification applies every element segment before any data segment, so a data
+            // segment that traps must not stop an element segment that precedes it from being written.
+            pending_data.push(if deferred {
+                Vec::new()
+            } else {
+                declaration.segments.clone()
+            });
+            if declaration.imported {
+                memories.push(None);
+                pending_imported_memories.push(Some(declaration.clone()));
+            } else {
+                let allocated = BaselineMemory::new(declaration.min_pages, declaration.max_pages)?;
+                memories.push(Some(Arc::new(Mutex::new(allocated))));
+                pending_imported_memories.push(None);
             }
-            None => (None, None),
-        };
+        }
         // The table is a shared handle for the same reason the memory is: an
         // importing module must reach the *same* table the exporter holds, since
         // a copy would pass every type check and then let a `table.set` or an
@@ -2494,7 +2614,8 @@ impl BaselineModule {
             deferred_elem_entries,
             function_locals,
             types: module.types.clone(),
-            memory,
+            memories,
+            memory_reach,
             globals,
             global_import_count,
             deferred_globals,
@@ -2502,8 +2623,9 @@ impl BaselineModule {
             elems,
             imports: module.imports.clone(),
             host: None,
-            pending_imported_memory,
+            pending_imported_memories,
             pending_segments,
+            pending_data,
             // The same default Micro starts from, so a module that recurses until
             // it traps does so at the same depth on either backend.
             max_call_depth: ResourceLimits::default().max_call_depth,
@@ -2541,37 +2663,65 @@ impl BaselineModule {
         self
     }
 
-    /// Supply the memory this module imports.
+    /// Supply the memory at index `index` that this module imports.
     ///
     /// The handle has to be the one the exporting instance holds, not a copy:
     /// that is what makes a store through either visible to both. The importing
     /// module's own active data segments are applied here, before any function
     /// can run and after the exporter's own segments, which is the order the
-    /// specification requires.
-    pub fn set_memory(&mut self, memory: SharedMemory) -> Result<(), CodegenError> {
-        if let Some(declaration) = self.pending_imported_memory.take() {
-            let mut guard = lock_shared(&memory)
-                .map_err(|_| CodegenError::UnsupportedMemory("shared memory is locked"))?;
-            if self.pending_segments.is_none() {
-                apply_segments(&mut guard, &declaration.segments)?;
-            }
+    /// specification requires. One memory may be imported under several indices: a call locks each distinct
+    /// memory once, and the indices share it.
+    pub fn set_memory(&mut self, index: usize, memory: SharedMemory) -> Result<(), CodegenError> {
+        let slot = self
+            .memories
+            .get(index)
+            .ok_or(CodegenError::UnsupportedMemory(
+                "the module has no such memory",
+            ))?;
+        if slot.is_some() || self.pending_imported_memories[index].is_none() {
+            return Err(CodegenError::UnsupportedMemory(
+                "the module does not import a memory at that index",
+            ));
         }
-        self.memory = Some(memory);
+        self.pending_imported_memories[index] = None;
+        self.memories[index] = Some(memory);
         Ok(())
     }
 
-    /// The handle to this module's memory, for an instance that imports it.
-    ///
-    /// `None` for a module that defines no memory, and for one that imports a
-    /// memory it has not been given yet.
-    pub fn memory_handle(&self) -> Option<SharedMemory> {
-        self.memory.clone()
+    /// Apply the data segments that were held back for the memories, in memory order: the ones the module
+    /// writes into an imported memory, and the ones it writes into its own. Call this once the tables are
+    /// wired. A segment that falls outside its memory traps, and the segments before it stay written, as the
+    /// specification has it.
+    pub fn finish_data(&mut self) -> Result<(), CodegenError> {
+        for index in 0..self.pending_data.len() {
+            let segments = std::mem::take(&mut self.pending_data[index]);
+            if segments.is_empty() {
+                continue;
+            }
+            let Some(handle) = self.memories[index].clone() else {
+                // An imported memory the embedder has not supplied has nothing to write into yet.
+                self.pending_data[index] = segments;
+                continue;
+            };
+            let mut guard = lock_shared(&handle)
+                .map_err(|_| CodegenError::UnsupportedMemory("shared memory is locked"))?;
+            apply_segments(&mut guard, &segments)?;
+        }
+        Ok(())
     }
 
-    /// Bound how many pages the module's own memory may grow to, by the engine's memory limit. A grow
+    /// The handle to memory `index` of this module, for an instance that imports it.
+    ///
+    /// `None` for an index the module does not have, and for an imported memory the
+    /// embedder has not been given yet.
+    pub fn memory_handle(&self, index: usize) -> Option<SharedMemory> {
+        self.memories.get(index).and_then(|slot| slot.clone())
+    }
+
+    /// Bound how many pages the module's own memories may grow to, by the engine's memory limit. A grow
     /// past it fails, as it does on the interpreter. An imported memory keeps its exporter's limit.
     pub fn set_max_memory_pages(&mut self, max_memory_pages: u64) -> &mut Self {
-        if let Some(handle) = self.memory.as_ref() {
+        for handle in self.memories.iter().flatten() {
             if let Ok(mut memory) = handle.lock() {
                 memory.set_memory_limit(max_memory_pages);
             }
@@ -2725,46 +2875,53 @@ impl BaselineModule {
         }
         // The deferred data segments, now that every global they may name has its value. Each offset is
         // resolved to a plain one, so the same bounds check and write apply as for any other segment.
-        if let Some(segments) = self.pending_segments.take() {
-            let memory = self.memory.clone().ok_or(CodegenError::UnsupportedMemory(
-                "a data segment is deferred but the module has no memory",
-            ))?;
-            let mut resolved = Vec::with_capacity(segments.len());
-            for segment in &segments {
-                let offset = match segment.offset_expr.as_ref() {
-                    None => segment.offset,
-                    Some(expr) => {
-                        let globals = &self.globals;
-                        let value = tpt_wasm_ir::eval_const(expr, &|global| {
-                            globals
-                                .get(global as usize)
-                                .and_then(|slot| slot.as_ref())
-                                .and_then(|handle| {
-                                    lock_shared(handle).ok().map(|guard| (*guard).clone())
-                                })
-                        })
-                        .map_err(|_| {
-                            CodegenError::UnsupportedMemory("a data offset could not be evaluated")
-                        })?;
-                        match value {
-                            Value::I32(offset) => offset as u32,
-                            _ => {
-                                return Err(CodegenError::UnsupportedMemory(
-                                    "a data offset is not an i32",
-                                ))
+        for index in 0..self.pending_segments.len() {
+            if let Some(segments) = self.pending_segments[index].take() {
+                let memory =
+                    self.memories[index]
+                        .clone()
+                        .ok_or(CodegenError::UnsupportedMemory(
+                            "a data segment is deferred but its memory has not been supplied",
+                        ))?;
+                let mut resolved = Vec::with_capacity(segments.len());
+                for segment in &segments {
+                    let offset = match segment.offset_expr.as_ref() {
+                        None => segment.offset,
+                        Some(expr) => {
+                            let globals = &self.globals;
+                            let value = tpt_wasm_ir::eval_const(expr, &|global| {
+                                globals
+                                    .get(global as usize)
+                                    .and_then(|slot| slot.as_ref())
+                                    .and_then(|handle| {
+                                        lock_shared(handle).ok().map(|guard| (*guard).clone())
+                                    })
+                            })
+                            .map_err(|_| {
+                                CodegenError::UnsupportedMemory(
+                                    "a data offset could not be evaluated",
+                                )
+                            })?;
+                            match value {
+                                Value::I32(offset) => offset as u32,
+                                _ => {
+                                    return Err(CodegenError::UnsupportedMemory(
+                                        "a data offset is not an i32",
+                                    ))
+                                }
                             }
                         }
-                    }
-                };
-                resolved.push(tpt_wasm_ir::IrDataSegment {
-                    offset,
-                    offset_expr: None,
-                    bytes: segment.bytes.clone(),
-                });
+                    };
+                    resolved.push(tpt_wasm_ir::IrDataSegment {
+                        offset,
+                        offset_expr: None,
+                        bytes: segment.bytes.clone(),
+                    });
+                }
+                let mut guard = lock_shared(&memory)
+                    .map_err(|_| CodegenError::UnsupportedMemory("shared memory is locked"))?;
+                apply_segments(&mut guard, &resolved)?;
             }
-            let mut guard = lock_shared(&memory)
-                .map_err(|_| CodegenError::UnsupportedMemory("shared memory is locked"))?;
-            apply_segments(&mut guard, &resolved)?;
         }
         // The deferred table initializers first, then the deferred segments in module order: a segment overwrites
         // what the initializer set, as the specification has it.
@@ -2973,8 +3130,10 @@ impl BaselineModule {
             deferred_elem_entries: self.deferred_elem_entries.clone(),
             function_locals: self.function_locals.clone(),
             types: self.types.clone(),
-            memory: self.memory.clone(),
-            pending_imported_memory: self.pending_imported_memory.clone(),
+            memories: self.memories.clone(),
+            memory_reach: self.memory_reach.clone(),
+            pending_data: self.pending_data.clone(),
+            pending_imported_memories: self.pending_imported_memories.clone(),
             pending_segments: self.pending_segments.clone(),
             pending_imported_tables: self.pending_imported_tables.clone(),
             globals: self.globals.clone(),
@@ -3002,11 +3161,29 @@ impl BaselineModule {
         fn unlocked<T>(shared: &Arc<Mutex<T>>) -> bool {
             shared.try_lock().is_ok()
         }
-        self.memory.as_ref().is_none_or(unlocked)
+        self.memories.iter().flatten().all(unlocked)
     }
 
-    /// Lower a verified IR module and wrap it so it can be executed.
+    /// Whether a call into function `index` can take the memories it reaches without waiting on a lock its
+    /// caller holds. A memory the function does not reach is not taken, so it does not matter that a caller
+    /// holds it. See [`memory_reach`].
+    pub fn is_free_for(&self, index: usize) -> bool {
+        self.memories.iter().enumerate().all(|(memory, slot)| {
+            !reaches(&self.memory_reach, index, memory)
+                || slot.as_ref().is_none_or(|shared| shared.try_lock().is_ok())
+        })
+    }
+
+    /// Lower a verified IR module and wrap it so it can be executed, with its data segments applied.
     pub fn lower(module: &tpt_wasm_ir::IrModule) -> Result<Self, CodegenError> {
+        let mut compiled = Self::lower_unwired(module)?;
+        compiled.finish_data()?;
+        Ok(compiled)
+    }
+
+    /// Lower a verified IR module without applying its data segments. The embedder wires the module's
+    /// memories and tables, then calls [`BaselineModule::finish_data`].
+    pub fn lower_unwired(module: &tpt_wasm_ir::IrModule) -> Result<Self, CodegenError> {
         Self::new(module, lower_module(module)?)
     }
 
@@ -3071,10 +3248,30 @@ impl BaselineModule {
         budget.current = function_key(imports, index);
         // The memory is locked for the whole execution, not per access, so the
         // module sees its own stores and no observer can see a half-applied one.
-        let mut memory = match self.memory.as_ref() {
-            Some(shared) => Some(lock_shared(shared)?),
-            None => None,
-        };
+        // Each distinct memory is locked once. A memory imported under two indices is one lock, so the two
+        // indices share one slot and see one set of bytes.
+        let mut distinct: Vec<SharedMemory> = Vec::new();
+        let mut memory_slots = Vec::with_capacity(self.memories.len());
+        for (memory, slot) in self.memories.iter().enumerate() {
+            memory_slots.push(match slot {
+                // A memory the function cannot reach is not locked, so an access to it is never made.
+                Some(shared) if reaches(&self.memory_reach, index, memory) => Some(match distinct
+                    .iter()
+                    .position(|known| Arc::ptr_eq(known, shared))
+                {
+                    Some(position) => position,
+                    None => {
+                        distinct.push(shared.clone());
+                        distinct.len() - 1
+                    }
+                }),
+                _ => None,
+            });
+        }
+        let mut memory_guards = Vec::with_capacity(distinct.len());
+        for shared in &distinct {
+            memory_guards.push(lock_shared(shared)?);
+        }
         // The globals and the table are locked for the whole execution for the
         // same reason the memory is, and for the same reason they are shared with
         // the store at all: a reader outside this call must not see half of a
@@ -3087,7 +3284,8 @@ impl BaselineModule {
             function_addresses: &self.function_addresses,
             tables: &self.tables,
             types: &self.types,
-            memory: memory.as_deref_mut(),
+            memory_slots,
+            memory_views: memory_guards.iter_mut().map(|guard| &mut **guard).collect(),
             datas: &self.datas,
             elems: &self.elems,
             globals: &globals,
@@ -3115,7 +3313,12 @@ struct ExecState<'a> {
     function_addresses: &'a [u32],
     /// Module types, so an indirect call can check its target's signature.
     types: &'a [FunctionType],
-    memory: Option<&'a mut BaselineMemory>,
+    /// The module's memories by index: the slot in `memory_views` each one reads and writes. Two indices may
+    /// name one slot, when the embedder imports one memory under two indices. `None` is an imported memory the
+    /// embedder has not supplied, which any access to it refuses.
+    memory_slots: Vec<Option<usize>>,
+    /// Each distinct memory the module holds, locked once for the whole execution.
+    memory_views: Vec<&'a mut BaselineMemory>,
     /// The module's data segments, `None` once dropped, locked for the whole execution like the memory.
     datas: &'a SharedData,
     /// The passive element segments by element index, as the module's own copy holds them.
@@ -3231,7 +3434,8 @@ impl BaselineFunction {
             function_addresses: &[],
             tables: &[],
             types: &[],
-            memory: None,
+            memory_slots: Vec::new(),
+            memory_views: Vec::new(),
             datas: &no_data,
             elems: &no_elems,
             globals: &mut Vec::new(),
@@ -3595,6 +3799,7 @@ fn exec_op(
         BaselineOp::Load {
             result,
             address,
+            memory: memory_index,
             offset,
             operation,
             // The bounds claim is read here but not acted on: this
@@ -3606,7 +3811,7 @@ fn exec_op(
             // address rather than taking the optimizer's word.
             bounds: _,
         } => {
-            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let memory = memory_at(state, *memory_index)?;
             let effective = effective_address(slots, *address, *offset)?;
             let bits = memory.read(effective, u64::from(operation.width()))?;
             slots[*result as usize] = Some(decode_load(*operation, bits));
@@ -3614,21 +3819,26 @@ fn exec_op(
         BaselineOp::Store {
             address,
             value,
+            memory: memory_index,
             offset,
             operation,
             bounds: _,
         } => {
-            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let memory = memory_at(state, *memory_index)?;
             let effective = effective_address(slots, *address, *offset)?;
             let bits = value_bits(slots, *value)?;
             memory.write(effective, u64::from(operation.width()), bits)?;
         }
-        BaselineOp::MemorySize { result } => {
-            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+        BaselineOp::MemorySize {
+            result,
+            memory: memory_index,
+        } => {
+            let memory = memory_at(state, *memory_index)?;
             slots[*result as usize] = Some(Value::I32(memory.pages() as i32));
         }
         BaselineOp::MemoryInit {
             data,
+            memory: memory_index,
             destination,
             source,
             length,
@@ -3641,7 +3851,7 @@ fn exec_op(
                 .get(*data as usize)
                 .and_then(|segment| segment.as_deref())
                 .unwrap_or(&[]);
-            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let memory = memory_at(state, *memory_index)?;
             let source_end = source
                 .checked_add(length)
                 .filter(|end| *end <= segment.len())
@@ -3659,6 +3869,8 @@ fn exec_op(
             }
         }
         BaselineOp::MemoryCopy {
+            destination_memory,
+            source_memory,
             destination,
             source,
             length,
@@ -3666,18 +3878,38 @@ fn exec_op(
             let destination = i32_slot(slots, *destination)? as u32 as usize;
             let source = i32_slot(slots, *source)? as u32 as usize;
             let length = i32_slot(slots, *length)? as u32 as usize;
-            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
-            let source_end = source
-                .checked_add(length)
-                .filter(|end| *end <= memory.len)
-                .ok_or(Trap::MemoryOutOfBounds)?;
-            destination
-                .checked_add(length)
-                .filter(|end| *end <= memory.len)
-                .ok_or(Trap::MemoryOutOfBounds)?;
-            memory.data.copy_within(source..source_end, destination);
+            if memory_slot(state, *destination_memory) == memory_slot(state, *source_memory) {
+                let memory = memory_at(state, *destination_memory)?;
+                let source_end = source
+                    .checked_add(length)
+                    .filter(|end| *end <= memory.len)
+                    .ok_or(Trap::MemoryOutOfBounds)?;
+                destination
+                    .checked_add(length)
+                    .filter(|end| *end <= memory.len)
+                    .ok_or(Trap::MemoryOutOfBounds)?;
+                memory.data.copy_within(source..source_end, destination);
+            } else {
+                // Two memories: read the source range first, so a range that leaves its memory traps with
+                // nothing written, then write it into the destination.
+                let bytes = {
+                    let from = memory_at(state, *source_memory)?;
+                    let source_end = source
+                        .checked_add(length)
+                        .filter(|end| *end <= from.len)
+                        .ok_or(Trap::MemoryOutOfBounds)?;
+                    from.data[source..source_end].to_vec()
+                };
+                let to = memory_at(state, *destination_memory)?;
+                let destination_end = destination
+                    .checked_add(length)
+                    .filter(|end| *end <= to.len)
+                    .ok_or(Trap::MemoryOutOfBounds)?;
+                to.data[destination..destination_end].copy_from_slice(&bytes);
+            }
         }
         BaselineOp::MemoryFill {
+            memory: memory_index,
             destination,
             value,
             length,
@@ -3685,15 +3917,19 @@ fn exec_op(
             let destination = i32_slot(slots, *destination)? as u32 as usize;
             let value = i32_slot(slots, *value)? as u8;
             let length = i32_slot(slots, *length)? as u32 as usize;
-            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+            let memory = memory_at(state, *memory_index)?;
             let end = destination
                 .checked_add(length)
                 .filter(|end| *end <= memory.len)
                 .ok_or(Trap::MemoryOutOfBounds)?;
             memory.data[destination..end].fill(value);
         }
-        BaselineOp::MemoryGrow { result, delta } => {
-            let memory = state.memory.as_deref_mut().ok_or_else(missing_memory)?;
+        BaselineOp::MemoryGrow {
+            result,
+            delta,
+            memory: memory_index,
+        } => {
+            let memory = memory_at(state, *memory_index)?;
             let delta = i32_slot(slots, *delta)? as u32 as u64;
             slots[*result as usize] = Some(Value::I32(memory.grow(delta)));
         }
@@ -3880,9 +4116,12 @@ fn exec_op(
             results,
         } => {
             let memory = state
-                .memory
-                .as_deref_mut()
-                .map(|memory| memory as &mut dyn GuestMemory);
+                .memory_slots
+                .first()
+                .copied()
+                .flatten()
+                .and_then(|slot| state.memory_views.get_mut(slot))
+                .map(|view| &mut **view as &mut dyn GuestMemory);
             let mut call_args = Vec::with_capacity(arguments.len());
             for slot in arguments {
                 call_args.push(read_slot(slots, *slot)?);
@@ -4037,9 +4276,12 @@ fn exec_call_indirect(
                 return Err(BaselineError::Trap(Trap::IndirectCallTypeMismatch));
             }
             let memory = state
-                .memory
-                .as_deref_mut()
-                .map(|memory| memory as &mut dyn GuestMemory);
+                .memory_slots
+                .first()
+                .copied()
+                .flatten()
+                .and_then(|slot| state.memory_views.get_mut(slot))
+                .map(|view| &mut **view as &mut dyn GuestMemory);
             invoke_import(
                 state.imports,
                 state
@@ -4488,6 +4730,22 @@ fn read_slot(slots: &[Option<Value>], slot: u32) -> Result<Value, Trap> {
 /// The error used when a memory instruction runs without a module memory.
 fn missing_memory() -> Trap {
     Trap::HostFailure("baseline memory instruction needs a module memory".into())
+}
+
+/// The memory at `index` of the running module, locked for this execution. An index the module does not
+/// declare, or an imported memory the embedder has not supplied, is missing.
+fn memory_at<'s>(state: &'s mut ExecState<'_>, index: u32) -> Result<&'s mut BaselineMemory, Trap> {
+    let slot = memory_slot(state, index).ok_or_else(missing_memory)?;
+    state
+        .memory_views
+        .get_mut(slot)
+        .map(|view| &mut **view)
+        .ok_or_else(missing_memory)
+}
+
+/// The slot in `memory_views` that memory `index` reads and writes, if the running module has it.
+fn memory_slot(state: &ExecState<'_>, index: u32) -> Option<usize> {
+    state.memory_slots.get(index as usize).copied().flatten()
 }
 
 /// The effective byte address of a memory access, `address + offset`, checked.

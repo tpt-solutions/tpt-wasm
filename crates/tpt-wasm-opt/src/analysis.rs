@@ -312,7 +312,7 @@ pub fn defines(instruction: &IrInstr) -> Option<ValueId> {
         | TableGrow { result, .. }
         | TableSize { result, .. }
         | Load { result, .. }
-        | MemorySize { result }
+        | MemorySize { result, .. }
         | MemoryGrow { result, .. }
         | GlobalGet { result, .. } => *result,
         I32Add { result, .. }
@@ -443,11 +443,13 @@ pub fn used_values(instruction: &IrInstr) -> Vec<ValueId> {
             destination,
             source,
             length,
+            ..
         } => vec![*destination, *source, *length],
         MemoryFill {
             destination,
             value,
             length,
+            ..
         } => vec![*destination, *value, *length],
         DataDrop { .. } => Vec::new(),
         GlobalSet { value, .. } => vec![*value],
@@ -894,6 +896,7 @@ pub fn map_operands(instruction: &mut IrInstr, mut f: impl FnMut(ValueId) -> Val
             destination,
             source,
             length,
+            ..
         } => {
             *destination = f(*destination);
             *source = f(*source);
@@ -903,6 +906,7 @@ pub fn map_operands(instruction: &mut IrInstr, mut f: impl FnMut(ValueId) -> Val
             destination,
             value,
             length,
+            ..
         } => {
             *destination = f(*destination);
             *value = f(*value);

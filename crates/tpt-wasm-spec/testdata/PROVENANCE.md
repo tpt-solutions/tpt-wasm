@@ -129,3 +129,7 @@ surfaced the lowering defects recorded in `todo.md`; several of them — a loop'
 result being dropped, an `else` arm being lowered into a terminated block, dead
 code desynchronizing the body reader — were invisible to the hand-written
 fixtures and to the seeded differential generator.
+
+## Multi-memory suite
+
+The 41 files in `multi-memory/` are copied unmodified from `test/core/multi-memory` in the spec repository at revision `608711107b7f1edb13efd57b7d79b49477462d36`, the same revision as the Core files above. They were fetched as raw bytes over HTTPS and checked against that revision. `tests/multi_memory.rs` runs them and pins the directive count of every file. The interpreter runs every directive. The baseline, optimizing engine and native tier run the same directives and must match the interpreter on each one.

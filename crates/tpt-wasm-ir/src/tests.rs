@@ -134,7 +134,7 @@ struct ModuleState {
 
 impl ModuleState {
     fn new(module: &IrModule) -> Self {
-        let (pages, max_pages, memory) = match module.memory.as_ref() {
+        let (pages, max_pages, memory) = match module.memories.first() {
             Some(declaration) => {
                 let mut bytes = vec![0u8; declaration.min_pages as usize * PAGE_SIZE];
                 // Active data segments apply in module order, so a later segment
@@ -531,7 +531,7 @@ fn execute_ir_function(
                     };
                     values.insert(*result, converted);
                 }
-                IrInstr::MemorySize { result } => {
+                IrInstr::MemorySize { result, .. } => {
                     values.insert(*result, Value::I32(state.pages as i32));
                 }
                 IrInstr::MemoryInit { .. }
@@ -548,7 +548,7 @@ fn execute_ir_function(
                         "bulk memory is not in the test interpreter".into(),
                     ));
                 }
-                IrInstr::MemoryGrow { result, delta } => {
+                IrInstr::MemoryGrow { result, delta, .. } => {
                     let delta = match values.get(delta) {
                         Some(Value::I32(value)) => *value as u32 as u64,
                         _ => return Err(Trap::HostFailure("memory.grow delta".into())),
@@ -2576,8 +2576,8 @@ fn unsupported_module_state_and_instructions_are_rejected() {
     let outcome = lower_module(&validated(with_memory));
     let lowered = outcome.expect("a module with a memory and a global should lower");
     assert_eq!(
-        lowered.memory,
-        Some(super::IrMemory {
+        lowered.memories.first(),
+        Some(&super::IrMemory {
             min_pages: 2,
             max_pages: Some(4),
             segments: Vec::new(),
@@ -2914,7 +2914,7 @@ fn verifier_rejects_memory_use_in_a_module_without_memory() {
     // hand-forged module, so the check has to stand on its own.
     let inner = module(Vec::new(), vec![ValueType::I32], vec![0x41, 0x00, 0x0b]);
     let mut ir = lower_module(&validated(inner)).unwrap();
-    assert_eq!(ir.memory, None);
+    assert!(ir.memories.is_empty());
     // A fresh id, so the forged value cannot collide with one lowering already
     // defined. A collision would be reported as a duplicate value, which the
     // verifier checks before the memory rule this test is about.
@@ -2927,6 +2927,7 @@ fn verifier_rejects_memory_use_in_a_module_without_memory() {
         super::IrInstr::Load {
             result: ValueId(fresh),
             address: ValueId(0),
+            memory: 0,
             offset: 0,
             operation: super::MemoryLoad::I32,
             bounds: super::BoundsCheck::Checked,
@@ -3453,7 +3454,11 @@ fn an_active_data_segment_becomes_part_of_the_memory_declaration() {
         });
     }
     let lowered = lower_module(&validated(with_memory)).expect("segments should lower");
-    let memory = lowered.memory.expect("the module declares a memory");
+    let memory = lowered
+        .memories
+        .first()
+        .cloned()
+        .expect("the module declares a memory");
     assert_eq!(memory.min_pages, 1);
     assert_eq!(
         memory.segments,

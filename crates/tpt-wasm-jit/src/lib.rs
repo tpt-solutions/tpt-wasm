@@ -871,11 +871,12 @@ pub struct LinearMemory<'a> {
 /// The largest memory maximum, in pages, that compiled code may grow in place.
 pub use tpt_wasm_codegen::MAX_RESERVED_PAGES;
 
-/// Whether `module`'s memory has a maximum small enough for compiled code to grow it in place.
+/// Whether `module`'s memory 0 has a maximum small enough for compiled code to grow it in place. Compiled
+/// code addresses memory 0 only, so that is the one memory it can grow.
 pub fn memory_reservable(module: &IrModule) -> bool {
     module
-        .memory
-        .as_ref()
+        .memories
+        .first()
         .and_then(|memory| memory.max_pages)
         .is_some_and(|max| max <= MAX_RESERVED_PAGES)
 }

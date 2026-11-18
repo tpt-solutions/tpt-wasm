@@ -248,10 +248,10 @@ fn execute_instruction(machine: &mut Machine, instruction: crate::instr::Instr) 
         crate::instr::Instr::I64Store32(arg) => store_i64(machine, arg, 4),
         crate::instr::Instr::MemorySize(index) => memory_size(machine, index),
         crate::instr::Instr::MemoryGrow(index) => memory_grow(machine, index),
-        crate::instr::Instr::MemoryInit(data) => memory_init(machine, data),
+        crate::instr::Instr::MemoryInit { data, memory } => memory_init(machine, data, memory),
         crate::instr::Instr::DataDrop(data) => data_drop(machine, data),
-        crate::instr::Instr::MemoryCopy => memory_copy(machine),
-        crate::instr::Instr::MemoryFill => memory_fill(machine),
+        crate::instr::Instr::MemoryCopy { dst, src } => memory_copy(machine, dst, src),
+        crate::instr::Instr::MemoryFill(memory) => memory_fill(machine, memory),
         crate::instr::Instr::TableInit { elem, table } => table_init(machine, elem, table),
         crate::instr::Instr::ElemDrop(elem) => elem_drop(machine, elem),
         crate::instr::Instr::TableCopy { dst, src } => table_copy(machine, dst, src),
@@ -1148,9 +1148,9 @@ fn memory_size(machine: &mut Machine, index: u32) -> Step {
     }
 }
 
-/// The store address of memory 0 of the running instance.
-fn memory_zero(machine: &Machine) -> Result<u32, Step> {
-    instance_address(machine, &memory_addresses(machine), 0, "memory")
+/// The store address of memory `index` of the running instance.
+fn memory_at(machine: &Machine, index: u32) -> Result<u32, Step> {
+    instance_address(machine, &memory_addresses(machine), index, "memory")
 }
 
 /// The store address of data segment `index` of the running instance.
@@ -1163,9 +1163,9 @@ fn data_address(machine: &Machine, index: u32) -> Result<u32, Step> {
         .ok_or(Step::Trap(Trap::MemoryOutOfBounds))
 }
 
-/// `memory.init`: copy `len` bytes from offset `src` of data segment `data` to `dst` in memory 0. A
-/// dropped segment is empty, so any copy from it past zero bytes traps.
-fn memory_init(machine: &mut Machine, data: u32) -> Step {
+/// `memory.init`: copy `len` bytes from offset `src` of data segment `data` to `dst` in memory `memory`.
+/// A dropped segment is empty, so any copy from it past zero bytes traps.
+fn memory_init(machine: &mut Machine, data: u32, memory: u32) -> Step {
     let (dst, src, len) = match (
         pop_typed_i32(machine),
         pop_typed_i32(machine),
@@ -1178,7 +1178,7 @@ fn memory_init(machine: &mut Machine, data: u32) -> Step {
         Ok(address) => address,
         Err(step) => return step,
     };
-    let memory_address = match memory_zero(machine) {
+    let memory_address = match memory_at(machine, memory) {
         Ok(address) => address,
         Err(step) => return step,
     };
@@ -1426,38 +1426,50 @@ fn table_size(machine: &mut Machine, table: u32) -> Step {
     }
 }
 
-/// `memory.copy`: copy `len` bytes from `src` to `dst` in memory 0, where the two may overlap. Either
-/// range leaving the memory traps before anything is written.
-fn memory_copy(machine: &mut Machine) -> Step {
-    let (dst, src, len) = match (
+/// `memory.copy`: copy `len` bytes from memory `src` at `src_at` to memory `dst` at `dst_at`. The two
+/// memories may be the same, and the ranges may overlap. Either range leaving its memory traps before
+/// anything is written.
+fn memory_copy(machine: &mut Machine, dst: u32, src: u32) -> Step {
+    let (dst_at, src_at, len) = match (
         pop_typed_i32(machine),
         pop_typed_i32(machine),
         pop_typed_i32(machine),
     ) {
-        (Ok(len), Ok(src), Ok(dst)) => (dst as u32 as u64, src as u32 as u64, len as u32 as usize),
+        (Ok(len), Ok(src_at), Ok(dst_at)) => (
+            dst_at as u32 as u64,
+            src_at as u32 as u64,
+            len as u32 as usize,
+        ),
         (Err(step), _, _) | (_, Err(step), _) | (_, _, Err(step)) => return step,
     };
-    let memory_address = match memory_zero(machine) {
+    let dst_address = match memory_at(machine, dst) {
         Ok(address) => address,
         Err(step) => return step,
     };
-    let memory = match machine.store.memory_mut(memory_address) {
-        Ok(memory) => memory,
+    let src_address = match memory_at(machine, src) {
+        Ok(address) => address,
+        Err(step) => return step,
+    };
+    // Read the source first, so a source range that leaves its memory traps with nothing written.
+    let bytes = match machine.store.memory(src_address) {
+        Ok(memory) => match memory.read(src_at, len) {
+            Ok(bytes) => bytes.to_vec(),
+            Err(_) => return Step::Trap(Trap::MemoryOutOfBounds),
+        },
         Err(_) => return Step::Trap(Trap::MemoryOutOfBounds),
     };
-    let bytes = match memory.read(src, len) {
-        Ok(bytes) => bytes.to_vec(),
-        Err(_) => return Step::Trap(Trap::MemoryOutOfBounds),
-    };
-    match memory.write(dst, &bytes) {
-        Ok(()) => Step::Continue,
+    match machine.store.memory_mut(dst_address) {
+        Ok(memory) => match memory.write(dst_at, &bytes) {
+            Ok(()) => Step::Continue,
+            Err(_) => Step::Trap(Trap::MemoryOutOfBounds),
+        },
         Err(_) => Step::Trap(Trap::MemoryOutOfBounds),
     }
 }
 
-/// `memory.fill`: set `len` bytes at `dst` in memory 0 to the low byte of `value`. The range is checked
-/// before anything is written.
-fn memory_fill(machine: &mut Machine) -> Step {
+/// `memory.fill`: set `len` bytes at `dst` in memory `memory` to the low byte of `value`. The range is
+/// checked before anything is written.
+fn memory_fill(machine: &mut Machine, index: u32) -> Step {
     let (dst, value, len) = match (
         pop_typed_i32(machine),
         pop_typed_i32(machine),
@@ -1466,7 +1478,7 @@ fn memory_fill(machine: &mut Machine) -> Step {
         (Ok(len), Ok(value), Ok(dst)) => (dst as u32 as u64, value as u8, len as u32 as usize),
         (Err(step), _, _) | (_, Err(step), _) | (_, _, Err(step)) => return step,
     };
-    let memory_address = match memory_zero(machine) {
+    let memory_address = match memory_at(machine, index) {
         Ok(address) => address,
         Err(step) => return step,
     };

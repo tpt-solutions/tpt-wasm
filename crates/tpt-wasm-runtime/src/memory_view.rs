@@ -116,7 +116,7 @@ impl Instance {
                 ));
             }
             let handle = module
-                .memory_handle()
+                .memory_handle(0)
                 .ok_or(RuntimeError::UnsupportedFeature("module has no memory"))?;
             return Ok(MemoryView {
                 target: Target::Baseline(handle),
@@ -169,7 +169,7 @@ impl Instance {
     pub fn own_memory(&self) -> Result<MemoryView, RuntimeError> {
         if let Some(module) = self.baseline.as_ref() {
             let handle = module
-                .memory_handle()
+                .memory_handle(0)
                 .ok_or(RuntimeError::UnsupportedFeature("module has no memory"))?;
             return Ok(MemoryView {
                 target: Target::Baseline(handle),

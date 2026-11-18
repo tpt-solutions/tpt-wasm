@@ -1229,7 +1229,7 @@ fn codegen_error(error: tpt_wasm_codegen::CodegenError) -> RuntimeError {
 }
 
 fn lower_baseline(ir: &IrModule) -> Result<tpt_wasm_codegen::BaselineModule, RuntimeError> {
-    let compiled = tpt_wasm_codegen::BaselineModule::lower(ir).map_err(codegen_error)?;
+    let compiled = tpt_wasm_codegen::BaselineModule::lower_unwired(ir).map_err(codegen_error)?;
     // The host boundary is installed by `instantiate_module`, once the imports
     // have been resolved to callbacks. Until then a `CallHost` traps, so a
     // compiled module cannot reach outside itself by accident.
@@ -1295,7 +1295,7 @@ impl tpt_wasm_codegen::HostBoundary for BaselineHost {
         const REENTERED: &str =
             "a function of another instance is already running, so it is refused rather than re-entered";
         let mut owner = shared.try_lock().map_err(|_| trap(REENTERED))?;
-        if !owner.is_free() {
+        if !owner.is_free_for(local) {
             return Err(trap(REENTERED));
         }
         if owner.function_type(local) != Some(expected) {
@@ -1655,81 +1655,108 @@ fn instantiate_module(
     }
 
     let mut elem_addrs = Vec::new();
-    for element in &module.elements {
-        let entries: Vec<RefValue> = match &element.init {
-            ElementInit::FuncIndices(indices) => indices
-                .iter()
-                .map(|index| {
-                    func_addrs
-                        .get(*index as usize)
-                        .map(|address| RefValue::FuncRef(*address))
-                        .ok_or(RuntimeError::Store(StoreError::UnknownFunction(*index)))
-                })
-                .collect::<Result<_, _>>()?,
-            ElementInit::Expressions(expressions) => expressions
-                .iter()
-                .map(|expression| element_reference(expression, &store, &global_addrs, &func_addrs))
-                .collect::<Result<_, _>>()?,
-        };
-        match &element.mode {
-            ElementMode::Active {
-                table_index,
-                offset,
-            } => {
-                let table_address = *table_addrs
-                    .get(*table_index as usize)
-                    .ok_or(RuntimeError::Store(StoreError::UnknownTable(*table_index)))?;
-                let start = const_i32(offset, &store, &global_addrs)? as u32 as u64;
-                // The whole segment must fit before any slot is written, as table initialization has it.
-                let length = store.table_mut(table_address)?.elements.len() as u64;
-                if start + entries.len() as u64 > length {
-                    return Err(RuntimeError::Trap(Trap::TableOutOfBounds));
+    let applied: Result<(), RuntimeError> = (|| {
+        for element in &module.elements {
+            let entries: Vec<RefValue> = match &element.init {
+                ElementInit::FuncIndices(indices) => indices
+                    .iter()
+                    .map(|index| {
+                        func_addrs
+                            .get(*index as usize)
+                            .map(|address| RefValue::FuncRef(*address))
+                            .ok_or(RuntimeError::Store(StoreError::UnknownFunction(*index)))
+                    })
+                    .collect::<Result<_, _>>()?,
+                ElementInit::Expressions(expressions) => expressions
+                    .iter()
+                    .map(|expression| {
+                        element_reference(expression, &store, &global_addrs, &func_addrs)
+                    })
+                    .collect::<Result<_, _>>()?,
+            };
+            match &element.mode {
+                ElementMode::Active {
+                    table_index,
+                    offset,
+                } => {
+                    // As for data segments: a compiled module writes its own tables when it is wired, so an
+                    // active segment is not applied to the store's copy here.
+                    if baseline_mode {
+                        elem_addrs.push(store.add_elem(None));
+                        continue;
+                    }
+                    let table_address = *table_addrs
+                        .get(*table_index as usize)
+                        .ok_or(RuntimeError::Store(StoreError::UnknownTable(*table_index)))?;
+                    let start = const_i32(offset, &store, &global_addrs)? as u32 as u64;
+                    // The whole segment must fit before any slot is written, as table initialization has it.
+                    let length = store.table_mut(table_address)?.elements.len() as u64;
+                    if start + entries.len() as u64 > length {
+                        return Err(RuntimeError::Trap(Trap::TableOutOfBounds));
+                    }
+                    for (delta, value) in entries.into_iter().enumerate() {
+                        store
+                            .table_mut(table_address)?
+                            .set(start as u32 + delta as u32, value)?;
+                    }
+                    // An active segment is dropped once it has been applied.
+                    elem_addrs.push(store.add_elem(None));
                 }
-                for (delta, value) in entries.into_iter().enumerate() {
-                    store
-                        .table_mut(table_address)?
-                        .set(start as u32 + delta as u32, value)?;
-                }
-                // An active segment is dropped once it has been applied.
-                elem_addrs.push(store.add_elem(None));
+                ElementMode::Passive => elem_addrs.push(store.add_elem(Some(entries))),
+                ElementMode::Declarative => elem_addrs.push(store.add_elem(None)),
             }
-            ElementMode::Passive => elem_addrs.push(store.add_elem(Some(entries))),
-            ElementMode::Declarative => elem_addrs.push(store.add_elem(None)),
         }
-    }
-    for segment in &module.data {
-        // A passive segment writes nothing at instantiation; it is only read by the instructions that
-        // name it, which are not yet implemented.
-        let DataMode::Active {
-            memory_index,
-            offset,
-        } = &segment.mode
-        else {
-            continue;
-        };
-        let memory_address =
-            *memory_addrs
-                .get(*memory_index as usize)
-                .ok_or(RuntimeError::Store(StoreError::UnknownMemory(
-                    *memory_index,
-                )))?;
-        let address = const_i32(offset, &store, &global_addrs)? as u32;
-        // A segment that falls outside its memory traps at instantiation, as the specification has it.
-        // The segments before it have already been written, so they stay.
-        store
-            .memory_mut(memory_address)?
-            .write(address as u64, &segment.data)
-            .map_err(|error| match error {
-                StoreError::MemoryOutOfBounds => RuntimeError::Trap(Trap::MemoryOutOfBounds),
-                other => RuntimeError::Store(other),
-            })?;
+        for segment in &module.data {
+            // A passive segment writes nothing at instantiation; it is only read by the instructions that
+            // name it, which are not yet implemented.
+            let DataMode::Active {
+                memory_index,
+                offset,
+            } = &segment.mode
+            else {
+                continue;
+            };
+            // A compiled module holds its own memories and applies its segments to them when it is wired, so
+            // the store's copy is not written here. Writing it first would stop instantiation on a trap before
+            // the compiled module was wired, and its writes before the trap would be lost.
+            if baseline_mode {
+                continue;
+            }
+            let memory_address =
+                *memory_addrs
+                    .get(*memory_index as usize)
+                    .ok_or(RuntimeError::Store(StoreError::UnknownMemory(
+                        *memory_index,
+                    )))?;
+            let address = const_i32(offset, &store, &global_addrs)? as u32;
+            // A segment that falls outside its memory traps at instantiation, as the specification has it.
+            // The segments before it have already been written, so they stay.
+            store
+                .memory_mut(memory_address)?
+                .write(address as u64, &segment.data)
+                .map_err(|error| match error {
+                    StoreError::MemoryOutOfBounds => RuntimeError::Trap(Trap::MemoryOutOfBounds),
+                    other => RuntimeError::Store(other),
+                })?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = applied {
+        // A segment that traps stops instantiation, and the store is not rolled back: the writes made
+        // before the trap stay, as do the functions and memories allocated so far, since a table slot or
+        // an importer may already name them. So the copy is kept, with the host callbacks it registered.
+        *lock_store(&context.store)? = store;
+        let mut callbacks = lock_host_functions(&context.host_functions)?;
+        for (name, implementation) in pending_host_functions {
+            callbacks.insert(name, implementation);
+        }
+        return Err(error);
     }
 
-    // Captured before `memory_addrs` moves into the store instance, because the
-    // baseline's memory wiring needs the address the module's memory 0 resolved
-    // to -- whether the module defined it or imported it, that is the same
-    // address, which is exactly why the two instances can share one memory.
-    let baseline_memory_address = memory_addrs.first().copied();
+    // Captured before `memory_addrs` moves into the store instance, because the baseline's memory wiring
+    // needs the address each of the module's memories resolved to, by index. Whether a module defined a
+    // memory or imported it, its address is the same, which is exactly why two instances can share one.
+    let baseline_memory_addresses: Vec<u32> = memory_addrs.clone();
     // Captured for the same reason: the baseline publishes a handle for each of
     // its globals under the store address that global was allocated at, and by
     // the time the module is lowered `global_addrs` has moved into the instance.
@@ -1820,6 +1847,8 @@ fn instantiate_module(
     // function, so a start function that calls a host function resolves too.
     let host_counts = Arc::clone(&instance.baseline_host_counts);
     let host_trace = Arc::clone(&instance.baseline_host_trace);
+    // The data segments' outcome, reported once the module's functions are registered (see `finish_data`).
+    let mut data_result: Result<(), tpt_wasm_codegen::CodegenError> = Ok(());
     if let Some(module) = instance.baseline.as_mut() {
         // Always installed: a call from another instance reaches this module through the boundary, even when
         // the module imports nothing itself.
@@ -1856,8 +1885,8 @@ fn instantiate_module(
         module
             .bind_function_addresses(&baseline_function_addresses)
             .map_err(codegen_error)?;
-        if let Some(address) = baseline_memory_address {
-            if let Some(shared) = module.memory_handle() {
+        for (index, address) in baseline_memory_addresses.iter().copied().enumerate() {
+            if let Some(shared) = module.memory_handle(index) {
                 lock_baseline_memories(&context.baseline_memories)?.insert(address, shared);
             } else {
                 let shared = lock_baseline_memories(&context.baseline_memories)?
@@ -1866,12 +1895,8 @@ fn instantiate_module(
                     .ok_or(RuntimeError::UnsupportedFeature(
                         "a memory imported in baseline mode that no instance in this store exports",
                     ))?;
-                module.set_memory(shared).map_err(codegen_error)?;
+                module.set_memory(index, shared).map_err(codegen_error)?;
             }
-        } else if module.memory_handle().is_some() {
-            return Err(RuntimeError::UnsupportedFeature(
-                "a compiled memory with no store address",
-            ));
         }
         // The table, by the same rule as the memory: a defined one publishes its
         // handle under the address it allocated, an imported one looks the
@@ -1891,6 +1916,11 @@ fn instantiate_module(
                 module.set_table(index, shared).map_err(codegen_error)?;
             }
         }
+        // The data segments, once the tables are wired: every element segment is applied before any data
+        // segment, as the specification has it, so a data segment that traps leaves the elements written.
+        // A trap here is reported after the rest of the wiring, so the element segments written before it stay
+        // reachable: a table entry may name a function of this instance, and that function has to be registered.
+        data_result = module.finish_data();
         // Globals, one handle each, keyed by store address. A *defined* global
         // publishes its handle so a reader and a later importer find the same
         // value the compiled code uses; an *imported* one takes the exporter's
@@ -1980,6 +2010,8 @@ fn instantiate_module(
             );
         }
     }
+    // The data segment that trapped, reported now that the instance's functions are registered.
+    data_result.map_err(codegen_error)?;
     if let Some(start) = start {
         // The start function runs on the same backend the instance will use, so
         // its effects are visible to later calls in baseline mode.
@@ -2109,7 +2141,7 @@ impl Instance {
         // The memory lock is what makes the two tiers one memory: the baseline cannot run
         // while the native function holds it, and the native function sees every store the
         // baseline made before the call.
-        let handle = self.baseline.as_ref()?.memory_handle();
+        let handle = self.baseline.as_ref()?.memory_handle(0);
         // The globals are copied out of the baseline's handles before the call and written back
         // after it, whatever the call returns, so a trap leaves them as the code left them.
         let globals = self.baseline.as_ref()?.globals_handles();
@@ -2199,7 +2231,7 @@ impl Instance {
     /// one.
     pub fn memory_pages(&self) -> Option<u64> {
         if let Some(module) = self.baseline.as_ref() {
-            let handle = module.memory_handle()?;
+            let handle = module.memory_handle(0)?;
             let memory = handle.lock().ok()?;
             return Some(u64::from(memory.pages()));
         }
@@ -2278,6 +2310,42 @@ impl Instance {
         ))
     }
 
+    /// The store address of the function an export names, when the export is a function this instance
+    /// imported rather than defined. `None` for any other export.
+    fn imported_export_address(&self, name: &str) -> Option<u32> {
+        let ExportDesc::Function(index) = self.exports.get(name)? else {
+            return None;
+        };
+        if self.baseline.as_ref()?.defined_index(*index).is_some() {
+            return None;
+        }
+        let store = lock_store(&self.context.store).ok()?;
+        store
+            .instance(self.index)
+            .ok()?
+            .func_addrs
+            .get(*index as usize)
+            .copied()
+    }
+
+    /// Call a function another instance defined and this one re-exports. It runs in the instance that
+    /// defined it, through the registry of compiled functions, as a call through a table does. A host function
+    /// that is re-exported is not compiled, so it is refused by name.
+    fn call_compiled_import(
+        &self,
+        address: u32,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let (shared, local) = lock_baseline_functions(&self.context.baseline_functions)?
+            .get(&address)
+            .cloned()
+            .ok_or(RuntimeError::UnsupportedFeature(
+                "an imported function that is not a compiled function of another instance",
+            ))?;
+        let mut owner = shared.lock().map_err(|_| RuntimeError::StorePoisoned)?;
+        owner.call(local, args).map_err(baseline_error)
+    }
+
     fn call_baseline(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
         if self
             .context
@@ -2285,6 +2353,9 @@ impl Instance {
             .load(std::sync::atomic::Ordering::SeqCst)
         {
             return Err(RuntimeError::DebugSessionActive);
+        }
+        if let Some(address) = self.imported_export_address(name) {
+            return self.call_compiled_import(address, args);
         }
         let index = self.baseline_index(name)?;
         self.last_call_profile.clear();
@@ -2358,7 +2429,7 @@ impl Instance {
                 ));
             }
             let handle = module
-                .memory_handle()
+                .memory_handle(0)
                 .ok_or(RuntimeError::UnsupportedFeature("module has no memory"))?;
             let memory = handle.lock().map_err(|_| RuntimeError::StorePoisoned)?;
             return memory
@@ -2401,7 +2472,7 @@ impl Instance {
                 ));
             }
             let handle = module
-                .memory_handle()
+                .memory_handle(0)
                 .ok_or(RuntimeError::UnsupportedFeature("module has no memory"))?;
             let mut memory = handle.lock().map_err(|_| RuntimeError::StorePoisoned)?;
             return if tpt_wasm_types::GuestMemory::write(&mut *memory, offset, bytes) {

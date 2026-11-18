@@ -226,6 +226,18 @@ impl FloatBits for f32 {
 
 /// The word a float result is stored as: its bits, or the canonical NaN if it is a NaN, as Micro gives
 /// every NaN from arithmetic.
+/// Compiled code addresses memory 0 only. An access to another memory is refused, so that function is left
+/// to the baseline, which runs every memory.
+fn memory_zero(memory: u32) -> Result<(), JitError> {
+    if memory == 0 {
+        Ok(())
+    } else {
+        Err(JitError::Unsupported(
+            "an access to a memory other than memory 0".into(),
+        ))
+    }
+}
+
 fn canonical<T: FloatBits>(value: T) -> i64 {
     if value.is_nan() {
         T::CANONICAL as i64
@@ -1389,13 +1401,19 @@ impl<'a> Lowerer<'a> {
                 });
                 return Ok(());
             }
-            I::MemorySize { result } => {
+            I::MemorySize { result, memory } => {
+                memory_zero(*memory)?;
                 ops.push(MirOp::MemorySize {
                     dst: Self::slot(*result),
                 });
                 return Ok(());
             }
-            I::MemoryGrow { result, delta } => {
+            I::MemoryGrow {
+                result,
+                delta,
+                memory,
+            } => {
+                memory_zero(*memory)?;
                 ops.push(MirOp::MemoryGrow {
                     dst: Self::slot(*result),
                     delta: Self::slot(*delta),
@@ -1407,10 +1425,12 @@ impl<'a> Lowerer<'a> {
             I::Load {
                 result,
                 address,
+                memory,
                 offset,
                 operation,
                 bounds: _,
             } => {
+                memory_zero(*memory)?;
                 ops.push(MirOp::Load {
                     op: load_op(*operation)?,
                     dst: Self::slot(*result),
@@ -1422,10 +1442,12 @@ impl<'a> Lowerer<'a> {
             I::Store {
                 address,
                 value,
+                memory,
                 offset,
                 operation,
                 bounds: _,
             } => {
+                memory_zero(*memory)?;
                 ops.push(MirOp::Store {
                     op: store_op(*operation)?,
                     address: Self::slot(*address),

@@ -74,14 +74,20 @@ pub enum Instr {
     I64Store32(MemArg),
     MemorySize(u32),
     MemoryGrow(u32),
-    /// `memory.init`: copy from a passive data segment into memory 0.
-    MemoryInit(u32),
+    /// `memory.init`: copy from passive data segment `data` into memory `memory`.
+    MemoryInit {
+        data: u32,
+        memory: u32,
+    },
     /// `data.drop`: discard a data segment, after which it is empty.
     DataDrop(u32),
-    /// `memory.copy` within memory 0.
-    MemoryCopy,
-    /// `memory.fill` within memory 0.
-    MemoryFill,
+    /// `memory.copy`: copy from memory `src` to memory `dst`, which may be the same memory.
+    MemoryCopy {
+        dst: u32,
+        src: u32,
+    },
+    /// `memory.fill` within memory `memory`.
+    MemoryFill(u32),
     /// `table.init`: copy from element segment `elem` into table `table`.
     TableInit {
         elem: u32,
@@ -434,29 +440,18 @@ fn decode_bulk(reader: &mut BodyReader<'_>) -> Result<Instr, InstrDecodeError> {
         17 => Ok(Instr::TableFill(reader.u32()?)),
         8 => {
             let data = reader.u32()?;
-            expect_memory_zero(reader)?;
-            Ok(Instr::MemoryInit(data))
+            let memory = reader.u32()?;
+            Ok(Instr::MemoryInit { data, memory })
         }
         9 => Ok(Instr::DataDrop(reader.u32()?)),
         10 => {
-            expect_memory_zero(reader)?;
-            expect_memory_zero(reader)?;
-            Ok(Instr::MemoryCopy)
+            let dst = reader.u32()?;
+            let src = reader.u32()?;
+            Ok(Instr::MemoryCopy { dst, src })
         }
-        11 => {
-            expect_memory_zero(reader)?;
-            Ok(Instr::MemoryFill)
-        }
+        11 => Ok(Instr::MemoryFill(reader.u32()?)),
         _ => Err(InstrDecodeError::InvalidOpcode(0xfc)),
     }
-}
-
-fn expect_memory_zero(reader: &mut BodyReader<'_>) -> Result<(), InstrDecodeError> {
-    let index = reader.byte()?;
-    if index != 0 {
-        return Err(InstrDecodeError::InvalidMemoryIndex(index));
-    }
-    Ok(())
 }
 
 fn decode_instruction(reader: &mut BodyReader<'_>) -> Result<Instr, InstrDecodeError> {
@@ -502,20 +497,8 @@ fn decode_instruction(reader: &mut BodyReader<'_>) -> Result<Instr, InstrDecodeE
         0x24 => Instr::GlobalSet(reader.u32()?),
         0x28..=0x35 => decode_load(opcode, reader)?,
         0x36..=0x3e => decode_store(opcode, reader)?,
-        0x3f => {
-            let index = reader.byte()?;
-            if index != 0 {
-                return Err(InstrDecodeError::InvalidMemoryIndex(index));
-            }
-            Instr::MemorySize(0)
-        }
-        0x40 => {
-            let index = reader.byte()?;
-            if index != 0 {
-                return Err(InstrDecodeError::InvalidMemoryIndex(index));
-            }
-            Instr::MemoryGrow(0)
-        }
+        0x3f => Instr::MemorySize(reader.u32()?),
+        0x40 => Instr::MemoryGrow(reader.u32()?),
         0xfc => decode_bulk(reader)?,
         0x41 => Instr::I32Const(reader.i32()?),
         0x42 => Instr::I64Const(reader.i64()?),
@@ -560,10 +543,14 @@ fn decode_ref_type(byte: u8) -> Result<RefType, InstrDecodeError> {
 }
 
 fn decode_mem_arg(reader: &mut BodyReader<'_>) -> Result<MemArg, InstrDecodeError> {
+    // Bit 6 of the alignment field says a memory index precedes the offset (multi-memory). Without
+    // it the access names memory 0.
+    let flags = reader.u32()?;
+    let memory_index = if flags & 0x40 != 0 { reader.u32()? } else { 0 };
     Ok(MemArg {
-        align: reader.u32()?,
+        align: flags & !0x40,
         offset: u64::from(reader.u32()?),
-        memory_index: 0,
+        memory_index,
     })
 }
 

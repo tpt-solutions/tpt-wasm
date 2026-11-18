@@ -128,10 +128,38 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
             import: None,
         });
     }
-    // MVP data segments are all active and all address memory 0, and their
-    // offset must be a constant `i32`. They are kept in module order so that a
-    // later segment overwrites an earlier one at the same address.
-    let mut segments = Vec::with_capacity(module.data.len());
+    // The memories in index order: imported ones first, then defined ones, as Wasm numbers them. An
+    // imported memory's limits are the module's own declaration, but nothing is sized from them: the
+    // embedder supplies the memory, and it must be the very one the exporting instance holds, or a store
+    // through one instance would be invisible to the other. Every memory is carried either way, and the
+    // data segments the module writes into it are applied when it arrives.
+    let mut memories: Vec<IrMemory> = Vec::new();
+    for import in &module.imports {
+        if let tpt_wasm_format::ImportDesc::Memory(memory_type) = import.desc {
+            if memory_type.memory64 {
+                return Err(LoweringError::UnsupportedFeature("64-bit memory"));
+            }
+            memories.push(IrMemory {
+                min_pages: memory_type.limits.min,
+                max_pages: memory_type.limits.max,
+                segments: Vec::new(),
+                imported: true,
+            });
+        }
+    }
+    for memory in &module.memories {
+        if memory.memory_type.memory64 {
+            return Err(LoweringError::UnsupportedFeature("64-bit memory"));
+        }
+        memories.push(IrMemory {
+            min_pages: memory.memory_type.limits.min,
+            max_pages: memory.memory_type.limits.max,
+            segments: Vec::new(),
+            imported: false,
+        });
+    }
+    // Active data segments are kept in module order, so that a later segment overwrites an earlier one
+    // at the same address. Each goes to the memory it names, and its offset must be a constant `i32`.
     for segment in &module.data {
         // A passive segment is only read by the instructions that name it, which the lowering does not
         // yet have, so it has no effect here and is not carried into the IR.
@@ -142,54 +170,23 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         else {
             continue;
         };
-        if *memory_index != 0 {
-            return Err(LoweringError::UnsupportedFeature("non-zero memory index"));
-        }
+        let target =
+            memories
+                .get_mut(*memory_index as usize)
+                .ok_or(LoweringError::UnsupportedFeature(
+                    "data segment names a missing memory",
+                ))?;
         let (offset_value, offset_expr) = if crate::const_expr::reads_globals(&offset.0) {
             (0, Some(offset.0.clone()))
         } else {
             (element_segment_offset(offset)?, None)
         };
-        segments.push(IrDataSegment {
+        target.segments.push(IrDataSegment {
             offset: offset_value,
             offset_expr,
             bytes: segment.data.clone(),
         });
     }
-    // A module either defines its memory or imports one, never both, and neither
-    // puts an entry in the memory *section* when the memory is imported. The
-    // declared limits of an imported memory are kept because they are the
-    // module's own declaration, but nothing is sized from them: the embedder
-    // supplies the memory, and it must be the very one the exporting instance
-    // holds, or a store through one instance would be invisible to the other.
-    // The data segments are the importing module's own and apply to the imported
-    // memory exactly as they would to a defined one, so they are carried either
-    // way and applied when the memory arrives.
-    let imported_memory = module.imports.iter().find_map(|import| match import.desc {
-        tpt_wasm_format::ImportDesc::Memory(memory_type) => Some(memory_type.limits),
-        _ => None,
-    });
-    let memory = match (module.memories.as_slice(), imported_memory) {
-        ([], Some(limits)) => Some(IrMemory {
-            min_pages: limits.min,
-            max_pages: limits.max,
-            segments,
-            imported: true,
-        }),
-        ([], None) => None,
-        ([only], _) => {
-            if only.memory_type.memory64 {
-                return Err(LoweringError::UnsupportedFeature("64-bit memory"));
-            }
-            Some(IrMemory {
-                min_pages: only.memory_type.limits.min,
-                max_pages: only.memory_type.limits.max,
-                segments,
-                imported: false,
-            })
-        }
-        _ => return Err(LoweringError::UnsupportedFeature("multiple memories")),
-    };
     let imported_tables: Vec<&tpt_wasm_format::Import> = module
         .imports
         .iter()
@@ -292,7 +289,7 @@ pub fn lower_module(validated: &ValidatedModule) -> Result<IrModule, LoweringErr
         passive_elements,
         imports,
         globals,
-        memory,
+        memories,
         tables,
         types: module.types.clone(),
     })
@@ -1208,40 +1205,35 @@ fn lower_body(
             0x28..=0x35 => lower_load(opcode, reader, state, builder)?,
             0x36..=0x3e => lower_store(opcode, reader, state, builder)?,
             0x3f => {
-                // `memory.size` carries a reserved memory index byte that MVP
-                // requires to be zero.
-                let index = reader.byte()?;
-                if index != 0 {
-                    return Err(LoweringError::UnsupportedFeature("multi-memory"));
-                }
+                let memory = reader.u32()?;
                 let result = state.allocate(ValueType::I32)?;
-                builder.push(IrInstr::MemorySize { result });
+                builder.push(IrInstr::MemorySize { result, memory });
                 state.push(result, ValueType::I32);
             }
             0x40 => {
-                let index = reader.byte()?;
-                if index != 0 {
-                    return Err(LoweringError::UnsupportedFeature("multi-memory"));
-                }
+                let memory = reader.u32()?;
                 let delta = state.pop(ValueType::I32)?;
                 let result = state.allocate(ValueType::I32)?;
-                builder.push(IrInstr::MemoryGrow { result, delta });
+                builder.push(IrInstr::MemoryGrow {
+                    result,
+                    delta,
+                    memory,
+                });
                 state.push(result, ValueType::I32);
             }
             0xfc => {
-                // The bulk memory instructions. Each names memory 0, and the operands are popped last
-                // first, so the length is on top of the stack.
+                // The bulk memory instructions. Their memory operands are read in the order the encoding
+                // gives them, and the operands are popped last first, so the length is on top of the stack.
                 match reader.u32()? {
                     8 => {
                         let data = reader.u32()?;
-                        if reader.byte()? != 0 {
-                            return Err(LoweringError::UnsupportedFeature("multi-memory"));
-                        }
+                        let memory = reader.u32()?;
                         let length = state.pop(ValueType::I32)?;
                         let source = state.pop(ValueType::I32)?;
                         let destination = state.pop(ValueType::I32)?;
                         builder.push(IrInstr::MemoryInit {
                             data,
+                            memory,
                             destination,
                             source,
                             length,
@@ -1252,26 +1244,26 @@ fn lower_body(
                         builder.push(IrInstr::DataDrop { data });
                     }
                     10 => {
-                        if reader.byte()? != 0 || reader.byte()? != 0 {
-                            return Err(LoweringError::UnsupportedFeature("multi-memory"));
-                        }
+                        let destination_memory = reader.u32()?;
+                        let source_memory = reader.u32()?;
                         let length = state.pop(ValueType::I32)?;
                         let source = state.pop(ValueType::I32)?;
                         let destination = state.pop(ValueType::I32)?;
                         builder.push(IrInstr::MemoryCopy {
+                            destination_memory,
+                            source_memory,
                             destination,
                             source,
                             length,
                         });
                     }
                     11 => {
-                        if reader.byte()? != 0 {
-                            return Err(LoweringError::UnsupportedFeature("multi-memory"));
-                        }
+                        let memory = reader.u32()?;
                         let length = state.pop(ValueType::I32)?;
                         let value = state.pop(ValueType::I32)?;
                         let destination = state.pop(ValueType::I32)?;
                         builder.push(IrInstr::MemoryFill {
+                            memory,
                             destination,
                             value,
                             length,
@@ -1475,11 +1467,19 @@ fn skip_immediates(opcode: u8, reader: &mut BodyReader<'_>) -> Result<(), Loweri
         }
         // Loads and stores share the `memarg` immediate.
         0x28..=0x3e => {
-            reader.u32()?; // alignment hint, advisory and not carried
+            // Alignment hint, advisory and not carried; its bit 6 names a memory index first.
+            let flags = reader.u32()?;
+            if flags & 0x40 != 0 {
+                reader.u32()?;
+            }
             reader.u32()?; // static offset
         }
-        // `memory.size`, `memory.grow`, and `ref.null` each carry one byte.
-        0x3f | 0x40 | 0xd0 => {
+        // `memory.size` and `memory.grow` carry a memory index.
+        0x3f | 0x40 => {
+            reader.u32()?;
+        }
+        // `ref.null` carries one byte.
+        0xd0 => {
             reader.byte()?;
         }
         0x41 => {
@@ -1545,11 +1545,14 @@ fn store_operation(opcode: u8) -> Option<MemoryStore> {
     })
 }
 
-/// Read a `memarg`. The alignment hint is advisory in Wasm and is not carried in
-/// the IR, so only the static offset is kept.
-fn read_memarg(reader: &mut BodyReader<'_>) -> Result<u32, LoweringError> {
-    let _align = reader.u32()?;
-    reader.u32()
+/// Read a `memarg`: the memory it accesses and its static offset. The alignment hint is advisory in
+/// Wasm and is not carried in the IR. Bit 6 of the alignment field says a memory index precedes the
+/// offset; without it the access names memory 0.
+fn read_memarg(reader: &mut BodyReader<'_>) -> Result<(u32, u32), LoweringError> {
+    let flags = reader.u32()?;
+    let memory = if flags & 0x40 != 0 { reader.u32()? } else { 0 };
+    let offset = reader.u32()?;
+    Ok((memory, offset))
 }
 
 fn lower_load(
@@ -1559,13 +1562,14 @@ fn lower_load(
     builder: &mut BodyBuilder,
 ) -> Result<(), LoweringError> {
     let operation = load_operation(opcode).ok_or(LoweringError::UnsupportedInstruction(opcode))?;
-    let offset = read_memarg(reader)?;
+    let (memory, offset) = read_memarg(reader)?;
     let address = state.pop(ValueType::I32)?;
     let result_type = operation.result_type();
     let result = state.allocate(result_type)?;
     builder.push(IrInstr::Load {
         result,
         address,
+        memory,
         offset,
         operation,
         // The address is an arbitrary `i32` at this point, so nothing is known
@@ -1584,12 +1588,13 @@ fn lower_store(
     builder: &mut BodyBuilder,
 ) -> Result<(), LoweringError> {
     let operation = store_operation(opcode).ok_or(LoweringError::UnsupportedInstruction(opcode))?;
-    let offset = read_memarg(reader)?;
+    let (memory, offset) = read_memarg(reader)?;
     let value = state.pop(operation.operand_type())?;
     let address = state.pop(ValueType::I32)?;
     builder.push(IrInstr::Store {
         address,
         value,
+        memory,
         offset,
         operation,
         // See `lower_load`: the address is unconstrained here.

@@ -9,7 +9,7 @@ use std::fmt;
 
 use tpt_wasm_types::{ReferenceType, ValueType};
 
-use super::{IrModule, ValueId};
+use super::{IrMemory, IrModule, ValueId};
 use crate::{lower_module, LoweringError};
 
 /// Errors found while verifying a lowered IR module.
@@ -1005,11 +1005,13 @@ pub fn instruction_operands(instruction: &super::IrInstr) -> Vec<ValueId> {
             destination,
             source,
             length,
+            ..
         } => vec![*destination, *source, *length],
         MemoryFill {
             destination,
             value,
             length,
+            ..
         } => vec![*destination, *value, *length],
         DataDrop { .. } => Vec::new(),
         // A global index is not a value; a set reads the value it stores.
@@ -1104,7 +1106,7 @@ pub fn instruction_results(instruction: &super::IrInstr) -> Vec<ValueId> {
         }
         // Every remaining instruction produces exactly one `result`.
         Load { result, .. }
-        | MemorySize { result }
+        | MemorySize { result, .. }
         | MemoryGrow { result, .. }
         | GlobalGet { result, .. }
         | RefNull { result, .. }
@@ -1746,11 +1748,12 @@ fn verify_instruction(
         super::IrInstr::Load {
             result,
             address,
+            memory: index,
             offset,
             operation,
             bounds,
         } => {
-            let memory = module.memory.as_ref().ok_or(VerificationError::NoMemory)?;
+            let memory = memory_at(module, *index)?;
             expect_defined_type(*address, ValueType::I32, function_index, values, defined)?;
             verify_proven_bounds(
                 *bounds,
@@ -1772,11 +1775,12 @@ fn verify_instruction(
         super::IrInstr::Store {
             address,
             value,
+            memory: index,
             offset,
             operation,
             bounds,
         } => {
-            let memory = module.memory.as_ref().ok_or(VerificationError::NoMemory)?;
+            let memory = memory_at(module, *index)?;
             expect_defined_type(*address, ValueType::I32, function_index, values, defined)?;
             expect_defined_type(
                 *value,
@@ -1795,21 +1799,18 @@ fn verify_instruction(
                 constants,
             )
         }
-        super::IrInstr::MemorySize { result } => {
-            if module.memory.is_none() {
-                return Err(VerificationError::NoMemory);
-            }
+        super::IrInstr::MemorySize { result, memory } => {
+            memory_at(module, *memory)?;
             define_value(*result, ValueType::I32, function_index, values, defined)
         }
         super::IrInstr::MemoryInit {
             data,
+            memory,
             destination,
             source,
             length,
         } => {
-            if module.memory.is_none() {
-                return Err(VerificationError::NoMemory);
-            }
+            memory_at(module, *memory)?;
             if *data as usize >= module.passive_data.len() {
                 return Err(VerificationError::UnknownDataSegment(*data));
             }
@@ -1825,35 +1826,37 @@ fn verify_instruction(
             Ok(())
         }
         super::IrInstr::MemoryCopy {
+            destination_memory,
+            source_memory,
             destination,
             source,
             length,
         } => {
-            if module.memory.is_none() {
-                return Err(VerificationError::NoMemory);
-            }
+            memory_at(module, *destination_memory)?;
+            memory_at(module, *source_memory)?;
             for value in [*destination, *source, *length] {
                 expect_defined_type(value, ValueType::I32, function_index, values, defined)?;
             }
             Ok(())
         }
         super::IrInstr::MemoryFill {
+            memory,
             destination,
             value,
             length,
         } => {
-            if module.memory.is_none() {
-                return Err(VerificationError::NoMemory);
-            }
+            memory_at(module, *memory)?;
             for operand in [*destination, *value, *length] {
                 expect_defined_type(operand, ValueType::I32, function_index, values, defined)?;
             }
             Ok(())
         }
-        super::IrInstr::MemoryGrow { result, delta } => {
-            if module.memory.is_none() {
-                return Err(VerificationError::NoMemory);
-            }
+        super::IrInstr::MemoryGrow {
+            result,
+            delta,
+            memory,
+        } => {
+            memory_at(module, *memory)?;
             expect_defined_type(*delta, ValueType::I32, function_index, values, defined)?;
             define_value(*result, ValueType::I32, function_index, values, defined)
         }
@@ -2151,6 +2154,14 @@ fn expect_defined_type(
 /// `u64`, so an address near `u32::MAX` plus a large offset cannot wrap into a
 /// small value and slip through: an overflowing sum is reported, not accepted.
 ///
+/// The memory a memory instruction names, which the module must declare.
+fn memory_at(module: &IrModule, index: u32) -> Result<&IrMemory, VerificationError> {
+    module
+        .memories
+        .get(index as usize)
+        .ok_or(VerificationError::NoMemory)
+}
+
 /// The available size comes from the memory's *declared minimum*, which
 /// instantiation guarantees and `memory.grow` can only increase, so proving an
 /// access fits the minimum proves it fits forever.

@@ -68,12 +68,12 @@ pub fn run(module: &mut IrModule) -> PassOutcome {
 
 /// Run only the bounds-check elimination pass.
 pub fn run_bounds_checks(module: &mut IrModule) -> PassOutcome {
-    // The memory declaration is read out before the functions are borrowed, so
-    // the pass does not need a second borrow of the module it is rewriting.
-    let memory = module.memory.clone();
+    // The memory declarations are read out before the functions are borrowed, so the pass does not
+    // need a second borrow of the module it is rewriting.
+    let memories = module.memories.clone();
     let mut rewrites = 0;
     for function in &mut module.functions {
-        rewrites += eliminate_bounds_checks(memory.as_ref(), function);
+        rewrites += eliminate_bounds_checks(&memories, function);
     }
     PassOutcome {
         rewrites,
@@ -100,10 +100,12 @@ fn optimize_function(function: &mut IrFunction) -> (usize, usize) {
 /// Everything remembered about one memory access in the current block.
 #[derive(Debug, Clone, Copy)]
 struct Access {
+    /// The memory written, so that an access to one memory never aliases an access to another.
+    memory: u32,
     /// The byte offset from the block's base that was written.
     offset: u64,
-    /// The value written, as raw bits in the stored width.
-    bits: u64,
+    /// The value written, as raw bits in the stored width, when the value is a known constant.
+    bits: Option<u64>,
     /// The stored width in bytes.
     width: u32,
 }
@@ -132,6 +134,7 @@ fn optimize_block(function: &mut IrFunction, block_index: usize) -> (usize, usiz
             IrInstr::Store {
                 address,
                 value,
+                memory,
                 offset,
                 operation,
                 ..
@@ -144,24 +147,28 @@ fn optimize_block(function: &mut IrFunction, block_index: usize) -> (usize, usiz
                 };
                 let start = u64::from(base).wrapping_add(u64::from(*offset));
                 let width = u64::from(operation.width());
+                let bits = stored_bits(&constants, *value, *operation);
 
-                // A store covering exactly the same bytes as the previous one, to
-                // the same bytes with the same value, is redundant -- provided the
-                // first one did not trap, which it did not, or we would not be
-                // here.
-                if last_store.iter().any(|(known, access)| {
-                    *known == start
-                        && access.width as u64 == width
-                        && access.bits == stored_bits(&constants, *value, *operation)
-                }) {
-                    drop.push(position);
-                    continue;
+                // A store is redundant only when the newest access it overlaps writes exactly the same
+                // bytes, with the same value that is known. An older access it overlaps is shadowed by that
+                // newest one, so an older match proves nothing about the bytes now.
+                if let (Some(bits), Some(newest)) =
+                    (bits, newest_overlap(&last_store, *memory, start, width))
+                {
+                    if newest.offset == start
+                        && u64::from(newest.width) == width
+                        && newest.bits == Some(bits)
+                    {
+                        drop.push(position);
+                        continue;
+                    }
                 }
                 last_store.push((
                     start,
                     Access {
+                        memory: *memory,
                         offset: start,
-                        bits: stored_bits(&constants, *value, *operation),
+                        bits,
                         width: u32::try_from(width).unwrap_or(u32::MAX),
                     },
                 ));
@@ -169,6 +176,7 @@ fn optimize_block(function: &mut IrFunction, block_index: usize) -> (usize, usiz
             IrInstr::Load {
                 result,
                 address,
+                memory,
                 offset,
                 operation,
                 ..
@@ -178,7 +186,7 @@ fn optimize_block(function: &mut IrFunction, block_index: usize) -> (usize, usiz
                     continue;
                 };
                 let start = u64::from(base).wrapping_add(u64::from(*offset));
-                if let Some(value) = forward(&last_store, start, *operation) {
+                if let Some(value) = forward(&last_store, *memory, start, *operation) {
                     // A reference-valued load has no constant form, so the
                     // forwarding is simply declined rather than approximated.
                     if let Some(constant) = constant_instruction(*result, value) {
@@ -239,21 +247,46 @@ fn constant_of(table: &std::collections::HashMap<ValueId, Const>, value: ValueId
     }
 }
 
-/// The bits a store would write, if the value is a constant.
+/// The bits a store would write, when the value is a known constant. A value the function does not
+/// define as a constant has no bits to compare, so it is `None` and never equal to anything.
 fn stored_bits(
     table: &std::collections::HashMap<ValueId, Const>,
     value: ValueId,
     operation: tpt_wasm_ir::MemoryStore,
-) -> u64 {
+) -> Option<u64> {
     let width = operation.width();
     let raw = match table.get(&value) {
         Some(Const::I32(v)) => u64::from(*v as u32),
         Some(Const::I64(v)) => *v as u64,
-        _ => return u64::MAX,
+        _ => return None,
     };
     // Mask to the stored width, because a store writes only that many bytes and
     // the remaining bits of the operand are not part of what it wrote.
-    raw & mask(width)
+    Some(raw & mask(width))
+}
+
+/// Whether the byte window `[a, a + a_width)` overlaps `[b, b + b_width)`.
+fn overlaps(a: u64, a_width: u64, b: u64, b_width: u64) -> bool {
+    a < b.saturating_add(b_width) && b < a.saturating_add(a_width)
+}
+
+/// The newest tracked access to `memory` that overlaps the window `[start, start + width)`. Only that
+/// access decides what the bytes of the window hold, since every later access it overlaps has already
+/// been checked against it.
+fn newest_overlap(
+    stores: &[(u64, Access)],
+    memory: u32,
+    start: u64,
+    width: u64,
+) -> Option<&Access> {
+    stores
+        .iter()
+        .rev()
+        .map(|(_, access)| access)
+        .find(|access| {
+            access.memory == memory
+                && overlaps(access.offset, u64::from(access.width), start, width)
+        })
 }
 
 fn mask(width: u32) -> u64 {
@@ -264,24 +297,29 @@ fn mask(width: u32) -> u64 {
     }
 }
 
-/// The value a load at `start` would read, if a tracked store covers it.
-fn forward(stores: &[(u64, Access)], start: u64, operation: MemoryLoad) -> Option<Value> {
+/// The value a load at `start` in `memory` would read. The newest access that overlaps the load decides:
+/// it must be a store of a known value that covers the whole load. If it does not, nothing is forwarded,
+/// because an older store underneath it is not what the load reads.
+fn forward(
+    stores: &[(u64, Access)],
+    memory: u32,
+    start: u64,
+    operation: MemoryLoad,
+) -> Option<Value> {
     let width = operation.width();
-    for (_, access) in stores.iter().rev() {
-        // The load must read a window entirely inside the stored bytes.
-        if start < access.offset {
-            continue;
-        }
-        let into = start - access.offset;
-        let into = u32::try_from(into).ok()?;
-        let end = into.checked_add(width)?;
-        if end > access.width {
-            continue;
-        }
-        let bits = (access.bits >> (into * 8)) & mask(width);
-        return Some(decode(operation, bits));
+    let access = newest_overlap(stores, memory, start, u64::from(width))?;
+    let raw = access.bits?;
+    // The load must read a window entirely inside the stored bytes.
+    if start < access.offset {
+        return None;
     }
-    None
+    let into = u32::try_from(start - access.offset).ok()?;
+    let end = into.checked_add(width)?;
+    if end > access.width {
+        return None;
+    }
+    let bits = (raw >> (into * 8)) & mask(width);
+    Some(decode(operation, bits))
 }
 
 /// Decode a loaded bit pattern exactly as the backend does.
@@ -329,17 +367,8 @@ fn constant_instruction(result: ValueId, value: Value) -> Option<IrInstr> {
     })
 }
 
-/// Mark every access that provably lies inside the memory's minimum size.
-fn eliminate_bounds_checks(
-    memory: Option<&tpt_wasm_ir::IrMemory>,
-    function: &mut IrFunction,
-) -> usize {
-    // No memory means no access could have verified in the first place, so there
-    // is nothing to prove.
-    let Some(memory) = memory else {
-        return 0;
-    };
-    let available = memory.min_pages.saturating_mul(crate::analysis::PAGE_SIZE);
+/// Mark every access that provably lies inside the minimum size of the memory it names.
+fn eliminate_bounds_checks(memories: &[tpt_wasm_ir::IrMemory], function: &mut IrFunction) -> usize {
     let constants = constant_table(function);
     let mut changes = 0;
     for block in &mut function.blocks {
@@ -347,26 +376,47 @@ fn eliminate_bounds_checks(
             // Read the access out first, then write the verdict back. Splitting
             // the two keeps the borrow of `instruction` short, which is what lets
             // the two arms share one proof instead of duplicating it.
-            let (address, offset, width, needs_check) = match instruction {
+            let (memory, address, offset, width, needs_check) = match instruction {
                 IrInstr::Load {
+                    memory,
                     address,
                     offset,
                     operation,
                     bounds,
                     ..
-                } => (*address, *offset, operation.width(), bounds.needs_check()),
+                } => (
+                    *memory,
+                    *address,
+                    *offset,
+                    operation.width(),
+                    bounds.needs_check(),
+                ),
                 IrInstr::Store {
+                    memory,
                     address,
                     offset,
                     operation,
                     bounds,
                     ..
-                } => (*address, *offset, operation.width(), bounds.needs_check()),
+                } => (
+                    *memory,
+                    *address,
+                    *offset,
+                    operation.width(),
+                    bounds.needs_check(),
+                ),
                 _ => continue,
             };
             if !needs_check {
                 continue;
             }
+            // An access to a memory the module does not declare has nothing to prove against.
+            let Some(declaration) = memories.get(memory as usize) else {
+                continue;
+            };
+            let available = declaration
+                .min_pages
+                .saturating_mul(crate::analysis::PAGE_SIZE);
             let Some(base) = constant_of(&constants, address) else {
                 continue;
             };

@@ -51,9 +51,9 @@ pub struct IrModule {
     /// check a `global.get`/`global.set` against the declaration without the
     /// original Wasm module.
     pub globals: Vec<IrGlobal>,
-    /// The single linear memory, if the module declares one. MVP allows at most
-    /// one memory, and every memory instruction addresses memory 0.
-    pub memory: Option<IrMemory>,
+    /// The linear memories, in index order: imported ones first, then defined ones, as Wasm numbers them.
+    /// Every memory instruction names one of these by index.
+    pub memories: Vec<IrMemory>,
     /// Each data segment's bytes, in data-index order: `Some` for a passive segment, which the bulk memory
     /// instructions read, and `None` for an active one, which is applied at instantiation.
     pub passive_data: Vec<Option<Vec<u8>>>,
@@ -568,35 +568,40 @@ pub enum IrInstr {
         arguments: Vec<ValueId>,
         results: Vec<ValueId>,
     },
-    /// Read `width` bytes little-endian from `address + offset`.
+    /// Read `width` bytes little-endian from `address + offset` in memory `memory`.
     Load {
         result: ValueId,
         address: ValueId,
+        memory: u32,
         offset: u32,
         operation: MemoryLoad,
         bounds: BoundsCheck,
     },
-    /// Write the low `width` bytes of `value` at `address + offset`.
+    /// Write the low `width` bytes of `value` at `address + offset` in memory `memory`.
     Store {
         address: ValueId,
         value: ValueId,
+        memory: u32,
         offset: u32,
         operation: MemoryStore,
         bounds: BoundsCheck,
     },
-    /// Current size of memory 0, in pages.
+    /// Current size of memory `memory`, in pages.
     MemorySize {
         result: ValueId,
+        memory: u32,
     },
-    /// Grow memory 0 by `delta` pages, yielding the previous size or -1.
+    /// Grow memory `memory` by `delta` pages, yielding the previous size or -1.
     MemoryGrow {
         result: ValueId,
         delta: ValueId,
+        memory: u32,
     },
     /// `memory.init`: copy `length` bytes from offset `source` of passive data segment `data` to
-    /// `destination` in memory 0.
+    /// `destination` in memory `memory`.
     MemoryInit {
         data: u32,
+        memory: u32,
         destination: ValueId,
         source: ValueId,
         length: ValueId,
@@ -605,14 +610,17 @@ pub enum IrInstr {
     DataDrop {
         data: u32,
     },
-    /// `memory.copy` within memory 0.
+    /// `memory.copy`: copy from memory `source_memory` to memory `destination_memory`, which may be the same.
     MemoryCopy {
+        destination_memory: u32,
+        source_memory: u32,
         destination: ValueId,
         source: ValueId,
         length: ValueId,
     },
-    /// `memory.fill` within memory 0.
+    /// `memory.fill` within memory `memory`.
     MemoryFill {
+        memory: u32,
         destination: ValueId,
         value: ValueId,
         length: ValueId,
