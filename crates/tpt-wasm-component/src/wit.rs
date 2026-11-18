@@ -1509,3 +1509,129 @@ world w {
         ));
     }
 }
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::WitDocument;
+    use crate::{
+        same_function_type, ComponentFuncType, ComponentType, ComponentTypeDef, RecordField, Scalar,
+    };
+
+    const AREA: &str = "\
+package demo:shapes@1.0.0;
+
+interface geometry {
+    record point { x: s32, y: s32 }
+    enum color { red, green }
+    area: func(p: point, c: color) -> u64;
+}
+";
+
+    fn point(fields: [&str; 2]) -> ComponentTypeDef {
+        ComponentTypeDef::Record(vec![
+            RecordField {
+                name: fields[0].to_owned(),
+                ty: Scalar::S32,
+            },
+            RecordField {
+                name: fields[1].to_owned(),
+                ty: Scalar::S32,
+            },
+        ])
+    }
+
+    fn color(labels: [&str; 2]) -> ComponentTypeDef {
+        ComponentTypeDef::Enum(labels.iter().map(|label| (*label).to_owned()).collect())
+    }
+
+    /// The WIT signature of `area`, with its own table.
+    fn wit_area() -> (Vec<ComponentTypeDef>, ComponentFuncType) {
+        WitDocument::parse(AREA)
+            .expect("parses")
+            .function_signature("geometry", "area")
+            .expect("maps")
+    }
+
+    /// A component's own table, in the opposite order from the WIT table, so only a structural
+    /// comparison can match the two.
+    fn component_area(
+        types: Vec<ComponentTypeDef>,
+        params: Vec<ComponentType>,
+    ) -> (Vec<ComponentTypeDef>, ComponentFuncType) {
+        (
+            types,
+            ComponentFuncType {
+                params,
+                result: Some(ComponentType::Scalar(Scalar::U64)),
+            },
+        )
+    }
+
+    #[test]
+    fn a_signature_matches_a_component_whose_table_is_in_another_order() {
+        let (wit_types, wit) = wit_area();
+        let (types, func) = component_area(
+            vec![color(["red", "green"]), point(["x", "y"])],
+            vec![ComponentType::Record(1), ComponentType::Enum(0)],
+        );
+        assert!(same_function_type(&wit_types, &wit, &types, &func));
+        assert!(same_function_type(&types, &func, &wit_types, &wit));
+    }
+
+    #[test]
+    fn a_renamed_label_or_field_is_a_different_type() {
+        let (wit_types, wit) = wit_area();
+        let (types, func) = component_area(
+            vec![color(["red", "blue"]), point(["x", "y"])],
+            vec![ComponentType::Record(1), ComponentType::Enum(0)],
+        );
+        assert!(!same_function_type(&wit_types, &wit, &types, &func));
+
+        let (types, func) = component_area(
+            vec![color(["red", "green"]), point(["x", "z"])],
+            vec![ComponentType::Record(1), ComponentType::Enum(0)],
+        );
+        assert!(!same_function_type(&wit_types, &wit, &types, &func));
+    }
+
+    #[test]
+    fn swapped_parameters_a_missing_result_or_a_wrong_kind_are_different_types() {
+        let (wit_types, wit) = wit_area();
+        let swapped = component_area(
+            vec![color(["red", "green"]), point(["x", "y"])],
+            vec![ComponentType::Enum(0), ComponentType::Record(1)],
+        );
+        assert!(!same_function_type(
+            &wit_types, &wit, &swapped.0, &swapped.1
+        ));
+
+        let no_result = ComponentFuncType {
+            params: vec![ComponentType::Record(1), ComponentType::Enum(0)],
+            result: None,
+        };
+        let types = vec![color(["red", "green"]), point(["x", "y"])];
+        assert!(!same_function_type(&wit_types, &wit, &types, &no_result));
+
+        // Record(0) names an enum in this table, so it has no shape.
+        let wrong_kind = ComponentFuncType {
+            params: vec![ComponentType::Record(0), ComponentType::Enum(1)],
+            result: Some(ComponentType::Scalar(Scalar::U64)),
+        };
+        assert!(!same_function_type(&wit_types, &wit, &types, &wrong_kind));
+    }
+
+    #[test]
+    fn an_index_past_the_table_is_never_the_same() {
+        let (wit_types, wit) = wit_area();
+        let dangling = component_area(
+            vec![color(["red", "green"]), point(["x", "y"])],
+            vec![ComponentType::Record(7), ComponentType::Enum(0)],
+        );
+        assert!(!same_function_type(
+            &wit_types,
+            &wit,
+            &dangling.0,
+            &dangling.1
+        ));
+    }
+}

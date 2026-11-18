@@ -402,6 +402,68 @@ pub struct ComponentFuncType {
     pub result: Option<ComponentType>,
 }
 
+/// The resolved shape of one value type. A type's index is not part of its shape: two types are
+/// the same when their shapes are, whatever order their definitions sit in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Shape {
+    Scalar(Scalar),
+    Compound(ComponentTypeDef),
+}
+
+/// The shape of `ty` in the type table `types`. A type whose index names a definition of another
+/// kind, or past the end of the table, has no shape.
+fn shape_of(ty: ComponentType, types: &[ComponentTypeDef]) -> Option<Shape> {
+    let index = match ty {
+        ComponentType::Scalar(scalar) => return Some(Shape::Scalar(scalar)),
+        ComponentType::Record(i)
+        | ComponentType::List(i)
+        | ComponentType::Option(i)
+        | ComponentType::Enum(i)
+        | ComponentType::Flags(i)
+        | ComponentType::Tuple(i)
+        | ComponentType::Result(i)
+        | ComponentType::Variant(i) => i,
+    };
+    let definition = types.get(index as usize)?;
+    let same_kind = matches!(
+        (ty, definition),
+        (ComponentType::Record(_), ComponentTypeDef::Record(_))
+            | (ComponentType::List(_), ComponentTypeDef::List(_))
+            | (ComponentType::Option(_), ComponentTypeDef::Option(_))
+            | (ComponentType::Enum(_), ComponentTypeDef::Enum(_))
+            | (ComponentType::Flags(_), ComponentTypeDef::Flags(_))
+            | (ComponentType::Tuple(_), ComponentTypeDef::Tuple(_))
+            | (ComponentType::Result(_), ComponentTypeDef::Result { .. })
+            | (ComponentType::Variant(_), ComponentTypeDef::Variant { .. })
+    );
+    same_kind.then(|| Shape::Compound(definition.clone()))
+}
+
+/// Whether two function types are the same, each judged in its own type table. The comparison is
+/// structural: a record's field names and order, an enum's and flags' labels, and every case of a
+/// variant or result must match, but the indices that name the definitions may differ. A type
+/// that names no valid definition is never the same as any other.
+pub fn same_function_type(
+    a_types: &[ComponentTypeDef],
+    a: &ComponentFuncType,
+    b_types: &[ComponentTypeDef],
+    b: &ComponentFuncType,
+) -> bool {
+    let same = |x: ComponentType, y: ComponentType| {
+        matches!(
+            (shape_of(x, a_types), shape_of(y, b_types)),
+            (Some(p), Some(q)) if p == q
+        )
+    };
+    a.params.len() == b.params.len()
+        && a.params.iter().zip(&b.params).all(|(x, y)| same(*x, *y))
+        && match (a.result, b.result) {
+            (None, None) => true,
+            (Some(x), Some(y)) => same(x, y),
+            _ => false,
+        }
+}
+
 /// A value of a component type, as the caller sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComponentValue {
@@ -660,6 +722,21 @@ pub struct Component {
 }
 
 impl Component {
+    /// The type table and declared function type of the import `name`, if the component has a
+    /// function import of that name. Pass both to [`same_function_type`] to compare the import
+    /// with a signature from elsewhere, such as a WIT document.
+    pub fn import_signature(
+        &self,
+        name: &str,
+    ) -> Option<(&[ComponentTypeDef], &ComponentFuncType)> {
+        self.functions.iter().find_map(|function| match function {
+            ComponentFunction::Import { name: import, ty } if import == name => {
+                Some((self.types.as_slice(), self.func_type(*ty)?))
+            }
+            _ => None,
+        })
+    }
+
     /// Decode a component envelope.
     pub fn decode(bytes: &[u8]) -> Result<Self, ComponentError> {
         if bytes.len() < PREAMBLE.len() || bytes[..PREAMBLE.len()] != PREAMBLE {
