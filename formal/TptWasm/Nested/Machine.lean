@@ -1,4 +1,5 @@
 import TptWasm.Nested.Frames
+import TptWasm.Nested.LoopSteps
 
 /-!
 # The machine runs nested statements the way the list semantics does
@@ -253,8 +254,136 @@ theorem machine_stmt : ∀ (k : Nat) (s : Stmt) (p : Nat) (P R : List Instr) (cw
             next => simp at hr
         next => simp at hr
     · simp [hstk] at hr
-  | _, .whileNZ _ _, _, _, _, _, _, _, _, _, _, hs, _, _, _, _ => by
-    simp [SupStmt] at hs
+  | 0, .whileNZ _ _, p, P, R, cw, cw', evs, f, fn, hp, _, _, _, _, hr => by
+    simp [runStmt] at hr
+  | k + 1, .whileNZ cond body, p, P, R, cw, cw', evs, f, fn, hp, hs, hf, hfn, hbody, hr => by
+    have hs0 := hs
+    obtain ⟨hsc, hsb⟩ := hs
+    unfold runStmt at hr
+    by_cases hstk : cw.operandStack = []
+    · simp only [hstk, ↓reduceIte] at hr
+      cases hcond : runWasm cond cw with
+      | none => simp [hcond] at hr
+      | some q =>
+        obtain ⟨c1, e1⟩ := q
+        simp only [hcond] at hr
+        split at hr
+        next v hop =>
+          -- the condition runs, from the loop's start
+          have hcondM := segment cond p P ((Instr.ifInstr (flatSeq body).length :: flatSeq body) ++
+            (Instr.loopBack (cond.length + 1 + (flatSeq body).length) :: R)) cw c1 e1 f fn hp hsc hf
+            hfn (by rw [hbody]; simp [flatStmt, List.append_assoc]) hcond
+          obtain ⟨hfs1, hfr1⟩ := runWasm_frames cond cw c1 e1 hsc hcond
+          obtain ⟨g, hg1, hgi⟩ := hfr1 f hf
+          have hfn1 : c1.store.function? g.functionIndex = some fn := by
+            rw [function?_of_functions cw.store c1.store hfs1, hgi]
+            exact hfn
+          -- the `if` on the condition's value, at the position after the condition
+          have hX : (c1.setActivePc (p + cond.length)).activeFrame? =
+              some { g with pc := p + cond.length } := by
+            rw [activeFrame_setActivePc, hg1]
+            rfl
+          have hXfn : (c1.setActivePc (p + cond.length)).store.function?
+              ({ g with pc := p + cond.length } : Frame).functionIndex = some fn := by
+            rw [setActivePc_store]
+            exact hfn1
+          have hXop : (c1.setActivePc (p + cond.length)).operandStack = [.i32 v] := by
+            rw [setActivePc_operandStack']
+            exact hop
+          have hbodyL : fn.body = (P ++ cond) ++
+              (Instr.ifInstr (flatSeq body).length :: flatSeq body) ++
+              (Instr.loopBack (cond.length + 1 + (flatSeq body).length) :: R) := by
+            rw [hbody]
+            simp [flatStmt, List.append_assoc]
+          have hpcL : ({ g with pc := p + cond.length } : Frame).pc = (P ++ cond).length := by
+            simp [hp]
+          have hcst : ({ c1 with operandStack := [] } : Configuration).activeFrame? =
+              some g := hg1
+          have hcstfn : ({ c1 with operandStack := [] } : Configuration).store.function?
+              g.functionIndex = some fn := hfn1
+          by_cases hv : v = 0
+          · -- the condition is zero: the loop ends, past its back-edge
+            subst hv
+            simp only [↓reduceIte, Option.some.injEq, Prod.mk.injEq] at hr
+            obtain ⟨hc2, hev⟩ := hr
+            subst hev
+            subst hc2
+            have Z := loop_zero_step (c1.setActivePc (p + cond.length)) { g with pc := p + cond.length }
+              fn (P ++ cond) (flatSeq body) R (cond.length + 1 + (flatSeq body).length) []
+              hX hXfn hbodyL hpcL (by rw [hXop])
+            rw [exit_eq] at Z
+            have hpos : ({ g with pc := p + cond.length } : Frame).pc + 1 +
+                (flatSeq body).length + 1 = p + (flatStmt (.whileNZ cond body)).length := by
+              simp [flatStmt]
+              omega
+            rw [hpos] at Z
+            have T := MReach.trans hcondM Z
+            simpa using T
+          · -- the condition is non-zero: the body runs, then the back-edge returns to the start
+            simp only [hv, ↓reduceIte] at hr
+            have N := loop_nonzero_step (c1.setActivePc (p + cond.length))
+              { g with pc := p + cond.length } fn (P ++ cond) (flatSeq body) R
+              (cond.length + 1 + (flatSeq body).length) v [] hX hXfn hbodyL hpcL (by rw [hXop]) hv
+            rw [nonzero_eq] at N
+            cases harm : runSeq k body { c1 with operandStack := [] } with
+            | none => simp [harm] at hr
+            | some q2 =>
+              obtain ⟨c3, e2⟩ := q2
+              simp only [harm] at hr
+              cases hrec : runStmt k (.whileNZ cond body) c3 with
+              | none => simp [hrec] at hr
+              | some q4 =>
+                obtain ⟨c4, e3⟩ := q4
+                simp only [hrec, Option.some.injEq, Prod.mk.injEq] at hr
+                obtain ⟨hc4, hev⟩ := hr
+                subst hev
+                subst hc4
+                -- the body, from the position after the `if`
+                have hp' : (P ++ cond ++ [Instr.ifInstr (flatSeq body).length]).length =
+                    p + cond.length + 1 := by
+                  simp [hp] <;> omega
+                have hbody' : fn.body = (P ++ cond ++ [Instr.ifInstr (flatSeq body).length]) ++
+                    flatSeq body ++ (Instr.loopBack (cond.length + 1 + (flatSeq body).length) :: R) := by
+                  rw [hbody]
+                  simp [flatStmt, List.append_assoc]
+                have Bd := machine_seq k body (p + cond.length + 1)
+                  (P ++ cond ++ [Instr.ifInstr (flatSeq body).length])
+                  (Instr.loopBack (cond.length + 1 + (flatSeq body).length) :: R)
+                  ({ c1 with operandStack := [] } : Configuration) c3 e2 g fn hp' hsb hcst hcstfn
+                  hbody' harm
+                obtain ⟨hf3, hr3⟩ :=
+                  runSeq_frames k body { c1 with operandStack := [] } c3 e2 hsb harm
+                obtain ⟨g3, hg3, hgi3⟩ := hr3 g hcst
+                have hfn3 : c3.store.function? g3.functionIndex = some fn := by
+                  rw [function?_of_functions cw.store c3.store (hf3.trans hfs1), hgi3, hgi]
+                  exact hfn
+                -- the back-edge, from the end of the body to the condition
+                have hX3 : (c3.setActivePc (p + cond.length + 1 + (flatSeq body).length)).activeFrame? =
+                    some { g3 with pc := p + cond.length + 1 + (flatSeq body).length } := by
+                  rw [activeFrame_setActivePc, hg3]
+                  rfl
+                have hX3fn : (c3.setActivePc (p + cond.length + 1 + (flatSeq body).length)).store.function?
+                    ({ g3 with pc := p + cond.length + 1 + (flatSeq body).length } : Frame).functionIndex
+                      = some fn := by
+                  rw [setActivePc_store]
+                  exact hfn3
+                have hbodyB : fn.body = (P ++ cond ++ [Instr.ifInstr (flatSeq body).length] ++
+                    flatSeq body) ++ (Instr.loopBack (cond.length + 1 + (flatSeq body).length) :: R) := by
+                  rw [hbody]
+                  simp [flatStmt, List.append_assoc]
+                have Bk := loop_back_step (c3.setActivePc (p + cond.length + 1 + (flatSeq body).length))
+                  { g3 with pc := p + cond.length + 1 + (flatSeq body).length } fn
+                  (P ++ cond ++ [Instr.ifInstr (flatSeq body).length] ++ flatSeq body) R
+                  (cond.length + 1 + (flatSeq body).length) p hX3 hX3fn hbodyB
+                  (by simp [hp] <;> omega) (by simp [hp] <;> omega)
+                rw [setActivePc_setActivePc] at Bk
+                -- the rest of the loop, from the start again
+                have IH := machine_stmt k (.whileNZ cond body) p P R c3 c4 e3 g3 fn hp hs0 hg3 hfn3
+                  hbody hrec
+                have T := MReach.trans hcondM (MReach.trans N (MReach.trans Bd (MReach.trans Bk IH)))
+                simpa [List.append_assoc] using T
+        next => simp at hr
+    · simp [hstk] at hr
 
 /-- A statement list, run by the list semantics, is run by the machine over its flat code. -/
 theorem machine_seq : ∀ (k : Nat) (ss : List Stmt) (p : Nat) (P R : List Instr) (cw cw' : Configuration)

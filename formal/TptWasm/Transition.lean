@@ -480,6 +480,11 @@ inductive OpStep : Instr -> Configuration -> Outcome -> Prop where
   | elseSkip (c : Configuration) (elseLen : Nat) (frame : Frame)
       (frameEq : c.activeFrame? = some frame) :
       OpStep (.elseInstr elseLen) c (.step (c.setActivePc (frame.pc + elseLen)))
+  /-- The back-edge of a loop. The back-edge has advanced, so it sits one instruction before the
+  frame's pc; it jumps back `distance` instructions from itself. -/
+  | loopBack (c : Configuration) (distance : Nat) (frame : Frame)
+      (frameEq : c.activeFrame? = some frame) :
+      OpStep (.loopBack distance) c (.step (c.setActivePc (frame.pc - 1 - distance)))
 
 /-- The machine transition: one instruction of the active frame.
 
@@ -685,6 +690,10 @@ def execOp : Instr -> Configuration -> Option Outcome
   | .elseInstr elseLen, c =>
     match c.activeFrame? with
     | some frame => some (.step (c.setActivePc (frame.pc + elseLen)))
+    | none => none
+  | .loopBack distance, c =>
+    match c.activeFrame? with
+    | some frame => some (.step (c.setActivePc (frame.pc - 1 - distance)))
     | none => none
 
 /-- The executable interpreter: fetch the active instruction and run it. -/

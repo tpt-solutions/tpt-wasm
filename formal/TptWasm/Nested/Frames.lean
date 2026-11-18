@@ -70,8 +70,50 @@ theorem runStmt_frames : ∀ (k : Nat) (s : Stmt) (c c' : Configuration) (e : Li
             next => simp at h
         next => simp at h
     · simp [hstk] at h
-  | _, .whileNZ _ _, _, _, _, hs, _ => by
-    simp [SupStmt] at hs
+  | 0, .whileNZ _ _, _, _, _, _, h => by
+    simp [runStmt] at h
+  | k + 1, .whileNZ cond body, c, c', e, hs, h => by
+    have hs0 := hs
+    obtain ⟨hsc, hsb⟩ := hs
+    unfold runStmt at h
+    by_cases hstk : c.operandStack = []
+    · simp only [hstk, ↓reduceIte] at h
+      cases hcond : runWasm cond c with
+      | none => simp [hcond] at h
+      | some q =>
+        obtain ⟨c1, e1⟩ := q
+        simp only [hcond] at h
+        split at h
+        next v hop =>
+          obtain ⟨hf1, hr1⟩ := runWasm_frames cond c c1 e1 hsc hcond
+          by_cases hv : v = 0
+          · simp only [hv, ↓reduceIte, Option.some.injEq, Prod.mk.injEq] at h
+            obtain ⟨hc2, -⟩ := h
+            subst hc2
+            exact ⟨hf1, hr1⟩
+          · simp only [hv, ↓reduceIte] at h
+            cases harm : runSeq k body { c1 with operandStack := [] } with
+            | none => simp [harm] at h
+            | some q2 =>
+              obtain ⟨c3, e2⟩ := q2
+              simp only [harm] at h
+              cases hrec : runStmt k (.whileNZ cond body) c3 with
+              | none => simp [hrec] at h
+              | some q4 =>
+                obtain ⟨c4, e3⟩ := q4
+                simp only [hrec, Option.some.injEq, Prod.mk.injEq] at h
+                obtain ⟨hc4, -⟩ := h
+                subst hc4
+                obtain ⟨hf3, hr3⟩ :=
+                  runSeq_frames k body { c1 with operandStack := [] } c3 e2 hsb harm
+                obtain ⟨hf4, hr4⟩ := runStmt_frames k (.whileNZ cond body) c3 c4 e3 hs0 hrec
+                refine ⟨(hf4.trans hf3).trans hf1, fun f hf => ?_⟩
+                obtain ⟨g, hg, hgi⟩ := hr1 f hf
+                obtain ⟨g3, hg3, hgi3⟩ := hr3 g hg
+                obtain ⟨g4, hg4, hgi4⟩ := hr4 g3 hg3
+                exact ⟨g4, hg4, hgi4.trans (hgi3.trans hgi)⟩
+        next => simp at h
+    · simp [hstk] at h
 
 theorem runSeq_frames : ∀ (k : Nat) (ss : List Stmt) (c c' : Configuration) (e : List Event),
     SupSeq ss → runSeq k ss c = some (c', e) →

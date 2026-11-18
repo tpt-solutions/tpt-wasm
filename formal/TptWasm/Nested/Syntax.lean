@@ -93,7 +93,9 @@ def flatStmt : Stmt → List Instr
   | .straight ops => ops
   | .ifElse cond t e =>
     cond ++ [.ifInstr (flatSeq t).length] ++ flatSeq t ++ [.elseInstr (flatSeq e).length] ++ flatSeq e
-  | .whileNZ _ _ => []
+  | .whileNZ cond body =>
+    cond ++ [.ifInstr (flatSeq body).length] ++ flatSeq body ++
+      [.loopBack (cond.length + 1 + (flatSeq body).length)]
 
 /-- The flat layout of a statement list. -/
 def flatSeq : List Stmt → List Instr
@@ -108,7 +110,7 @@ mutual
 def SupStmt : Stmt → Prop
   | .straight ops => ∀ i ∈ ops, V4Diamond.Supported i
   | .ifElse cond t e => (∀ i ∈ cond, V4Diamond.Supported i) ∧ SupSeq t ∧ SupSeq e
-  | .whileNZ _ _ => False
+  | .whileNZ cond body => (∀ i ∈ cond, V4Diamond.Supported i) ∧ SupSeq body
 
 /-- Every statement of a list is supported, loop-free. -/
 def SupSeq : List Stmt → Prop
@@ -139,7 +141,7 @@ mutual
 theorem supStmt_toL : ∀ (s : Stmt), SupStmt s → SupStmtL s
   | .straight _, h => h
   | .ifElse _ t e, ⟨hc, ht, he⟩ => ⟨hc, supSeq_toL t ht, supSeq_toL e he⟩
-  | .whileNZ _ _, h => h.elim
+  | .whileNZ _ _, ⟨hc, hb⟩ => ⟨hc, supSeq_toL _ hb⟩
 
 /-- A loop-free supported list is supported in the loop-allowing sense. -/
 theorem supSeq_toL : ∀ (ss : List Stmt), SupSeq ss → SupSeqL ss

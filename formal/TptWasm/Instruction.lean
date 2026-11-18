@@ -181,6 +181,9 @@ inductive Instr where
   /-- The marker at the end of a then-body: control reaching it skips the `elseLen` instructions
   of the else-body. -/
   | elseInstr (elseLen : Nat)
+  /-- The back-edge of a loop: control reaching it jumps back `distance` instructions from the
+  back-edge itself, to the loop's condition. -/
+  | loopBack (distance : Nat)
   deriving Repr
 
 /-- The default value a local or global of a given type starts at. -/

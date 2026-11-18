@@ -104,11 +104,12 @@ list semantics does (`machine_seq`); the lowering gives each statement a continu
 steps (`GotoN`), and the simulation is by induction over the statement structure (`Simulate`).
 `nested_triangle` states the machine and the IR agree with the Wasm run, and `Nested.Example`
 applies it to a program with an `if` nested in an arm. Loops are in the list semantics and in the
-IR simulation: `whileNZ` runs with fuel bounding its iterations (`sim_stmt`), and `LoopExample`
-applies it to a counting loop. The machine layer does not cover loops yet, so `nested_triangle` is for
-loop-free programs. Branches, calls, and traps inside statements are not yet in the model.
+IR simulation: `whileNZ` runs with fuel bounding its iterations (`sim_stmt`). The machine runs a loop
+as a `cond ; if body ; loopBack` layout (`Nested.Machine`, `Nested.LoopSteps`), so `nested_triangle`
+covers loops too, and `LoopExample.loop_triangle` applies it to a counting loop. Branches, calls, and
+traps inside statements are not yet in the model.
 
-Not proved: loops in the machine layer and in the triangle, `br`/`br_if`/`br_table`, calls, traps in the diamond,
+Not proved: `br`/`br_if`/`br_table`, calls, traps in the diamond,
 the store and locals after the run (the diamond theorem exports events and values only), and
 the refinement chain that composes V4 with V5 and V6. The Rust lowerer is not yet tied to the
 lowering by translation validation for the diamond or for nested programs. The straight-line subset is.
