@@ -106,10 +106,14 @@ steps (`GotoN`), and the simulation is by induction over the statement structure
 applies it to a program with an `if` nested in an arm. Loops are in the list semantics and in the
 IR simulation: `whileNZ` runs with fuel bounding its iterations (`sim_stmt`). The machine runs a loop
 as a `cond ; if body ; loopBack` layout (`Nested.Machine`, `Nested.LoopSteps`), so `nested_triangle`
-covers loops too, and `LoopExample.loop_triangle` applies it to a counting loop. Branches, calls, and
-traps inside statements are not yet in the model.
+covers loops too, and `LoopExample.loop_triangle` applies it to a counting loop. A trap in a statement
+is a trace and a trap: `TrapS` and `TrapSeq` describe a run that traps (`Nested.Trap`), and
+`TrapSim` proves the lowered block graph then traps with the same events and trap, which
+`nested_trap` lifts to the function. `TrapExample` applies it to a store past the end of a memory.
+That is the IR side; the machine does not yet relate a trap to the flat code. Branches and calls are
+not yet in the model.
 
-Not proved: `br`/`br_if`/`br_table`, calls, traps in the diamond,
+Not proved: `br`/`br_if`/`br_table`, calls, traps at the machine level,
 the store and locals after the run (the diamond theorem exports events and values only), and
 the refinement chain that composes V4 with V5 and V6. The Rust lowerer is not yet tied to the
 lowering by translation validation for the diamond or for nested programs. The straight-line subset is.

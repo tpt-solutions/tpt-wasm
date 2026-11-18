@@ -37,3 +37,8 @@ import TptWasm.Nested.Simulate
 import TptWasm.Nested.Program
 import TptWasm.Nested.Example
 import TptWasm.Nested.LoopExample
+import TptWasm.Proofs.V4Trap
+import TptWasm.Nested.Trap
+import TptWasm.Nested.TrapSim
+import TptWasm.Nested.TrapProgram
+import TptWasm.Nested.TrapExample
