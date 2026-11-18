@@ -174,6 +174,13 @@ inductive Instr where
   | callHost (capability : String)
   | ret
   | endInstr
+  /-- A structured `if`: pops an `i32`. A non-zero value falls into the then-body, which is the
+  next `thenLen` instructions. A zero value jumps past the then-body and its `elseInstr` marker,
+  to the start of the else-body. The marker is not counted in `thenLen`. -/
+  | ifInstr (thenLen : Nat)
+  /-- The marker at the end of a then-body: control reaching it skips the `elseLen` instructions
+  of the else-body. -/
+  | elseInstr (elseLen : Nat)
   deriving Repr
 
 /-- The default value a local or global of a given type starts at. -/

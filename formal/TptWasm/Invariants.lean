@@ -35,6 +35,27 @@ theorem advance_operandStack (c : Configuration) : (c.advance).operandStack = c.
   | nil => simp [Configuration.advance, h]
   | cons frame rest => simp [Configuration.advance, h]
 
+/-- Setting the program counter leaves the operand stack alone. -/
+theorem setActivePc_operandStack (c : Configuration) (pc : Nat) :
+    (c.setActivePc pc).operandStack = c.operandStack := by
+  cases h : c.frames.reverse with
+  | nil => simp [Configuration.setActivePc, h]
+  | cons frame rest => simp [Configuration.setActivePc, h]
+
+/-- Setting the program counter leaves the grants alone. -/
+theorem setActivePc_grants (c : Configuration) (pc : Nat) :
+    (c.setActivePc pc).grants = c.grants := by
+  cases h : c.frames.reverse with
+  | nil => simp [Configuration.setActivePc, h]
+  | cons frame rest => simp [Configuration.setActivePc, h]
+
+/-- Setting the program counter leaves the store alone. -/
+theorem setActivePc_store (c : Configuration) (pc : Nat) :
+    (c.setActivePc pc).store = c.store := by
+  cases h : c.frames.reverse with
+  | nil => simp [Configuration.setActivePc, h]
+  | cons frame rest => simp [Configuration.setActivePc, h]
+
 /-- Advancing the program counter leaves the grants alone. -/
 theorem advance_grants (c : Configuration) : (c.advance).grants = c.grants := by
   cases h : c.frames.reverse with
@@ -45,7 +66,8 @@ theorem advance_grants (c : Configuration) : (c.advance).grants = c.grants := by
 theorem opStep_disciplined {instr : Instr} {c c' : Configuration}
     (h : OpStep instr c (.step c')) : PushesAtMostOne c c' ∧ GrantsUnchanged c c' := by
   cases h <;>
-    simp_all [PushesAtMostOne, GrantsUnchanged, Configuration.push, Configuration.pushCall] <;>
+    simp_all [PushesAtMostOne, GrantsUnchanged, Configuration.push, Configuration.pushCall,
+      setActivePc_operandStack, setActivePc_grants] <;>
     omega
 
 /-- The same, for the machine transition, which only adds a program counter. -/

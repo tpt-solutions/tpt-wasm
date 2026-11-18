@@ -464,6 +464,22 @@ inductive OpStep : Instr -> Configuration -> Outcome -> Prop where
       (arity : results.length = frame.returnArity)
       (final : c.frames = [frame]) :
       OpStep .endInstr c (.returning results)
+  /-- `if` with a non-zero condition: fall into the then-body. The rule is stated on the
+  configuration after the `if` has advanced, as every rule is. -/
+  | ifThen (c : Configuration) (thenLen : Nat) (frame : Frame) (v : Int) (rest : List Value)
+      (frameEq : c.activeFrame? = some frame) (stack : c.operandStack = .i32 v :: rest)
+      (taken : v ≠ 0) :
+      OpStep (.ifInstr thenLen) c (.step { c with operandStack := rest })
+  /-- `if` with a zero condition: jump past the then-body and its marker, to the else-body. The
+  `if` has advanced by one, so the else-body begins `thenLen + 1` instructions further on. -/
+  | ifElse (c : Configuration) (thenLen : Nat) (frame : Frame) (rest : List Value)
+      (frameEq : c.activeFrame? = some frame) (stack : c.operandStack = .i32 0 :: rest) :
+      OpStep (.ifInstr thenLen) c
+        (.step { c.setActivePc (frame.pc + thenLen + 1) with operandStack := rest })
+  /-- The marker at the end of a then-body: skip the else-body, which is `elseLen` instructions. -/
+  | elseSkip (c : Configuration) (elseLen : Nat) (frame : Frame)
+      (frameEq : c.activeFrame? = some frame) :
+      OpStep (.elseInstr elseLen) c (.step (c.setActivePc (frame.pc + elseLen)))
 
 /-- The machine transition: one instruction of the active frame.
 
@@ -660,6 +676,16 @@ def execOp : Instr -> Configuration -> Option Outcome
     if capability ∈ c.grants then some (.step (c.push (.i32 0))) else none
   | .ret, c => execReturn c
   | .endInstr, c => execReturn c
+  | .ifInstr thenLen, c =>
+    match c.activeFrame?, c.operandStack with
+    | some frame, .i32 v :: rest =>
+      if v = 0 then some (.step { c.setActivePc (frame.pc + thenLen + 1) with operandStack := rest })
+      else some (.step { c with operandStack := rest })
+    | _, _ => none
+  | .elseInstr elseLen, c =>
+    match c.activeFrame? with
+    | some frame => some (.step (c.setActivePc (frame.pc + elseLen)))
+    | none => none
 
 /-- The executable interpreter: fetch the active instruction and run it. -/
 def exec (c : Configuration) : Option Outcome :=

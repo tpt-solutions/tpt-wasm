@@ -26,3 +26,4 @@ import TptWasm.Proofs.Fold
 import TptWasm.Dominance
 import TptWasm.Proofs.FoldGlobal
 import TptWasm.Proofs.FoldWhole
+import TptWasm.Proofs.IfControl

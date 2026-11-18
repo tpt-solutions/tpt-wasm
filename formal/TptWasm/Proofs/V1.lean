@@ -77,7 +77,7 @@ theorem execOp_sound {instr : Instr} {c : Configuration} {out : Outcome}
     (h : OpStep instr c out) : execOp instr c = some out := by
   cases h <;>
     simp_all [execOp, execReturn, Configuration.push, Configuration.pushCall,
-      Configuration.setLocal?, get?_snoc, get?_mid, replaceAt?_snoc, replaceAt?_mid, maxCallDepth] <;>
+      Configuration.setLocal?, get?_mid, replaceAt?_mid, maxCallDepth] <;>
 
     (try split) <;> omega <;>
     simp_all [execReturn, take_snoc, maxCallDepth, length_map_congr,

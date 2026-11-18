@@ -122,6 +122,13 @@ def currentInstr? (c : Configuration) : Option Instr :=
     | none => none
   | none => none
 
+/-- The configuration with the active frame's program counter set to `pc`. The other frames, the
+stacks, and the grants are unchanged. Structured control uses this to jump. -/
+def setActivePc (c : Configuration) (pc : Nat) : Configuration :=
+  match c.frames.reverse with
+  | [] => c
+  | frame :: rest => { c with frames := rest.reverse ++ [{ frame with pc := pc }] }
+
 /-- The configuration with the active frame's program counter advanced. -/
 def advance (c : Configuration) : Configuration :=
   match c.frames.reverse with
