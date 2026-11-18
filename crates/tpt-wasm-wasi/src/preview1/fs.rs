@@ -405,7 +405,8 @@ pub(super) fn path_open(
     errno::SUCCESS
 }
 
-/// `fd_read` on a file descriptor: fill the iovecs from the file at its position.
+/// `fd_read` on a file descriptor: fill the iovecs from the file at its position, which moves past
+/// what was read.
 pub(super) fn read(
     fs: &mut FsState,
     memory: &mut dyn GuestMemory,
@@ -414,13 +415,58 @@ pub(super) fn read(
     iovs_len: u64,
     read_at: u64,
 ) -> i32 {
+    let mut offset = match cursor(fs, fd) {
+        Ok(offset) => offset,
+        Err(status) => return status,
+    };
+    let status = read_from(fs, memory, fd, iovs_at, iovs_len, read_at, &mut offset);
+    set_cursor(fs, fd, offset);
+    status
+}
+
+/// `fd_pread`: fill the iovecs from the file at `position`. The descriptor's position does not move.
+pub(super) fn read_positioned(
+    fs: &mut FsState,
+    memory: &mut dyn GuestMemory,
+    fd: u32,
+    iovs_at: u64,
+    iovs_len: u64,
+    read_at: u64,
+    position: u64,
+) -> i32 {
+    let mut offset = position;
+    read_from(fs, memory, fd, iovs_at, iovs_len, read_at, &mut offset)
+}
+
+/// The position of a file descriptor. A directory has none, and an unknown descriptor is `BADF`.
+fn cursor(fs: &FsState, fd: u32) -> Result<u64, i32> {
+    match fs.open.get(&fd) {
+        Some(Open::File { offset, .. }) => Ok(*offset),
+        Some(Open::Directory { .. }) => Err(errno::ISDIR),
+        None => Err(errno::BADF),
+    }
+}
+
+/// Store the position a transfer ended at, so a fault part-way through still keeps what moved.
+fn set_cursor(fs: &mut FsState, fd: u32, position: u64) {
+    if let Some(Open::File { offset, .. }) = fs.open.get_mut(&fd) {
+        *offset = position;
+    }
+}
+
+/// Fill the iovecs from the file at `offset`, moving `offset` past the bytes read.
+fn read_from(
+    fs: &mut FsState,
+    memory: &mut dyn GuestMemory,
+    fd: u32,
+    iovs_at: u64,
+    iovs_len: u64,
+    read_at: u64,
+    offset: &mut u64,
+) -> i32 {
     let FsState { preopens, open, .. } = fs;
-    let (preopen, path, offset) = match open.get_mut(&fd) {
-        Some(Open::File {
-            preopen,
-            path,
-            offset,
-        }) => (*preopen, path, offset),
+    let (preopen, path) = match open.get(&fd) {
+        Some(Open::File { preopen, path, .. }) => (*preopen, path),
         Some(Open::Directory { .. }) => return errno::ISDIR,
         None => return errno::BADF,
     };
@@ -457,7 +503,7 @@ pub(super) fn read(
 }
 
 /// `fd_write` on a file descriptor: write the iovecs at its position, growing the file
-/// with zeros where the position is past its end.
+/// with zeros where the position is past its end. The position moves past the bytes written.
 pub(super) fn write(
     fs: &mut FsState,
     memory: &mut dyn GuestMemory,
@@ -466,13 +512,42 @@ pub(super) fn write(
     iovs_len: u64,
     written_at: u64,
 ) -> i32 {
+    let mut offset = match cursor(fs, fd) {
+        Ok(offset) => offset,
+        Err(status) => return status,
+    };
+    let status = write_from(fs, memory, fd, iovs_at, iovs_len, written_at, &mut offset);
+    set_cursor(fs, fd, offset);
+    status
+}
+
+/// `fd_pwrite`: write the iovecs at `position`. The descriptor's position does not move.
+pub(super) fn write_positioned(
+    fs: &mut FsState,
+    memory: &mut dyn GuestMemory,
+    fd: u32,
+    iovs_at: u64,
+    iovs_len: u64,
+    written_at: u64,
+    position: u64,
+) -> i32 {
+    let mut offset = position;
+    write_from(fs, memory, fd, iovs_at, iovs_len, written_at, &mut offset)
+}
+
+/// Write the iovecs at `offset`, moving `offset` past the bytes written.
+fn write_from(
+    fs: &mut FsState,
+    memory: &mut dyn GuestMemory,
+    fd: u32,
+    iovs_at: u64,
+    iovs_len: u64,
+    written_at: u64,
+    offset: &mut u64,
+) -> i32 {
     let FsState { preopens, open, .. } = fs;
-    let (preopen, path, offset) = match open.get_mut(&fd) {
-        Some(Open::File {
-            preopen,
-            path,
-            offset,
-        }) => (*preopen, path, offset),
+    let (preopen, path) = match open.get(&fd) {
+        Some(Open::File { preopen, path, .. }) => (*preopen, path),
         Some(Open::Directory { .. }) => return errno::ISDIR,
         None => return errno::BADF,
     };
@@ -1057,6 +1132,38 @@ pub(super) fn allocate(fs: &mut FsState, fd: u32, offset: u64, length: u64) -> i
         contents.resize(end, 0);
     }
     errno::SUCCESS
+}
+
+/// `fd_filestat_set_size`: make a file exactly `size` bytes long, growing it with zeros or cutting
+/// it short. The file must be writable, and a directory is not a file. A size past
+/// [`MAX_FILE_BYTES`] is `FBIG`.
+pub(super) fn set_size(fs: &mut FsState, fd: u32, size: u64) -> i32 {
+    let (preopen, path) = match fs.open.get(&fd) {
+        Some(Open::File { preopen, path, .. }) => (*preopen, path.clone()),
+        Some(Open::Directory { .. }) => return errno::ISDIR,
+        None => return errno::BADF,
+    };
+    if !fs.preopens[preopen].writable {
+        return errno::BADF;
+    }
+    if size > MAX_FILE_BYTES {
+        return errno::FBIG;
+    }
+    let Some(contents) = file_at_mut(&mut fs.preopens[preopen].root, &path) else {
+        return errno::BADF;
+    };
+    contents.resize(size as usize, 0);
+    errno::SUCCESS
+}
+
+/// `fd_fdstat_set_rights`. Rights are not modelled, so a descriptor's rights cannot change: an open
+/// descriptor is `NOTSUP`, and an unknown one `BADF`.
+pub(super) fn set_rights(fs: &FsState, fd: u32) -> i32 {
+    if fs.open.contains_key(&fd) {
+        errno::NOTSUP
+    } else {
+        errno::BADF
+    }
 }
 
 /// `fd_fdstat_set_flags`. The tree has no append or non-blocking mode, so only the empty flag

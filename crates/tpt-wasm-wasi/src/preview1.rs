@@ -214,6 +214,10 @@ enum Function {
     FdDatasync,
     FdAdvise,
     FdAllocate,
+    FdPread,
+    FdPwrite,
+    FdFilestatSetSize,
+    FdFdstatSetRights,
     PathLink,
     PathSymlink,
     PathReadlink,
@@ -229,7 +233,7 @@ enum Function {
 }
 
 impl Function {
-    const ALL: [Function; 38] = [
+    const ALL: [Function; 42] = [
         Function::ArgsSizesGet,
         Function::ArgsGet,
         Function::EnvironSizesGet,
@@ -256,6 +260,10 @@ impl Function {
         Function::FdDatasync,
         Function::FdAdvise,
         Function::FdAllocate,
+        Function::FdPread,
+        Function::FdPwrite,
+        Function::FdFilestatSetSize,
+        Function::FdFdstatSetRights,
         Function::PathLink,
         Function::PathSymlink,
         Function::PathReadlink,
@@ -298,6 +306,10 @@ impl Function {
             Function::FdDatasync => "fd_datasync",
             Function::FdAdvise => "fd_advise",
             Function::FdAllocate => "fd_allocate",
+            Function::FdPread => "fd_pread",
+            Function::FdPwrite => "fd_pwrite",
+            Function::FdFilestatSetSize => "fd_filestat_set_size",
+            Function::FdFdstatSetRights => "fd_fdstat_set_rights",
             Function::PathLink => "path_link",
             Function::PathSymlink => "path_symlink",
             Function::PathReadlink => "path_readlink",
@@ -327,6 +339,9 @@ impl Function {
             Function::FdClose | Function::FdSync | Function::FdDatasync => (vec![I32], vec![I32]),
             Function::FdAdvise => (vec![I32, I64, I64, I32], vec![I32]),
             Function::FdAllocate => (vec![I32, I64, I64], vec![I32]),
+            Function::FdPread | Function::FdPwrite => (vec![I32, I32, I32, I64, I32], vec![I32]),
+            Function::FdFilestatSetSize => (vec![I32, I64], vec![I32]),
+            Function::FdFdstatSetRights => (vec![I32, I64, I64], vec![I32]),
             Function::PathLink => (vec![I32, I32, I32, I32, I32, I32, I32], vec![I32]),
             Function::PathSymlink => (vec![I32, I32, I32, I32, I32], vec![I32]),
             Function::PathReadlink => (vec![I32, I32, I32, I32, I32, I32], vec![I32]),
@@ -435,6 +450,16 @@ impl HostFunction for Implementation {
                     arguments[1],
                     arguments[2],
                 ))]);
+            }
+            Function::FdFilestatSetSize => {
+                return Ok(vec![Value::I32(fd_filestat_set_size(
+                    &mut state,
+                    arguments[0],
+                    arguments[1],
+                ))]);
+            }
+            Function::FdFdstatSetRights => {
+                return Ok(vec![Value::I32(fd_fdstat_set_rights(&state, arguments[0]))]);
             }
             // There is one thread, so yielding it is a no-op that succeeds.
             Function::SchedYield => return Ok(vec![Value::I32(errno::SUCCESS)]),
@@ -548,6 +573,27 @@ impl HostFunction for Implementation {
             | Function::FdFilestatSetTimes
             | Function::FdFdstatSetFlags
             | Function::FdRenumber => {
+                unreachable!("handled before the memory check")
+            }
+            Function::FdPread => fd_pread(
+                &mut state,
+                memory,
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+            ),
+            Function::FdPwrite => fd_pwrite(
+                &mut state,
+                memory,
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+            ),
+            Function::FdFilestatSetSize | Function::FdFdstatSetRights => {
                 unreachable!("handled before the memory check")
             }
             Function::FdPrestatDirName => {
@@ -859,6 +905,87 @@ fn fd_advise(state: &State, fd: u64, advice: u64) -> i32 {
     }
     if stream_granted(state, fd) {
         errno::INVAL
+    } else {
+        errno::BADF
+    }
+}
+
+/// `fd_pread`: a positional read. A stream cannot seek, so it is refused with `ESPIPE`.
+fn fd_pread(
+    state: &mut State,
+    memory: &mut dyn GuestMemory,
+    fd: u64,
+    iovs_at: u64,
+    iovs_len: u64,
+    position: u64,
+    read_at: u64,
+) -> i32 {
+    if let Some(fd) = fs::file_descriptor(fd) {
+        return fs::read_positioned(
+            &mut state.fs,
+            memory,
+            fd,
+            iovs_at,
+            iovs_len,
+            read_at,
+            position,
+        );
+    }
+    if stream_granted(state, fd) {
+        errno::SPIPE
+    } else {
+        errno::BADF
+    }
+}
+
+/// `fd_pwrite`: a positional write. A stream cannot seek, so it is refused with `ESPIPE`.
+fn fd_pwrite(
+    state: &mut State,
+    memory: &mut dyn GuestMemory,
+    fd: u64,
+    iovs_at: u64,
+    iovs_len: u64,
+    position: u64,
+    written_at: u64,
+) -> i32 {
+    if let Some(fd) = fs::file_descriptor(fd) {
+        return fs::write_positioned(
+            &mut state.fs,
+            memory,
+            fd,
+            iovs_at,
+            iovs_len,
+            written_at,
+            position,
+        );
+    }
+    if stream_granted(state, fd) {
+        errno::SPIPE
+    } else {
+        errno::BADF
+    }
+}
+
+/// `fd_filestat_set_size`. A stream has no length to change, so it is refused with `EINVAL`.
+fn fd_filestat_set_size(state: &mut State, fd: u64, size: u64) -> i32 {
+    if let Some(fd) = fs::file_descriptor(fd) {
+        return fs::set_size(&mut state.fs, fd, size);
+    }
+    if stream_granted(state, fd) {
+        errno::INVAL
+    } else {
+        errno::BADF
+    }
+}
+
+/// `fd_fdstat_set_rights`: rights are not modelled, so an open file or directory and a granted
+/// stream answer `NOTSUP`, and an unknown descriptor `BADF`.
+fn fd_fdstat_set_rights(state: &State, fd: u64) -> i32 {
+    if let Some(fd) = fs::file_descriptor(fd) {
+        return fs::set_rights(&state.fs, fd);
+    }
+    if stream_granted(state, fd) {
+        errno::NOTSUP
     } else {
         errno::BADF
     }

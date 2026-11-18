@@ -1701,6 +1701,10 @@ fn file_imports() -> Vec<(&'static str, FunctionType)> {
         ("fd_datasync", signature(&[I32], &[I32])),
         ("fd_advise", signature(&[I32, I64, I64, I32], &[I32])),
         ("fd_allocate", signature(&[I32, I64, I64], &[I32])),
+        ("fd_pread", signature(&[I32, I32, I32, I64, I32], &[I32])),
+        ("fd_pwrite", signature(&[I32, I32, I32, I64, I32], &[I32])),
+        ("fd_filestat_set_size", signature(&[I32, I64], &[I32])),
+        ("fd_fdstat_set_rights", signature(&[I32, I64, I64], &[I32])),
         (
             "path_link",
             signature(&[I32, I32, I32, I32, I32, I32, I32], &[I32]),
@@ -2295,4 +2299,238 @@ fn a_file_cannot_grow_past_the_cap_and_the_write_is_refused() {
             "{mode:?}: a write that would grow the file past the cap is refused"
         );
     }
+}
+
+#[test]
+fn fd_pread_reads_at_its_offset_and_leaves_the_position_where_it_was() {
+    for mode in BOTH {
+        // Open hello.txt, pread 5 bytes at offset 6 ("world"), then an ordinary read from the
+        // position, which must still be at the start: all 11 bytes.
+        let (result, instance, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(2),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_pread",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(READ_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I64(6),
+                        Arg::I32(COUNT_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_read",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(READ_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I32(SEEK_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(
+            le_at(&instance, COUNT_OUT),
+            5,
+            "{mode:?}: pread got five bytes"
+        );
+        assert_eq!(
+            le_at(&instance, SEEK_OUT),
+            11,
+            "{mode:?}: the next read starts at the start, so pread did not move the position"
+        );
+        assert_eq!(
+            instance
+                .read_memory("mem", u64::from(READ_BUFFER), 11)
+                .expect("reads"),
+            b"hello world",
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn fd_pwrite_writes_at_its_offset_and_keeps_the_file_otherwise() {
+    for mode in BOTH {
+        // Overwrite the first three bytes of hello.txt with "abc", at offset 0.
+        let (result, instance, preview1) = run_files(
+            mode,
+            grant(true),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(64),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_pwrite",
+                    vec![
+                        Arg::I32(4),
+                        Arg::I32(WRITE_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I64(0),
+                        Arg::I32(COUNT_OUT as i32),
+                    ],
+                ),
+            ],
+            file_data(b"abc"),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(le_at(&instance, COUNT_OUT), 3, "{mode:?}");
+        assert_eq!(
+            preview1.read_file(0, "hello.txt").expect("the file exists"),
+            b"abclo world",
+            "{mode:?}: the positional write replaces the bytes at its offset only"
+        );
+    }
+}
+
+#[test]
+fn fd_filestat_set_size_truncates_and_extends_a_writable_file() {
+    for mode in BOTH {
+        // Cut hello.txt to 5 bytes, then extend it to 8. The extension is zeros.
+        let (result, _, preview1) = run_files(
+            mode,
+            grant(true),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(64),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                ("fd_filestat_set_size", vec![Arg::I32(4), Arg::I64(5)]),
+                ("fd_filestat_set_size", vec![Arg::I32(4), Arg::I64(8)]),
+            ],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::SUCCESS)], "{mode:?}");
+        assert_eq!(
+            preview1.read_file(0, "hello.txt").expect("the file exists"),
+            b"hello\0\0\0",
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn fd_pread_and_fd_pwrite_on_a_stream_are_refused_as_not_seekable() {
+    for mode in BOTH {
+        for name in ["fd_pread", "fd_pwrite"] {
+            let result = run_with_stdout(
+                mode,
+                &[(
+                    name,
+                    vec![
+                        Arg::I32(1),
+                        Arg::I32(READ_IOV as i32),
+                        Arg::I32(1),
+                        Arg::I64(0),
+                        Arg::I32(COUNT_OUT as i32),
+                    ],
+                )],
+            );
+            assert_eq!(result, vec![Value::I32(errno::SPIPE)], "{mode:?}: {name}");
+        }
+    }
+}
+
+#[test]
+fn fd_fdstat_set_rights_is_not_supported_on_an_open_descriptor_and_bad_on_an_unknown_one() {
+    for mode in BOTH {
+        let (result, _, _) = run_files(
+            mode,
+            grant(false),
+            &[
+                (
+                    "path_open",
+                    vec![
+                        Arg::I32(3),
+                        Arg::I32(0),
+                        Arg::I32(HELLO_PATH as i32),
+                        Arg::I32(9),
+                        Arg::I32(0),
+                        Arg::I64(2),
+                        Arg::I64(0),
+                        Arg::I32(0),
+                        Arg::I32(FD_OUT as i32),
+                    ],
+                ),
+                (
+                    "fd_fdstat_set_rights",
+                    vec![Arg::I32(4), Arg::I64(2), Arg::I64(0)],
+                ),
+            ],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::NOTSUP)], "{mode:?}: open");
+
+        let (result, _, _) = run_files(
+            mode,
+            grant(false),
+            &[(
+                "fd_fdstat_set_rights",
+                vec![Arg::I32(9), Arg::I64(2), Arg::I64(0)],
+            )],
+            file_data(&[]),
+        );
+        assert_eq!(result, vec![Value::I32(errno::BADF)], "{mode:?}: unknown");
+    }
+}
+
+/// Run one call against a program whose standard output is granted, so the stream is a
+/// descriptor the call can name. Returns the call's errno.
+fn run_with_stdout(mode: EngineMode, calls: &[(&str, Vec<Arg>)]) -> Vec<Value> {
+    use ValueType::I32;
+    let config = Preview1Config {
+        stdout: Some(Box::new(std::io::sink())),
+        ..Preview1Config::default()
+    };
+    let imports = file_imports();
+    let module = module(
+        &imports
+            .iter()
+            .map(|(name, sig)| (*name, sig.clone()))
+            .collect::<Vec<_>>(),
+        signature(&[], &[I32]),
+        typed_body(calls),
+        file_data(&[]),
+    );
+    let (mut instance, _) = instantiate(mode, config, module);
+    instance.call("run", Vec::new()).expect("run returns")
 }
