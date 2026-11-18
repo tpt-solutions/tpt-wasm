@@ -403,15 +403,32 @@ fn select_result(
     Ok(())
 }
 
+/// Bit 6 of a `memarg`'s alignment field: set when a memory index precedes the offset (multi-memory).
+const MEMARG_INDEXED: u32 = 0x40;
+
+/// Read a memory index and check that the module declares that memory.
+fn memory_index(reader: &mut Reader<'_>, module: &ModuleContext) -> Result<u32, ValidationError> {
+    let index = reader.u32()?;
+    if index as usize >= module.memory_count {
+        return Err(ValidationError::UnknownMemory(index));
+    }
+    Ok(index)
+}
+
+/// A `memarg`: the alignment flags, an optional memory index (bit 6 of the flags), and the offset.
+/// Without the index the access names memory 0, which the module must declare.
 fn memory_arg(
     reader: &mut Reader<'_>,
     module: &ModuleContext,
     natural_alignment: u32,
 ) -> Result<(), ValidationError> {
-    if module.memory_count == 0 {
+    let flags = reader.u32()?;
+    let alignment = flags & !MEMARG_INDEXED;
+    if flags & MEMARG_INDEXED != 0 {
+        memory_index(reader, module)?;
+    } else if module.memory_count == 0 {
         return Err(ValidationError::UnknownMemory(0));
     }
-    let alignment = reader.u32()?;
     let _offset = reader.u32()?;
     if alignment > 31 || alignment > natural_alignment {
         return Err(ValidationError::InvalidMemoryAlignment(alignment));
@@ -694,22 +711,18 @@ fn bulk_memory_instruction(
             _ => return Err(ValidationError::UnknownDataSegment(data)),
         }
     }
+    // Each memory operand is an index the module declares. `memory.copy` names its destination and
+    // then its source, and `memory.init` names its data segment before its memory.
     match sub {
-        8 | 10 => {
-            if reader.byte()? != 0 || (sub == 10 && reader.byte()? != 0) {
-                return Err(ValidationError::InvalidMemoryIndex(0));
-            }
+        8 | 11 => {
+            memory_index(reader, module)?;
         }
-        11 => {
-            if reader.byte()? != 0 {
-                return Err(ValidationError::InvalidMemoryIndex(0));
-            }
+        10 => {
+            memory_index(reader, module)?;
+            memory_index(reader, module)?;
         }
         9 => return Ok(()),
         _ => return Err(ValidationError::InvalidInstruction(0xfc)),
-    }
-    if module.memory_count == 0 {
-        return Err(ValidationError::UnknownMemory(0));
     }
     for _ in 0..3 {
         pop_value(stack, controls, Some(ValueType::I32))?;
@@ -744,16 +757,12 @@ fn memory_instruction(
         0x3d => (1, ValueType::I64, true),
         0x3e => (2, ValueType::I64, true),
         0x3f => {
-            if reader.byte()? != 0 || module.memory_count == 0 {
-                return Err(ValidationError::InvalidMemoryIndex(0));
-            }
+            memory_index(reader, module)?;
             push_value(stack, ValueType::I32);
             return Ok(());
         }
         0x40 => {
-            if reader.byte()? != 0 || module.memory_count == 0 {
-                return Err(ValidationError::InvalidMemoryIndex(0));
-            }
+            memory_index(reader, module)?;
             pop_value(stack, controls, Some(ValueType::I32))?;
             push_value(stack, ValueType::I32);
             return Ok(());
@@ -842,6 +851,11 @@ fn reference_instruction(
             // the module context is the authority on whether it exists.
             let index = reader.u32()?;
             function_type(index, module)?;
+            // The spec lets a body take a reference only to a function the module declares
+            // (an export, an element segment, or a global initializer), not any function.
+            if !module.declared_functions.contains(&index) {
+                return Err(ValidationError::UndeclaredFunctionReference(index));
+            }
             push_value(stack, ValueType::Ref(RefType::FuncRef));
         }
         _ => return Err(ValidationError::InvalidInstruction(opcode)),

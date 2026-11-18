@@ -6471,7 +6471,8 @@ mod tests {
                 offset,
             } = &element.mode
             else {
-                panic!("test element segment must be active");
+                // A passive or declarative segment initializes no table at instantiation.
+                continue;
             };
             let base = tpt_wasm_ir::const_expr_i32(offset)
                 .expect("test element offset must be a constant i32");
@@ -7112,6 +7113,13 @@ mod tests {
             type_index: 0,
             locals: vec![],
             body: const_i32(0).into_iter().chain([0x0b]).collect(),
+        });
+        // Declare both functions for `ref.func`, which the spec requires. A declarative
+        // segment adds no table entries.
+        module.elements.push(tpt_wasm_format::Element {
+            element_type: tpt_wasm_types::RefType::FuncRef,
+            mode: tpt_wasm_format::ElementMode::Declarative,
+            init: tpt_wasm_format::ElementInit::FuncIndices(vec![0, 1]),
         });
         module
     }
@@ -8073,14 +8081,24 @@ mod tests {
                 },
                 init: None,
             }],
-            elements: vec![tpt_wasm_format::Element {
-                element_type: tpt_wasm_types::RefType::FuncRef,
-                mode: tpt_wasm_format::ElementMode::Active {
-                    table_index: 0,
-                    offset: tpt_wasm_format::ConstExpr(vec![0x41, 0x00, 0x0b]),
+            elements: vec![
+                tpt_wasm_format::Element {
+                    element_type: tpt_wasm_types::RefType::FuncRef,
+                    mode: tpt_wasm_format::ElementMode::Active {
+                        table_index: 0,
+                        offset: tpt_wasm_format::ConstExpr(vec![0x41, 0x00, 0x0b]),
+                    },
+                    init: tpt_wasm_format::ElementInit::FuncIndices(vec![1]),
                 },
-                init: tpt_wasm_format::ElementInit::FuncIndices(vec![1]),
-            }],
+                tpt_wasm_format::Element {
+                    // Declares the entry and the helper for `ref.func`, which the spec
+                    // allows only for declared functions. A declarative segment adds no
+                    // table entries, so the table's contents are unchanged.
+                    element_type: tpt_wasm_types::RefType::FuncRef,
+                    mode: tpt_wasm_format::ElementMode::Declarative,
+                    init: tpt_wasm_format::ElementInit::FuncIndices(vec![0, 1]),
+                },
+            ],
             ..Module::default()
         });
         // `global.get`/`global.set` round trip through the module-level slot the

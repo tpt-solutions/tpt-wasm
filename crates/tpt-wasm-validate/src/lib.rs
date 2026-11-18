@@ -31,6 +31,9 @@ pub enum ValidationError {
         actual: String,
     },
     UnknownFunction(u32),
+    /// A `ref.func` names a function that no export, element segment, or global initializer
+    /// declares. The spec allows a function body to take a reference only to such a function.
+    UndeclaredFunctionReference(u32),
     UnknownGlobal(u32),
     UnknownMemory(u32),
     UnknownTable(u32),

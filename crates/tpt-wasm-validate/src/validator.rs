@@ -21,6 +21,94 @@ pub(crate) struct ModuleContext {
     pub data_count: Option<u32>,
     /// The element type of each element segment, in segment order.
     pub elem_types: Vec<RefType>,
+    /// The functions a `ref.func` in a function body may name: those that an export, an element
+    /// segment, or a global initializer declares. A function named only by a start function or
+    /// by a body is not in it.
+    pub declared_functions: HashSet<u32>,
+}
+
+/// The index of every function the module declares for reference: each function export, each
+/// function in an element segment, and each `ref.func` in an element or global constant
+/// expression.
+fn declared_functions(module: &Module) -> HashSet<u32> {
+    let mut declared = HashSet::new();
+    for export in &module.exports {
+        if let ExportDesc::Function(index) = export.desc {
+            declared.insert(index);
+        }
+    }
+    for global in &module.globals {
+        ref_funcs_in_const(&global.init.0, &mut declared);
+    }
+    for element in &module.elements {
+        match &element.init {
+            ElementInit::FuncIndices(indices) => declared.extend(indices.iter().copied()),
+            ElementInit::Expressions(expressions) => {
+                for expression in expressions {
+                    ref_funcs_in_const(&expression.0, &mut declared);
+                }
+            }
+        }
+    }
+    declared
+}
+
+/// Collect the function index of every `ref.func` in one constant expression. The expression has
+/// already been decoded, so its immediates are read only to step over them. An unknown opcode
+/// stops the scan rather than being guessed at.
+fn ref_funcs_in_const(bytes: &[u8], declared: &mut HashSet<u32>) {
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let opcode = bytes[pos];
+        pos += 1;
+        match opcode {
+            0x0b => break,
+            // `i32.const` and `i64.const` take a signed LEB128; `global.get` and `ref.func` an
+            // unsigned one. Stepping over either needs only the continuation bits.
+            0x41 | 0x42 | 0x23 => pos = leb_end(bytes, pos),
+            0x43 => pos += 4,
+            0x44 => pos += 8,
+            // `ref.null` takes its heap type byte.
+            0xd0 => pos += 1,
+            0xd2 => {
+                let (index, next) = leb_u32(bytes, pos);
+                declared.insert(index);
+                pos = next;
+            }
+            // The integer arithmetic of an extended constant expression takes no immediate.
+            0x6a..=0x6c | 0x7c..=0x7e => {}
+            _ => break,
+        }
+    }
+}
+
+/// The position just past an LEB128 integer that starts at `pos`.
+fn leb_end(bytes: &[u8], mut pos: usize) -> usize {
+    while let Some(&byte) = bytes.get(pos) {
+        pos += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    pos
+}
+
+/// The unsigned LEB128 integer at `pos` and the position just past it. Bits past the 32nd are
+/// dropped, which is harmless here: the index is checked against the function count elsewhere.
+fn leb_u32(bytes: &[u8], mut pos: usize) -> (u32, usize) {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    while let Some(&byte) = bytes.get(pos) {
+        pos += 1;
+        if shift < 32 {
+            value |= u64::from(byte & 0x7f) << shift;
+        }
+        shift += 7;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    (value as u32, pos)
 }
 
 pub(crate) fn validate_module(module: &Module) -> Result<(), ValidationError> {
@@ -114,11 +202,6 @@ fn build_context(module: &Module) -> Result<ModuleContext, ValidationError> {
         validate_global_type(global.global_type)?;
         global_types.push(global.global_type);
     }
-    if memory_count > 1 {
-        return Err(ValidationError::InvalidLimits(
-            "MVP modules may contain at most one memory".into(),
-        ));
-    }
     let elem_types = module
         .elements
         .iter()
@@ -132,6 +215,7 @@ fn build_context(module: &Module) -> Result<ModuleContext, ValidationError> {
         table_types,
         memory_count,
         global_types,
+        declared_functions: declared_functions(module),
     })
 }
 
@@ -182,7 +266,7 @@ fn validate_exports(module: &Module, context: &ModuleContext) -> Result<(), Vali
                 }
             }
             ExportDesc::Memory(index) => {
-                if index != 0 || context.memory_count == 0 {
+                if index as usize >= context.memory_count {
                     return Err(ValidationError::UnknownMemory(index));
                 }
             }
@@ -316,7 +400,7 @@ fn validate_segments(module: &Module, context: &ModuleContext) -> Result<(), Val
         else {
             continue;
         };
-        if *memory_index != 0 || context.memory_count == 0 {
+        if *memory_index as usize >= context.memory_count {
             return Err(ValidationError::UnknownMemory(*memory_index));
         }
         validate_const_expr(offset, ValueType::I32, context, true)?;

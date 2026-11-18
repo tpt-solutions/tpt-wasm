@@ -212,13 +212,69 @@ fn reference_instructions_are_validated() {
     ))
     .is_ok());
 
-    // `ref.func 0` names a real function, so it type-checks as a `funcref`.
+    // `ref.func 0` names a function the module exports, so it type-checks as a `funcref`.
     let body = vec![0xd2, 0x00, 0xd1, 0x0b];
-    assert!(validate(module_with_function(
-        function_type(vec![], vec![ValueType::I32]),
-        body
-    ))
-    .is_ok());
+    let mut module = module_with_function(function_type(vec![], vec![ValueType::I32]), body);
+    module.exports = vec![Export {
+        name: "f".to_owned(),
+        desc: ExportDesc::Function(0),
+    }];
+    assert!(validate(module).is_ok());
+}
+
+#[test]
+fn ref_func_to_an_undeclared_function_is_rejected() {
+    // `ref.func 0` names a real function, but nothing declares it for reference: no export,
+    // no element segment, no global initializer. The spec rejects this.
+    let body = vec![0xd2, 0x00, 0xd1, 0x0b];
+    assert_eq!(
+        validate(module_with_function(
+            function_type(vec![], vec![ValueType::I32]),
+            body
+        )),
+        Err(ValidationError::UndeclaredFunctionReference(0))
+    );
+}
+
+#[test]
+fn a_start_function_does_not_declare_a_reference_to_itself() {
+    // The spec's `(module (start $f) (func $f (drop (ref.func $f))))` is invalid.
+    let body = vec![0xd2, 0x00, 0x1a, 0x0b];
+    let mut module = module_with_function(function_type(vec![], vec![]), body);
+    module.start = Some(0);
+    assert_eq!(
+        validate(module),
+        Err(ValidationError::UndeclaredFunctionReference(0))
+    );
+}
+
+#[test]
+fn ref_func_to_a_function_declared_by_an_element_segment_or_a_global_is_accepted() {
+    use tpt_wasm_format::{Element, ElementInit, ElementMode};
+    use tpt_wasm_types::RefType;
+
+    let body = vec![0xd2, 0x00, 0xd1, 0x0b];
+
+    // Declared by an element segment that lists it by index.
+    let mut module =
+        module_with_function(function_type(vec![], vec![ValueType::I32]), body.clone());
+    module.elements = vec![Element {
+        element_type: RefType::FuncRef,
+        mode: ElementMode::Declarative,
+        init: ElementInit::FuncIndices(vec![0]),
+    }];
+    assert!(validate(module).is_ok());
+
+    // Declared by a global whose initializer is `ref.func 0`.
+    let mut module = module_with_function(function_type(vec![], vec![ValueType::I32]), body);
+    module.globals = vec![Global {
+        global_type: GlobalType {
+            value_type: ValueType::Ref(RefType::FuncRef),
+            mutable: false,
+        },
+        init: ConstExpr(vec![0xd2, 0x00, 0x0b]),
+    }];
+    assert!(validate(module).is_ok());
 }
 
 #[test]
@@ -330,4 +386,57 @@ fn nested_block_results_are_propagated_to_the_function_frame() {
         vec![0x02, 0x7f, 0x41, 0x2a, 0x0b, 0x0b],
     );
     assert!(validate(module).is_ok());
+}
+
+/// A module of `count` one-page memories, and one function with no parameters and no results whose
+/// body is `body`.
+fn module_with_memories(count: usize, body: Vec<u8>) -> Module {
+    let memory = tpt_wasm_format::Memory {
+        memory_type: tpt_wasm_types::MemoryType {
+            limits: tpt_wasm_types::Limits { min: 1, max: None },
+            memory64: false,
+        },
+    };
+    Module {
+        memories: vec![memory; count],
+        ..module_with_function(function_type(vec![], vec![]), body)
+    }
+}
+
+#[test]
+fn a_load_names_the_memory_it_reads_and_that_memory_must_exist() {
+    // `i32.const 0; i32.load` with the multi-memory flag (bit 6 of the alignment) and memory 1, then
+    // `drop`. Two memories declared, so memory 1 exists.
+    let body = vec![0x41, 0x00, 0x28, 0x42, 0x01, 0x00, 0x1a, 0x0b];
+    assert!(validate(module_with_memories(2, body.clone())).is_ok());
+
+    // Only one memory declared, so memory 1 does not.
+    assert_eq!(
+        validate(module_with_memories(1, body)),
+        Err(ValidationError::UnknownMemory(1))
+    );
+}
+
+#[test]
+fn memory_size_and_grow_name_their_memory() {
+    // `memory.size 1; drop`, with memory 1 declared.
+    let body = vec![0x3f, 0x01, 0x1a, 0x0b];
+    assert!(validate(module_with_memories(2, body.clone())).is_ok());
+    assert_eq!(
+        validate(module_with_memories(1, body)),
+        Err(ValidationError::UnknownMemory(1))
+    );
+}
+
+#[test]
+fn memory_copy_names_its_destination_and_source_memories() {
+    // `memory.copy dst=1 src=0` (0xfc 10), with the three i32 operands on the stack.
+    let body = vec![
+        0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0xfc, 0x0a, 0x01, 0x00, 0x0b,
+    ];
+    assert!(validate(module_with_memories(2, body.clone())).is_ok());
+    assert_eq!(
+        validate(module_with_memories(1, body)),
+        Err(ValidationError::UnknownMemory(1))
+    );
 }

@@ -67,6 +67,9 @@ fn module(set_code: &[u8], probe_code: &[u8]) -> Vec<u8> {
             0x05, b'p', b'r', b'o', b'b', b'e', 0x00, 0x02,
         ],
     ));
+    // Element: one declarative segment naming f, so `set`'s `ref.func 0` is to a declared
+    // function, as the spec requires. A declarative segment fills no table slot.
+    bytes.extend(section(0x09, &[0x01, 0x03, 0x00, 0x01, 0x00]));
     // Code: f, set, and probe.
     let mut code = vec![0x03];
     code.extend(body(&[]));
