@@ -37,7 +37,11 @@ extended_const      = false
 # Phase 3
 exception_handling = false
 memory64           = false
-multi_memory       = false
+# "partial": every engine runs the 41 vendored multi-memory spec files, with each directive count pinned in
+# `crates/tpt-wasm-spec/tests/multi_memory.rs`: the interpreter, the baseline, the optimizing engine and the
+# native tier. Still partial: the native tier compiles a function only when it touches memory 0, the rest run on
+# the baseline, and the multi-memory programs are not yet fuzzed.
+multi_memory       = "partial"
 tail_call          = false
 relaxed_simd       = false
 
@@ -425,10 +429,11 @@ differential = false
 verified = false
 
 [evidence.multi_memory]
-tested = false
+tested = true
 fuzzed = false
 differential = false
 verified = false
+notes = "All 41 vendored multi-memory spec files pass every directive on the interpreter, the baseline, the optimizing engine and the native tier, with pinned directive counts (crates/tpt-wasm-spec/tests/multi_memory.rs). Store-to-load forwarding keys each access by its memory (crates/tpt-wasm-runtime/tests/store_forwarding.rs). Not yet differential evidence: no random multi-memory programs are compared against the interpreter."
 
 [evidence.tail_call]
 tested = false
