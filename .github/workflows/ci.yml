@@ -212,6 +212,51 @@ jobs:
               sys.exit(1)
           PY
 
+  # The translation tests check the Lean model against the Micro engine on generated programs.
+  # They need Lean (`lake env lean` reads the built model), so they run here rather than in
+  # `check`. Each runs twice: once to require agreement, and once with corrupted expectations to
+  # require that the checker rejects them, so a check that cannot fail is caught.
+  translation-validation:
+    name: Lean model against the Micro engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Build the formal model
+        working-directory: formal
+        run: lake build
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Agreement on generated programs
+        env:
+          TPT_TRANSLATION_VALIDATION: "1"
+        run: |
+          cargo test -p tpt-wasm-opt \
+            --test diamond_validation --test global_validation --test local_validation \
+            --test memory_validation --test nested_validation --test numeric_validation \
+            --test state_validation --test straight_line_validation \
+            --test translation_validation --test trap_validation
+
+      - name: Corrupted expectations are rejected
+        env:
+          TPT_TRANSLATION_VALIDATION: "1"
+          TPT_TRANSLATION_MUTANT: "1"
+        run: |
+          cargo test -p tpt-wasm-opt \
+            --test diamond_validation --test global_validation --test local_validation \
+            --test memory_validation --test nested_validation --test numeric_validation \
+            --test state_validation --test straight_line_validation \
+            --test translation_validation --test trap_validation
+
   spec-tests:
     name: WebAssembly spec tests
     runs-on: ubuntu-latest

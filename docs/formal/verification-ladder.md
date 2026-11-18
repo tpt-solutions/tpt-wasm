@@ -111,8 +111,9 @@ the store and locals after the run (the diamond theorem exports events and value
 the refinement chain that composes V4 with V5 and V6. The Rust lowerer is not yet tied to the
 lowering by translation validation for the diamond or for nested programs. The straight-line subset is.
 `crates/tpt-wasm-opt/tests/diamond_validation.rs` and `nested_validation.rs` check the model against
-the Micro engine on generated diamonds and nested programs (opt-in, `TPT_TRANSLATION_VALIDATION=1`);
-a corrupted copy of each is rejected. These check the model's semantics against the engine, not the
+the Micro engine on generated diamonds and nested programs (opt-in locally with
+`TPT_TRANSLATION_VALIDATION=1`; the `translation-validation` CI job runs them and their corrupted
+copies, which must be rejected). These check the model's semantics against the engine, not the
 lowering the Rust compiler performs.
 
 ### V5: what is proved
