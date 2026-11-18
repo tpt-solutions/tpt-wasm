@@ -108,8 +108,12 @@ statements are not yet in the model.
 
 Not proved: nested control flow, loops, `br`/`br_if`/`br_table`, calls, traps in the diamond,
 the store and locals after the run (the diamond theorem exports events and values only), and
-the refinement chain that composes V4 with V5 and V6. The lowering is not yet tied to the Rust
-lowerer by translation validation for the diamond; the straight-line subset is.
+the refinement chain that composes V4 with V5 and V6. The Rust lowerer is not yet tied to the
+lowering by translation validation for the diamond or for nested programs. The straight-line subset is.
+`crates/tpt-wasm-opt/tests/diamond_validation.rs` and `nested_validation.rs` check the model against
+the Micro engine on generated diamonds and nested programs (opt-in, `TPT_TRANSLATION_VALIDATION=1`);
+a corrupted copy of each is rejected. These check the model's semantics against the engine, not the
+lowering the Rust compiler performs.
 
 ### V5: what is proved
 
