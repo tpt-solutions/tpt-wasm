@@ -19,6 +19,7 @@ use super::*;
 use tpt_wasm_format::{
     Element, ElementInit, ElementMode, Export, ExportDesc, Function, Module, Table,
 };
+use tpt_wasm_jit::{HostCalls, LinearMemory};
 use tpt_wasm_types::{FunctionType, Limits, RefType, ResultType, TableType};
 
 /// `dispatch(x, y, sel)` calls the table's slot `sel` with `(x, y)`. The table has four slots: `add`
@@ -308,4 +309,210 @@ fn a_module_with_several_results_keeps_them_through_the_artifact() {
         .call_with_host_results(1, &[7], None, &mut [], None)
         .expect("runs");
     assert_eq!(shifted, vec![8, 6]);
+}
+
+/// A module with one mutable `i32` global and `bump(x)`, which adds `x` to the global and returns
+/// the new value. The global's state must survive from one call to the next, both in memory and
+/// from the artifact's bytes.
+fn global_module() -> Module {
+    Module {
+        types: vec![FunctionType {
+            params: ResultType(vec![ValueType::I32]),
+            results: ResultType(vec![ValueType::I32]),
+        }],
+        functions: vec![Function {
+            type_index: 0,
+            locals: Vec::new(),
+            // global.get 0; local.get 0; i32.add; global.set 0; global.get 0
+            body: vec![0x23, 0x00, 0x20, 0x00, 0x6a, 0x24, 0x00, 0x23, 0x00, 0x0b],
+        }],
+        globals: vec![tpt_wasm_format::Global {
+            global_type: tpt_wasm_types::GlobalType {
+                value_type: ValueType::I32,
+                mutable: true,
+            },
+            init: tpt_wasm_format::ConstExpr(vec![0x41, 0x00, 0x0b]),
+        }],
+        exports: vec![Export {
+            name: "bump".into(),
+            desc: ExportDesc::Function(0),
+        }],
+        ..Module::default()
+    }
+}
+
+#[test]
+fn a_global_keeps_its_value_across_calls_from_the_artifact_as_in_memory() {
+    let ir = lowered(global_module());
+    let artifact = compile_module_artifact(&ir, 1000, false).expect("compiles");
+    let bytes = artifact.to_bytes();
+    let loaded = ModuleArtifact::from_bytes(&bytes)
+        .expect("reads back")
+        .load()
+        .expect("loads on this host");
+    let in_memory = compile_module(&ir, 1000, false);
+
+    let mut stored_globals = vec![0u64];
+    let mut memory_globals = vec![0u64];
+    for x in [5i64, 2, -7] {
+        let stored = loaded
+            .call_with_globals(0, &[x], None, &mut stored_globals)
+            .expect("runs from its bytes");
+        let direct = in_memory
+            .call_with_globals(0, &[x], None, &mut memory_globals)
+            .expect("runs in memory");
+        assert_eq!(stored, direct, "bump({x})");
+        assert_eq!(stored_globals, memory_globals, "the global after bump({x})");
+    }
+    assert_eq!(stored_globals[0] as u32 as i32, 0, "5 + 2 - 7 leaves zero");
+}
+
+/// A module with one memory of at most 4 pages and `grow(n)`, which grows the memory by `n` pages
+/// and returns the old size, or -1 when it cannot.
+fn grow_module() -> Module {
+    Module {
+        types: vec![FunctionType {
+            params: ResultType(vec![ValueType::I32]),
+            results: ResultType(vec![ValueType::I32]),
+        }],
+        functions: vec![Function {
+            type_index: 0,
+            locals: Vec::new(),
+            // local.get 0; memory.grow 0
+            body: vec![0x20, 0x00, 0x40, 0x00, 0x0b],
+        }],
+        memories: vec![tpt_wasm_format::Memory {
+            memory_type: tpt_wasm_types::MemoryType {
+                limits: Limits {
+                    min: 1,
+                    max: Some(4),
+                },
+                memory64: false,
+            },
+        }],
+        exports: vec![Export {
+            name: "grow".into(),
+            desc: ExportDesc::Function(0),
+        }],
+        ..Module::default()
+    }
+}
+
+#[test]
+fn a_module_that_grows_its_memory_keeps_the_flag_and_grows_as_in_memory() {
+    let ir = lowered(grow_module());
+    let artifact = compile_module_artifact(&ir, 1000, false).expect("compiles");
+    let loaded = ModuleArtifact::from_bytes(&artifact.to_bytes())
+        .expect("reads back")
+        .load()
+        .expect("loads on this host");
+    assert!(
+        loaded.memory_grows(),
+        "the growth flag survives the artifact, so the caller reserves the memory"
+    );
+    let in_memory = compile_module(&ir, 1000, false);
+
+    // Each case starts from a fresh one-page memory: growing by 1 or 2 succeeds and returns the old
+    // size, and growing by 4 would pass the maximum of 4 pages, so it fails with -1.
+    for (pages, expected, expected_len) in [(1i64, 1, 2 * 65536), (2, 1, 3 * 65536), (4, -1, 65536)]
+    {
+        // Reserve the maximum, so compiled code grows into bytes already allocated.
+        let mut stored_bytes = vec![0u8; 4 * 65536];
+        let mut stored = LinearMemory {
+            bytes: &mut stored_bytes,
+            len: 65536,
+        };
+        let mut memory_bytes = vec![0u8; 4 * 65536];
+        let mut direct = LinearMemory {
+            bytes: &mut memory_bytes,
+            len: 65536,
+        };
+        let from_bytes = loaded
+            .call_with_memory(0, &[pages], Some(&mut stored), &mut [])
+            .expect("grows from its bytes");
+        let from_memory = in_memory
+            .call_with_memory(0, &[pages], Some(&mut direct), &mut [])
+            .expect("grows in memory");
+        assert_eq!(from_bytes, from_memory, "grow({pages})");
+        assert_eq!(from_bytes as u32 as i32, expected, "grow({pages}) result");
+        assert_eq!(stored.len, direct.len, "the size after grow({pages})");
+        assert_eq!(
+            stored.len, expected_len,
+            "the size after grow({pages}) from one page"
+        );
+    }
+}
+
+/// Supplies one import, `add1`, which adds one to its argument and counts its calls.
+struct AddOne {
+    calls: u32,
+}
+
+impl HostCalls for AddOne {
+    fn arity(&self, _import: u32) -> (usize, usize) {
+        (1, 1)
+    }
+
+    fn call(
+        &mut self,
+        _import: u32,
+        args: &[i64],
+        results: &mut [i64],
+        _memory: Option<&mut [u8]>,
+    ) -> bool {
+        self.calls += 1;
+        results[0] = args[0] + 1;
+        true
+    }
+}
+
+/// A module that imports `env.add1` and defines `plus_two(x)`, which calls the import twice.
+fn import_module() -> Module {
+    let i32_to_i32 = FunctionType {
+        params: ResultType(vec![ValueType::I32]),
+        results: ResultType(vec![ValueType::I32]),
+    };
+    Module {
+        types: vec![i32_to_i32],
+        imports: vec![tpt_wasm_format::Import {
+            module: "env".into(),
+            name: "add1".into(),
+            desc: tpt_wasm_format::ImportDesc::Function(0),
+        }],
+        functions: vec![Function {
+            type_index: 0,
+            locals: Vec::new(),
+            // local.get 0; call 0 (the import); call 0
+            body: vec![0x20, 0x00, 0x10, 0x00, 0x10, 0x00, 0x0b],
+        }],
+        exports: vec![Export {
+            name: "plus_two".into(),
+            desc: ExportDesc::Function(1),
+        }],
+        ..Module::default()
+    }
+}
+
+#[test]
+fn a_module_with_an_import_keeps_its_host_calls_through_the_artifact() {
+    let ir = lowered(import_module());
+    let artifact = compile_module_artifact(&ir, 1000, false).expect("compiles");
+    let loaded = ModuleArtifact::from_bytes(&artifact.to_bytes())
+        .expect("reads back")
+        .load()
+        .expect("loads on this host");
+    let in_memory = compile_module(&ir, 1000, false);
+
+    let mut stored_host = AddOne { calls: 0 };
+    let mut direct_host = AddOne { calls: 0 };
+    let from_bytes = loaded
+        .call_with_host_results(0, &[40], None, &mut [], Some(&mut stored_host))
+        .expect("calls the import from its bytes");
+    let from_memory = in_memory
+        .call_with_host_results(0, &[40], None, &mut [], Some(&mut direct_host))
+        .expect("calls the import in memory");
+    assert_eq!(from_bytes, from_memory);
+    assert_eq!(from_bytes, vec![42], "40 + 1 + 1");
+    assert_eq!(stored_host.calls, 2, "the import is called twice");
+    assert_eq!(stored_host.calls, direct_host.calls);
 }
