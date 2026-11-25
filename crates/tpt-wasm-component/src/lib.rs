@@ -88,6 +88,11 @@ const TYPE_FLAGS: u8 = 0x6e;
 const TYPE_TUPLE: u8 = 0x6f;
 const TYPE_RESULT: u8 = 0x6a;
 const TYPE_VARIANT: u8 = 0x71;
+const TYPE_INSTANCE: u8 = 0x42;
+const COMPONENT_SORT_TYPE: u8 = 0x03;
+const EXTERN_INSTANCE: u8 = 0x05;
+const INSTANCE_DECL_TYPE: u8 = 0x01;
+const INSTANCE_DECL_EXPORT: u8 = 0x04;
 /// The canon tag of a lift, and of a lower.
 const CANON_LIFT: u8 = 0x00;
 const CANON_LOWER: u8 = 0x01;
@@ -364,9 +369,40 @@ pub struct RecordField {
     pub ty: ComponentType,
 }
 
+/// What an instance type exports, as an index into the component's type table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceExport {
+    /// A function, of the function type at this index.
+    Func(u32),
+    /// A type, at this index.
+    Type(u32),
+}
+
+/// An instance type: the definitions it declares, in its own index space, and the names it
+/// exports, which index those definitions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceType {
+    /// The definitions the instance type declares.
+    pub types: Vec<ComponentTypeDef>,
+    /// The names the instance exports, each a function or a type of `types`.
+    pub exports: Vec<(String, InstanceExport)>,
+}
+
+/// An instance the component imports: its name, and the type that declares what it exports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceDef {
+    /// The import's name, which the embedder uses to supply its functions.
+    pub name: String,
+    /// What the instance declares and exports.
+    pub ty: InstanceType,
+}
+
 /// One definition of the component's type index space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComponentTypeDef {
+    /// An instance type: its own table of definitions, and the names it exports, which index that
+    /// table.
+    Instance(InstanceType),
     /// A function type.
     Func(ComponentFuncType),
     /// A record type, with its fields in order.
@@ -498,8 +534,14 @@ pub enum StringEncoding {
 /// A component function: one entry of the component function index space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComponentFunction {
-    /// A function the embedder supplies, under this name, of the type with index `ty`.
-    Import { name: String, ty: u32 },
+    /// A function the embedder supplies, under this name, of the type `func`. `types` is the
+    /// table `func` names its types in: a snapshot taken where the import is declared, so the
+    /// function's types do not take up indices of the component's own index space.
+    Import {
+        name: String,
+        func: ComponentFuncType,
+        types: Arc<Vec<ComponentTypeDef>>,
+    },
     /// A core function lifted to the type with index `ty`. Its `memory` and `realloc` are the
     /// core memory and function that a string or an indirect result crosses through.
     Lift {
@@ -599,6 +641,9 @@ pub type ComponentFn =
 #[derive(Clone)]
 struct SuppliedFunction {
     ty: ComponentFuncType,
+    /// The table the type's indices name, when the embedder built the type in one. Without a table the
+    /// type's indices are the component's own, and the type is compared as it is.
+    types: Option<Arc<Vec<ComponentTypeDef>>>,
     closure: ComponentFn,
 }
 
@@ -645,6 +690,32 @@ impl Imports {
             name.into(),
             SuppliedFunction {
                 ty,
+                types: None,
+                closure: Arc::new(function),
+            },
+        );
+        self
+    }
+
+    /// Supply a function whose type names definitions of `types`: the table the embedder built the
+    /// type in, for example from a WIT document's `function_signature`. Instantiation compares the
+    /// type with the component's declaration structurally, so the two tables may order their
+    /// definitions differently.
+    pub fn define_typed_function<F>(
+        &mut self,
+        name: impl Into<String>,
+        types: Vec<ComponentTypeDef>,
+        ty: ComponentFuncType,
+        function: F,
+    ) -> &mut Self
+    where
+        F: Fn(&[ComponentValue]) -> Result<Vec<ComponentValue>, String> + Send + Sync + 'static,
+    {
+        self.functions.insert(
+            name.into(),
+            SuppliedFunction {
+                ty,
+                types: Some(Arc::new(types)),
                 closure: Arc::new(function),
             },
         );
@@ -661,6 +732,7 @@ pub struct Component {
     core_instances: Vec<CoreInstance>,
     types: Vec<ComponentTypeDef>,
     functions: Vec<ComponentFunction>,
+    instances: Vec<InstanceDef>,
     exports: Vec<ComponentExport>,
 }
 
@@ -673,9 +745,11 @@ impl Component {
         name: &str,
     ) -> Option<(&[ComponentTypeDef], &ComponentFuncType)> {
         self.functions.iter().find_map(|function| match function {
-            ComponentFunction::Import { name: import, ty } if import == name => {
-                Some((self.types.as_slice(), self.func_type(*ty)?))
-            }
+            ComponentFunction::Import {
+                name: import,
+                func,
+                types,
+            } if import == name => Some((types.as_slice(), func)),
             _ => None,
         })
     }
@@ -705,6 +779,8 @@ impl Component {
                     &component.core_instances,
                     &mut component.core_functions,
                     &mut component.core_memories,
+                    &mut component.functions,
+                    &component.instances,
                 )?,
                 SECTION_CORE_INSTANCE => decode_instances(
                     &mut section,
@@ -713,9 +789,12 @@ impl Component {
                     &mut component.core_instances,
                 )?,
                 SECTION_TYPE => decode_types(&mut section, &mut component.types)?,
-                SECTION_IMPORT => {
-                    decode_imports(&mut section, &component.types, &mut component.functions)?
-                }
+                SECTION_IMPORT => decode_imports(
+                    &mut section,
+                    &component.types,
+                    &mut component.functions,
+                    &mut component.instances,
+                )?,
                 SECTION_CANON => decode_canon(
                     &mut section,
                     &mut component.core_functions,
@@ -723,9 +802,11 @@ impl Component {
                     &component.types,
                     &mut component.functions,
                 )?,
-                SECTION_EXPORT => {
-                    decode_exports(&mut section, &component.functions, &mut component.exports)?
-                }
+                SECTION_EXPORT => decode_exports(
+                    &mut section,
+                    &mut component.functions,
+                    &mut component.exports,
+                )?,
                 other => {
                     return Err(ComponentError::UnsupportedSection {
                         id: other,
@@ -802,15 +883,23 @@ impl Component {
     ) -> Result<ComponentInstance, ComponentError> {
         // Every import must be supplied, at the type the component declares for it.
         for function in &self.functions {
-            if let ComponentFunction::Import { name, ty } = function {
+            if let ComponentFunction::Import {
+                name,
+                func: declared,
+                types,
+            } = function
+            {
                 let supplied = imports
                     .functions
                     .get(name)
                     .ok_or_else(|| ComponentError::MissingImport { name: name.clone() })?;
-                let declared = self
-                    .func_type(*ty)
-                    .ok_or(ComponentError::NoSuchType { index: *ty })?;
-                if supplied.ty != *declared {
+                let same = match &supplied.types {
+                    Some(supplied_types) => {
+                        same_function_type(supplied_types, &supplied.ty, types, declared)
+                    }
+                    None => supplied.ty == *declared,
+                };
+                if !same {
                     return Err(ComponentError::ImportMismatch {
                         name: name.clone(),
                         message: format!(
@@ -861,31 +950,6 @@ impl Component {
                             instance: index,
                             message: error.to_string(),
                         })?;
-                    // A lowered import that names a memory is only meaningful to a consumer that shares that
-                    // memory, since its pointers are into it. Refuse one that does not.
-                    for argument in arguments {
-                        let Slot::Exports(bound) = &slots[argument.instance as usize] else {
-                            continue;
-                        };
-                        for export in bound {
-                            let Target::Host(host) = &export.target else {
-                                continue;
-                            };
-                            let Some(named) = host.memory.as_ref() else {
-                                continue;
-                            };
-                            let shares = runtime.own_memory().is_ok_and(|own| own.is_same(named));
-                            if !shares {
-                                return Err(ComponentError::Instantiate {
-                                    instance: index,
-                                    message: format!(
-                                        "the import {} names a memory this instance does not share",
-                                        export.name
-                                    ),
-                                });
-                            }
-                        }
-                    }
                     Slot::Runtime(Box::new(runtime))
                 }
                 CoreInstance::FromExports { exports } => {
@@ -1172,28 +1236,31 @@ impl Component {
             | ComponentTypeDef::Flags(_)
             | ComponentTypeDef::Tuple(_)
             | ComponentTypeDef::Result { .. }
-            | ComponentTypeDef::Variant { .. } => None,
+            | ComponentTypeDef::Variant { .. }
+            | ComponentTypeDef::Instance(_) => None,
         }
     }
 
     /// The host function a lowered import is, given the embedder's implementation.
     fn lowered(&self, function: u32, imports: &Imports) -> Result<LoweredHost, String> {
-        let ComponentFunction::Import { name, ty } = &self.functions[function as usize] else {
+        let ComponentFunction::Import {
+            name,
+            func: declared,
+            types,
+        } = &self.functions[function as usize]
+        else {
             return Err("a lowered function is not an import".to_owned());
         };
         let supplied = imports
             .functions
             .get(name)
             .ok_or_else(|| format!("the import {name} was not supplied"))?;
-        let declared = self
-            .func_type(*ty)
-            .ok_or_else(|| format!("the import {name} is not a function"))?;
         Ok(LoweredHost {
             name: name.clone(),
             closure: supplied.closure.clone(),
             params: declared.params.clone(),
             result: declared.result,
-            types: self.types.clone(),
+            types: types.as_ref().clone(),
             capabilities: imports.capabilities.clone(),
             memory: None,
             realloc: None,
@@ -1369,6 +1436,15 @@ impl LoweredHost {
 
     /// The bytes at `pointer`, from the calling instance's memory during a call, or from the named
     /// memory when no instance is running.
+    /// The memory a lowered call reads and writes while an instance is running: the memory the
+    /// lower names, found by its store address, when it names one, and the caller's own otherwise.
+    fn caller_memory<'a>(&self, caller: &'a mut dyn Caller) -> Option<&'a mut dyn GuestMemory> {
+        match self.memory.as_ref().and_then(MemoryView::store_address) {
+            Some(address) => caller.memory_at(address),
+            None => caller.memory(),
+        }
+    }
+
     fn read_guest(
         &self,
         caller: &mut Option<&mut dyn Caller>,
@@ -1377,7 +1453,9 @@ impl LoweredHost {
     ) -> Result<Vec<u8>, String> {
         let bytes = match caller.as_mut() {
             Some(caller) => {
-                let memory = caller.memory().ok_or_else(|| self.no_memory())?;
+                let memory = self
+                    .caller_memory(&mut **caller)
+                    .ok_or_else(|| self.no_memory())?;
                 GuestMemory::read(memory, u64::from(pointer), length)
             }
             None => {
@@ -1402,7 +1480,9 @@ impl LoweredHost {
     ) -> Result<(), String> {
         let written = match caller.as_mut() {
             Some(caller) => {
-                let memory = caller.memory().ok_or_else(|| self.no_memory())?;
+                let memory = self
+                    .caller_memory(&mut **caller)
+                    .ok_or_else(|| self.no_memory())?;
                 GuestMemory::write(memory, u64::from(pointer), bytes)
             }
             None => {
@@ -1962,15 +2042,16 @@ fn decode_aliases(
     instances: &[CoreInstance],
     functions: &mut Vec<CoreFunction>,
     memories: &mut Vec<CoreMemory>,
+    component_functions: &mut Vec<ComponentFunction>,
+    component_instances: &[InstanceDef],
 ) -> Result<(), ComponentError> {
     let count = reader.u32()?;
     for _ in 0..count {
         let at = reader.position();
-        if reader.byte()? != SORT_CORE_WRAPPER {
-            return Err(ComponentError::UnsupportedAlias {
-                what: "alias of a non-core sort",
-                offset: at,
-            });
+        let first = reader.byte()?;
+        if first != SORT_CORE_WRAPPER {
+            decode_component_alias(reader, first, at, component_functions, component_instances)?;
+            continue;
         }
         let sort = reader.byte()?;
         if sort != SORT_FUNC && sort != SORT_CORE_MEMORY {
@@ -2005,6 +2086,62 @@ fn decode_aliases(
         }
     }
     Ok(())
+}
+
+/// Decode a component alias of an export of an instance the component imports. A function alias
+/// defines a component function, named `instance#function` so the embedder can supply it. A type
+/// alias adds the type to the table, as a copy of the definition it names.
+fn decode_component_alias(
+    reader: &mut Reader<'_>,
+    sort: u8,
+    at: usize,
+    functions: &mut Vec<ComponentFunction>,
+    instances: &[InstanceDef],
+) -> Result<(), ComponentError> {
+    if reader.byte()? != 0x00 {
+        return Err(ComponentError::UnsupportedAlias {
+            what: "alias other than an export of an instance",
+            offset: at,
+        });
+    }
+    let instance = reader.u32()?;
+    let name = reader.name()?;
+    let source = instances
+        .get(instance as usize)
+        .ok_or(ComponentError::NoSuchInstance {
+            instance: instance as usize,
+        })?;
+    let export = source
+        .ty
+        .exports
+        .iter()
+        .find(|(exported, _)| *exported == name)
+        .map(|(_, export)| export.clone())
+        .ok_or(ComponentError::UnsupportedAlias {
+            what: "alias of an export the instance does not have",
+            offset: at,
+        })?;
+    match (sort, export) {
+        (COMPONENT_SORT_FUNC, InstanceExport::Func(index)) => {
+            let Some(ComponentTypeDef::Func(func)) = source.ty.types.get(index as usize) else {
+                return Err(ComponentError::NoSuchType { index });
+            };
+            functions.push(ComponentFunction::Import {
+                name: format!("{}#{}", source.name, name),
+                func: func.clone(),
+                types: Arc::new(source.ty.types.clone()),
+            });
+            Ok(())
+        }
+        (COMPONENT_SORT_TYPE, InstanceExport::Type(_)) => Err(ComponentError::UnsupportedAlias {
+            what: "alias of a type an instance exports",
+            offset: at,
+        }),
+        _ => Err(ComponentError::UnsupportedAlias {
+            what: "alias of an instance export of another kind",
+            offset: at,
+        }),
+    }
 }
 
 /// Decode a core-instance section's contents: a count, then each instance expression, which
@@ -2133,6 +2270,10 @@ fn value_type(
             what: "a function type used as a value",
             offset: at,
         }),
+        Some(ComponentTypeDef::Instance(_)) => Err(ComponentError::UnsupportedType {
+            what: "an instance type used as a value",
+            offset: at,
+        }),
         None => Err(ComponentError::NoSuchType { index }),
     }
 }
@@ -2147,6 +2288,18 @@ fn decode_types(
 ) -> Result<(), ComponentError> {
     let count = reader.u32()?;
     for _ in 0..count {
+        decode_definition(reader, types)?;
+    }
+    Ok(())
+}
+
+/// Decode one type definition: its tag, then its contents. An instance type declares its own
+/// types and exports, and its types join the component's table as the definitions it names.
+fn decode_definition(
+    reader: &mut Reader<'_>,
+    types: &mut Vec<ComponentTypeDef>,
+) -> Result<(), ComponentError> {
+    {
         let at = reader.position();
         match reader.byte()? {
             TYPE_FUNC => {
@@ -2280,6 +2433,76 @@ fn decode_types(
                 let element = value_type(reader, types)?;
                 types.push(ComponentTypeDef::List(element));
             }
+            TYPE_INSTANCE => {
+                // An instance type's indices are its own: its definitions form a table of their own,
+                // and the instance takes one entry of the component's table.
+                let mut local: Vec<ComponentTypeDef> = Vec::new();
+                let declaration_count = reader.u32()?;
+                let mut exports: Vec<(String, InstanceExport)> = Vec::new();
+                for _ in 0..declaration_count {
+                    let at_declaration = reader.position();
+                    match reader.byte()? {
+                        INSTANCE_DECL_TYPE => decode_definition(reader, &mut local)?,
+                        INSTANCE_DECL_EXPORT => {
+                            // The name carries a tag byte, as a top-level export's does.
+                            let at_name = reader.position();
+                            match reader.byte()? {
+                                0x00 | 0x01 => {}
+                                _ => return Err(ComponentError::Malformed { offset: at_name }),
+                            }
+                            let name = reader.name()?;
+                            let at_kind = reader.position();
+                            match reader.byte()? {
+                                EXTERN_FUNC => {
+                                    let function = reader.u32()?;
+                                    if !matches!(
+                                        local.get(function as usize),
+                                        Some(ComponentTypeDef::Func(_))
+                                    ) {
+                                        return Err(ComponentError::NoSuchType { index: function });
+                                    }
+                                    exports.push((name, InstanceExport::Func(function)));
+                                }
+                                COMPONENT_SORT_TYPE => {
+                                    // The bound is `eq` a type of this table; a resource is not supported.
+                                    let at_bound = reader.position();
+                                    if reader.byte()? != 0x00 {
+                                        return Err(ComponentError::UnsupportedType {
+                                            what: "a resource type in an instance type",
+                                            offset: at_bound,
+                                        });
+                                    }
+                                    let index = reader.u32()?;
+                                    let Some(definition) = local.get(index as usize).cloned()
+                                    else {
+                                        return Err(ComponentError::NoSuchType { index });
+                                    };
+                                    // An exported type takes the next type index of the instance, as a
+                                    // copy of the definition it names, so later indices count it.
+                                    local.push(definition);
+                                    let exported = (local.len() - 1) as u32;
+                                    exports.push((name, InstanceExport::Type(exported)));
+                                }
+                                _ => {
+                                    return Err(ComponentError::UnsupportedType {
+                                        what: "an instance export other than a function or a type",
+                                        offset: at_kind,
+                                    })
+                                }
+                            }
+                        }
+                        _ => return Err(ComponentError::UnsupportedType {
+                            what:
+                                "a declaration in an instance type other than a type or an export",
+                            offset: at_declaration,
+                        }),
+                    }
+                }
+                types.push(ComponentTypeDef::Instance(InstanceType {
+                    types: local,
+                    exports,
+                }));
+            }
             _ => {
                 return Err(ComponentError::UnsupportedType {
                     what: "a type other than a function type, a record, or a list",
@@ -2298,6 +2521,7 @@ fn decode_imports(
     reader: &mut Reader<'_>,
     types: &[ComponentTypeDef],
     functions: &mut Vec<ComponentFunction>,
+    instances: &mut Vec<InstanceDef>,
 ) -> Result<(), ComponentError> {
     let count = reader.u32()?;
     for _ in 0..count {
@@ -2314,23 +2538,45 @@ fn decode_imports(
         }
         let name = reader.name()?;
         let sort_at = reader.position();
-        if reader.byte()? != EXTERN_FUNC {
-            return Err(ComponentError::UnsupportedImport {
-                what: "import of a sort other than function",
-                offset: sort_at,
-            });
+        match reader.byte()? {
+            EXTERN_FUNC => {
+                let ty = reader.u32()?;
+                let Some(ComponentTypeDef::Func(func)) = types.get(ty as usize) else {
+                    return Err(ComponentError::NoSuchType { index: ty });
+                };
+                let func = func.clone();
+                let duplicate = functions.iter().any(|function| {
+                    matches!(function, ComponentFunction::Import { name: existing, .. } if *existing == name)
+                });
+                if duplicate {
+                    return Err(ComponentError::Malformed { offset: at });
+                }
+                functions.push(ComponentFunction::Import {
+                    name,
+                    func,
+                    types: Arc::new(types.to_vec()),
+                });
+            }
+            EXTERN_INSTANCE => {
+                let ty = reader.u32()?;
+                let Some(ComponentTypeDef::Instance(instance_type)) = types.get(ty as usize) else {
+                    return Err(ComponentError::NoSuchType { index: ty });
+                };
+                if instances.iter().any(|instance| instance.name == name) {
+                    return Err(ComponentError::Malformed { offset: at });
+                }
+                instances.push(InstanceDef {
+                    name,
+                    ty: instance_type.clone(),
+                });
+            }
+            _ => {
+                return Err(ComponentError::UnsupportedImport {
+                    what: "import of a sort other than function or instance",
+                    offset: sort_at,
+                })
+            }
         }
-        let ty = reader.u32()?;
-        let Some(ComponentTypeDef::Func(_)) = types.get(ty as usize) else {
-            return Err(ComponentError::NoSuchType { index: ty });
-        };
-        let duplicate = functions.iter().any(|function| {
-            matches!(function, ComponentFunction::Import { name: existing, .. } if *existing == name)
-        });
-        if duplicate {
-            return Err(ComponentError::Malformed { offset: at });
-        }
-        functions.push(ComponentFunction::Import { name, ty });
     }
     Ok(())
 }
@@ -2446,10 +2692,12 @@ fn decode_canon(
                         offset: at,
                     })
                 }
-                Some(ComponentFunction::Import { ty, .. }) => {
-                    let Some(ComponentTypeDef::Func(func)) = types.get(*ty as usize) else {
-                        return Err(ComponentError::NoSuchType { index: *ty });
-                    };
+                Some(ComponentFunction::Import {
+                    func,
+                    types: import_types,
+                    ..
+                }) => {
+                    let types: &[ComponentTypeDef] = import_types;
                     if flat_param_count(func, types) > MAX_FLAT_PARAMS {
                         return Err(ComponentError::UnsupportedCanon {
                             what: "lowering a function with more than 16 flat parameters",
@@ -2669,7 +2917,7 @@ fn decode_canon(
 /// function with no extern type.
 fn decode_exports(
     reader: &mut Reader<'_>,
-    functions: &[ComponentFunction],
+    functions: &mut Vec<ComponentFunction>,
     exports: &mut Vec<ComponentExport>,
 ) -> Result<(), ComponentError> {
     let count = reader.u32()?;
@@ -2719,6 +2967,10 @@ fn decode_exports(
             return Err(ComponentError::Malformed { offset: at });
         }
         exports.push(ComponentExport { name, function });
+        // An export also takes the next function index of the component, as an alias of the function
+        // it exports, so later declarations count it.
+        let alias = functions[function as usize].clone();
+        functions.push(alias);
     }
     Ok(())
 }

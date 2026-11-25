@@ -322,6 +322,14 @@ pub trait Caller {
     /// The calling instance's memory, if it has one.
     fn memory(&mut self) -> Option<&mut dyn GuestMemory>;
 
+    /// The memory at store address `address`, which may belong to any instance on the store and not
+    /// only to the caller. A host function reads the memory a lowered call names through this, since
+    /// that memory may belong to an instance further up the call stack.
+    fn memory_at(&mut self, address: u32) -> Option<&mut dyn GuestMemory> {
+        let _ = address;
+        None
+    }
+
     /// The store address of the calling instance's function export named `name`, if it has one.
     fn export_function(&self, name: &str) -> Option<u32>;
 
@@ -2711,6 +2719,11 @@ impl Caller for MicroCaller<'_> {
     fn memory(&mut self) -> Option<&mut dyn GuestMemory> {
         let instance = self.instance?;
         let address = *self.store.instance(instance).ok()?.memory_addrs.first()?;
+        let memory = self.store.memory_mut(address).ok()?;
+        Some(memory as &mut dyn GuestMemory)
+    }
+
+    fn memory_at(&mut self, address: u32) -> Option<&mut dyn GuestMemory> {
         let memory = self.store.memory_mut(address).ok()?;
         Some(memory as &mut dyn GuestMemory)
     }

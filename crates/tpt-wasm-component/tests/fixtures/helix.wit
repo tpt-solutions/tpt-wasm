@@ -1,0 +1,128 @@
+// Helix Runtime WIT interfaces.
+//
+// These are the canonical capability interfaces a guest WASM module consumes
+// from the Helix Runtime host. They are the source of truth for the generated
+// host (`Guest` trait) and guest (call shim) bindings produced by
+// `wit_bindgen`.
+//
+// Package `helix:runtime@0.1.0` generates Rust modules under
+// `helix::runtime::{network, storage, dom}`.
+
+package helix:runtime@0.1.0;
+
+// ---------------------------------------------------------------------------
+// network
+// ---------------------------------------------------------------------------
+
+interface network {
+    record request {
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    // Issues a request and resolves to the response, or an error string
+    // describing why the (capability-scoped) request was rejected / failed.
+    fetch: func(req: request) -> result<response, string>;
+}
+
+// ---------------------------------------------------------------------------
+// storage
+// ---------------------------------------------------------------------------
+
+interface storage {
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>) -> result<_, string>;
+    delete: func(key: string) -> result<_, string>;
+}
+
+// ---------------------------------------------------------------------------
+// dom
+// ---------------------------------------------------------------------------
+
+interface dom {
+    record element-id {
+        id: u64,
+    }
+
+    create-element: func(tag: string) -> element-id;
+    set-text: func(el: element-id, text: string);
+    set-attribute: func(el: element-id, name: string, value: string);
+    append-child: func(parent: element-id, child: element-id);
+
+    // Registers a previously-declared click handler (identified by an opaque
+    // `handler-id`) against an element. The runtime invokes the handler when
+    // the element is activated. Callbacks cross the component boundary as
+    // handles/ids rather than first-class function values.
+    on-click: func(el: element-id, handler-id: u64);
+
+    // Registers a handler for a named DOM event such as `submit`, `change`,
+    // `input`, `play`, `pause`, or `ended`. The event name is lowercase ASCII
+    // letters, up to 32 bytes. Like `on-click`, the callback is an opaque id.
+    on-event: func(el: element-id, event: string, handler-id: u64);
+}
+
+// ---------------------------------------------------------------------------
+// media
+// ---------------------------------------------------------------------------
+
+interface media {
+    record player-handle {
+        handle: u64,
+    }
+
+    record video-config {
+        codec: string,  // "h264", "vp9", "av1"
+        width: u32,
+        height: u32,
+        bitrate: u32,
+    }
+
+    // Creates a media player for the given configuration. Fails with an error
+    // string when the module lacks a `media` capability covering the requested
+    // resolution, or the configuration cannot be satisfied.
+    create-player: func(config: video-config) -> result<player-handle, string>;
+    play: func(handle: player-handle);
+    pause: func(handle: player-handle);
+    seek: func(handle: player-handle, time-ms: u64);
+}
+
+// ---------------------------------------------------------------------------
+// worlds
+// ---------------------------------------------------------------------------
+
+// The host (Helix Runtime) *exports* these capability interfaces: a guest
+// component imports them and calls them. `wit_bindgen` generates a `Guest`
+// trait per interface (under `host::exports`) that the native host implements.
+// Named `helix-host` to match the `world:` selector in `crates/tpt-helix-wit`.
+world helix-host {
+    export network;
+    export storage;
+    export dom;
+    export media;
+}
+
+// A guest module *imports* the same interfaces. `wit_bindgen` generates the
+// call shims (`helix::runtime::network::fetch`, etc.) a guest compiles against.
+// It also *exports* a `run` entry point that the host invokes after
+// instantiation to drive the module (see the smoke-test guest in
+// `crates/tpt-helix-guest-example` and the wasmtime host in `crates/tpt-helix-runtime`).
+// Named `helix-guest` (not `helix`) to avoid colliding with the `helix`
+// package namespace in wasmtime's codegen.
+world helix-guest {
+    import network;
+    import storage;
+    import dom;
+    import media;
+    export run: func();
+    // Called by the host once per handler that a DOM event triggers. The argument
+    // is the handler id the guest registered with `on-click` or `on-event`.
+    export dispatch: func(handler-id: u64);
+}

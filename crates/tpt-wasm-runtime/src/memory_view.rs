@@ -145,6 +145,14 @@ impl Instance {
 impl MemoryView {
     /// Whether two views are the same memory: the same address in the same store, or the same compiled
     /// memory.
+    /// The store address of the memory this view names, if it is a memory of the interpreter's store.
+    pub fn store_address(&self) -> Option<u32> {
+        match &self.target {
+            Target::Store { address, .. } => Some(*address),
+            _ => None,
+        }
+    }
+
     pub fn is_same(&self, other: &MemoryView) -> bool {
         match (&self.target, &other.target) {
             (

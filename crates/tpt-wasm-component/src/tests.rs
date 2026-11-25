@@ -895,9 +895,9 @@ fn an_import_with_attributes_or_another_sort_is_refused() {
         Component::decode(&with(&with_attributes)),
         Err(ComponentError::UnsupportedImport { .. })
     ));
-    let instance_sort = section(SECTION_IMPORT, &[1, 0x00, 3, b'a', b'd', b'd', 0x05, 0]);
+    let value_sort = section(SECTION_IMPORT, &[1, 0x00, 3, b'a', b'd', b'd', 0x02, 0]);
     assert!(matches!(
-        Component::decode(&with(&instance_sort)),
+        Component::decode(&with(&value_sort)),
         Err(ComponentError::UnsupportedImport { .. })
     ));
 }
@@ -951,7 +951,8 @@ fn lifting_a_lowered_function_is_refused() {
 fn a_lowered_import_calls_the_embedder_function() {
     let bytes = host_component();
     let component = Component::decode(&bytes).expect("decodes");
-    assert_eq!(component.component_functions().len(), 2);
+    // The import, the lifted function, and the index the export of the lifted function takes.
+    assert_eq!(component.component_functions().len(), 3);
     let mut imports = granted("add").0;
     imports.define_function("add", add_type(), |args| match args {
         [ComponentValue::S32(a), ComponentValue::S32(b)] => Ok(vec![ComponentValue::S32(a + b)]),
@@ -4270,7 +4271,7 @@ fn consumer_without_memory() -> Vec<u8> {
 }
 
 #[test]
-fn a_consumer_that_does_not_share_the_named_memory_is_refused_at_instantiation() {
+fn a_consumer_that_does_not_share_the_named_memory_reads_it_by_address() {
     let types = [
         2,
         TYPE_FUNC,
@@ -4295,16 +4296,12 @@ fn a_consumer_that_does_not_share_the_named_memory_is_refused_at_instantiation()
         },
         |_| Ok(vec![ComponentValue::U32(0)]),
     );
-    let refused = Component::decode(&bytes)
+    // The lowered import reads the memory the lower names by its store address, so the consumer
+    // need not own that memory.
+    let instantiated = Component::decode(&bytes)
         .expect("decodes")
         .instantiate_with(&engine(), &imports);
-    assert!(
-        matches!(
-            &refused,
-            Err(ComponentError::Instantiate { message, .. }) if message.contains("does not share")
-        ),
-        "the consumer's pointers would not address the named memory: {refused:?}"
-    );
+    assert!(instantiated.is_ok(), "{instantiated:?}");
 }
 
 use crate::canon;
