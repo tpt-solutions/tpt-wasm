@@ -360,8 +360,8 @@ pub enum ComponentType {
 pub struct RecordField {
     /// The field's label.
     pub name: String,
-    /// The field's type. A record field is a scalar, not a string or another record.
-    pub ty: Scalar,
+    /// The field's type, which may be any component type.
+    pub ty: ComponentType,
 }
 
 /// One definition of the component's type index space.
@@ -371,23 +371,23 @@ pub enum ComponentTypeDef {
     Func(ComponentFuncType),
     /// A record type, with its fields in order.
     Record(Vec<RecordField>),
-    /// A list type, whose elements are of one scalar type.
-    List(Scalar),
-    /// An option type, whose payload is of one scalar type.
-    Option(Scalar),
+    /// A list type, whose elements are of one type.
+    List(ComponentType),
+    /// An option type, whose payload is of one type.
+    Option(ComponentType),
     /// An enum type: its case labels, in order. A value is the index of one of them.
     Enum(Vec<String>),
-    /// A tuple of scalars, in order.
-    Tuple(Vec<Scalar>),
+    /// A tuple, whose items are of any types, in order.
+    Tuple(Vec<ComponentType>),
     /// A result: the payload types of its ok and error cases, each optional.
     Result {
-        ok: Option<Scalar>,
-        err: Option<Scalar>,
+        ok: Option<ComponentType>,
+        err: Option<ComponentType>,
     },
     /// A variant: each case's label and the scalar its payload holds, if it has one. Every
     /// payload shares one flat type.
     Variant {
-        cases: Vec<(String, Option<Scalar>)>,
+        cases: Vec<(String, Option<ComponentType>)>,
     },
     /// A set of flags: its labels, at most 32, each a bit.
     Flags(Vec<String>),
@@ -402,64 +402,20 @@ pub struct ComponentFuncType {
     pub result: Option<ComponentType>,
 }
 
-/// The resolved shape of one value type. A type's index is not part of its shape: two types are
-/// the same when their shapes are, whatever order their definitions sit in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Shape {
-    Scalar(Scalar),
-    Compound(ComponentTypeDef),
-}
-
-/// The shape of `ty` in the type table `types`. A type whose index names a definition of another
-/// kind, or past the end of the table, has no shape.
-fn shape_of(ty: ComponentType, types: &[ComponentTypeDef]) -> Option<Shape> {
-    let index = match ty {
-        ComponentType::Scalar(scalar) => return Some(Shape::Scalar(scalar)),
-        ComponentType::Record(i)
-        | ComponentType::List(i)
-        | ComponentType::Option(i)
-        | ComponentType::Enum(i)
-        | ComponentType::Flags(i)
-        | ComponentType::Tuple(i)
-        | ComponentType::Result(i)
-        | ComponentType::Variant(i) => i,
-    };
-    let definition = types.get(index as usize)?;
-    let same_kind = matches!(
-        (ty, definition),
-        (ComponentType::Record(_), ComponentTypeDef::Record(_))
-            | (ComponentType::List(_), ComponentTypeDef::List(_))
-            | (ComponentType::Option(_), ComponentTypeDef::Option(_))
-            | (ComponentType::Enum(_), ComponentTypeDef::Enum(_))
-            | (ComponentType::Flags(_), ComponentTypeDef::Flags(_))
-            | (ComponentType::Tuple(_), ComponentTypeDef::Tuple(_))
-            | (ComponentType::Result(_), ComponentTypeDef::Result { .. })
-            | (ComponentType::Variant(_), ComponentTypeDef::Variant { .. })
-    );
-    same_kind.then(|| Shape::Compound(definition.clone()))
-}
-
-/// Whether two function types are the same, each judged in its own type table. The comparison is
-/// structural: a record's field names and order, an enum's and flags' labels, and every case of a
-/// variant or result must match, but the indices that name the definitions may differ. A type
-/// that names no valid definition is never the same as any other.
 pub fn same_function_type(
     a_types: &[ComponentTypeDef],
     a: &ComponentFuncType,
     b_types: &[ComponentTypeDef],
     b: &ComponentFuncType,
 ) -> bool {
-    let same = |x: ComponentType, y: ComponentType| {
-        matches!(
-            (shape_of(x, a_types), shape_of(y, b_types)),
-            (Some(p), Some(q)) if p == q
-        )
-    };
     a.params.len() == b.params.len()
-        && a.params.iter().zip(&b.params).all(|(x, y)| same(*x, *y))
+        && a.params
+            .iter()
+            .zip(&b.params)
+            .all(|(x, y)| canon::same_type(a_types, x, b_types, y))
         && match (a.result, b.result) {
             (None, None) => true,
-            (Some(x), Some(y)) => same(x, y),
+            (Some(x), Some(y)) => canon::same_type(a_types, &x, b_types, &y),
             _ => false,
         }
 }
@@ -537,19 +493,6 @@ pub enum StringEncoding {
     Utf16,
     /// Latin-1 where the string fits it, and UTF-16 where it does not, marked by the length's tag.
     Latin1Utf16,
-}
-
-/// How a string read from memory is decoded, which the encoding and the length tag select.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StringDecoding {
-    Utf8,
-    Utf16,
-    Latin1,
-}
-
-/// The little-endian UTF-16 bytes of `text`, two bytes a code unit.
-fn utf16_bytes(text: &str) -> Vec<u8> {
-    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
 /// A component function: one entry of the component function index space.
@@ -1245,15 +1188,6 @@ impl Component {
         let declared = self
             .func_type(*ty)
             .ok_or_else(|| format!("the import {name} is not a function"))?;
-        // A result that flattens to more than one value, and is not a string or list, is returned
-        // through memory in a form this host does not write.
-        if let Some(result) = &declared.result {
-            if !(holds_string(result) || holds_list(result))
-                && flat_of(result, &self.types).len() > MAX_FLAT_RESULTS
-            {
-                return Err(format!("the import {name} returns a value through memory"));
-            }
-        }
         Ok(LoweredHost {
             name: name.clone(),
             closure: supplied.closure.clone(),
@@ -1267,283 +1201,13 @@ impl Component {
     }
 }
 
-/// The size and alignment a component type takes in memory, by the canonical ABI. A discriminant
-/// is one byte for up to 256 cases, two bytes up to 65536, and four beyond that.
-fn size_and_align_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> (usize, usize) {
-    match ty {
-        ComponentType::Scalar(scalar) => scalar.size_and_align(),
-        ComponentType::List(_) => (8, 4),
-        ComponentType::Record(index) => match types.get(*index as usize) {
-            Some(ComponentTypeDef::Record(fields)) => {
-                let (_, size, align) = record_layout(fields);
-                (size, align)
-            }
-            _ => (0, 1),
-        },
-        ComponentType::Tuple(index) => match types.get(*index as usize) {
-            Some(ComponentTypeDef::Tuple(scalars)) => {
-                let fields = tuple_fields(scalars);
-                let (_, size, align) = record_layout(&fields);
-                (size, align)
-            }
-            _ => (0, 1),
-        },
-        ComponentType::Enum(index) => match types.get(*index as usize) {
-            Some(ComponentTypeDef::Enum(labels)) => {
-                let size = discriminant_size(labels.len());
-                (size, size)
-            }
-            _ => (1, 1),
-        },
-        ComponentType::Flags(index) => match types.get(*index as usize) {
-            Some(ComponentTypeDef::Flags(labels)) => {
-                let size = match labels.len() {
-                    0..=8 => 1,
-                    9..=16 => 2,
-                    _ => 4,
-                };
-                (size, size)
-            }
-            _ => (1, 1),
-        },
-        ComponentType::Option(index) => match types.get(*index as usize) {
-            Some(ComponentTypeDef::Option(payload)) => case_layout(&[Some(*payload)]),
-            _ => (1, 1),
-        },
-        ComponentType::Result(index) => match types.get(*index as usize) {
-            Some(ComponentTypeDef::Result { ok, err }) => case_layout(&[*ok, *err]),
-            _ => (1, 1),
-        },
-        ComponentType::Variant(index) => match types.get(*index as usize) {
-            Some(ComponentTypeDef::Variant { cases }) => {
-                let payloads: Vec<Option<Scalar>> = cases.iter().map(|(_, p)| *p).collect();
-                case_layout(&payloads)
-            }
-            _ => (1, 1),
-        },
-    }
-}
-
-/// The size and alignment of a value with cases, each holding an optional scalar. The case
-/// index is one byte; the payload follows at the offset its widest case's alignment allows.
-fn case_layout(payloads: &[Option<Scalar>]) -> (usize, usize) {
-    let align = payloads
-        .iter()
-        .flatten()
-        .map(|payload| payload.size_and_align().1)
-        .fold(1, usize::max);
-    let payload_size = payloads
-        .iter()
-        .flatten()
-        .map(|payload| payload.size_and_align().0)
-        .fold(0, usize::max);
-    (align_to(align_to(1, align) + payload_size, align), align)
-}
-
-/// The number of bytes a discriminant of `count` cases takes.
-fn discriminant_size(count: usize) -> usize {
-    match count {
-        0..=256 => 1,
-        257..=65536 => 2,
-        _ => 4,
-    }
-}
-
-/// The fields of a tuple of scalars, unlabelled, for laying it out as a record is.
-fn tuple_fields(scalars: &[Scalar]) -> Vec<RecordField> {
-    scalars
-        .iter()
-        .map(|ty| RecordField {
-            name: String::new(),
-            ty: *ty,
-        })
-        .collect()
-}
-
-/// The offsets of a list of values laid out one after another, and the size and alignment of
-/// the whole, by the canonical record rules.
-fn layout_of(types: &[ComponentType], defined: &[ComponentTypeDef]) -> (Vec<usize>, usize, usize) {
-    let mut offsets = Vec::with_capacity(types.len());
-    let mut size = 0usize;
-    let mut align = 1usize;
-    for ty in types {
-        let (field_size, field_align) = size_and_align_of(ty, defined);
-        align = align.max(field_align);
-        let offset = align_to(size, field_align);
-        offsets.push(offset);
-        size = offset + field_size;
-    }
-    (offsets, align_to(size, align), align)
-}
-
-/// Write `bytes` into `buffer` at `at`, refusing a write past its end.
-fn write_at(buffer: &mut [u8], at: usize, bytes: &[u8]) -> Result<(), String> {
-    let end = at
-        .checked_add(bytes.len())
-        .filter(|end| *end <= buffer.len())
-        .ok_or_else(|| "a value is written past the end of its parameters".to_owned())?;
-    buffer[at..end].copy_from_slice(bytes);
-    Ok(())
-}
-
-/// Store a value of type `ty` into `buffer` at `at`, in the canonical layout. Strings and lists
-/// are refused, since their contents would need copying into memory of their own.
-fn store(
-    value: &ComponentValue,
-    ty: &ComponentType,
-    types: &[ComponentTypeDef],
-    buffer: &mut [u8],
-    at: usize,
-) -> Result<(), String> {
-    let mismatch = || "a value does not match its type".to_owned();
-    match (value, ty) {
-        (ComponentValue::String(_) | ComponentValue::List(_), _) => {
-            Err("a string or list among indirect parameters is not stored".to_owned())
-        }
-        (value, ComponentType::Scalar(scalar)) => {
-            let bytes = scalar_bytes(value, *scalar).ok_or_else(mismatch)?;
-            write_at(buffer, at, &bytes)
-        }
-        (ComponentValue::Record(fields), ComponentType::Record(index)) => {
-            let Some(ComponentTypeDef::Record(defined)) = types.get(*index as usize) else {
-                return Err(mismatch());
-            };
-            let (offsets, _, _) = record_layout(defined);
-            if fields.len() != defined.len() {
-                return Err(mismatch());
-            }
-            for (((_, value), field), offset) in fields.iter().zip(defined).zip(offsets) {
-                store(
-                    value,
-                    &ComponentType::Scalar(field.ty),
-                    types,
-                    buffer,
-                    at + offset,
-                )?;
-            }
-            Ok(())
-        }
-        (ComponentValue::Tuple(items), ComponentType::Tuple(index)) => {
-            let Some(ComponentTypeDef::Tuple(scalars)) = types.get(*index as usize) else {
-                return Err(mismatch());
-            };
-            let (offsets, _, _) = record_layout(&tuple_fields(scalars));
-            if items.len() != scalars.len() {
-                return Err(mismatch());
-            }
-            for ((item, scalar), offset) in items.iter().zip(scalars).zip(offsets) {
-                store(
-                    item,
-                    &ComponentType::Scalar(*scalar),
-                    types,
-                    buffer,
-                    at + offset,
-                )?;
-            }
-            Ok(())
-        }
-        (ComponentValue::Enum(label), ComponentType::Enum(index)) => {
-            let Some(ComponentTypeDef::Enum(labels)) = types.get(*index as usize) else {
-                return Err(mismatch());
-            };
-            let case = labels
-                .iter()
-                .position(|candidate| candidate == label)
-                .ok_or_else(mismatch)?;
-            let size = discriminant_size(labels.len());
-            write_at(buffer, at, &(case as u32).to_le_bytes()[..size])
-        }
-        (ComponentValue::Flags(set), ComponentType::Flags(index)) => {
-            let Some(ComponentTypeDef::Flags(defined)) = types.get(*index as usize) else {
-                return Err(mismatch());
-            };
-            let mut bits: u32 = 0;
-            for label in set {
-                let position = defined
-                    .iter()
-                    .position(|candidate| candidate == label)
-                    .ok_or_else(mismatch)?;
-                bits |= 1u32 << position;
-            }
-            let (size, _) = size_and_align_of(ty, types);
-            write_at(buffer, at, &bits.to_le_bytes()[..size])
-        }
-        (ComponentValue::Option(payload), ComponentType::Option(index)) => {
-            let Some(ComponentTypeDef::Option(element)) = types.get(*index as usize) else {
-                return Err(mismatch());
-            };
-            let (_, align) = case_layout(&[Some(*element)]);
-            match payload.as_deref() {
-                None => write_at(buffer, at, &[0u8]),
-                Some(value) => {
-                    write_at(buffer, at, &[1u8])?;
-                    store(
-                        value,
-                        &ComponentType::Scalar(*element),
-                        types,
-                        buffer,
-                        at + align_to(1, align),
-                    )
-                }
-            }
-        }
-        (ComponentValue::Result(outcome), ComponentType::Result(index)) => {
-            let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) else {
-                return Err(mismatch());
-            };
-            let (discriminant, case_type, payload) = match outcome {
-                Ok(payload) => (0u8, *ok, payload.as_deref()),
-                Err(payload) => (1u8, *err, payload.as_deref()),
-            };
-            // The payload sits at the alignment of the widest payload of either case.
-            let (_, align) = case_layout(&[*ok, *err]);
-            write_at(buffer, at, &[discriminant])?;
-            match (case_type, payload) {
-                (None, None) => Ok(()),
-                (Some(scalar), Some(value)) => store(
-                    value,
-                    &ComponentType::Scalar(scalar),
-                    types,
-                    buffer,
-                    at + align_to(1, align),
-                ),
-                _ => Err(mismatch()),
-            }
-        }
-        (ComponentValue::Variant(label, payload), ComponentType::Variant(index)) => {
-            let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) else {
-                return Err(mismatch());
-            };
-            let case = cases
-                .iter()
-                .position(|(name, _)| name == label)
-                .ok_or_else(mismatch)?;
-            let payloads: Vec<Option<Scalar>> = cases.iter().map(|(_, p)| *p).collect();
-            let (_, align) = case_layout(&payloads);
-            write_at(buffer, at, &[case as u8])?;
-            match (cases[case].1, payload.as_deref()) {
-                (None, None) => Ok(()),
-                (Some(scalar), Some(value)) => store(
-                    value,
-                    &ComponentType::Scalar(scalar),
-                    types,
-                    buffer,
-                    at + align_to(1, align),
-                ),
-                _ => Err(mismatch()),
-            }
-        }
-        _ => Err(mismatch()),
-    }
-}
-
 /// The core signature a post-return must have: it takes the flat values of the lifted result, or
 /// one pointer when they do not fit, and returns nothing.
 fn post_return_signature(func: &ComponentFuncType, types: &[ComponentTypeDef]) -> FunctionType {
     let params = match func.result {
         None => Vec::new(),
         Some(ty) => {
-            let flat = flat_of(&ty, types);
+            let flat = canon::flat(&ty, types);
             if flat.len() > MAX_FLAT_RESULTS {
                 vec![ValueType::I32]
             } else {
@@ -1573,12 +1237,12 @@ fn flat_signature(func: &ComponentFuncType, types: &[ComponentTypeDef]) -> Funct
     let params = func
         .params
         .iter()
-        .flat_map(|ty| flat_of(ty, types))
+        .flat_map(|ty| canon::flat(ty, types))
         .collect();
     let results = match func.result {
         None => Vec::new(),
         Some(ty) => {
-            let flat = flat_of(&ty, types);
+            let flat = canon::flat(&ty, types);
             if flat.len() > MAX_FLAT_RESULTS {
                 vec![ValueType::I32]
             } else {
@@ -1590,86 +1254,6 @@ fn flat_signature(func: &ComponentFuncType, types: &[ComponentTypeDef]) -> Funct
         params: ResultType(params),
         results: ResultType(results),
     }
-}
-
-/// The core values a component type flattens to: a record flattens to its fields in order.
-fn flat_of(ty: &ComponentType, types: &[ComponentTypeDef]) -> Vec<ValueType> {
-    match ty {
-        ComponentType::Scalar(scalar) => scalar.flat_params(),
-        ComponentType::Record(index) => match types.get(*index as usize) {
-            Some(ComponentTypeDef::Record(fields)) => fields
-                .iter()
-                .flat_map(|field| field.ty.flat_params())
-                .collect(),
-            _ => Vec::new(),
-        },
-        // A list is its pointer and its length, as a string is.
-        ComponentType::List(_) => vec![ValueType::I32, ValueType::I32],
-        ComponentType::Tuple(index) => match types.get(*index as usize) {
-            Some(ComponentTypeDef::Tuple(scalars)) => scalars
-                .iter()
-                .flat_map(|scalar| scalar.flat_params())
-                .collect(),
-            _ => Vec::new(),
-        },
-        // An enum is its case index.
-        ComponentType::Enum(_) | ComponentType::Flags(_) => vec![ValueType::I32],
-        // An option is its discriminant, then its payload's flat values.
-        ComponentType::Option(index) => {
-            let mut flat = vec![ValueType::I32];
-            if let Some(ComponentTypeDef::Option(payload)) = types.get(*index as usize) {
-                flat.extend(payload.flat_params());
-            }
-            flat
-        }
-        // A result is its discriminant, then the joined flat value of its payloads.
-        ComponentType::Result(index) => {
-            let mut flat = vec![ValueType::I32];
-            if let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) {
-                if let Some(joined) = joined_flat([*ok, *err].into_iter().flatten()) {
-                    flat.push(joined);
-                }
-            }
-            flat
-        }
-        // A variant is its case index, then the one flat value every payload shares.
-        ComponentType::Variant(index) => {
-            let mut flat = vec![ValueType::I32];
-            if let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) {
-                if let Some(joined) = joined_flat(cases.iter().filter_map(|(_, p)| *p)) {
-                    flat.push(joined);
-                }
-            }
-            flat
-        }
-    }
-}
-
-/// Whether a component type holds a string, at the top level.
-fn holds_string(ty: &ComponentType) -> bool {
-    matches!(ty, ComponentType::Scalar(Scalar::String))
-}
-
-/// Whether a component type is a list, at the top level.
-fn holds_list(ty: &ComponentType) -> bool {
-    matches!(ty, ComponentType::List(_))
-}
-
-/// The offsets of a record's fields in memory, and the record's size and alignment, by the
-/// canonical ABI: each field is placed at the next offset its alignment allows, and the
-/// record's size is rounded up to its alignment.
-fn record_layout(fields: &[RecordField]) -> (Vec<usize>, usize, usize) {
-    let mut offsets = Vec::with_capacity(fields.len());
-    let mut size = 0usize;
-    let mut align = 1usize;
-    for field in fields {
-        let (field_size, field_align) = field.ty.size_and_align();
-        align = align.max(field_align);
-        let offset = align_to(size, field_align);
-        offsets.push(offset);
-        size = offset + field_size;
-    }
-    (offsets, align_to(size, align), align)
 }
 
 /// `value` rounded up to a multiple of `align`.
@@ -1775,21 +1359,6 @@ struct LoweredHost {
     realloc: Option<u32>,
 }
 
-/// The two core words a string or a list takes as an argument: its pointer and its length.
-fn two_words(values: &mut std::slice::Iter<'_, Value>) -> Result<(u32, u32), String> {
-    let mut word = || match values.next() {
-        Some(Value::I32(word)) => Ok(*word as u32),
-        _ => Err("a string or list argument is not two i32 values".to_owned()),
-    };
-    Ok((word()?, word()?))
-}
-
-/// Whether a result is returned through memory: a string or a list is, as two words the caller
-/// names a pointer for, rather than as flat values.
-fn returns_through_memory(ty: &ComponentType) -> bool {
-    holds_string(ty) || holds_list(ty)
-}
-
 impl LoweredHost {
     fn no_memory(&self) -> String {
         format!(
@@ -1848,130 +1417,10 @@ impl LoweredHost {
         }
     }
 
-    fn read_text(
-        &self,
-        caller: &mut Option<&mut dyn Caller>,
-        pointer: u32,
-        length: u32,
-    ) -> Result<String, String> {
-        if u64::from(length) > MAX_STRING_BYTE_LENGTH as u64 {
-            return Err("a string argument is too long for the canonical ABI".to_owned());
-        }
-        let bytes = self.read_guest(caller, pointer, u64::from(length))?;
-        String::from_utf8(bytes).map_err(|_| "a string argument is not valid UTF-8".to_owned())
-    }
-
-    /// A list of scalars, read element by element.
-    fn read_list(
-        &self,
-        caller: &mut Option<&mut dyn Caller>,
-        index: u32,
-        pointer: u32,
-        count: u32,
-    ) -> Result<Vec<ComponentValue>, String> {
-        let Some(ComponentTypeDef::List(scalar)) = self.types.get(index as usize) else {
-            return Err("the list is not defined".to_owned());
-        };
-        let (size, align) = scalar.size_and_align();
-        if !(pointer as usize).is_multiple_of(align) {
-            return Err("a list argument is not aligned for its element".to_owned());
-        }
-        let length = u64::from(count) * size as u64;
-        if length > MAX_STRING_BYTE_LENGTH as u64 {
-            return Err("a list argument is too long for the canonical ABI".to_owned());
-        }
-        let bytes = self.read_guest(caller, pointer, length)?;
-        bytes
-            .chunks_exact(size)
-            .map(|element| scalar_from_bytes(*scalar, element))
-            .collect()
-    }
-
-    /// Allocate `size` bytes aligned to `align` in the calling instance, through its `realloc`. A
-    /// string or list result cannot be lowered without a calling instance, so this fails without one.
-    fn allocate(
-        &self,
-        caller: &mut Option<&mut dyn Caller>,
-        size: u32,
-        align: u32,
-    ) -> Result<u32, String> {
-        let realloc = self.realloc.ok_or_else(|| {
-            format!(
-                "the import {} returns a string or a list, so its lower needs a realloc option",
-                self.name
-            )
-        })?;
-        let caller = caller.as_mut().ok_or_else(|| {
-            format!(
-                "the import {} returns a string or a list, which needs a calling instance",
-                self.name
-            )
-        })?;
-        let results = caller.call(
-            realloc,
-            vec![
-                Value::I32(0),
-                Value::I32(0),
-                Value::I32(align as i32),
-                Value::I32(size as i32),
-            ],
-        )?;
-        match results.as_slice() {
-            [Value::I32(pointer)] => Ok(*pointer as u32),
-            _ => Err("realloc did not return one i32".to_owned()),
-        }
-    }
-
-    /// Lower a result to its flat values. A string or list is written into memory allocated for it,
-    /// and lowers to its pointer and length.
-    fn lower_result(
-        &self,
-        caller: &mut Option<&mut dyn Caller>,
-        value: &ComponentValue,
-        ty: &ComponentType,
-    ) -> Result<Vec<Value>, String> {
-        match (value, ty) {
-            (ComponentValue::String(text), _) => {
-                let bytes = text.as_bytes();
-                let pointer = self.allocate(caller, bytes.len() as u32, 1)?;
-                self.write_guest(caller, pointer, bytes)?;
-                Ok(vec![
-                    Value::I32(pointer as i32),
-                    Value::I32(bytes.len() as i32),
-                ])
-            }
-            (ComponentValue::List(items), ComponentType::List(index)) => {
-                let Some(ComponentTypeDef::List(scalar)) = self.types.get(*index as usize) else {
-                    return Err("the list is not defined".to_owned());
-                };
-                let (size, align) = scalar.size_and_align();
-                let mut bytes = vec![0u8; items.len() * size];
-                for (position, item) in items.iter().enumerate() {
-                    store(
-                        item,
-                        &ComponentType::Scalar(*scalar),
-                        &self.types,
-                        &mut bytes,
-                        position * size,
-                    )?;
-                }
-                let pointer = self.allocate(caller, bytes.len() as u32, align as u32)?;
-                self.write_guest(caller, pointer, &bytes)?;
-                Ok(vec![
-                    Value::I32(pointer as i32),
-                    Value::I32(items.len() as i32),
-                ])
-            }
-            _ => {
-                let mut lowered = Vec::new();
-                lower_flats(value, ty, &self.types, &mut lowered)?;
-                Ok(lowered)
-            }
-        }
-    }
-
     /// Lift the core values into the parameters, run the embedder's function, and lower its result.
-    /// A string or list result is written through the return pointer the caller passes last.
+    /// A result that flattens to more than one core value is stored through the return pointer the
+    /// caller passes last. Parameters that flatten to more than the core limit come from one block
+    /// the caller points to.
     fn invoke(
         &self,
         args: &[Value],
@@ -1979,32 +1428,48 @@ impl LoweredHost {
     ) -> Result<Vec<Value>, String> {
         // The grant is checked on every call, so a revoked import stops working at once.
         authorize_call(self.capabilities.as_ref(), &self.name)?;
+        let encoding = StringEncoding::Utf8;
+        let mut memory = HostMemory {
+            host: self,
+            caller: &mut caller,
+        };
         let mut remaining = args.iter();
+        let flat_count: usize = self
+            .params
+            .iter()
+            .map(|ty| flat(ty, &self.types).len())
+            .sum();
         let mut values = Vec::with_capacity(self.params.len());
-        for ty in &self.params {
-            match ty {
-                ComponentType::Scalar(Scalar::String) => {
-                    let (pointer, length) = two_words(&mut remaining)?;
-                    values.push(ComponentValue::String(self.read_text(
-                        &mut caller,
-                        pointer,
-                        length,
-                    )?));
+        if flat_count > MAX_FLAT_PARAMS {
+            let pointer = match remaining.next() {
+                Some(Value::I32(pointer)) => *pointer as u32,
+                _ => {
+                    return Err(format!(
+                        "the import {} was not given its parameter block",
+                        self.name
+                    ))
                 }
-                ComponentType::List(index) => {
-                    let (pointer, count) = two_words(&mut remaining)?;
-                    values.push(ComponentValue::List(self.read_list(
-                        &mut caller,
-                        *index,
-                        pointer,
-                        count,
-                    )?));
-                }
-                _ => values.push(lift_flats(&mut remaining, ty, &self.types)?),
+            };
+            let (offsets, _, _) = layout(&self.params, &self.types);
+            for (ty, offset) in self.params.iter().zip(offsets) {
+                let at = pointer.checked_add(offset as u32).ok_or_else(|| {
+                    format!("the import {} was given a block past memory", self.name)
+                })?;
+                values.push(canon::load(&mut memory, encoding, at, ty, &self.types)?);
+            }
+        } else {
+            for ty in &self.params {
+                values.push(canon::lift(
+                    &mut memory,
+                    encoding,
+                    &mut remaining,
+                    ty,
+                    &self.types,
+                )?);
             }
         }
         let return_pointer = match self.result.as_ref() {
-            Some(ty) if returns_through_memory(ty) => match remaining.next() {
+            Some(ty) if flat(ty, &self.types).len() > MAX_FLAT_RESULTS => match remaining.next() {
                 Some(Value::I32(pointer)) => Some(*pointer as u32),
                 _ => {
                     return Err(format!(
@@ -2024,23 +1489,13 @@ impl LoweredHost {
         let results = (self.closure)(&values)?;
         match (self.result.as_ref(), results.as_slice()) {
             (None, []) => Ok(Vec::new()),
-            (Some(ty), [value]) if value_matches(value, ty, &self.types) => {
-                let lowered = self.lower_result(&mut caller, value, ty)?;
-                match return_pointer {
-                    Some(pointer) => {
-                        let [Value::I32(ptr), Value::I32(len)] = lowered.as_slice() else {
-                            return Err("a result through memory lowered to other than two words"
-                                .to_owned());
-                        };
-                        let mut words = Vec::with_capacity(8);
-                        words.extend_from_slice(&(*ptr as u32).to_le_bytes());
-                        words.extend_from_slice(&(*len as u32).to_le_bytes());
-                        self.write_guest(&mut caller, pointer, &words)?;
-                        Ok(Vec::new())
-                    }
-                    None => Ok(lowered),
+            (Some(ty), [value]) if canon::matches(value, ty, &self.types) => match return_pointer {
+                Some(pointer) => {
+                    canon::store(&mut memory, encoding, value, ty, &self.types, pointer)?;
+                    Ok(Vec::new())
                 }
-            }
+                None => canon::lower(&mut memory, encoding, value, ty, &self.types),
+            },
             _ => Err(format!(
                 "the import {} returned values that do not match its type",
                 self.name
@@ -2057,17 +1512,25 @@ impl fmt::Debug for LoweredHost {
 
 impl HostFunction for LoweredHost {
     fn function_type(&self) -> FunctionType {
-        let mut params: Vec<ValueType> = self
+        let flat_count: usize = self
             .params
             .iter()
-            .flat_map(|ty| flat_of(ty, &self.types))
-            .collect();
+            .map(|ty| flat(ty, &self.types).len())
+            .sum();
+        let mut params: Vec<ValueType> = if flat_count > MAX_FLAT_PARAMS {
+            vec![ValueType::I32]
+        } else {
+            self.params
+                .iter()
+                .flat_map(|ty| flat(ty, &self.types))
+                .collect()
+        };
         let results = match self.result.as_ref() {
-            Some(ty) if returns_through_memory(ty) => {
+            Some(ty) if flat(ty, &self.types).len() > MAX_FLAT_RESULTS => {
                 params.push(ValueType::I32);
                 Vec::new()
             }
-            Some(ty) => flat_of(ty, &self.types),
+            Some(ty) => flat(ty, &self.types),
             None => Vec::new(),
         };
         FunctionType {
@@ -2141,6 +1604,114 @@ fn bind(linker: &mut Linker, module: &str, slots: &[Slot], instance: usize) -> R
     }
 }
 
+/// A component instance's memory during a call: the memory and the `realloc` that the export's
+/// canonical options name.
+struct InstanceMemory<'a> {
+    host: &'a mut ComponentInstance,
+    instance: usize,
+    memory: Option<String>,
+    realloc: Option<String>,
+}
+
+impl Memory for InstanceMemory<'_> {
+    fn read(&mut self, address: u32, length: u32) -> Result<Vec<u8>, String> {
+        let memory = self
+            .memory
+            .as_deref()
+            .ok_or_else(|| "a value needs a memory, which the export does not name".to_owned())?;
+        self.host
+            .read_core_memory(self.instance, memory, u64::from(address), length as usize)
+            .map_err(|error| error.to_string())
+    }
+
+    fn write(&mut self, address: u32, bytes: &[u8]) -> Result<(), String> {
+        let memory = self
+            .memory
+            .as_deref()
+            .ok_or_else(|| "a value needs a memory, which the export does not name".to_owned())?;
+        self.host
+            .write_core_memory(self.instance, memory, u64::from(address), bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn realloc(
+        &mut self,
+        old: u32,
+        old_size: u32,
+        align: u32,
+        new_size: u32,
+    ) -> Result<u32, String> {
+        let realloc = self
+            .realloc
+            .as_deref()
+            .ok_or_else(|| "a value needs a realloc, which the export does not name".to_owned())?;
+        let results = self
+            .host
+            .call_core(
+                self.instance,
+                realloc,
+                vec![
+                    Value::I32(old as i32),
+                    Value::I32(old_size as i32),
+                    Value::I32(align as i32),
+                    Value::I32(new_size as i32),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        match results.as_slice() {
+            [Value::I32(pointer)] => Ok(*pointer as u32),
+            _ => Err("realloc did not return one i32".to_owned()),
+        }
+    }
+}
+
+/// A host import's view of guest memory during a call: the calling instance's memory and
+/// `realloc` while one is running, or the memory the lower names when none is.
+struct HostMemory<'a, 'c> {
+    host: &'a LoweredHost,
+    caller: &'a mut Option<&'c mut dyn Caller>,
+}
+
+impl Memory for HostMemory<'_, '_> {
+    fn read(&mut self, address: u32, length: u32) -> Result<Vec<u8>, String> {
+        self.host
+            .read_guest(&mut *self.caller, address, u64::from(length))
+    }
+
+    fn write(&mut self, address: u32, bytes: &[u8]) -> Result<(), String> {
+        self.host.write_guest(&mut *self.caller, address, bytes)
+    }
+
+    fn realloc(
+        &mut self,
+        old: u32,
+        old_size: u32,
+        align: u32,
+        new_size: u32,
+    ) -> Result<u32, String> {
+        let name = self.host.name.clone();
+        let realloc = self.host.realloc.ok_or_else(|| {
+            format!("the import {name} needs a realloc option, which its lower does not name")
+        })?;
+        let caller = self.caller.as_mut().ok_or_else(|| {
+            format!("the import {name} needs a calling instance to allocate, and none is running")
+        })?;
+        let results = caller.call(
+            realloc,
+            vec![
+                Value::I32(old as i32),
+                Value::I32(old_size as i32),
+                Value::I32(align as i32),
+                Value::I32(new_size as i32),
+            ],
+        )?;
+        match results.as_slice() {
+            [Value::I32(pointer)] => Ok(*pointer as u32),
+            _ => Err("realloc did not return one i32".to_owned()),
+        }
+    }
+}
+
 /// The core instances of a running component, its lifted exports, and its type definitions.
 #[derive(Debug)]
 pub struct ComponentInstance {
@@ -2164,10 +1735,9 @@ impl ComponentInstance {
     }
 
     /// Call an exported component function. The arguments must match the export's parameter
-    /// types in number and in type. A string argument is copied into the instance's memory
-    /// through its `realloc`. A string result, or a record result that flattens to more than one
-    /// core value, is read back from memory. The result is lifted back to the export's result
-    /// type.
+    /// types in number and in type. Arguments are lowered into the instance's memory, through its
+    /// `realloc`, where they hold strings or lists. The result is lifted from the core values it
+    /// returned, or from the memory it points into when it is returned through a pointer.
     pub fn call_export(
         &mut self,
         name: &str,
@@ -2191,8 +1761,9 @@ impl ComponentInstance {
                 ),
             });
         }
+        let types = Arc::clone(&self.types);
         for (position, (expected, argument)) in export.params.iter().zip(&arguments).enumerate() {
-            if !value_matches(argument, expected, &self.types) {
+            if !canon::matches(argument, expected, &types) {
                 return Err(ComponentError::ArgumentMismatch {
                     export: name.to_owned(),
                     message: format!(
@@ -2202,636 +1773,79 @@ impl ComponentInstance {
             }
         }
         let instance = export.core_instance;
+        let encoding = export.encoding;
+        let mut memory = InstanceMemory {
+            host: self,
+            instance,
+            memory: export.memory.clone(),
+            realloc: export.realloc.clone(),
+        };
         let mut core_arguments = Vec::new();
         let flat_count: usize = export
             .params
             .iter()
-            .map(|ty| flat_of(ty, &self.types).len())
+            .map(|ty| canon::flat(ty, &types).len())
             .sum();
         if flat_count > MAX_FLAT_PARAMS {
             // The parameters are stored in one block, laid out as a record of them, and the core
             // function takes a pointer to the block.
-            let (offsets, size, align) = layout_of(&export.params, &self.types);
-            let mut block = vec![0u8; size];
+            let (offsets, size, align) = canon::layout(&export.params, &types);
+            let block = memory
+                .realloc(0, 0, align as u32, size as u32)
+                .map_err(|message| ComponentError::Call { instance, message })?;
             for ((argument, ty), offset) in arguments.iter().zip(&export.params).zip(offsets) {
-                store(argument, ty, &self.types, &mut block, offset)
+                let at = block
+                    .checked_add(offset as u32)
+                    .ok_or_else(|| ComponentError::Call {
+                        instance,
+                        message: "the parameter block is past the end of memory".to_owned(),
+                    })?;
+                canon::store(&mut memory, encoding, argument, ty, &types, at)
                     .map_err(|message| ComponentError::Call { instance, message })?;
             }
-            let (Some(realloc), Some(memory)) = (&export.realloc, &export.memory) else {
-                return Err(ComponentError::Call {
-                    instance,
-                    message: "indirect parameters need a memory and a realloc".to_owned(),
-                });
-            };
-            let allocated = self.call_core(
-                instance,
-                realloc,
-                vec![
-                    Value::I32(0),
-                    Value::I32(0),
-                    Value::I32(align as i32),
-                    Value::I32(size as i32),
-                ],
-            )?;
-            let pointer = match allocated.as_slice() {
-                [Value::I32(pointer)] => *pointer,
-                _ => {
-                    return Err(ComponentError::Call {
-                        instance,
-                        message: "realloc did not return one i32".to_owned(),
-                    })
-                }
-            };
-            self.write_core_memory(instance, memory, u64::from(pointer as u32), &block)?;
-            core_arguments.push(Value::I32(pointer));
+            core_arguments.push(Value::I32(block as i32));
         } else {
             for (argument, ty) in arguments.iter().zip(&export.params) {
-                self.lower_argument(&export, argument, ty, &mut core_arguments)
+                let lowered = canon::lower(&mut memory, encoding, argument, ty, &types)
                     .map_err(|message| ComponentError::Call { instance, message })?;
+                core_arguments.extend(lowered);
             }
         }
-        let core_results = self.call_core(instance, &export.core_export, core_arguments)?;
-        let lifted = match export.result {
+        let core_results = memory
+            .host
+            .call_core(instance, &export.core_export, core_arguments)?;
+        let lifted: Result<Vec<ComponentValue>, String> = match export.result {
             None if core_results.is_empty() => Ok(Vec::new()),
-            None => Err(ComponentError::Call {
-                instance,
-                message: "the core function returned a result its type does not have".to_owned(),
-            }),
+            None => Err("the core function returned a result its type does not have".to_owned()),
+            Some(ty) if canon::flat(&ty, &types).len() > MAX_FLAT_RESULTS => {
+                match core_results.as_slice() {
+                    [Value::I32(pointer)] => {
+                        canon::load(&mut memory, encoding, *pointer as u32, &ty, &types)
+                            .map(|value| vec![value])
+                    }
+                    _ => Err("an indirect result did not return one pointer".to_owned()),
+                }
+            }
             Some(ty) => {
-                let value = self
-                    .lift_result(&export, &ty, &core_results)
-                    .map_err(|message| ComponentError::Call { instance, message })?;
-                Ok(vec![value])
+                let mut remaining = core_results.iter();
+                canon::lift(&mut memory, encoding, &mut remaining, &ty, &types).and_then(|value| {
+                    if remaining.next().is_some() {
+                        Err("the core function returned the wrong number of results".to_owned())
+                    } else {
+                        Ok(vec![value])
+                    }
+                })
             }
         };
+        let lifted = lifted.map_err(|message| ComponentError::Call { instance, message });
         // The post-return runs once the result has been read, with the core values the function
         // returned, so that the module may free what the result pointed into.
         if lifted.is_ok() {
             if let Some(post_return) = &export.post_return {
-                self.call_core(instance, post_return, core_results)?;
+                memory.host.call_core(instance, post_return, core_results)?;
             }
         }
         lifted
-    }
-
-    /// Lower one argument of type `ty` to core values, appending them. A string or a list is
-    /// copied into the callee's memory with its `realloc`, and what is appended is its pointer and
-    /// length.
-    fn lower_argument(
-        &mut self,
-        export: &LiftedExport,
-        argument: &ComponentValue,
-        ty: &ComponentType,
-        out: &mut Vec<Value>,
-    ) -> Result<(), String> {
-        match argument {
-            ComponentValue::List(items) => {
-                let ComponentType::List(index) = ty else {
-                    return Err("a list argument is not a list type".to_owned());
-                };
-                let element = match self.types.get(*index as usize) {
-                    Some(ComponentTypeDef::List(element)) => *element,
-                    _ => return Err("the list is not defined".to_owned()),
-                };
-                let (Some(realloc), Some(memory)) = (&export.realloc, &export.memory) else {
-                    return Err("a list argument needs a memory and a realloc".to_owned());
-                };
-                let (size, align) = element.size_and_align();
-                let byte_length = items
-                    .len()
-                    .checked_mul(size)
-                    .and_then(|bytes| i32::try_from(bytes).ok())
-                    .ok_or_else(|| "a list argument is too long for a core length".to_owned())?;
-                let length = i32::try_from(items.len())
-                    .map_err(|_| "a list argument is too long for a core length".to_owned())?;
-                // Allocate the elements in the callee's memory, as the canonical ABI does:
-                // realloc(0, 0, align, byte length).
-                let allocated = self
-                    .call_core(
-                        export.core_instance,
-                        realloc,
-                        vec![
-                            Value::I32(0),
-                            Value::I32(0),
-                            Value::I32(align as i32),
-                            Value::I32(byte_length),
-                        ],
-                    )
-                    .map_err(|error| error.to_string())?;
-                let pointer = match allocated.as_slice() {
-                    [Value::I32(pointer)] => *pointer,
-                    _ => return Err("realloc did not return one i32".to_owned()),
-                };
-                let mut bytes = Vec::with_capacity(byte_length as usize);
-                for item in items {
-                    bytes.extend(
-                        scalar_bytes(item, element)
-                            .ok_or_else(|| "a list element does not match its type".to_owned())?,
-                    );
-                }
-                self.write_core_memory(
-                    export.core_instance,
-                    memory,
-                    u64::from(pointer as u32),
-                    &bytes,
-                )
-                .map_err(|error| error.to_string())?;
-                out.push(Value::I32(pointer));
-                out.push(Value::I32(length));
-                Ok(())
-            }
-            ComponentValue::String(text) => {
-                let (pointer, length) = self.lower_string(export, text)?;
-                out.push(Value::I32(pointer));
-                out.push(Value::I32(length));
-                Ok(())
-            }
-            other => lower_flats(other, ty, &self.types, out),
-        }
-    }
-
-    /// Lift a result from the core values the function returned. A result that flattens to more
-    /// than one core value is a pointer to its canonical layout in memory.
-    fn lift_result(
-        &self,
-        export: &LiftedExport,
-        ty: &ComponentType,
-        core_results: &[Value],
-    ) -> Result<ComponentValue, String> {
-        let flat = flat_of(ty, &self.types);
-        if flat.len() > MAX_FLAT_RESULTS {
-            let [Value::I32(pointer)] = core_results else {
-                return Err("an indirect result did not return one pointer".to_owned());
-            };
-            let memory = export
-                .memory
-                .as_deref()
-                .ok_or_else(|| "an indirect result needs a memory".to_owned())?;
-            return self.load(
-                export.core_instance,
-                memory,
-                *pointer as u32,
-                ty,
-                export.encoding,
-            );
-        }
-        match (ty, core_results) {
-            (ComponentType::Scalar(scalar), [value]) => lift(value.clone(), *scalar),
-            // A result with no payloads is its discriminant alone, so it is a direct value.
-            // A variant with no payloads is its case index alone, so it is a direct value.
-            (ComponentType::Variant(index), [value]) => {
-                let Some(ComponentTypeDef::Variant { cases }) = self.types.get(*index as usize)
-                else {
-                    return Err("the result's variant is not defined".to_owned());
-                };
-                if shared_payload(cases).is_some() {
-                    return Err("a variant with payloads is returned through memory".to_owned());
-                }
-                let case = enum_case(value, cases.len())?;
-                Ok(ComponentValue::Variant(cases[case].0.clone(), None))
-            }
-            (ComponentType::Result(index), [Value::I32(discriminant)]) => {
-                let Some(ComponentTypeDef::Result { ok, err }) = self.types.get(*index as usize)
-                else {
-                    return Err("the result's result type is not defined".to_owned());
-                };
-                if ok.is_some() || err.is_some() {
-                    return Err("a result with payloads is returned through memory".to_owned());
-                }
-                match discriminant {
-                    0 => Ok(ComponentValue::Result(Ok(None))),
-                    1 => Ok(ComponentValue::Result(Err(None))),
-                    _ => Err("a result's discriminant is neither 0 nor 1".to_owned()),
-                }
-            }
-            (ComponentType::Tuple(index), values) => {
-                let Some(ComponentTypeDef::Tuple(scalars)) = self.types.get(*index as usize) else {
-                    return Err("the result's tuple is not defined".to_owned());
-                };
-                if values.len() != scalars.len() {
-                    return Err(
-                        "the core function returned the wrong number of tuple values".to_owned(),
-                    );
-                }
-                let mut lifted = Vec::with_capacity(scalars.len());
-                for (scalar, value) in scalars.iter().zip(values) {
-                    lifted.push(lift(value.clone(), *scalar)?);
-                }
-                Ok(ComponentValue::Tuple(lifted))
-            }
-            (ComponentType::Flags(index), [value]) => {
-                let Some(ComponentTypeDef::Flags(labels)) = self.types.get(*index as usize) else {
-                    return Err("the result's flags are not defined".to_owned());
-                };
-                let Value::I32(bits) = value else {
-                    return Err("a flags result is not an i32".to_owned());
-                };
-                let bits = *bits as u32;
-                // A bit beyond the labels names no flag, which the canonical ABI traps on.
-                if labels.len() < 32 && bits >> labels.len() != 0 {
-                    return Err(format!("{bits:#x} sets a bit that names no flag"));
-                }
-                let set = labels
-                    .iter()
-                    .enumerate()
-                    .filter(|(position, _)| bits & (1u32 << position) != 0)
-                    .map(|(_, label)| label.clone())
-                    .collect();
-                Ok(ComponentValue::Flags(set))
-            }
-            (ComponentType::Enum(index), [value]) => {
-                let Some(ComponentTypeDef::Enum(labels)) = self.types.get(*index as usize) else {
-                    return Err("the result's enum is not defined".to_owned());
-                };
-                let case = enum_case(value, labels.len())?;
-                Ok(ComponentValue::Enum(labels[case].clone()))
-            }
-            (ComponentType::Record(index), values) => {
-                let Some(ComponentTypeDef::Record(fields)) = self.types.get(*index as usize) else {
-                    return Err("the result's record is not defined".to_owned());
-                };
-                if values.len() != fields.len() {
-                    return Err(
-                        "the core function returned the wrong number of record fields".to_owned(),
-                    );
-                }
-                let mut lifted = Vec::with_capacity(fields.len());
-                for (field, value) in fields.iter().zip(values) {
-                    lifted.push((field.name.clone(), lift(value.clone(), field.ty)?));
-                }
-                Ok(ComponentValue::Record(lifted))
-            }
-            _ => Err("the core function returned the wrong number of results".to_owned()),
-        }
-    }
-
-    /// Lower a string into the callee's memory in the lift's encoding, by the canonical ABI's
-    /// `realloc` sequence. The result is the pointer and the length in code units, with the
-    /// Latin-1 tag bit set when the string is stored as UTF-16 under `latin1+utf16`.
-    fn lower_string(&mut self, export: &LiftedExport, text: &str) -> Result<(i32, i32), String> {
-        let (Some(realloc), Some(memory)) = (&export.realloc, &export.memory) else {
-            return Err("a string argument needs a memory and a realloc".to_owned());
-        };
-        let instance = export.core_instance;
-        let source_units = text.len();
-        if source_units > MAX_STRING_BYTE_LENGTH {
-            return Err("a string argument is too long for the canonical ABI".to_owned());
-        }
-        let (pointer, bytes, tagged) = match export.encoding {
-            StringEncoding::Utf8 => {
-                let pointer = self.canon_alloc(instance, realloc, 1, source_units)?;
-                (pointer, text.as_bytes().to_vec(), source_units as u32)
-            }
-            StringEncoding::Utf16 => {
-                let worst = 2 * source_units;
-                let mut pointer = self.canon_alloc(instance, realloc, 2, worst)?;
-                let encoded = utf16_bytes(text);
-                if encoded.len() < worst {
-                    pointer =
-                        self.canon_realloc(instance, realloc, pointer, worst, 2, encoded.len())?;
-                }
-                let units = (encoded.len() / 2) as u32;
-                (pointer, encoded, units)
-            }
-            StringEncoding::Latin1Utf16 => {
-                let mut pointer = self.canon_alloc(instance, realloc, 2, source_units)?;
-                if text.chars().all(|c| (c as u32) < 256) {
-                    let latin1: Vec<u8> = text.chars().map(|c| c as u8).collect();
-                    if latin1.len() < source_units {
-                        pointer = self.canon_realloc(
-                            instance,
-                            realloc,
-                            pointer,
-                            source_units,
-                            2,
-                            latin1.len(),
-                        )?;
-                    }
-                    let units = latin1.len() as u32;
-                    (pointer, latin1, units)
-                } else {
-                    let worst = 2 * source_units;
-                    pointer =
-                        self.canon_realloc(instance, realloc, pointer, source_units, 2, worst)?;
-                    let encoded = utf16_bytes(text);
-                    if worst > encoded.len() {
-                        pointer = self.canon_realloc(
-                            instance,
-                            realloc,
-                            pointer,
-                            worst,
-                            2,
-                            encoded.len(),
-                        )?;
-                    }
-                    let units = (encoded.len() / 2) as u32 | UTF16_TAG;
-                    (pointer, encoded, units)
-                }
-            }
-        };
-        self.write_core_memory(instance, memory, u64::from(pointer as u32), &bytes)
-            .map_err(|error| error.to_string())?;
-        Ok((pointer, tagged as i32))
-    }
-
-    /// `realloc(0, 0, align, size)`, which allocates a block in the callee's memory.
-    fn canon_alloc(
-        &mut self,
-        instance: usize,
-        realloc: &str,
-        align: usize,
-        size: usize,
-    ) -> Result<i32, String> {
-        self.canon_call(
-            instance,
-            realloc,
-            vec![
-                Value::I32(0),
-                Value::I32(0),
-                Value::I32(align as i32),
-                Value::I32(size as i32),
-            ],
-        )
-    }
-
-    /// `realloc(pointer, old size, align, new size)`, which resizes a block in the callee's memory.
-    fn canon_realloc(
-        &mut self,
-        instance: usize,
-        realloc: &str,
-        pointer: i32,
-        old_size: usize,
-        align: usize,
-        new_size: usize,
-    ) -> Result<i32, String> {
-        self.canon_call(
-            instance,
-            realloc,
-            vec![
-                Value::I32(pointer),
-                Value::I32(old_size as i32),
-                Value::I32(align as i32),
-                Value::I32(new_size as i32),
-            ],
-        )
-    }
-
-    fn canon_call(
-        &mut self,
-        instance: usize,
-        realloc: &str,
-        arguments: Vec<Value>,
-    ) -> Result<i32, String> {
-        let allocated = self
-            .call_core(instance, realloc, arguments)
-            .map_err(|error| error.to_string())?;
-        match allocated.as_slice() {
-            [Value::I32(pointer)] => Ok(*pointer),
-            _ => Err("realloc did not return one i32".to_owned()),
-        }
-    }
-
-    /// Read a string of the lift's encoding at `pointer`, whose length is `tagged_length` code
-    /// units, as the canonical ABI reads it: under `latin1+utf16` the tag bit selects UTF-16, and a
-    /// string must be aligned, within the length limit, and valid in its encoding.
-    fn load_string(
-        &self,
-        instance: usize,
-        memory: &str,
-        pointer: u32,
-        tagged_length: u32,
-        encoding: StringEncoding,
-    ) -> Result<String, String> {
-        let (byte_length, alignment, decoding) = match encoding {
-            StringEncoding::Utf8 => (u64::from(tagged_length), 1, StringDecoding::Utf8),
-            StringEncoding::Utf16 => (2 * u64::from(tagged_length), 2, StringDecoding::Utf16),
-            StringEncoding::Latin1Utf16 if tagged_length & UTF16_TAG != 0 => (
-                2 * u64::from(tagged_length ^ UTF16_TAG),
-                2,
-                StringDecoding::Utf16,
-            ),
-            StringEncoding::Latin1Utf16 => (u64::from(tagged_length), 2, StringDecoding::Latin1),
-        };
-        if byte_length > MAX_STRING_BYTE_LENGTH as u64 {
-            return Err("the string is too long for the canonical ABI".to_owned());
-        }
-        if !(pointer as usize).is_multiple_of(alignment) {
-            return Err("the string is not aligned for its encoding".to_owned());
-        }
-        let bytes = self
-            .read_core_memory(instance, memory, u64::from(pointer), byte_length as usize)
-            .map_err(|error| error.to_string())?;
-        match decoding {
-            StringDecoding::Utf8 => {
-                String::from_utf8(bytes).map_err(|_| "the string is not valid UTF-8".to_owned())
-            }
-            StringDecoding::Utf16 => {
-                // A byte length of a UTF-16 string is even, so every code unit is whole.
-                let (pairs, _) = bytes.as_chunks::<2>();
-                let units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
-                String::from_utf16(&units).map_err(|_| "the string is not valid UTF-16".to_owned())
-            }
-            StringDecoding::Latin1 => Ok(bytes.iter().map(|&byte| char::from(byte)).collect()),
-        }
-    }
-
-    /// Load a value of type `ty` at `pointer` in the memory `memory` of core instance `instance`,
-    /// by the canonical layout. A string is read in `encoding`.
-    fn load(
-        &self,
-        instance: usize,
-        memory: &str,
-        pointer: u32,
-        ty: &ComponentType,
-        encoding: StringEncoding,
-    ) -> Result<ComponentValue, String> {
-        match ty {
-            ComponentType::Scalar(Scalar::String) => {
-                let header = self
-                    .read_core_memory(instance, memory, u64::from(pointer), 8)
-                    .map_err(|error| error.to_string())?;
-                let data_pointer = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-                let tagged_length =
-                    u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-                self.load_string(instance, memory, data_pointer, tagged_length, encoding)
-                    .map(ComponentValue::String)
-            }
-            ComponentType::Scalar(scalar) => {
-                self.load_scalar(instance, memory, u64::from(pointer), *scalar)
-            }
-            ComponentType::Tuple(index) => {
-                let Some(ComponentTypeDef::Tuple(scalars)) = self.types.get(*index as usize) else {
-                    return Err("the tuple is not defined".to_owned());
-                };
-                // A tuple lays out like a record whose fields have no labels.
-                let fields: Vec<RecordField> = scalars
-                    .iter()
-                    .map(|ty| RecordField {
-                        name: String::new(),
-                        ty: *ty,
-                    })
-                    .collect();
-                let (offsets, _, _) = record_layout(&fields);
-                let mut lifted = Vec::with_capacity(fields.len());
-                for (field, offset) in fields.iter().zip(offsets) {
-                    lifted.push(self.load_scalar(
-                        instance,
-                        memory,
-                        u64::from(pointer) + offset as u64,
-                        field.ty,
-                    )?);
-                }
-                Ok(ComponentValue::Tuple(lifted))
-            }
-            ComponentType::Enum(_) | ComponentType::Flags(_) => {
-                // An enum is only ever a direct value, so it is never read from memory.
-                Err("an enum is not read from memory".to_owned())
-            }
-            ComponentType::Option(index) => {
-                let Some(ComponentTypeDef::Option(payload)) = self.types.get(*index as usize)
-                else {
-                    return Err("the option is not defined".to_owned());
-                };
-                let payload = *payload;
-                // The discriminant is one byte; the payload follows at its aligned offset.
-                let discriminant = self
-                    .read_core_memory(instance, memory, u64::from(pointer), 1)
-                    .map_err(|error| error.to_string())?[0];
-                let (_, payload_align) = payload.size_and_align();
-                let payload_offset = align_to(1, payload_align) as u64;
-                match discriminant {
-                    0 => Ok(ComponentValue::Option(None)),
-                    1 => {
-                        let value = self.load_scalar(
-                            instance,
-                            memory,
-                            u64::from(pointer) + payload_offset,
-                            payload,
-                        )?;
-                        Ok(ComponentValue::Option(Some(Box::new(value))))
-                    }
-                    _ => Err("an option's discriminant is neither 0 nor 1".to_owned()),
-                }
-            }
-            ComponentType::Variant(index) => {
-                let Some(ComponentTypeDef::Variant { cases }) = self.types.get(*index as usize)
-                else {
-                    return Err("the variant is not defined".to_owned());
-                };
-                // The discriminant is one byte, and the payload follows at the offset its
-                // widest case needs.
-                let discriminant = self
-                    .read_core_memory(instance, memory, u64::from(pointer), 1)
-                    .map_err(|error| error.to_string())?[0];
-                let Some((label, case_type)) = cases.get(usize::from(discriminant)) else {
-                    return Err("a variant's discriminant names no case".to_owned());
-                };
-                let payload = match case_type {
-                    None => None,
-                    Some(scalar) => {
-                        let align = cases
-                            .iter()
-                            .filter_map(|(_, payload)| *payload)
-                            .map(|payload| payload.size_and_align().1)
-                            .max()
-                            .unwrap_or(1);
-                        let offset = u64::from(pointer) + align_to(1, align) as u64;
-                        Some(Box::new(
-                            self.load_scalar(instance, memory, offset, *scalar)?,
-                        ))
-                    }
-                };
-                Ok(ComponentValue::Variant(label.clone(), payload))
-            }
-            ComponentType::Result(index) => {
-                let Some(ComponentTypeDef::Result { ok, err }) = self.types.get(*index as usize)
-                else {
-                    return Err("the result is not defined".to_owned());
-                };
-                let (ok, err) = (*ok, *err);
-                // The discriminant is one byte, and the payload follows at its aligned offset.
-                let discriminant = self
-                    .read_core_memory(instance, memory, u64::from(pointer), 1)
-                    .map_err(|error| error.to_string())?[0];
-                let case_type = match discriminant {
-                    0 => ok,
-                    1 => err,
-                    _ => return Err("a result's discriminant is neither 0 nor 1".to_owned()),
-                };
-                let payload = match case_type {
-                    None => None,
-                    Some(scalar) => {
-                        let (_, align) = scalar.size_and_align();
-                        let offset = u64::from(pointer) + align_to(1, align) as u64;
-                        Some(Box::new(
-                            self.load_scalar(instance, memory, offset, scalar)?,
-                        ))
-                    }
-                };
-                Ok(ComponentValue::Result(if discriminant == 0 {
-                    Ok(payload)
-                } else {
-                    Err(payload)
-                }))
-            }
-            ComponentType::List(index) => {
-                let Some(ComponentTypeDef::List(element)) = self.types.get(*index as usize) else {
-                    return Err("the list is not defined".to_owned());
-                };
-                let element = *element;
-                // The list is its pointer and its length, and its elements are at the pointer.
-                let header = self
-                    .read_core_memory(instance, memory, u64::from(pointer), 8)
-                    .map_err(|error| error.to_string())?;
-                let data_pointer = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-                let data_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-                let (size, _) = element.size_and_align();
-                let byte_length = (data_length as usize)
-                    .checked_mul(size)
-                    .ok_or_else(|| "the list is too long".to_owned())?;
-                let bytes = self
-                    .read_core_memory(instance, memory, u64::from(data_pointer), byte_length)
-                    .map_err(|error| error.to_string())?;
-                let mut items = Vec::new();
-                for chunk in bytes.chunks_exact(size) {
-                    items.push(scalar_from_bytes(element, chunk)?);
-                }
-                Ok(ComponentValue::List(items))
-            }
-            ComponentType::Record(index) => {
-                let Some(ComponentTypeDef::Record(fields)) = self.types.get(*index as usize) else {
-                    return Err("the record is not defined".to_owned());
-                };
-                let (offsets, _, _) = record_layout(fields);
-                let mut lifted = Vec::with_capacity(fields.len());
-                for (field, offset) in fields.iter().zip(offsets) {
-                    let value = self.load_scalar(
-                        instance,
-                        memory,
-                        u64::from(pointer) + offset as u64,
-                        field.ty,
-                    )?;
-                    lifted.push((field.name.clone(), value));
-                }
-                Ok(ComponentValue::Record(lifted))
-            }
-        }
-    }
-
-    /// Load one scalar at `offset` in memory. The bytes are read little-endian, zero-extended,
-    /// and lifted as the scalar's core value.
-    fn load_scalar(
-        &self,
-        instance: usize,
-        memory: &str,
-        offset: u64,
-        scalar: Scalar,
-    ) -> Result<ComponentValue, String> {
-        let (size, _) = scalar.size_and_align();
-        let bytes = self
-            .read_core_memory(instance, memory, offset, size)
-            .map_err(|error| error.to_string())?;
-        scalar_from_bytes(scalar, &bytes)
     }
 
     /// Read `length` bytes at `offset` from the memory `memory` of core instance `instance`.
@@ -2930,196 +1944,12 @@ impl ComponentInstance {
     }
 }
 
-/// Whether `value` has the component type `ty`. A record matches a record of the same fields, in
-/// the same order, with matching field types.
-fn value_matches(value: &ComponentValue, ty: &ComponentType, types: &[ComponentTypeDef]) -> bool {
-    match (value, ty) {
-        (ComponentValue::Record(fields), ComponentType::Record(index)) => {
-            let Some(ComponentTypeDef::Record(defined)) = types.get(*index as usize) else {
-                return false;
-            };
-            fields.len() == defined.len()
-                && fields.iter().zip(defined).all(|((name, value), field)| {
-                    *name == field.name && value.scalar() == Some(field.ty)
-                })
-        }
-        (ComponentValue::Tuple(items), ComponentType::Tuple(index)) => {
-            match types.get(*index as usize) {
-                Some(ComponentTypeDef::Tuple(scalars)) => {
-                    items.len() == scalars.len()
-                        && items
-                            .iter()
-                            .zip(scalars)
-                            .all(|(item, scalar)| item.scalar() == Some(*scalar))
-                }
-                _ => false,
-            }
-        }
-        (ComponentValue::Flags(set), ComponentType::Flags(index)) => {
-            match types.get(*index as usize) {
-                Some(ComponentTypeDef::Flags(defined)) => {
-                    set.iter().all(|label| defined.contains(label))
-                }
-                _ => false,
-            }
-        }
-        (ComponentValue::Enum(label), ComponentType::Enum(index)) => {
-            matches!(types.get(*index as usize), Some(ComponentTypeDef::Enum(labels)) if labels.contains(label))
-        }
-        (ComponentValue::Option(payload), ComponentType::Option(index)) => {
-            let Some(ComponentTypeDef::Option(element)) = types.get(*index as usize) else {
-                return false;
-            };
-            match payload {
-                None => true,
-                Some(value) => value.scalar() == Some(*element),
-            }
-        }
-        (ComponentValue::List(items), ComponentType::List(index)) => {
-            let Some(ComponentTypeDef::List(element)) = types.get(*index as usize) else {
-                return false;
-            };
-            items.iter().all(|item| item.scalar() == Some(*element))
-        }
-        (ComponentValue::Variant(label, payload), ComponentType::Variant(index)) => {
-            let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) else {
-                return false;
-            };
-            match cases.iter().find(|(name, _)| name == label) {
-                Some((_, None)) => payload.is_none(),
-                Some((_, Some(scalar))) => payload
-                    .as_deref()
-                    .is_some_and(|value| value.scalar() == Some(*scalar)),
-                None => false,
-            }
-        }
-        (ComponentValue::Result(outcome), ComponentType::Result(index)) => {
-            let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) else {
-                return false;
-            };
-            let (payload, case) = match outcome {
-                Ok(payload) => (payload, ok),
-                Err(payload) => (payload, err),
-            };
-            match (payload, case) {
-                (None, None) => true,
-                (Some(value), Some(scalar)) => value.scalar() == Some(*scalar),
-                _ => false,
-            }
-        }
-        (value, ComponentType::Scalar(scalar)) => value.scalar() == Some(*scalar),
-        _ => false,
-    }
-}
-
-/// The little-endian bytes of one list element of scalar type `element`, or `None` if the value is
-/// not of that type.
-fn scalar_bytes(value: &ComponentValue, element: Scalar) -> Option<Vec<u8>> {
-    if value.scalar() != Some(element) {
-        return None;
-    }
-    let (size, _) = element.size_and_align();
-    match lower_scalar(value)? {
-        Value::I32(value) => Some(value.to_le_bytes()[..size].to_vec()),
-        Value::I64(value) => Some(value.to_le_bytes().to_vec()),
-        Value::F32(bits) => Some(bits.to_le_bytes().to_vec()),
-        Value::F64(bits) => Some(bits.to_le_bytes().to_vec()),
-        _ => None,
-    }
-}
-
-/// The core value a scalar lowers to, or `None` for a string, a record, or a list, which are not
-/// single scalars. Signed and unsigned values share their bits.
-fn lower_scalar(value: &ComponentValue) -> Option<Value> {
-    match value {
-        ComponentValue::S32(value) => Some(Value::I32(*value)),
-        ComponentValue::U32(value) => Some(Value::I32(*value as i32)),
-        ComponentValue::S64(value) => Some(Value::I64(*value)),
-        ComponentValue::U64(value) => Some(Value::I64(*value as i64)),
-        ComponentValue::F32(value) => Some(Value::F32(value.to_bits())),
-        ComponentValue::F64(value) => Some(Value::F64(value.to_bits())),
-        ComponentValue::Bool(value) => Some(Value::I32(i32::from(*value))),
-        ComponentValue::S8(value) => Some(Value::I32(i32::from(*value))),
-        ComponentValue::U8(value) => Some(Value::I32(i32::from(*value))),
-        ComponentValue::S16(value) => Some(Value::I32(i32::from(*value))),
-        ComponentValue::U16(value) => Some(Value::I32(i32::from(*value))),
-        ComponentValue::Char(value) => Some(Value::I32(*value as u32 as i32)),
-        ComponentValue::String(_)
-        | ComponentValue::Record(_)
-        | ComponentValue::List(_)
-        | ComponentValue::Option(_)
-        | ComponentValue::Enum(_)
-        | ComponentValue::Flags(_)
-        | ComponentValue::Tuple(_)
-        | ComponentValue::Result(_)
-        | ComponentValue::Variant(..) => None,
-    }
-}
-
 /// The case index an enum's core value names, which must be one of its `count` cases.
 fn enum_case(value: &Value, count: usize) -> Result<usize, String> {
     match value {
         Value::I32(index) if (*index as u32 as usize) < count => Ok(*index as u32 as usize),
         other => Err(format!(
             "{other:?} is not a case of an enum of {count} cases"
-        )),
-    }
-}
-
-/// The zero core value of a flat type: what an option's payload is when the option is `None`.
-fn zero_value(ty: ValueType) -> Value {
-    match ty {
-        ValueType::I64 => Value::I64(0),
-        ValueType::F32 => Value::F32(0),
-        ValueType::F64 => Value::F64(0),
-        _ => Value::I32(0),
-    }
-}
-
-/// The scalar that `bytes`, read little-endian and zero-extended, lifts to. `bytes` is exactly the
-/// scalar's size in memory.
-fn scalar_from_bytes(scalar: Scalar, bytes: &[u8]) -> Result<ComponentValue, String> {
-    let (size, _) = scalar.size_and_align();
-    if bytes.len() != size {
-        return Err(format!("{} bytes do not hold a {scalar:?}", bytes.len()));
-    }
-    let mut buffer = [0u8; 8];
-    buffer[..size].copy_from_slice(bytes);
-    let value = match scalar {
-        Scalar::S64 | Scalar::U64 => Value::I64(i64::from_le_bytes(buffer)),
-        Scalar::F64 => Value::F64(u64::from_le_bytes(buffer)),
-        Scalar::F32 => Value::F32(u32::from_le_bytes([
-            buffer[0], buffer[1], buffer[2], buffer[3],
-        ])),
-        _ => Value::I32(i32::from_le_bytes([
-            buffer[0], buffer[1], buffer[2], buffer[3],
-        ])),
-    };
-    lift(value, scalar)
-}
-
-/// The scalar a core value lifts to, when the core value has the scalar's type. A string is not
-/// lifted from a single value: it is read from memory.
-fn lift(value: Value, scalar: Scalar) -> Result<ComponentValue, String> {
-    match (scalar, value) {
-        (Scalar::S32, Value::I32(value)) => Ok(ComponentValue::S32(value)),
-        (Scalar::U32, Value::I32(value)) => Ok(ComponentValue::U32(value as u32)),
-        (Scalar::S64, Value::I64(value)) => Ok(ComponentValue::S64(value)),
-        (Scalar::U64, Value::I64(value)) => Ok(ComponentValue::U64(value as u64)),
-        (Scalar::F32, Value::F32(bits)) => Ok(ComponentValue::F32(f32::from_bits(bits))),
-        (Scalar::F64, Value::F64(bits)) => Ok(ComponentValue::F64(f64::from_bits(bits))),
-        // A small integer keeps the low bits of the core value, and a signed one sign-extends
-        // them, as the canonical ABI's lift does. A boolean is true for any non-zero value.
-        (Scalar::Bool, Value::I32(value)) => Ok(ComponentValue::Bool(value != 0)),
-        (Scalar::S8, Value::I32(value)) => Ok(ComponentValue::S8(value as i8)),
-        (Scalar::U8, Value::I32(value)) => Ok(ComponentValue::U8(value as u8)),
-        (Scalar::S16, Value::I32(value)) => Ok(ComponentValue::S16(value as i16)),
-        (Scalar::U16, Value::I32(value)) => Ok(ComponentValue::U16(value as u16)),
-        (Scalar::Char, Value::I32(value)) => char::from_u32(value as u32)
-            .map(ComponentValue::Char)
-            .ok_or_else(|| format!("{value:#x} is not a Unicode scalar value")),
-        (scalar, value) => Err(format!(
-            "a core value {value:?} does not lift to {scalar:?}"
         )),
     }
 }
@@ -3309,8 +2139,8 @@ fn value_type(
 
 /// Decode a type section's contents: a count, then each type definition. A function type is its
 /// tag, a labelled parameter list, and a result: `0x00` and a value type, or `0x01 0x00` for none.
-/// A record is its tag, then its labelled fields, each a scalar; a record field may not be a
-/// string, a record, or another compound type.
+/// A record is its tag, then its labelled fields, each a value type. Every value type names an
+/// earlier definition, so the table cannot be cyclic.
 fn decode_types(
     reader: &mut Reader<'_>,
     types: &mut Vec<ComponentTypeDef>,
@@ -3347,66 +2177,13 @@ fn decode_types(
                 let mut fields = Vec::new();
                 for _ in 0..field_count {
                     let name = reader.name()?;
-                    let at_field = reader.position();
-                    match value_type(reader, types)? {
-                        ComponentType::Scalar(Scalar::String) => {
-                            return Err(ComponentError::UnsupportedType {
-                                what: "a string in a record",
-                                offset: at_field,
-                            })
-                        }
-                        ComponentType::Scalar(ty) => fields.push(RecordField { name, ty }),
-                        ComponentType::Option(_)
-                        | ComponentType::Enum(_)
-                        | ComponentType::Flags(_)
-                        | ComponentType::Tuple(_)
-                        | ComponentType::Result(_)
-                        | ComponentType::Variant(_) => {
-                            return Err(ComponentError::UnsupportedType {
-                                what: "an option or an enum in a record",
-                                offset: at_field,
-                            })
-                        }
-                        ComponentType::List(_) => {
-                            return Err(ComponentError::UnsupportedType {
-                                what: "a list in a record",
-                                offset: at_field,
-                            })
-                        }
-                        ComponentType::Record(_) => {
-                            return Err(ComponentError::UnsupportedType {
-                                what: "a record in a record",
-                                offset: at_field,
-                            })
-                        }
-                    }
+                    let ty = value_type(reader, types)?;
+                    fields.push(RecordField { name, ty });
                 }
                 types.push(ComponentTypeDef::Record(fields));
             }
             TYPE_OPTION => {
-                let payload_at = reader.position();
-                let payload = match value_type(reader, types)? {
-                    ComponentType::Scalar(Scalar::String) => {
-                        return Err(ComponentError::UnsupportedType {
-                            what: "an option of a string",
-                            offset: payload_at,
-                        })
-                    }
-                    ComponentType::Scalar(scalar) => scalar,
-                    ComponentType::Record(_)
-                    | ComponentType::List(_)
-                    | ComponentType::Option(_)
-                    | ComponentType::Enum(_)
-                    | ComponentType::Flags(_)
-                    | ComponentType::Tuple(_)
-                    | ComponentType::Result(_)
-                    | ComponentType::Variant(_) => {
-                        return Err(ComponentError::UnsupportedType {
-                            what: "an option of a record, list, or option",
-                            offset: payload_at,
-                        })
-                    }
-                };
+                let payload = value_type(reader, types)?;
                 types.push(ComponentTypeDef::Option(payload));
             }
             TYPE_TUPLE => {
@@ -3414,26 +2191,11 @@ fn decode_types(
                 if count == 0 {
                     return Err(ComponentError::Malformed { offset: at });
                 }
-                let mut scalars = Vec::new();
+                let mut items = Vec::new();
                 for _ in 0..count {
-                    let at_type = reader.position();
-                    match value_type(reader, types)? {
-                        ComponentType::Scalar(Scalar::String) => {
-                            return Err(ComponentError::UnsupportedType {
-                                what: "a string in a tuple",
-                                offset: at_type,
-                            })
-                        }
-                        ComponentType::Scalar(scalar) => scalars.push(scalar),
-                        _ => {
-                            return Err(ComponentError::UnsupportedType {
-                                what: "a compound type in a tuple",
-                                offset: at_type,
-                            })
-                        }
-                    }
+                    items.push(value_type(reader, types)?);
                 }
-                types.push(ComponentTypeDef::Tuple(scalars));
+                types.push(ComponentTypeDef::Tuple(items));
             }
             TYPE_FLAGS => {
                 let label_count = reader.u32()?;
@@ -3469,29 +2231,12 @@ fn decode_types(
             }
             TYPE_RESULT => {
                 // Each case is `0x00` for no payload, or `0x01` and a value type.
-                let mut cases = [None, None];
+                let mut cases: [Option<ComponentType>; 2] = [None, None];
                 for case in &mut cases {
                     let at_case = reader.position();
                     match reader.byte()? {
                         0x00 => {}
-                        0x01 => {
-                            let at_payload = reader.position();
-                            *case = Some(match value_type(reader, types)? {
-                                ComponentType::Scalar(Scalar::String) => {
-                                    return Err(ComponentError::UnsupportedType {
-                                        what: "a string in a result",
-                                        offset: at_payload,
-                                    })
-                                }
-                                ComponentType::Scalar(scalar) => scalar,
-                                _ => {
-                                    return Err(ComponentError::UnsupportedType {
-                                        what: "a compound type in a result",
-                                        offset: at_payload,
-                                    })
-                                }
-                            });
-                        }
+                        0x01 => *case = Some(value_type(reader, types)?),
                         _ => return Err(ComponentError::Malformed { offset: at_case }),
                     }
                 }
@@ -3509,7 +2254,7 @@ fn decode_types(
                         offset: at,
                     });
                 }
-                let mut cases: Vec<(String, Option<Scalar>)> = Vec::new();
+                let mut cases: Vec<(String, Option<ComponentType>)> = Vec::new();
                 for _ in 0..case_count {
                     let at_label = reader.position();
                     let label = reader.name()?;
@@ -3519,24 +2264,7 @@ fn decode_types(
                     let at_case = reader.position();
                     let payload = match reader.byte()? {
                         0x00 => None,
-                        0x01 => {
-                            let at_payload = reader.position();
-                            match value_type(reader, types)? {
-                                ComponentType::Scalar(Scalar::String) => {
-                                    return Err(ComponentError::UnsupportedType {
-                                        what: "a string in a variant",
-                                        offset: at_payload,
-                                    })
-                                }
-                                ComponentType::Scalar(scalar) => Some(scalar),
-                                _ => {
-                                    return Err(ComponentError::UnsupportedType {
-                                        what: "a compound type in a variant",
-                                        offset: at_payload,
-                                    })
-                                }
-                            }
-                        }
+                        0x01 => Some(value_type(reader, types)?),
                         _ => return Err(ComponentError::Malformed { offset: at_case }),
                     };
                     // The case's refines field is `0x00`; a refining case is not supported.
@@ -3549,29 +2277,7 @@ fn decode_types(
                 types.push(ComponentTypeDef::Variant { cases });
             }
             TYPE_LIST => {
-                let element_at = reader.position();
-                let element = match value_type(reader, types)? {
-                    ComponentType::Scalar(Scalar::String) => {
-                        return Err(ComponentError::UnsupportedType {
-                            what: "a list of strings",
-                            offset: element_at,
-                        })
-                    }
-                    ComponentType::Scalar(scalar) => scalar,
-                    ComponentType::Record(_)
-                    | ComponentType::List(_)
-                    | ComponentType::Option(_)
-                    | ComponentType::Enum(_)
-                    | ComponentType::Flags(_)
-                    | ComponentType::Tuple(_)
-                    | ComponentType::Result(_)
-                    | ComponentType::Variant(_) => {
-                        return Err(ComponentError::UnsupportedType {
-                            what: "a list of records, lists, or options",
-                            offset: element_at,
-                        })
-                    }
-                };
+                let element = value_type(reader, types)?;
                 types.push(ComponentTypeDef::List(element));
             }
             _ => {
@@ -3631,7 +2337,10 @@ fn decode_imports(
 
 /// The flat core parameters a function of type `func` takes directly.
 fn flat_param_count(func: &ComponentFuncType, types: &[ComponentTypeDef]) -> usize {
-    func.params.iter().map(|ty| flat_of(ty, types).len()).sum()
+    func.params
+        .iter()
+        .map(|ty| canon::flat(ty, types).len())
+        .sum()
 }
 
 /// Decode a canon section's contents: a count, then each canonical function.
@@ -3750,10 +2459,7 @@ fn decode_canon(
                     // Strings and lists among the parameters are read through the memory the lower
                     // names, so such a lower needs one. A string or list result would be written into
                     // memory the host cannot reach, so it is refused.
-                    if func
-                        .params
-                        .iter()
-                        .any(|ty| holds_string(ty) || holds_list(ty))
+                    if func.params.iter().any(|ty| canon::needs_memory(ty, types))
                         && memory.is_none()
                     {
                         return Err(ComponentError::UnsupportedCanon {
@@ -3763,10 +2469,7 @@ fn decode_canon(
                     }
                     // A string or list result is written through the realloc and the memory, which both need the
                     // options. It is returned through a pointer, so it does not count as flat values here.
-                    if func
-                        .result
-                        .iter()
-                        .any(|ty| holds_string(ty) || holds_list(ty))
+                    if func.result.iter().any(|ty| canon::needs_memory(ty, types))
                         && (memory.is_none() || realloc.is_none())
                     {
                         return Err(ComponentError::UnsupportedCanon {
@@ -3774,12 +2477,14 @@ fn decode_canon(
                             offset: at,
                         });
                     }
-                    if func.result.iter().any(|ty| {
-                        !(holds_string(ty) || holds_list(ty))
-                            && flat_of(ty, types).len() > MAX_FLAT_RESULTS
-                    }) {
+                    if func
+                        .result
+                        .iter()
+                        .any(|ty| canon::flat(ty, types).len() > MAX_FLAT_RESULTS)
+                        && memory.is_none()
+                    {
                         return Err(ComponentError::UnsupportedCanon {
-                            what: "lowering a function whose result is returned through memory",
+                            what: "a result returned through memory of a lowered import without a memory option",
                             offset: at,
                         });
                     }
@@ -3918,33 +2623,23 @@ fn decode_canon(
         // Past 16 flat parameters, they are passed as one pointer to them in memory, which is
         // copied in through the memory and `realloc` options. A string or a list cannot be laid
         // out that way here.
-        if flat_param_count(func, types) > MAX_FLAT_PARAMS {
-            if func
-                .params
-                .iter()
-                .any(|ty| holds_string(ty) || holds_list(ty))
-            {
-                return Err(ComponentError::UnsupportedType {
-                    what: "a string or list among more than 16 flat parameters",
-                    offset: at,
-                });
-            }
-            if memory.is_none() || realloc.is_none() {
-                return Err(ComponentError::UnsupportedCanon {
-                    what: "more than 16 flat parameters without a memory and a realloc",
-                    offset: at,
-                });
-            }
+        if flat_param_count(func, types) > MAX_FLAT_PARAMS
+            && (memory.is_none() || realloc.is_none())
+        {
+            return Err(ComponentError::UnsupportedCanon {
+                what: "more than 16 flat parameters without a memory and a realloc",
+                offset: at,
+            });
         }
         // A string or a list lives in memory, as does a result that is returned through a pointer.
         let needs_memory = func
             .params
             .iter()
             .chain(func.result.iter())
-            .any(|ty| holds_string(ty) || holds_list(ty));
+            .any(|ty| canon::needs_memory(ty, types));
         let indirect_result = func
             .result
-            .map(|ty| flat_of(&ty, types).len() > MAX_FLAT_RESULTS)
+            .map(|ty| canon::flat(&ty, types).len() > MAX_FLAT_RESULTS)
             .unwrap_or(false);
         if (needs_memory || indirect_result) && memory.is_none() {
             return Err(ComponentError::UnsupportedCanon {
@@ -3952,12 +2647,7 @@ fn decode_canon(
                 offset: at,
             });
         }
-        if func
-            .params
-            .iter()
-            .any(|ty| holds_string(ty) || holds_list(ty))
-            && realloc.is_none()
-        {
+        if func.params.iter().any(|ty| canon::needs_memory(ty, types)) && realloc.is_none() {
             return Err(ComponentError::UnsupportedCanon {
                 what: "a string or list parameter without a realloc option",
                 offset: at,
@@ -4112,351 +2802,6 @@ impl<'a> Reader<'a> {
 mod tests;
 
 /// Reading WIT, and mapping a world's imports to the capability ids they name.
+mod canon;
+use canon::{flat, layout, Memory};
 pub mod wit;
-
-/// The scalar every payload of a variant's cases shares, if any case has one. Decoding refuses a
-/// variant whose payloads differ in flat type, so the first payload found is the one all share.
-fn shared_payload(cases: &[(String, Option<Scalar>)]) -> Option<Scalar> {
-    cases.iter().find_map(|(_, payload)| *payload)
-}
-
-/// The flat type that the canonical ABI's join gives the payloads of a variant or a result: equal
-/// types stay as they are, `i32` and `f32` join as `i32`, and any other two join as `i64`.
-fn join_flat(a: ValueType, b: ValueType) -> ValueType {
-    match (a, b) {
-        _ if a == b => a,
-        (ValueType::I32, ValueType::F32) | (ValueType::F32, ValueType::I32) => ValueType::I32,
-        _ => ValueType::I64,
-    }
-}
-
-/// The one flat type that the payloads of some cases join to, or `None` if no case has one.
-fn joined_flat(payloads: impl Iterator<Item = Scalar>) -> Option<ValueType> {
-    payloads
-        .filter_map(|scalar| scalar.flat_params().first().copied())
-        .reduce(join_flat)
-}
-
-/// Widen a lowered payload to the joined flat type of its variant or result, as the canonical ABI
-/// does: `i32` to `i64` by its unsigned value, and `f32` or `f64` to the integer of its bits.
-fn widen(value: Value, to: ValueType) -> Result<Value, String> {
-    Ok(match (value, to) {
-        (same @ Value::I32(_), ValueType::I32)
-        | (same @ Value::I64(_), ValueType::I64)
-        | (same @ Value::F32(_), ValueType::F32)
-        | (same @ Value::F64(_), ValueType::F64) => same,
-        (Value::I32(bits), ValueType::I64) => Value::I64(i64::from(bits as u32)),
-        (Value::F32(bits), ValueType::I32) => Value::I32(bits as i32),
-        (Value::F32(bits), ValueType::I64) => Value::I64(i64::from(bits)),
-        (Value::F64(bits), ValueType::I64) => Value::I64(bits as i64),
-        _ => return Err("a payload does not widen to the flat type of its variant".to_owned()),
-    })
-}
-
-/// Lower a value of type `ty` to the core values it flattens to, appending them, for the types
-/// that need no memory: scalars, enums, flags, tuples, records, options, results, and variants. A
-/// string or a list lives in memory, so it is refused here.
-fn lower_flats(
-    value: &ComponentValue,
-    ty: &ComponentType,
-    types: &[ComponentTypeDef],
-    out: &mut Vec<Value>,
-) -> Result<(), String> {
-    let mismatch = || format!("{value:?} does not match its type");
-    match (value, ty) {
-        (ComponentValue::String(_) | ComponentValue::List(_), _) => {
-            Err("a string or list is passed through memory".to_owned())
-        }
-        (value, ComponentType::Scalar(scalar)) => {
-            if value.scalar() != Some(*scalar) {
-                return Err(mismatch());
-            }
-            out.push(lower_scalar(value).ok_or_else(mismatch)?);
-            Ok(())
-        }
-        (ComponentValue::Tuple(items), ComponentType::Tuple(index)) => {
-            let Some(ComponentTypeDef::Tuple(scalars)) = types.get(*index as usize) else {
-                return Err("the tuple is not defined".to_owned());
-            };
-            if items.len() != scalars.len() {
-                return Err("the tuple has the wrong number of values".to_owned());
-            }
-            for (item, scalar) in items.iter().zip(scalars) {
-                if item.scalar() != Some(*scalar) {
-                    return Err("a tuple value does not match its type".to_owned());
-                }
-                out.push(lower_scalar(item).ok_or_else(mismatch)?);
-            }
-            Ok(())
-        }
-        (ComponentValue::Record(fields), ComponentType::Record(index)) => {
-            let Some(ComponentTypeDef::Record(defined)) = types.get(*index as usize) else {
-                return Err("the record is not defined".to_owned());
-            };
-            if fields.len() != defined.len() {
-                return Err("the record has the wrong number of fields".to_owned());
-            }
-            for ((_, value), field) in fields.iter().zip(defined) {
-                if value.scalar() != Some(field.ty) {
-                    return Err("a record field does not match its type".to_owned());
-                }
-                out.push(lower_scalar(value).ok_or_else(mismatch)?);
-            }
-            Ok(())
-        }
-        (ComponentValue::Flags(set), ComponentType::Flags(index)) => {
-            let Some(ComponentTypeDef::Flags(defined)) = types.get(*index as usize) else {
-                return Err("the flags are not defined".to_owned());
-            };
-            let mut bits: u32 = 0;
-            for label in set {
-                let position = defined
-                    .iter()
-                    .position(|candidate| candidate == label)
-                    .ok_or_else(|| format!("the flags have no label {label}"))?;
-                bits |= 1u32 << position;
-            }
-            out.push(Value::I32(bits as i32));
-            Ok(())
-        }
-        (ComponentValue::Enum(label), ComponentType::Enum(index)) => {
-            let Some(ComponentTypeDef::Enum(labels)) = types.get(*index as usize) else {
-                return Err("the enum is not defined".to_owned());
-            };
-            let case = labels
-                .iter()
-                .position(|candidate| candidate == label)
-                .ok_or_else(|| format!("the enum has no case {label}"))?;
-            out.push(Value::I32(case as i32));
-            Ok(())
-        }
-        (ComponentValue::Option(payload), ComponentType::Option(index)) => {
-            let Some(ComponentTypeDef::Option(element)) = types.get(*index as usize) else {
-                return Err("the option is not defined".to_owned());
-            };
-            match payload.as_deref() {
-                None => {
-                    out.push(Value::I32(0));
-                    out.extend(element.flat_params().into_iter().map(zero_value));
-                }
-                Some(value) => {
-                    if value.scalar() != Some(*element) {
-                        return Err("an option payload does not match its type".to_owned());
-                    }
-                    out.push(Value::I32(1));
-                    out.push(lower_scalar(value).ok_or_else(mismatch)?);
-                }
-            }
-            Ok(())
-        }
-        (ComponentValue::Result(outcome), ComponentType::Result(index)) => {
-            let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) else {
-                return Err("the result is not defined".to_owned());
-            };
-            let (discriminant, case_type, payload) = match outcome {
-                Ok(payload) => (0, *ok, payload.as_deref()),
-                Err(payload) => (1, *err, payload.as_deref()),
-            };
-            out.push(Value::I32(discriminant));
-            let joined = joined_flat([*ok, *err].into_iter().flatten());
-            lower_payload(case_type, payload, joined, out)
-        }
-        (ComponentValue::Variant(label, payload), ComponentType::Variant(index)) => {
-            let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) else {
-                return Err("the variant is not defined".to_owned());
-            };
-            let case = cases
-                .iter()
-                .position(|(name, _)| name == label)
-                .ok_or_else(|| format!("the variant has no case {label}"))?;
-            out.push(Value::I32(case as i32));
-            let joined = joined_flat(cases.iter().filter_map(|(_, p)| *p));
-            lower_payload(cases[case].1, payload.as_deref(), joined, out)
-        }
-        _ => Err(mismatch()),
-    }
-}
-
-/// Lower the payload slot of a result or a variant. A case with a value fills the slot with that
-/// value, widened to the joined flat type; a case without one fills it with zero. The slot exists
-/// only when some case has a payload, so nothing is pushed otherwise.
-fn lower_payload(
-    case_type: Option<Scalar>,
-    payload: Option<&ComponentValue>,
-    joined: Option<ValueType>,
-    out: &mut Vec<Value>,
-) -> Result<(), String> {
-    match (case_type, payload) {
-        (None, None) => {
-            if let Some(joined) = joined {
-                out.push(zero_value(joined));
-            }
-            Ok(())
-        }
-        (Some(scalar), Some(value)) => {
-            if value.scalar() != Some(scalar) {
-                return Err("a payload does not match its case".to_owned());
-            }
-            let lowered =
-                lower_scalar(value).ok_or_else(|| "a payload did not lower".to_owned())?;
-            if let Some(joined) = joined {
-                out.push(widen(lowered, joined)?);
-            }
-            Ok(())
-        }
-        _ => Err("a payload does not match its case".to_owned()),
-    }
-}
-
-/// Lift the core values of one parameter or result of type `ty` from `values`, consuming exactly
-/// the values it flattens to, in the canonical order. A payload of a result or a variant arrives
-/// as the joined flat type, and is narrowed to the type of its case first.
-fn lift_flats(
-    values: &mut std::slice::Iter<'_, Value>,
-    ty: &ComponentType,
-    types: &[ComponentTypeDef],
-) -> Result<ComponentValue, String> {
-    let mut take = || {
-        values
-            .next()
-            .cloned()
-            .ok_or_else(|| "the core function passed too few values".to_owned())
-    };
-    match ty {
-        ComponentType::Scalar(Scalar::String) | ComponentType::List(_) => {
-            Err("a string or list is passed through memory".to_owned())
-        }
-        ComponentType::Scalar(scalar) => lift(take()?, *scalar),
-        ComponentType::Enum(index) => {
-            let Some(ComponentTypeDef::Enum(labels)) = types.get(*index as usize) else {
-                return Err("the enum is not defined".to_owned());
-            };
-            let case = enum_case(&take()?, labels.len())?;
-            Ok(ComponentValue::Enum(labels[case].clone()))
-        }
-        ComponentType::Flags(index) => {
-            let Some(ComponentTypeDef::Flags(labels)) = types.get(*index as usize) else {
-                return Err("the flags are not defined".to_owned());
-            };
-            let Value::I32(bits) = take()? else {
-                return Err("a flags value is not an i32".to_owned());
-            };
-            let bits = bits as u32;
-            if labels.len() < 32 && bits >> labels.len() != 0 {
-                return Err(format!("{bits:#x} sets a bit that names no flag"));
-            }
-            let set = labels
-                .iter()
-                .enumerate()
-                .filter(|(position, _)| bits & (1u32 << position) != 0)
-                .map(|(_, label)| label.clone())
-                .collect();
-            Ok(ComponentValue::Flags(set))
-        }
-        ComponentType::Tuple(index) => {
-            let Some(ComponentTypeDef::Tuple(scalars)) = types.get(*index as usize) else {
-                return Err("the tuple is not defined".to_owned());
-            };
-            let mut lifted = Vec::with_capacity(scalars.len());
-            for scalar in scalars {
-                lifted.push(lift(take()?, *scalar)?);
-            }
-            Ok(ComponentValue::Tuple(lifted))
-        }
-        ComponentType::Record(index) => {
-            let Some(ComponentTypeDef::Record(fields)) = types.get(*index as usize) else {
-                return Err("the record is not defined".to_owned());
-            };
-            let mut lifted = Vec::with_capacity(fields.len());
-            for field in fields {
-                lifted.push((field.name.clone(), lift(take()?, field.ty)?));
-            }
-            Ok(ComponentValue::Record(lifted))
-        }
-        ComponentType::Option(index) => {
-            let Some(ComponentTypeDef::Option(element)) = types.get(*index as usize) else {
-                return Err("the option is not defined".to_owned());
-            };
-            let discriminant = take()?;
-            // The payload slot is always present; its value is read only for the some case.
-            let payload = take()?;
-            match discriminant {
-                Value::I32(0) => Ok(ComponentValue::Option(None)),
-                Value::I32(1) => Ok(ComponentValue::Option(Some(Box::new(lift(
-                    payload, *element,
-                )?)))),
-                _ => Err("an option's discriminant is neither 0 nor 1".to_owned()),
-            }
-        }
-        ComponentType::Result(index) => {
-            let Some(ComponentTypeDef::Result { ok, err }) = types.get(*index as usize) else {
-                return Err("the result is not defined".to_owned());
-            };
-            let discriminant = take()?;
-            let joined = joined_flat([*ok, *err].into_iter().flatten());
-            let slot = if joined.is_some() {
-                Some(take()?)
-            } else {
-                None
-            };
-            let (is_ok, case_type) = match discriminant {
-                Value::I32(0) => (true, *ok),
-                Value::I32(1) => (false, *err),
-                _ => return Err("a result's discriminant is neither 0 nor 1".to_owned()),
-            };
-            let payload = lift_payload(case_type, slot)?;
-            Ok(ComponentValue::Result(if is_ok {
-                Ok(payload)
-            } else {
-                Err(payload)
-            }))
-        }
-        ComponentType::Variant(index) => {
-            let Some(ComponentTypeDef::Variant { cases }) = types.get(*index as usize) else {
-                return Err("the variant is not defined".to_owned());
-            };
-            let discriminant = take()?;
-            let joined = joined_flat(cases.iter().filter_map(|(_, p)| *p));
-            let slot = if joined.is_some() {
-                Some(take()?)
-            } else {
-                None
-            };
-            let case = enum_case(&discriminant, cases.len())?;
-            let (label, case_type) = &cases[case];
-            let payload = lift_payload(*case_type, slot)?;
-            Ok(ComponentValue::Variant(label.clone(), payload))
-        }
-    }
-}
-
-/// Lift the payload of a case from its slot, narrowing the joined value to the case's type.
-fn lift_payload(
-    case_type: Option<Scalar>,
-    slot: Option<Value>,
-) -> Result<Option<Box<ComponentValue>>, String> {
-    match (case_type, slot) {
-        (None, _) => Ok(None),
-        (Some(scalar), Some(slot)) => {
-            let narrowed = narrow(slot, scalar.flat_params()[0])?;
-            Ok(Some(Box::new(lift(narrowed, scalar)?)))
-        }
-        (Some(_), None) => Err("a payload has no slot".to_owned()),
-    }
-}
-
-/// Narrow a joined core value to the flat type of its case, as the canonical ABI coerces it: an
-/// i64 wraps to an i32, and the bits of an integer reinterpret as a float.
-fn narrow(value: Value, want: ValueType) -> Result<Value, String> {
-    Ok(match (value, want) {
-        (same @ Value::I32(_), ValueType::I32)
-        | (same @ Value::I64(_), ValueType::I64)
-        | (same @ Value::F32(_), ValueType::F32)
-        | (same @ Value::F64(_), ValueType::F64) => same,
-        (Value::I64(bits), ValueType::I32) => Value::I32(bits as i32),
-        (Value::I32(bits), ValueType::F32) => Value::F32(bits as u32),
-        (Value::I64(bits), ValueType::F32) => Value::F32(bits as u32),
-        (Value::I64(bits), ValueType::F64) => Value::F64(bits as u64),
-        _ => return Err("a joined value does not narrow to the type of its case".to_owned()),
-    })
-}

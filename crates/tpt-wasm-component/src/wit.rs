@@ -198,9 +198,9 @@ impl WitDocument {
 
     /// The component types of `function` in `interface`, as a type table and a function type whose
     /// indices name that table. The table holds the interface's records and enums, in declaration
-    /// order, followed by each list, option, tuple and result the signature uses. A string is allowed
-    /// as a parameter or a result, but not inside a list, an option, a tuple, a result, or a record,
-    /// which the component layer does not lay out. Anything else is refused by name.
+    /// order, followed by each list, option, tuple and result the signature uses, with the types
+    /// they hold placed before them. A record field may name a record or enum declared before it.
+    /// A type the component layer cannot name is refused by name.
     pub fn function_signature(
         &self,
         interface: &str,
@@ -392,19 +392,16 @@ impl SignatureTable<'_> {
         (self.defs.len() - 1) as u32
     }
 
-    /// Add a declared record or enum. A record's fields must be scalars other than a string.
+    /// Add a declared record or enum. A record's fields may be of any type the table can name.
     fn declare(&mut self, declared: &WitTypeDef) -> Result<(), WitError> {
         match declared {
             WitTypeDef::Record { name, fields } => {
                 let mut record = Vec::with_capacity(fields.len());
                 for (field, ty) in fields {
-                    let scalar = match scalar_name(ty) {
-                        Some(Scalar::String) | None => return Err(self.refuse(ty)),
-                        Some(scalar) => scalar,
-                    };
+                    let ty = self.value_type(ty)?;
                     record.push(RecordField {
                         name: field.clone(),
-                        ty: scalar,
+                        ty,
                     });
                 }
                 let index = self.push(ComponentTypeDef::Record(record));
@@ -468,16 +465,13 @@ impl SignatureTable<'_> {
         }
     }
 
-    /// A scalar that a list, option, tuple or result holds: any scalar but a string.
-    fn payload(&self, text: &str) -> Result<Scalar, WitError> {
-        match scalar_name(text.trim()) {
-            Some(Scalar::String) | None => Err(self.refuse(text)),
-            Some(scalar) => Ok(scalar),
-        }
+    /// The type a list, option, tuple or result holds.
+    fn payload(&mut self, text: &str) -> Result<ComponentType, WitError> {
+        self.value_type(text)
     }
 
     /// A result's payload, where `_` means the case has none.
-    fn optional_payload(&self, text: &str) -> Result<Option<Scalar>, WitError> {
+    fn optional_payload(&mut self, text: &str) -> Result<Option<ComponentType>, WitError> {
         if text.trim() == "_" {
             return Ok(None);
         }
@@ -1380,11 +1374,11 @@ world w {
                 ComponentTypeDef::Record(vec![
                     RecordField {
                         name: "x".to_owned(),
-                        ty: Scalar::S32,
+                        ty: ComponentType::Scalar(Scalar::S32),
                     },
                     RecordField {
                         name: "y".to_owned(),
-                        ty: Scalar::S32,
+                        ty: ComponentType::Scalar(Scalar::S32),
                     },
                 ]),
                 ComponentTypeDef::Enum(vec![
@@ -1409,10 +1403,16 @@ world w {
         let (table, signature) = document
             .function_signature("geometry", "points")
             .expect("maps");
-        assert_eq!(table[2], ComponentTypeDef::List(Scalar::U8));
+        assert_eq!(
+            table[2],
+            ComponentTypeDef::List(ComponentType::Scalar(Scalar::U8))
+        );
         assert_eq!(
             table[3],
-            ComponentTypeDef::Tuple(vec![Scalar::U8, Scalar::Bool])
+            ComponentTypeDef::Tuple(vec![
+                ComponentType::Scalar(Scalar::U8),
+                ComponentType::Scalar(Scalar::Bool)
+            ])
         );
         assert_eq!(
             signature,
@@ -1434,11 +1434,11 @@ world w {
                 ComponentTypeDef::Record(vec![
                     RecordField {
                         name: "x".to_owned(),
-                        ty: Scalar::S32
+                        ty: ComponentType::Scalar(Scalar::S32)
                     },
                     RecordField {
                         name: "y".to_owned(),
-                        ty: Scalar::S32
+                        ty: ComponentType::Scalar(Scalar::S32)
                     },
                 ]),
                 ComponentTypeDef::Enum(vec![
@@ -1446,7 +1446,7 @@ world w {
                     "green".to_owned(),
                     "blue".to_owned()
                 ]),
-                ComponentTypeDef::Option(Scalar::U32),
+                ComponentTypeDef::Option(ComponentType::Scalar(Scalar::U32)),
             ]
         );
         assert_eq!(signature.result, Some(ComponentType::Option(2)));
@@ -1457,8 +1457,8 @@ world w {
         assert_eq!(
             table[2],
             ComponentTypeDef::Result {
-                ok: Some(Scalar::U32),
-                err: Some(Scalar::U8),
+                ok: Some(ComponentType::Scalar(Scalar::U32)),
+                err: Some(ComponentType::Scalar(Scalar::U8)),
             }
         );
         assert_eq!(signature.result, Some(ComponentType::Result(2)));
@@ -1470,43 +1470,37 @@ world w {
             table[2],
             ComponentTypeDef::Result {
                 ok: None,
-                err: Some(Scalar::U8),
+                err: Some(ComponentType::Scalar(Scalar::U8)),
             }
         );
         assert!(signature.params.is_empty());
     }
 
     #[test]
-    fn compound_shapes_the_component_layer_does_not_lay_out_are_refused_by_name() {
+    fn compound_shapes_with_strings_and_records_are_laid_out() {
         let document = WitDocument::parse(SHAPES).expect("parses");
-        assert_eq!(
-            document.function_signature("geometry", "corners"),
-            Err(WitError::UnsupportedType {
-                function: "corners".to_owned(),
-                ty: "point".to_owned(),
-            }),
-            "a list of records is not laid out"
+        assert!(
+            document.function_signature("geometry", "corners").is_ok(),
+            "a list of records is laid out"
         );
-        assert_eq!(
-            document.function_signature("geometry", "named"),
-            Err(WitError::UnsupportedType {
-                function: "named".to_owned(),
-                ty: "string".to_owned(),
-            }),
-            "a list of strings is not laid out"
+        assert!(
+            document.function_signature("geometry", "named").is_ok(),
+            "a list of strings is laid out"
         );
     }
 
     #[test]
-    fn a_record_with_a_string_field_is_refused_at_its_declaration() {
+    fn a_record_with_a_string_field_is_laid_out_at_its_declaration() {
         let document = WitDocument::parse(
             "package a:b;\ninterface i {\n  record r { name: string }\n  f: func(x: r);\n}\n",
         )
         .expect("parses");
-        assert!(matches!(
-            document.function_signature("i", "f"),
-            Err(WitError::UnsupportedType { ty, .. }) if ty == "string"
-        ));
+        let (table, signature) = document
+            .function_signature("i", "f")
+            .expect("a record with a string field is laid out");
+        assert_eq!(signature.params.len(), 1);
+        assert!(matches!(&table[0], ComponentTypeDef::Record(fields)
+            if fields.len() == 1 && fields[0].ty == ComponentType::Scalar(Scalar::String)));
     }
 }
 
@@ -1531,11 +1525,11 @@ interface geometry {
         ComponentTypeDef::Record(vec![
             RecordField {
                 name: fields[0].to_owned(),
-                ty: Scalar::S32,
+                ty: ComponentType::Scalar(Scalar::S32),
             },
             RecordField {
                 name: fields[1].to_owned(),
-                ty: Scalar::S32,
+                ty: ComponentType::Scalar(Scalar::S32),
             },
         ])
     }

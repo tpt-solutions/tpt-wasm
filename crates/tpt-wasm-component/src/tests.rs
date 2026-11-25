@@ -1191,62 +1191,68 @@ fn answer_returning(valtype: u8) -> Vec<u8> {
 #[test]
 fn the_small_and_boolean_types_lift_from_their_core_value() {
     assert_eq!(
-        lift(Value::I32(2), Scalar::Bool),
+        canon::lift_scalar(Value::I32(2), Scalar::Bool),
         Ok(ComponentValue::Bool(true))
     );
     assert_eq!(
-        lift(Value::I32(0), Scalar::Bool),
+        canon::lift_scalar(Value::I32(0), Scalar::Bool),
         Ok(ComponentValue::Bool(false))
     );
     // The unsigned types keep the low bits; the signed ones sign-extend them.
     assert_eq!(
-        lift(Value::I32(0x1ff), Scalar::U8),
+        canon::lift_scalar(Value::I32(0x1ff), Scalar::U8),
         Ok(ComponentValue::U8(0xff))
     );
     assert_eq!(
-        lift(Value::I32(0xff), Scalar::S8),
+        canon::lift_scalar(Value::I32(0xff), Scalar::S8),
         Ok(ComponentValue::S8(-1))
     );
     assert_eq!(
-        lift(Value::I32(0x8000), Scalar::S16),
+        canon::lift_scalar(Value::I32(0x8000), Scalar::S16),
         Ok(ComponentValue::S16(i16::MIN))
     );
     assert_eq!(
-        lift(Value::I32(0x1_ffff), Scalar::U16),
+        canon::lift_scalar(Value::I32(0x1_ffff), Scalar::U16),
         Ok(ComponentValue::U16(0xffff))
     );
     assert_eq!(
-        lift(Value::I32(42), Scalar::Char),
+        canon::lift_scalar(Value::I32(42), Scalar::Char),
         Ok(ComponentValue::Char('*'))
     );
 }
 
 #[test]
 fn a_character_that_is_not_a_scalar_value_traps() {
-    assert!(lift(Value::I32(0xD800), Scalar::Char).is_err());
-    assert!(lift(Value::I32(0xDFFF), Scalar::Char).is_err());
-    assert!(lift(Value::I32(0x11_0000), Scalar::Char).is_err());
-    assert!(lift(Value::I32(-1), Scalar::Char).is_err());
+    assert!(canon::lift_scalar(Value::I32(0xD800), Scalar::Char).is_err());
+    assert!(canon::lift_scalar(Value::I32(0xDFFF), Scalar::Char).is_err());
+    assert!(canon::lift_scalar(Value::I32(0x11_0000), Scalar::Char).is_err());
+    assert!(canon::lift_scalar(Value::I32(-1), Scalar::Char).is_err());
 }
 
 #[test]
 fn the_small_and_boolean_types_lower_to_one_i32() {
     assert_eq!(
-        lower_scalar(&ComponentValue::Bool(true)),
+        canon::lower_scalar(&ComponentValue::Bool(true)),
         Some(Value::I32(1))
     );
-    assert_eq!(lower_scalar(&ComponentValue::S8(-1)), Some(Value::I32(-1)));
     assert_eq!(
-        lower_scalar(&ComponentValue::U8(255)),
+        canon::lower_scalar(&ComponentValue::S8(-1)),
+        Some(Value::I32(-1))
+    );
+    assert_eq!(
+        canon::lower_scalar(&ComponentValue::U8(255)),
         Some(Value::I32(255))
     );
-    assert_eq!(lower_scalar(&ComponentValue::S16(-2)), Some(Value::I32(-2)));
     assert_eq!(
-        lower_scalar(&ComponentValue::U16(65535)),
+        canon::lower_scalar(&ComponentValue::S16(-2)),
+        Some(Value::I32(-2))
+    );
+    assert_eq!(
+        canon::lower_scalar(&ComponentValue::U16(65535)),
         Some(Value::I32(65535))
     );
     assert_eq!(
-        lower_scalar(&ComponentValue::Char('A')),
+        canon::lower_scalar(&ComponentValue::Char('A')),
         Some(Value::I32(65))
     );
 }
@@ -1338,30 +1344,33 @@ fn no_truncation_or_corruption_of_a_component_panics() {
 #[test]
 fn scalars_lower_and_lift_by_their_bits() {
     assert_eq!(
-        lower_scalar(&ComponentValue::U32(u32::MAX)),
+        canon::lower_scalar(&ComponentValue::U32(u32::MAX)),
         Some(Value::I32(-1))
     );
     assert_eq!(
-        lift(Value::I32(-1), Scalar::U32),
+        canon::lift_scalar(Value::I32(-1), Scalar::U32),
         Ok(ComponentValue::U32(u32::MAX))
     );
     assert_eq!(
-        lift(Value::I32(-1), Scalar::S32),
+        canon::lift_scalar(Value::I32(-1), Scalar::S32),
         Ok(ComponentValue::S32(-1))
     );
     // A NaN with a payload keeps its bits through the round trip.
     let nan = f32::from_bits(0x7fc0_1234);
-    let lowered = lower_scalar(&ComponentValue::F32(nan)).expect("a scalar lowers");
+    let lowered = canon::lower_scalar(&ComponentValue::F32(nan)).expect("a scalar lowers");
     assert_eq!(lowered, Value::F32(0x7fc0_1234));
     assert_eq!(
-        lift(lowered, Scalar::F32).map(|value| match value {
+        canon::lift_scalar(lowered, Scalar::F32).map(|value| match value {
             ComponentValue::F32(value) => value.to_bits(),
             _ => 0,
         }),
         Ok(0x7fc0_1234)
     );
-    assert!(lift(Value::I64(1), Scalar::S32).is_err());
-    assert_eq!(lower_scalar(&ComponentValue::String("x".to_owned())), None);
+    assert!(canon::lift_scalar(Value::I64(1), Scalar::S32).is_err());
+    assert_eq!(
+        canon::lower_scalar(&ComponentValue::String("x".to_owned())),
+        None
+    );
 }
 
 /// A core module with memory, and two functions over a record of `x: u32` and `y: u8`:
@@ -1536,25 +1545,31 @@ fn a_record_is_laid_out_by_the_canonical_alignment_rules() {
     let point = [
         RecordField {
             name: "x".to_owned(),
-            ty: Scalar::U32,
+            ty: ComponentType::Scalar(Scalar::U32),
         },
         RecordField {
             name: "y".to_owned(),
-            ty: Scalar::U8,
+            ty: ComponentType::Scalar(Scalar::U8),
         },
     ];
-    assert_eq!(record_layout(&point), (vec![0, 4], 8, 4));
+    assert_eq!(
+        canon::layout(&point.iter().map(|field| field.ty).collect::<Vec<_>>(), &[]),
+        (vec![0, 4], 8, 4)
+    );
     let mixed = [
         RecordField {
             name: "a".to_owned(),
-            ty: Scalar::U8,
+            ty: ComponentType::Scalar(Scalar::U8),
         },
         RecordField {
             name: "b".to_owned(),
-            ty: Scalar::U64,
+            ty: ComponentType::Scalar(Scalar::U64),
         },
     ];
-    assert_eq!(record_layout(&mixed), (vec![0, 8], 16, 8));
+    assert_eq!(
+        canon::layout(&mixed.iter().map(|field| field.ty).collect::<Vec<_>>(), &[]),
+        (vec![0, 8], 16, 8)
+    );
 }
 
 /// A core module with memory and `realloc`, and three functions over lists: `first(ptr, len)`
@@ -1944,15 +1959,9 @@ fn an_option_payload_of_another_type_is_refused() {
 }
 
 #[test]
-fn an_option_of_a_string_is_refused() {
+fn an_option_of_a_string_decodes() {
     let bytes = with(&section(SECTION_TYPE, &[1, TYPE_OPTION, VALTYPE_STRING]));
-    assert!(matches!(
-        Component::decode(&bytes),
-        Err(ComponentError::UnsupportedType {
-            what: "an option of a string",
-            ..
-        })
-    ));
+    assert!(Component::decode(&bytes).is_ok());
 }
 
 /// A core module with two functions over an enum's case index: `echo(i) -> i32` returns its
@@ -2311,21 +2320,16 @@ fn a_tuple_with_the_wrong_arity_is_refused() {
 }
 
 #[test]
-fn an_empty_tuple_is_malformed_and_a_string_in_a_tuple_is_refused() {
+fn an_empty_tuple_is_malformed_and_a_string_in_a_tuple_decodes() {
     assert!(matches!(
         Component::decode(&with(&section(SECTION_TYPE, &[1, TYPE_TUPLE, 0]))),
         Err(ComponentError::Malformed { .. })
     ));
-    assert!(matches!(
-        Component::decode(&with(&section(
-            SECTION_TYPE,
-            &[1, TYPE_TUPLE, 1, VALTYPE_STRING]
-        ))),
-        Err(ComponentError::UnsupportedType {
-            what: "a string in a tuple",
-            ..
-        })
-    ));
+    assert!(Component::decode(&with(&section(
+        SECTION_TYPE,
+        &[1, TYPE_TUPLE, 1, VALTYPE_STRING]
+    )))
+    .is_ok());
 }
 
 /// A core module with a memory, and four functions. `ok` and `err` return a pointer to a result
@@ -2556,28 +2560,18 @@ fn a_result_argument_passes_its_discriminant_and_payload() {
 }
 
 #[test]
-fn a_result_with_a_string_or_a_compound_payload_is_refused() {
-    assert!(matches!(
-        Component::decode(&with(&section(
-            SECTION_TYPE,
-            &[1, TYPE_RESULT, 1, VALTYPE_STRING, 0]
-        ))),
-        Err(ComponentError::UnsupportedType {
-            what: "a string in a result",
-            ..
-        })
-    ));
-    // Type 0 is a list, so the result's payload is a compound type.
-    assert!(matches!(
-        Component::decode(&with(&section(
-            SECTION_TYPE,
-            &[2, TYPE_LIST, VALTYPE_U8, TYPE_RESULT, 1, 0x00, 0]
-        ))),
-        Err(ComponentError::UnsupportedType {
-            what: "a compound type in a result",
-            ..
-        })
-    ));
+fn results_with_a_string_or_a_compound_payload_decode() {
+    assert!(Component::decode(&with(&section(
+        SECTION_TYPE,
+        &[1, TYPE_RESULT, 1, VALTYPE_STRING, 0]
+    )))
+    .is_ok());
+    // Type 0 is a list, and the result's payload is that list.
+    assert!(Component::decode(&with(&section(
+        SECTION_TYPE,
+        &[2, TYPE_LIST, VALTYPE_U8, TYPE_RESULT, 1, 0x00, 0]
+    )))
+    .is_ok());
 }
 
 #[test]
@@ -2828,17 +2822,12 @@ fn a_variant_argument_that_does_not_match_its_type_is_refused() {
 }
 
 #[test]
-fn a_variant_with_a_string_or_a_repeated_label_is_refused() {
-    assert!(matches!(
-        Component::decode(&with(&section(
-            SECTION_TYPE,
-            &[1, TYPE_VARIANT, 1, 1, b'a', 0x01, VALTYPE_STRING, 0]
-        ))),
-        Err(ComponentError::UnsupportedType {
-            what: "a string in a variant",
-            ..
-        })
-    ));
+fn a_variant_with_a_string_decodes_and_a_repeated_label_is_malformed() {
+    assert!(Component::decode(&with(&section(
+        SECTION_TYPE,
+        &[1, TYPE_VARIANT, 1, 1, b'a', 0x01, VALTYPE_STRING, 0]
+    )))
+    .is_ok());
     assert!(matches!(
         Component::decode(&with(&section(
             SECTION_TYPE,
@@ -2954,7 +2943,7 @@ fn seventeen_parameters_are_stored_as_one_block_behind_a_pointer() {
 }
 
 #[test]
-fn indirect_parameters_need_a_realloc_and_may_not_hold_a_string() {
+fn indirect_parameters_need_a_memory_and_may_hold_a_string() {
     assert!(matches!(
         Component::decode(&wide_component(
             &seventeen_u32_params(),
@@ -2966,13 +2955,7 @@ fn indirect_parameters_need_a_realloc_and_may_not_hold_a_string() {
     for name in b'b'..b'b' + 16 {
         with_string.extend_from_slice(&[1, name, VALTYPE_U32]);
     }
-    assert!(matches!(
-        Component::decode(&wide_component(&with_string, &WIDE_OPTIONS)),
-        Err(ComponentError::UnsupportedType {
-            what: "a string or list among more than 16 flat parameters",
-            ..
-        })
-    ));
+    assert!(Component::decode(&wide_component(&with_string, &WIDE_OPTIONS)).is_ok());
 }
 
 #[test]
@@ -2999,15 +2982,15 @@ fn a_record_and_an_option_are_stored_at_their_canonical_offsets() {
     let defined = vec![ComponentTypeDef::Record(vec![
         RecordField {
             name: "a".to_owned(),
-            ty: Scalar::U8,
+            ty: ComponentType::Scalar(Scalar::U8),
         },
         RecordField {
             name: "b".to_owned(),
-            ty: Scalar::U32,
+            ty: ComponentType::Scalar(Scalar::U32),
         },
     ])];
     let mut buffer = [0u8; 8];
-    store(
+    store_flat(
         &ComponentValue::Record(vec![
             ("a".to_owned(), ComponentValue::U8(7)),
             ("b".to_owned(), ComponentValue::U32(0x0102_0304)),
@@ -3020,9 +3003,9 @@ fn a_record_and_an_option_are_stored_at_their_canonical_offsets() {
     .expect("stores");
     assert_eq!(buffer, [7, 0, 0, 0, 4, 3, 2, 1]);
 
-    let defined = vec![ComponentTypeDef::Option(Scalar::U32)];
+    let defined = vec![ComponentTypeDef::Option(ComponentType::Scalar(Scalar::U32))];
     let mut buffer = [0u8; 8];
-    store(
+    store_flat(
         &ComponentValue::Option(Some(Box::new(ComponentValue::U32(5)))),
         &ComponentType::Option(0),
         &defined,
@@ -3541,13 +3524,13 @@ fn a_variant_whose_payloads_differ_in_flat_type_joins_as_the_canonical_abi_does(
 
 #[test]
 fn the_canonical_join_of_flat_types_is_i32_for_i32_and_f32_and_i64_otherwise() {
-    assert_eq!(join_flat(ValueType::I32, ValueType::I32), ValueType::I32);
-    assert_eq!(join_flat(ValueType::I32, ValueType::F32), ValueType::I32);
-    assert_eq!(join_flat(ValueType::F32, ValueType::I32), ValueType::I32);
-    assert_eq!(join_flat(ValueType::F32, ValueType::F32), ValueType::F32);
-    assert_eq!(join_flat(ValueType::I32, ValueType::I64), ValueType::I64);
-    assert_eq!(join_flat(ValueType::F32, ValueType::F64), ValueType::I64);
-    assert_eq!(join_flat(ValueType::F64, ValueType::F64), ValueType::F64);
+    assert_eq!(canon::join(ValueType::I32, ValueType::I32), ValueType::I32);
+    assert_eq!(canon::join(ValueType::I32, ValueType::F32), ValueType::I32);
+    assert_eq!(canon::join(ValueType::F32, ValueType::I32), ValueType::I32);
+    assert_eq!(canon::join(ValueType::F32, ValueType::F32), ValueType::F32);
+    assert_eq!(canon::join(ValueType::I32, ValueType::I64), ValueType::I64);
+    assert_eq!(canon::join(ValueType::F32, ValueType::F64), ValueType::I64);
+    assert_eq!(canon::join(ValueType::F64, ValueType::F64), ValueType::F64);
 }
 
 /// Types for a lowered import of `pick: func(p: record) -> enum`, where the record is
@@ -3675,7 +3658,7 @@ fn a_lowered_import_returning_more_than_one_value_is_refused() {
     assert!(matches!(
         Component::decode(&with(&[types, import, lower].concat())),
         Err(ComponentError::UnsupportedCanon {
-            what: "lowering a function whose result is returned through memory",
+            what: "a result returned through memory of a lowered import without a memory option",
             ..
         })
     ));
@@ -4322,4 +4305,238 @@ fn a_consumer_that_does_not_share_the_named_memory_is_refused_at_instantiation()
         ),
         "the consumer's pointers would not address the named memory: {refused:?}"
     );
+}
+
+use crate::canon;
+
+/// A memory that is only a byte buffer, for storing values that hold no string or list.
+struct FlatMemory(Vec<u8>);
+
+impl canon::Memory for FlatMemory {
+    fn read(&mut self, address: u32, length: u32) -> Result<Vec<u8>, String> {
+        let start = address as usize;
+        self.0
+            .get(start..start + length as usize)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| "the read is outside the buffer".to_owned())
+    }
+
+    fn write(&mut self, address: u32, bytes: &[u8]) -> Result<(), String> {
+        let start = address as usize;
+        let slot = self
+            .0
+            .get_mut(start..start + bytes.len())
+            .ok_or_else(|| "the write is outside the buffer".to_owned())?;
+        slot.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn realloc(&mut self, _: u32, _: u32, _: u32, _: u32) -> Result<u32, String> {
+        Err("this memory has no realloc".to_owned())
+    }
+}
+
+/// Store a value into `buffer` at `at`, for values that hold no string or list.
+fn store_flat(
+    value: &ComponentValue,
+    ty: &ComponentType,
+    types: &[ComponentTypeDef],
+    buffer: &mut [u8],
+    at: usize,
+) -> Result<(), String> {
+    let mut memory = FlatMemory(buffer.to_vec());
+    let result = canon::store(
+        &mut memory,
+        StringEncoding::Utf8,
+        value,
+        ty,
+        types,
+        at as u32,
+    );
+    buffer.copy_from_slice(&memory.0);
+    result
+}
+
+/// A memory with a bump allocator, for values that hold strings and lists. `realloc` copies the
+/// old block into the new one, as the canonical ABI's `realloc` does.
+struct Heap {
+    bytes: Vec<u8>,
+    next: u32,
+}
+
+impl Heap {
+    fn new() -> Self {
+        // The first 256 bytes are reserved for the value the tests store at address 0.
+        Heap {
+            bytes: vec![0; 4096],
+            next: 256,
+        }
+    }
+}
+
+impl canon::Memory for Heap {
+    fn read(&mut self, address: u32, length: u32) -> Result<Vec<u8>, String> {
+        let start = address as usize;
+        self.bytes
+            .get(start..start + length as usize)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| "the read is outside the heap".to_owned())
+    }
+
+    fn write(&mut self, address: u32, bytes: &[u8]) -> Result<(), String> {
+        let start = address as usize;
+        let slot = self
+            .bytes
+            .get_mut(start..start + bytes.len())
+            .ok_or_else(|| "the write is outside the heap".to_owned())?;
+        slot.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn realloc(
+        &mut self,
+        old: u32,
+        old_size: u32,
+        align: u32,
+        new_size: u32,
+    ) -> Result<u32, String> {
+        let align = align.max(1);
+        let start = self.next.div_ceil(align) * align;
+        let end = start
+            .checked_add(new_size)
+            .filter(|end| *end as usize <= self.bytes.len())
+            .ok_or_else(|| "the heap is full".to_owned())?;
+        for offset in 0..old_size.min(new_size) {
+            self.bytes[(start + offset) as usize] = self.bytes[(old + offset) as usize];
+        }
+        self.next = end;
+        Ok(start)
+    }
+}
+
+#[test]
+fn a_record_with_a_string_and_an_option_of_a_list_round_trips_through_memory() {
+    // Type 0 is a list of bytes, type 1 an option of it, type 2 a record of a string and type 1.
+    let types = vec![
+        ComponentTypeDef::List(ComponentType::Scalar(Scalar::U8)),
+        ComponentTypeDef::Option(ComponentType::List(0)),
+        ComponentTypeDef::Record(vec![
+            RecordField {
+                name: "name".to_owned(),
+                ty: ComponentType::Scalar(Scalar::String),
+            },
+            RecordField {
+                name: "body".to_owned(),
+                ty: ComponentType::Option(1),
+            },
+        ]),
+    ];
+    let ty = ComponentType::Record(2);
+    let value = ComponentValue::Record(vec![
+        (
+            "name".to_owned(),
+            ComponentValue::String("héllo".to_owned()),
+        ),
+        (
+            "body".to_owned(),
+            ComponentValue::Option(Some(Box::new(ComponentValue::List(vec![
+                ComponentValue::U8(1),
+                ComponentValue::U8(2),
+            ])))),
+        ),
+    ]);
+
+    let mut heap = Heap::new();
+    canon::store(&mut heap, StringEncoding::Utf8, &value, &ty, &types, 0).expect("stores");
+    let loaded = canon::load(&mut heap, StringEncoding::Utf8, 0, &ty, &types).expect("loads");
+    assert_eq!(loaded, value);
+
+    // Flat: the record's string is two words, and the option is a discriminant with the list's two
+    // words, so the lowered value is five core values, and it lifts back to the same record.
+    let mut heap = Heap::new();
+    let flat = canon::lower(&mut heap, StringEncoding::Utf8, &value, &ty, &types).expect("lowers");
+    assert_eq!(flat.len(), 5);
+    let lifted = canon::lift(
+        &mut heap,
+        StringEncoding::Utf8,
+        &mut flat.iter(),
+        &ty,
+        &types,
+    )
+    .expect("lifts");
+    assert_eq!(lifted, value);
+}
+
+#[test]
+fn a_result_of_a_list_or_a_string_round_trips_through_memory_for_both_cases() {
+    // Type 0 is a list of bytes, and type 1 a result of it or a string.
+    let types = vec![
+        ComponentTypeDef::List(ComponentType::Scalar(Scalar::U8)),
+        ComponentTypeDef::Result {
+            ok: Some(ComponentType::List(0)),
+            err: Some(ComponentType::Scalar(Scalar::String)),
+        },
+    ];
+    let ty = ComponentType::Result(1);
+    let cases = [
+        ComponentValue::Result(Ok(Some(Box::new(ComponentValue::List(vec![
+            ComponentValue::U8(9),
+        ]))))),
+        ComponentValue::Result(Err(Some(Box::new(ComponentValue::String(
+            "failed".to_owned(),
+        ))))),
+    ];
+    for value in cases {
+        let mut heap = Heap::new();
+        let flat =
+            canon::lower(&mut heap, StringEncoding::Utf8, &value, &ty, &types).expect("lowers");
+        let lifted = canon::lift(
+            &mut heap,
+            StringEncoding::Utf8,
+            &mut flat.iter(),
+            &ty,
+            &types,
+        )
+        .expect("lifts");
+        assert_eq!(lifted, value);
+
+        let mut heap = Heap::new();
+        canon::store(&mut heap, StringEncoding::Utf8, &value, &ty, &types, 0).expect("stores");
+        let loaded = canon::load(&mut heap, StringEncoding::Utf8, 0, &ty, &types).expect("loads");
+        assert_eq!(loaded, value);
+    }
+}
+
+#[test]
+fn a_list_of_string_pairs_round_trips_through_memory() {
+    // Type 0 is a pair of strings, and type 1 a list of pairs.
+    let types = vec![
+        ComponentTypeDef::Tuple(vec![
+            ComponentType::Scalar(Scalar::String),
+            ComponentType::Scalar(Scalar::String),
+        ]),
+        ComponentTypeDef::List(ComponentType::Tuple(0)),
+    ];
+    let ty = ComponentType::List(1);
+    let value = ComponentValue::List(vec![
+        ComponentValue::Tuple(vec![
+            ComponentValue::String("content-type".to_owned()),
+            ComponentValue::String("text/plain".to_owned()),
+        ]),
+        ComponentValue::Tuple(vec![
+            ComponentValue::String("x".to_owned()),
+            ComponentValue::String(String::new()),
+        ]),
+    ]);
+    let mut heap = Heap::new();
+    let flat = canon::lower(&mut heap, StringEncoding::Utf8, &value, &ty, &types).expect("lowers");
+    let lifted = canon::lift(
+        &mut heap,
+        StringEncoding::Utf8,
+        &mut flat.iter(),
+        &ty,
+        &types,
+    )
+    .expect("lifts");
+    assert_eq!(lifted, value);
 }
