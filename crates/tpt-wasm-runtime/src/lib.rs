@@ -162,6 +162,10 @@ pub struct Config {
     /// each level of Wasm call. When this is given, `Engine::new` refuses a configuration whose call
     /// depth could not fit in it. When it is not, the depth limit is not checked against any stack.
     pub host_stack_bytes: Option<usize>,
+    /// Wall-clock time one call may run before it traps with `DeadlineExceeded`, or `None` for no
+    /// deadline. Only the Micro interpreter enforces it, so `Engine::new` refuses it on another
+    /// mode. A deadline makes a trap depend on the host clock, so it is off by default.
+    pub max_call_time: Option<std::time::Duration>,
 }
 
 impl Default for Config {
@@ -178,6 +182,7 @@ impl Default for Config {
             max_verification_work: tpt_wasm_ir::DEFAULT_VERIFICATION_WORK,
             max_optimization_work: tpt_wasm_opt::DEFAULT_OPTIMIZATION_WORK,
             host_stack_bytes: None,
+            max_call_time: None,
         }
     }
 }
@@ -682,6 +687,11 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: Config) -> Result<Self, RuntimeError> {
+        if config.max_call_time.is_some() && config.engine_mode != EngineMode::Micro {
+            return Err(RuntimeError::UnsupportedFeature(
+                "max_call_time is enforced by the Micro interpreter only",
+            ));
+        }
         // Every mode is now implemented. The optimizing mode differs from the
         // baseline only in the compilation it runs -- both execute through the
         // same portable executor -- so the two can be compared directly, and
@@ -792,11 +802,12 @@ impl Engine {
         key: Option<&str>,
         linker: &Linker,
     ) -> Result<Instance, RuntimeError> {
-        let execution = if self.config.deterministic {
+        let mut execution = if self.config.deterministic {
             ExecutionConfig::deterministic(0)
         } else {
             ExecutionConfig::host_dependent()
         };
+        execution.call_deadline = self.config.max_call_time;
         let native = match (self.native_cache.as_ref(), key) {
             (Some(cache), Some(key)) => Some((cache, key)),
             _ => None,

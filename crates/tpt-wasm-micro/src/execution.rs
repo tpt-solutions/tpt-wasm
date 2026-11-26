@@ -18,6 +18,9 @@ pub enum ExecutionMode {
 pub struct ExecutionConfig {
     pub mode: ExecutionMode,
     pub seed: u64,
+    /// Wall-clock time a machine may run before it traps with `DeadlineExceeded`, or `None` for no
+    /// deadline. A deadline makes a trap depend on the host clock, so it is off by default.
+    pub call_deadline: Option<std::time::Duration>,
 }
 
 impl Default for ExecutionConfig {
@@ -25,6 +28,7 @@ impl Default for ExecutionConfig {
         Self {
             mode: ExecutionMode::Deterministic,
             seed: 0,
+            call_deadline: None,
         }
     }
 }
@@ -34,6 +38,7 @@ impl ExecutionConfig {
         Self {
             mode: ExecutionMode::Deterministic,
             seed,
+            call_deadline: None,
         }
     }
 
@@ -41,6 +46,7 @@ impl ExecutionConfig {
         Self {
             mode: ExecutionMode::HostDependent,
             seed: 0,
+            call_deadline: None,
         }
     }
 }

@@ -25,7 +25,13 @@ pub struct Machine {
     pub pending_host_results: Option<usize>,
     pub execution: ExecutionConfig,
     rng: DeterministicRng,
+    /// The instant the call must stop by, from the execution config's call deadline, if any.
+    deadline: Option<std::time::Instant>,
 }
+
+/// How many steps pass between reads of the clock for the call deadline. A read per step would cost
+/// more than the step it guards; this bounds how far past the deadline a call can run.
+const DEADLINE_CHECK_INTERVAL: u64 = 256;
 
 /// An activation frame (function call frame).
 #[derive(Debug)]
@@ -156,6 +162,13 @@ pub fn step(machine: &mut Machine) -> Step {
     if let Some(limit) = machine.store.limits.max_execution_steps {
         if machine.steps >= limit {
             return Step::Trap(Trap::StepsExhausted);
+        }
+    }
+    if machine.steps.is_multiple_of(DEADLINE_CHECK_INTERVAL) {
+        if let Some(deadline) = machine.deadline {
+            if std::time::Instant::now() >= deadline {
+                return Step::Trap(Trap::DeadlineExceeded);
+            }
         }
     }
     let Some(frame) = machine.frames.last_mut() else {
@@ -2242,6 +2255,9 @@ impl Machine {
             profile: None,
             pending_host_results: None,
             rng: DeterministicRng::new(execution.seed),
+            deadline: execution
+                .call_deadline
+                .map(|limit| std::time::Instant::now() + limit),
             execution,
         }
     }

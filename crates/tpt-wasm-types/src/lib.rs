@@ -133,6 +133,8 @@ pub enum Trap {
     StackOverflow,
     CallDepthExceeded,
     StepsExhausted,
+    /// The call ran past its wall-clock deadline.
+    DeadlineExceeded,
     HostFailure(String),
 }
 
